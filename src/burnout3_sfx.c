@@ -29,6 +29,9 @@
  * event law asks for: gain, playback rate, distance roll-off, looping.
  */
 #include "burnout3_sfx.h"
+#include "burnout3_sfx_emitters.h"
+#include "burnout3_emu.h"
+#include "burnout3_backend.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -633,12 +636,45 @@ static int start(B3SfxEvent ev, const B3SfxShot* sh, float gain)
     return (vi << 16) | (int)(v->gen & 0xFFFF);
 }
 
+
+/* sfx=retail: ask the game's own emitter what it would play.
+ *
+ * The emitter runs for real up to PlaySound3D (0x001CD8D0) and the captured
+ * {wave, gain, pitch} comes back; past that point retail is talking to the
+ * Xbox's 3D voice manager, which this harness replaces with its own mixer.
+ * So retail decides the LAW -- gain and playback rate for this impulse -- and
+ * the port keeps resolving which shipped file the wave base names, which is
+ * asset plumbing rather than game logic.
+ *
+ * The port's cooldown stays authoritative: tools/emulate_sfx.py clears the
+ * emitter's own cooldown bytes before every call, so retail would answer as
+ * if the event were always fresh.
+ *
+ * Events whose emitter has no captured calling convention have addr 0 in the
+ * generated table and simply stay on the port. */
+static void sfx_retail_override(B3SfxEvent ev, float impulse, B3SfxShot* sh)
+{
+    if (b3_backend_get(B3_FEAT_SFX) != B3_BACKEND_RETAIL) return;
+    if ((unsigned)ev >= B3_SFX_EMITTER_COUNT) return;
+    const B3SfxEmitter* e = &B3_SFX_EMITTERS[ev];
+    if (!e->addr) return;
+
+    B3EmuVoice v[4];
+    int n = 0;
+    if (!b3_emu_sfx_fire(e->addr, e->kind, impulse, v, &n)) return;
+    if (n <= 0) { sh->play = 0; return; }   /* retail played nothing */
+    sh->gain  = v[0].gain;
+    sh->pitch = v[0].pitch;
+}
+
 int b3_sfx_event(B3SfxEvent ev, float impulse)
 {
     if ((unsigned)ev >= B3_SFX_COUNT) return -1;
     if (g_cooldown[ev] > 0) return -1;
     B3SfxShot sh;
     if (!b3_sfx_resolve(ev, impulse, -1, &sh)) return -1;
+    sfx_retail_override(ev, impulse, &sh);
+    if (!sh.play) return -1;
 
     const B3SfxDef* d = &g_defs[ev];
     g_cooldown[ev] = d->cooldown +
@@ -658,6 +694,8 @@ int b3_sfx_event_at(B3SfxEvent ev, float impulse, float x, float y, float z)
     if (g_cooldown[ev] > 0) return -1;
     B3SfxShot sh;
     if (!b3_sfx_resolve(ev, impulse, -1, &sh)) return -1;
+    sfx_retail_override(ev, impulse, &sh);
+    if (!sh.play) return -1;
 
     const B3SfxDef* d = &g_defs[ev];
     g_cooldown[ev] = d->cooldown +
@@ -727,9 +765,30 @@ int b3_sfx_voice_active(int voice)
     return g_voices[vi].active && (g_voices[vi].gen & 0xFFFF) == gen;
 }
 
+/* THE AUDIO TIME SCALE -- DAT_003EBFD0 -> DAT_004A1EF0 [C].  See the long
+ * note in burnout3_sfx.h section 3.  Retail multiplies each non-exempt
+ * voice's own playback rate by this global inside the per-voice parameter
+ * update (FUN_001CAD10 @0x001CADC6 and its five siblings), which is a LIVE
+ * multiply: the rate change pitches voices that are already sounding.  So
+ * it is applied here at the step, not baked into Voice.step at start().
+ *
+ * Written from the render thread (b3_sfx_set_time_scale), read from the
+ * audio thread; a float store/load is atomic on every target this port
+ * builds for and a one-callback-late rate is inaudible. */
+static volatile float g_time_scale = 1.0f;
+
+void b3_sfx_set_time_scale(float rate)
+{
+    if (!(rate > 0.0f)) rate = 1.0f;      /* a zero rate would freeze a voice */
+    g_time_scale = rate;
+}
+
+float b3_sfx_time_scale(void) { return g_time_scale; }
+
 float b3_sfx_next_sample(void)
 {
     float acc = 0.0f;
+    const double ts = (double)g_time_scale;
     for (int i = 0; i < NVOICES; i++) {
         Voice* v = &g_voices[i];
         if (!v->active) continue;
@@ -745,7 +804,7 @@ float b3_sfx_next_sample(void)
         float fr = (float)(v->pos - (double)i0);
         float s = (float)w->pcm[i0] * (1.0f - fr) + (float)w->pcm[i1] * fr;
         acc += s * v->gain;
-        v->pos += v->step;
+        v->pos += v->step * ts;     /* DAT_004A1EF0, @0x001CADC6 */
     }
     return acc;
 }

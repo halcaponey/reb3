@@ -1,5 +1,7 @@
 #ifndef BURNOUT3_TAKEDOWN_H
 #define BURNOUT3_TAKEDOWN_H
+
+#include <stddef.h>
 /* Takedown presentation FX: the game's slow-motion moment, the takedown /
  * crash camera hand-over, and the callout trigger chain.
  *
@@ -50,23 +52,38 @@ extern "C" {
                                     * 0x00025D5C player crash              */
 #define B3_TDFX_DIV_IMPACT      6  /* 0x0002655B big-hit impact slam       */
 
-typedef struct B3TdfxTimer {
-    /* the real object's fields, same order (offsets in the comments) */
-    int   last_raw;      /* +0x00 last frame-counter value seen            */
-    int   prev_delta;    /* +0x04 previous (counter - base)                */
-    int   paused_acc;    /* +0x08 accumulated while +0x28 == 0             */
-    int   whole;         /* +0x0C accumulated whole ticks at current rate  */
-    int   rem;           /* +0x10 sub-tick remainder                       */
-    int   base;          /* +0x14 counter origin                           */
-    int   divisor;       /* +0x18 current time divisor                     */
-    float dt;            /* +0x1C per-frame dt seconds                     */
-    float clock;         /* +0x20 clock seconds                           */
-    int   requested;     /* +0x24 requested divisor                        */
-    int   running;       /* +0x28 running flag                             */
-    /* not in the game object: this port keeps its own period copy instead
-     * of the DAT_0049C120 global */
-    float period;
+typedef struct __attribute__((packed)) B3TdfxTimer {
+    // ---- RETAIL WINDOW 0x0000..0x002C: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    int                  last_raw;  /* +0x00 last frame-counter value seen            */
+    int                  prev_delta;  /* +0x04 previous (counter - base)                */
+    int                  paused_acc;  /* +0x08 accumulated while +0x28 == 0             */
+    int                  whole;  /* +0x0C accumulated whole ticks at current rate  */
+    int                  rem;  /* +0x10 sub-tick remainder                       */
+    int                  base;  /* +0x14 counter origin                           */
+    int                  divisor;  /* +0x18 current time divisor                     */
+    float                dt;  /* +0x1C per-frame dt seconds                     */
+    float                clock;  /* +0x20 clock seconds                           */
+    int                  requested;  /* +0x24 requested divisor                        */
+    int                  running;  /* +0x28 running flag                             */
+
+    // ---- HARNESS SIDE, past the retail window: no recovered
+    // offset in THIS object, so it must not squat on retail's bytes.
+    float                period;  
 } B3TdfxTimer;
+
+#define B3TDFXTIMER_RETAIL_SPAN 0x002Cu
+_Static_assert(offsetof(B3TdfxTimer, last_raw) == 0x0000, "last_raw off retail");
+_Static_assert(offsetof(B3TdfxTimer, prev_delta) == 0x0004, "prev_delta off retail");
+_Static_assert(offsetof(B3TdfxTimer, paused_acc) == 0x0008, "paused_acc off retail");
+_Static_assert(offsetof(B3TdfxTimer, whole) == 0x000C, "whole off retail");
+_Static_assert(offsetof(B3TdfxTimer, rem) == 0x0010, "rem off retail");
+_Static_assert(offsetof(B3TdfxTimer, base) == 0x0014, "base off retail");
+_Static_assert(offsetof(B3TdfxTimer, divisor) == 0x0018, "divisor off retail");
+_Static_assert(offsetof(B3TdfxTimer, dt) == 0x001C, "dt off retail");
+_Static_assert(offsetof(B3TdfxTimer, clock) == 0x0020, "clock off retail");
+_Static_assert(offsetof(B3TdfxTimer, requested) == 0x0024, "requested off retail");
+_Static_assert(offsetof(B3TdfxTimer, running) == 0x0028, "running off retail");
 
 void  b3_tdfx_timer_init(B3TdfxTimer *t, float period);        /* GLUE ctor */
 void  b3_tdfx_timer_rescale(B3TdfxTimer *t);                   /* FUN_001B5B60 [C] */
@@ -94,15 +111,29 @@ void  b3_tdfx_timer_tick(B3TdfxTimer *t, int frame_counter);   /* FUN_001B5AC0 [
  * ====================================================================== */
 
 /* camera record: the real 0x10-byte record at director+0x20 + i*0x10 */
-typedef struct B3TdCamRecord {
+typedef struct __attribute__((packed)) B3TdCamRecord {
+    // ---- RETAIL WINDOW 0x0000..0x0010: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    unsigned char _pad00[0x4];
+    float                elapsed;  /* +0x04 seconds since entry (-1 = idle) */
+    int                  slot;  /* +0x08 owner racecar slot / player idx */
+    unsigned char        flag_c;  /* +0x0C armed flag (cleared at t>=2.5)  */
+    unsigned char        callout_done;  /* +0x0D "event 10 already posted"       */
+    unsigned char        active;  /* +0x0E cinematic running               */
+    unsigned char        chain;  /* +0x0F copy of racecar+0x11EE          */
+
+    // ---- HARNESS SIDE, past the retail window: no recovered
+    // offset in THIS object, so it must not squat on retail's bytes.
     void         *victim;        /* +0x00 victim racecar                  */
-    float         elapsed;       /* +0x04 seconds since entry (-1 = idle) */
-    int           slot;          /* +0x08 owner racecar slot / player idx */
-    unsigned char flag_c;        /* +0x0C armed flag (cleared at t>=2.5)  */
-    unsigned char callout_done;  /* +0x0D "event 10 already posted"       */
-    unsigned char active;        /* +0x0E cinematic running               */
-    unsigned char chain;         /* +0x0F copy of racecar+0x11EE          */
 } B3TdCamRecord;
+
+#define B3TDCAMRECORD_RETAIL_SPAN 0x0010u
+_Static_assert(offsetof(B3TdCamRecord, elapsed) == 0x0004, "elapsed off retail");
+_Static_assert(offsetof(B3TdCamRecord, slot) == 0x0008, "slot off retail");
+_Static_assert(offsetof(B3TdCamRecord, flag_c) == 0x000C, "flag_c off retail");
+_Static_assert(offsetof(B3TdCamRecord, callout_done) == 0x000D, "callout_done off retail");
+_Static_assert(offsetof(B3TdCamRecord, active) == 0x000E, "active off retail");
+_Static_assert(offsetof(B3TdCamRecord, chain) == 0x000F, "chain off retail");
 
 /* the subset of the racecar the cinematic reads/writes (offsets from
  * DAT_0073A1D0 + slot*0x27E0) */
@@ -112,23 +143,57 @@ typedef struct B3TdVehicle {
     unsigned char flags1353;     /* v+0x1353 crash/ghost bits             */
 } B3TdVehicle;
 
-typedef struct B3TdRacecar {
+typedef struct __attribute__((packed)) B3TdRacecar {
+    // ---- RETAIL WINDOW 0x0000..0x2800: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    unsigned char _pad00[0x10DC];
+    float                clock;  /* +0x10DC race clock                */
+    unsigned char _pad01[0x10E];
+    unsigned char        chain_flag;  /* +0x11EE burnout-chain flag        */
+    unsigned char _pad02[0x2];
+    unsigned char        boost_ramp_done;  /* +0x11F1                           */
+    unsigned char _pad03[0x12E];
+    int                  signature;  /* +0x1320 signature-takedown id     */
+    unsigned char _pad04[0x28];
+    int                  race_state;  /* +0x134C 3 = finished              */
+    unsigned char _pad05[0xBC];
+    float                crash_stamp;  /* +0x140C crash-start stamp         */
+    unsigned char _pad06[0x4EA];
+    unsigned char        crashed;  /* +0x18FA                           */
+    unsigned char _pad07[0x25];
+    int                  cls;  /* +0x1920 0 = human                 */
+    unsigned char _pad08[0x98];
+    unsigned char        grid_slot;  /* +0x19BC                           */
+    unsigned char _pad09[0xA5A];
+    unsigned char        burnout_grant;  /* +0x2417                           */
+    unsigned char _pad0A[0x45];
+    unsigned char        hud_flag;  /* +0x245D                           */
+    unsigned char _pad0B[0x372];
+    int                  player_index;  /* +0x27D0 local player index        */
+    unsigned char _pad0C[0x4];
+    unsigned char        cam_active;  /* +0x27D8 takedown camera engaged   */
+    unsigned char _pad0D[0x27];
+
+    // ---- HARNESS SIDE, past the retail window: no recovered
+    // offset in THIS object, so it must not squat on retail's bytes.
     struct B3TdRacecar *victim;      /* +0x15A4 last car I took down      */
-    float          clock;            /* +0x10DC race clock                */
-    float          crash_stamp;      /* +0x140C crash-start stamp         */
-    int            cls;              /* +0x1920 0 = human                 */
-    int            race_state;       /* +0x134C 3 = finished              */
-    int            signature;        /* +0x1320 signature-takedown id     */
-    int            player_index;     /* +0x27D0 local player index        */
-    unsigned char  crashed;          /* +0x18FA                           */
-    unsigned char  grid_slot;        /* +0x19BC                           */
-    unsigned char  chain_flag;       /* +0x11EE burnout-chain flag        */
-    unsigned char  boost_ramp_done;  /* +0x11F1                           */
-    unsigned char  cam_active;       /* +0x27D8 takedown camera engaged   */
-    unsigned char  hud_flag;         /* +0x245D                           */
-    unsigned char  burnout_grant;    /* +0x2417                           */
     B3TdVehicle   *pv;               /* +0x2440 physics vehicle           */
 } B3TdRacecar;
+
+#define B3TDRACECAR_RETAIL_SPAN 0x2800u
+_Static_assert(offsetof(B3TdRacecar, clock) == 0x10DC, "clock off retail");
+_Static_assert(offsetof(B3TdRacecar, chain_flag) == 0x11EE, "chain_flag off retail");
+_Static_assert(offsetof(B3TdRacecar, boost_ramp_done) == 0x11F1, "boost_ramp_done off retail");
+_Static_assert(offsetof(B3TdRacecar, signature) == 0x1320, "signature off retail");
+_Static_assert(offsetof(B3TdRacecar, race_state) == 0x134C, "race_state off retail");
+_Static_assert(offsetof(B3TdRacecar, crash_stamp) == 0x140C, "crash_stamp off retail");
+_Static_assert(offsetof(B3TdRacecar, crashed) == 0x18FA, "crashed off retail");
+_Static_assert(offsetof(B3TdRacecar, cls) == 0x1920, "cls off retail");
+_Static_assert(offsetof(B3TdRacecar, grid_slot) == 0x19BC, "grid_slot off retail");
+_Static_assert(offsetof(B3TdRacecar, burnout_grant) == 0x2417, "burnout_grant off retail");
+_Static_assert(offsetof(B3TdRacecar, hud_flag) == 0x245D, "hud_flag off retail");
+_Static_assert(offsetof(B3TdRacecar, player_index) == 0x27D0, "player_index off retail");
+_Static_assert(offsetof(B3TdRacecar, cam_active) == 0x27D8, "cam_active off retail");
 
 /* every HUD/presentation post the cinematic makes, captured in order */
 typedef struct B3TdfxPost {
@@ -283,22 +348,36 @@ int b3_tdfx_select_takedown_message(int revenge, int aftertouch,
  * direct port (camera framing, the world query).
  * ====================================================================== */
 
-typedef struct B3TdfxCamera {
-    int   active;       /* 1 while the cinematic owns the view            */
-    float weight;       /* 0..1 ease-in/out blend (GLUE)                  */
-    float eye[3];
-    float look[3];
-    float fov;          /* degrees; 90 base / 110 at full boost [C]       */
-    float pitch_deg;    /* the smoothed pitch state, mode obj +0x1C  [C]  */
-    float yaw_deg;      /* the smoothed yaw state,   mode obj +0x18  [C]  */
-    /* --- appended by the crash-director pass (section 9); the retail
-     * camera state's own fields --- */
-    float right[3];     /* the camera basis rows (state +0x20 as a quat)  */
-    float up[3];
-    float fwd[3];
-    float quat[4];      /* camera state +0x20, FUN_00011B10's output      */
-    float focus[3];     /* the look anchor: car.pos in Focus Offset space */
+/* packed pins the retail offsets; aligned(4) pins only the struct BASE.
+ * No member moves (the offsetof asserts below prove it) -- but with a
+ * 4-aligned base the 4-byte fields ARE 4-aligned, so taking their address
+ * is no longer undefined and -Waddress-of-packed-member goes quiet on the
+ * fields that really are aligned (and still fires on any that are not). */
+typedef struct __attribute__((packed, aligned(4))) B3TdfxCamera {
+    // ---- RETAIL WINDOW 0x0000..0x0024: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    unsigned char _pad00[0x18];
+    float                yaw_deg;  /* the smoothed yaw state,   mode obj +0x18  [C]  */
+    float                pitch_deg;  /* the smoothed pitch state, mode obj +0x1C  [C]  */
+    float                right[3];  /* the camera basis rows (state +0x20 as a quat)  */
+
+    // ---- HARNESS SIDE, past the retail window: no recovered
+    // offset in THIS object, so it must not squat on retail's bytes.
+    int                  active;  /* 1 while the cinematic owns the view            */
+    float                weight;  /* 0..1 ease-in/out blend (GLUE)                  */
+    float                eye[3];  
+    float                look[3];  
+    float                fov;  /* degrees; 90 base / 110 at full boost [C]       */
+    float                up[3];  
+    float                fwd[3];  
+    float                focus[3];  /* the look anchor: car.pos in Focus Offset space */
+    float                quat[4];  /* camera state +0x20, FUN_00011B10's output      */
 } B3TdfxCamera;
+
+#define B3TDFXCAMERA_RETAIL_SPAN 0x0024u
+_Static_assert(offsetof(B3TdfxCamera, yaw_deg) == 0x0018, "yaw_deg off retail");
+_Static_assert(offsetof(B3TdfxCamera, pitch_deg) == 0x001C, "pitch_deg off retail");
+_Static_assert(offsetof(B3TdfxCamera, right) == 0x0020, "right off retail");
 
 /* ----------------------------------------------------------------------
  * 3b. THE RECOVERED CAMERA LAW  (RE_TAKEDOWN_FX section 8)
@@ -379,12 +458,25 @@ float b3_cam_smooth_angle(float cur_deg, float target_deg, float blend);
 #define B3_CAM_RAD2DEG  57.29578f             /* 0x00395D78 */
 
 /* the real mode object's per-frame state */
-typedef struct B3CamFollow {
-    float yaw_deg;      /* mode +0x18                                    */
-    float pitch_deg;    /* mode +0x1C                                    */
-    int   yaw_gate;     /* mode +0x24, set to 1 by the enter FUN_0015E060 */
-    int   look_back;    /* mode +0x26, negates car.fwd and car.right      */
+typedef struct __attribute__((packed)) B3CamFollow {
+    // ---- RETAIL WINDOW 0x0000..0x002A: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    unsigned char _pad00[0x18];
+    float                yaw_deg;  /* mode +0x18                                    */
+    float                pitch_deg;  /* mode +0x1C                                    */
+    unsigned char _pad01[0x4];
+    int                  yaw_gate;  /* mode +0x24, set to 1 by the enter FUN_0015E060 */
+    unsigned char _pad02[0x2];
+
+    // ---- HARNESS SIDE, past the retail window: no recovered
+    // offset in THIS object, so it must not squat on retail's bytes.
+    int                  look_back;  /* mode +0x26, negates car.fwd and car.right      */
 } B3CamFollow;
+
+#define B3CAMFOLLOW_RETAIL_SPAN 0x002Au
+_Static_assert(offsetof(B3CamFollow, yaw_deg) == 0x0018, "yaw_deg off retail");
+_Static_assert(offsetof(B3CamFollow, pitch_deg) == 0x001C, "pitch_deg off retail");
+_Static_assert(offsetof(B3CamFollow, yaw_gate) == 0x0024, "yaw_gate off retail");
 
 void b3_cam_follow_init(B3CamFollow *st);
 
@@ -598,6 +690,19 @@ void  b3_tdfx_event_reset(void);
 void  b3_tdfx_status(B3TdfxStatus *out);
 float b3_tdfx_timescale(void);
 int   b3_tdfx_divisor(void);
+
+/* DAT_003EBFD0 -- the AUDIO TIME SCALE, the second argument of the retail
+ * per-frame audio update FUN_001CA530, which lands in DAT_004A1EF0 and
+ * multiplies every non-exempt voice's playback rate.  A flat 0.75 for any
+ * dilation in the crash / aftertouch family, 1.0 otherwise.
+ *
+ * This is a LATCH, not `1/divisor` and not `divisor != 1`.  The takedown
+ * cinematic (0x0002795F / 0x00027A3D / 0x00027BCD) and the wreck instant
+ * (0x00025D5C) request divisors with NO paired DAT_003EBFD0 store, so a
+ * takedown cinematic slows time at normal audio pitch.  The full write
+ * table, with all ten paired sites, is in burnout3_sfx.h section 3.
+ *
+ * Feed it to b3_sfx_set_time_scale() once per frame.                  [C] */
 float b3_tdfx_pitch(void);
 
 /* Cinematic camera.  Target is the VICTIM [C].  The angle smoothing, the

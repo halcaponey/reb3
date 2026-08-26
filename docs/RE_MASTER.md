@@ -196,7 +196,10 @@ Per-frame chain [C]:
   (`FUN_00115130 @0x00115265` → `FUN_00127180`).
 - Panel kinds (`.bgv+0xAC4`): 0/1 doors, 2/3 front/rear wings, 4 bonnet
   (pivot x = 0; 50/50 skip-loose + flip-up pose), 5 boot/hatch, 6 extra.
-  Hinge axes at `.bgv+0xADC`/`+0xAFC` (loose pose, not yet in sidecar [?]).
+  Hinge axes at `.bgv+0xADC`/`+0xAFC`. **Status (2026-08-22):** `+0xADC` is in
+  the sidecar now — `tools/cextract/cx_cars_bgv.c` writes it as the `panelbb`
+  axis and `src/burnout3_panels.c` consumes it; `+0xAFC` (loose pose) is still
+  absent `[?]`.
 - Panel/debris flight = class-7 bodies: ctor `FUN_001068A0`, pool
   `gameworld+0xD3380` stride 0x4E0, update `FUN_00106D00` via vtable
   0x003B1108 (ledger PH-05 spec).
@@ -274,6 +277,39 @@ Per-frame chain [C]:
 
 ## 9. Props and particles
 
+- **INSTANCED SCENERY (NEW RECOVERY 2026-08-21, no python oracle).**
+  `static.dat`'s **FIRST** 0x70-record table — hdr `+0x34` u16 count /
+  `+0x38` i32 table — is the world's dressing, and until now nothing read
+  it: `tools/py_extract_archive/extract_track.py:23` records it as
+  `(not extracted, [S])` and :719-727 argues the omission away as an LOD
+  choice. It is not. It holds palms, hero trees, bushes, lamp posts,
+  traffic-light/tram posts, telegraph poles, overhead/hospital/speed signs,
+  phone boxes, park benches, moored boats and parked vehicles (bus, Suv_1,
+  PeopleCarrier, FedEx_Van) — the shader-class 8/9 materials
+  `extract_track.py:957-984` calls "the foliage/prop/cone families" and then
+  reports no shipped track uses, *because the geometry that uses them is not
+  in the world mesh at all*. 36 shipped tracks, 1,534 model records,
+  **79,585 placements**, 3,676 of them palms. The symptom that found it: the world
+  mesh DOES draw the `WF_Palm_shadow` decal, so the port painted palm-tree
+  shadows on the road with no palm above them (`build/debug_dump_082.bmp`).
+  - Record shape is IDENTICAL to the destructible-prop record above (LOD0
+    `+0x20`, LOD1 `+0x34`, LOD2 `+0x48`, material ids `+0x5C/5E/60`, flags
+    `+0x62`, near/far `+0x64/+0x68`); reader `FUN_001ADA40
+    @0x001ADBC0..0x001ADD40`, cursor `+= 0x70`, gated on `+0x62 & 2`. [C]
+  - PLACEMENT is **per streamed unit**, not in static.dat: the unit LOD
+    block carries `{i32 counts_off, i32 lists_off}` at **+0xA8**, relinked
+    by `FUN_0019D7A0 @0x0019D7D9 -> FUN_0019D760` against
+    **`block + 0xA8`** (`ADD ECX,EDX` where `EDX = ESI+0xA8`) — NOT against
+    the block start the way `+0xA0`/`+0xA4` are. Count = hdr`+0x34`
+    (`MOVSX EDI,word ptr [EAX+0x34]` @0x0019CBD1). `counts` is
+    `u8[record_count]`, `lists` is `i32[record_count]`, each entry another
+    block-relative offset to `count` × 0x40-byte 4×4 row-major matrices
+    (w slots = the baked half-range instance colour, props convention). [C]
+  - Stage `tools/cextract/cx_scenery.c` → `build/tracks/<ID>/scenery.bin`
+    ('B3SC'); runtime `src/burnout3_scenery.c`; gate
+    `tools/validate_scenery.py` (315/315), which re-derives everything from
+    the shipped `.dat` pair because `verify_cextract.py`'s oracle diff
+    cannot cover a stage with no python original.
 - Prop placement: every `static.dat` carries a second 0x70-record model
   table: hdr+0x36/+0x3C models, +0x40/+0x48 instance 4x4s (w slots = baked
   instance colour), +0x44 per-model CLASS byte, +0x4C/+0x50 per-unit
@@ -433,10 +469,23 @@ Per-frame chain [C]:
   124 px right-aligned; glyph 30×30 at text_left−4−15; swaps to the
   aftertouch cursor (54×36, callback `FUN_0004FCA0`) when boost held:
   four wedges around (0.5,0.45) from 7-vertex table 0x003FCF38 +
-  4-primitive table 0x00388928; pulse `1−frac(t·2)²`; alpha ease
-  `2a−a²`; gloss pass mirrors U; art = Global.txd "Aftertouch" (right half
-  of the badge; UVs mirror about the vertical centreline; ValueDB endpoints
-  not in image [S]).
+  4-primitive table 0x00388928 (bytes `04 00 01 03 02 | 04 04 05 03 06 |
+  03 00 03 04 07 | 03 02 03 06 07`, walked count..1 @0x00050031), each row
+  emitted as a **triangle strip** — both draw sites (0x000500FC,
+  0x000501C0) call the strip batcher `FUN_001C7710`, batch kind 2, whose
+  D3D primitive type @0x003A7C28+2×12 is 6 = `D3DPT_TRIANGLESTRIP`;
+  pulse `1−frac(t·2)²`; alpha ease
+  `2a−a²`; gloss pass mirrors U; art = Global.txd "Aftertouch", a
+  TWO-SPRITE 64×64 sheet — crisp badge in the right half, soft glow in the
+  left. **UV endpoints are [C], not [S]:** `FUN_00265D10` fills the
+  vertex-indexed table 0x0054F680 from four ValueDB scalars whose
+  compiled-in defaults come from one-instruction C++ dynamic initialisers —
+  u 32.5/64 @0x00265C60→0x0054F6D4 (box x=0.5) and 63.5/64
+  @0x00265C80→0x0054F678 (x=0/1); v 0.5/64 @0x00265CA0→0x0054F664 (y=0)
+  and 63.5/64 @0x00265CC0→0x0054F6E0 (y=1); centre-vertex v derived
+  @0x00265CE0 as `vTOP+(vBOT−vTOP)×0.45` (0x003A2D1C), i.e. v is linear in
+  box y. So pass 1 samples the sheet's right half and the pass-2 `u:=1−u`
+  mirror its left half.
 - Crash ticker: `FUN_0004ED40` joins descriptors with "+ "; `FUN_0017A720`
   formats from a 30-row table at 0x003A2F70 (flags: &4 metres×3.28084+"ft";
   &8 %.1f+"s" — AIR is SECONDS; &1|&2 count×180°; &1 Double/Triple names);

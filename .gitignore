@@ -1,38 +1,56 @@
 # ---------------------------------------------------------------------------
 # Nothing derived from the retail game may be committed to this repository.
 #
-# Everything below is regenerated on your machine from YOUR copy of the game
-# by the tools in tools/ (see docs/ASSETS.md). None of it is redistributable.
+# Everything the game needs is read off YOUR copy of the disc at run time, or
+# materialised into build/ from it (see docs/ASSETS.md). None of it is
+# redistributable, and none of it belongs in this history.
 # ---------------------------------------------------------------------------
 
 # Build output
 /burnout3
 *.o
+/dist/
 
-# The corrected ELF, all extracted geometry, textures, audio, music, track and
-# collision data. ~7 GB once fully extracted.
+# The corrected ELF and every materialised asset: geometry, textures, audio,
+# music, collision, the per-track binaries and the ISO cache. Several GB once a
+# full extraction has run; nothing here is committed.
 #   burnout3.elf   : tools/xbe2elf.py
-#   track.obj/.mtl : tools/extract_track.py
-#   textures/      : tools/extract_textures.py
-#   cars/          : tools/extract_bgv.py
-#   audio/, music/ : tools/extract_awd.py, tools/extract_eatrax.py
+#   everything else: tools/cextract (in process, on a cache miss)
 /build/
 
-# GENERATED HEADERS -- retail data tables, emitted into src/ by the extractors.
-# These are game content in C form, not source. `make assets` writes them.
+# THE EIGHT PURGED HEADERS -- a tripwire, not a build product.
+#
+# These used to bake retail data into src/: the vehicle roster, per-car tuning,
+# the fonts, track paths, start grids, AI pace, traffic sets and the Globalus
+# display strings. All eight are GONE, replaced by src/*_runtime.h loaders that
+# read the user's own files at boot, and tools/validate_no_baked_data.py fails
+# if any of them comes back. They are listed here so that an old tree, or an
+# archived generator run by hand, cannot quietly re-commit one.
+/src/burnout3_ai_pace.h
 /src/burnout3_car_physics.h
 /src/burnout3_font.h
-/src/burnout3_physics_params.h
 /src/burnout3_start_grid.h
 /src/burnout3_track_paths.h
+/src/burnout3_trackselect.h
 /src/burnout3_traffic_data.h
 /src/burnout3_vehicle_data.h
 
 # Reference captures. Screenshots of the retail game are the game's artwork --
-# cite a frame in the docs by all means, but do not commit one.
+# cite a frame in the docs by all means, but do not commit one. That is why the
+# frames docs/ and web/README.md cite are named rather than embedded.
 /REFERENCE IMAGES/
 *.xbe
 *.iso
+*.xiso
+
+# THIRD-PARTY SOURCE IS FETCHED, NEVER COMMITTED -- three of them, same rule:
+#   third_party/          Rockbox's libwma (LGPL), tools/fetch_wma.sh
+#   android/third_party/  SDL2, SDL2_image, gl4es, android/fetch_deps.sh
+#   web/third_party/      nothing any more; web/fetch_deps.sh says why
+# Keeping the LGPL decoder out of this history is what keeps it separable --
+# see THIRD_PARTY.md.
+/third_party/
+/web/third_party/
 
 # Ghidra project database (regenerable by importing build/burnout3.elf)
 /ghirda-manual.rep/

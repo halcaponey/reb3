@@ -21,6 +21,9 @@
  * reproduces.
  */
 #include "burnout3_boostfx.h"
+/* the retained renderer publishes the frame camera, so the billboard passes
+ * do not have to read it back out of the driver */
+#include "burnout3_render.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -171,11 +174,18 @@ static GLuint load_png(const char* path)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_GENERATE_MIPMAP, GL_TRUE);
+    b3r_tex_mipmap_pre();
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rgba->w, rgba->h, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, rgba->pixels);
+    b3r_gen_mipmap();
+    /* GL_GENERATE_MIPMAP is GL 1.4 / GLES1: it does not exist in GLES2, and
+     * therefore not in WebGL either.  Asking for it there is INVALID_ENUM,
+     * the chain never gets built, and a GL_LINEAR_MIPMAP_LINEAR minifier on
+     * a texture with no chain is MIPMAP-INCOMPLETE -- which samples black.
+     * glGenerateMipmap() after the upload is the GL 3.0 / GLES2 spelling of
+     * the same thing, and it is what every target here uses now. */
     SDL_FreeSurface(rgba);
-    glBindTexture(GL_TEXTURE_2D, 0);
+    /* no unbind -- see the note by b3_hud_load_texture() in burnout3_hud.c */
     return t;
 }
 
@@ -333,22 +343,20 @@ int b3_boostfx_resolve(float level, int red, float* out_size, float out_rgb[3])
 void b3_boostfx_pass_begin(void)
 {
     if (!g.ready) return;
-    glPushAttrib(GL_ENABLE_BIT | GL_DEPTH_BUFFER_BIT | GL_COLOR_BUFFER_BIT
-                 | GL_TEXTURE_BIT | GL_CURRENT_BIT);
-    glEnable(GL_TEXTURE_2D);
-    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-    glEnable(GL_BLEND);
-    /* Same reading as the corona pass (docs/RE_CARFX.md 4.3): the literal
-     * Xbox blend factors for the sprite pool were not decoded [?], the pool
-     * colour is multiplied by 64.0 (DAT_0035BF1C @0x00042B1A) and both
-     * coronaboost rasters ship fully opaque with the glow in RGB, which only
-     * makes sense saturating into an additive blend.                   GLUE */
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-    glEnable(GL_DEPTH_TEST);      /* flames occluded by world geometry */
-    glDepthMask(GL_FALSE);
-    glDisable(GL_LIGHTING);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_ALPHA_TEST);
+    /* The attrib push stays -- it is what hands the frame back the depth and
+     * blend state this pass moves -- but it no longer protects the geometry:
+     * the quads are buffered by the retained batcher, so b3_boostfx_pass_end()
+     * flushes them before the pop. */
+    b3r_state_push();
+    /* GL_TEXTURE_2D and the MODULATE texture env are gone: the retained
+     * program does the modulate, and b3r_begin() keeps the fixed-function
+     * features off.  The blend / depth / cull / alpha-test tuple this function
+     * used to set moves WHOLE into the B3RState b3_boostfx_draw_pose() hands
+     * the batcher -- with the evidence note that justifies the blend.  The
+     * blend EQUATION is untouched here, exactly as it was before: nothing in
+     * the frame leaves it anything but GL_FUNC_ADD (burnout3_particlefx.c
+     * restores it, and it runs after this pass). */
+    b3r2d_begin();
     g.bound = 0;
     /* re-seed once per pass, the way the retail counter does */
     g.seed_ctr++;
@@ -388,14 +396,36 @@ void b3_boostfx_draw_pose(int slot, const float pos[3], const float rot3[9],
     if (!emit) return;
 
     GLuint tex = (red && g.tex_red) ? g.tex_red : g.tex_blue;
-    if (tex != g.bound) { glBindTexture(GL_TEXTURE_2D, tex); g.bound = tex; }
+    /* The whole pass state, per car -- the same tuple b3_boostfx_pass_begin()
+     * used to issue as six GL calls, now carried to the batcher so it is
+     * applied to the draw rather than to the driver's global state.
+     * b3r_batch_state diffs it, so re-handing the same tuple for the next car
+     * costs nothing.  g.bound stays the pass' own record of the bound raster.
+     *
+     * Same reading as the corona pass (docs/RE_CARFX.md 4.3): the literal
+     * Xbox blend factors for the sprite pool were not decoded [?], the pool
+     * colour is multiplied by 64.0 (DAT_0035BF1C @0x00042B1A) and both
+     * coronaboost rasters ship fully opaque with the glow in RGB, which only
+     * makes sense saturating into an additive blend.                   GLUE */
+    B3RState st;
+    st.tex        = tex;
+    st.mode       = B3R_TEX_MODULATE;
+    st.blend      = B3R_BLEND_SA_ONE;     /* glBlendFunc(SRC_ALPHA, ONE) */
+    st.alpha_ref  = -1.0f;
+    st.depth_mask = 0;
+    st.depth_test = 1;            /* flames occluded by world geometry */
+    st.depth_func = 0;
+    st.cull       = 0;
+    b3r_batch_state(&st);
+    g.bound = tex;
 
     /* camera basis + position out of the live modelview -- the harness has
      * already loaded the world view matrix, and taking the axes from it makes
      * the billboard immune to the projection-level x-mirror.  Identical to
      * b3_carfx_corona_draw. */
-    float mv[16];
-    glGetFloatv(GL_MODELVIEW_MATRIX, mv);
+    /* was a per-car glGetFloatv(GL_MODELVIEW_MATRIX) -- see the same hoist in
+     * b3fx_corona_draw_table(); render_frame() already published this matrix */
+    const float* mv = b3r_view();
     const float rt[3] = { mv[0], mv[4], mv[8] };
     const float up[3] = { mv[1], mv[5], mv[9] };
     const float cam[3] = {
@@ -403,7 +433,7 @@ void b3_boostfx_draw_pose(int slot, const float pos[3], const float rot3[9],
         -(mv[4]*mv[12] + mv[5]*mv[13] + mv[6]*mv[14]),
         -(mv[8]*mv[12] + mv[9]*mv[13] + mv[10]*mv[14]) };
 
-    glBegin(GL_QUADS);
+    b3r2d_prim(B3R2D_QUADS);
     for (int i = 0; i < c->n; i++) {
         const B3BFEmitter* e = &c->e[i];
         /* FUN_001871E0 blends three part matrices (veh+0x590 + idx*0x40) by
@@ -450,33 +480,42 @@ void b3_boostfx_draw_pose(int slot, const float pos[3], const float rot3[9],
              * scales the result by 4, i.e. 64/255*4 = 1.0039 -- a 0..4 HDR
              * range in a byte, so the effective vertex colour is the raw
              * value.  Same reading (and same choice) as the corona pass. */
-            glColor4f(col[0]*u, col[1]*u, col[2]*u, 1.0f);
+            b3r2d_color(col[0]*u, col[1]*u, col[2]*u, 1.0f);
 
             /* V-origin: v = 0 is texel row 0, matching the corona pass and
              * the harness convention; the sprite is radially symmetric so
              * the winding/orientation is cosmetic, but keep it identical to
              * FUN_00042BC0's four vertices. */
-            glTexCoord2f(0.0f, 0.0f);
-            glVertex3f(qx - (rt[0]+up[0])*half, qy - (rt[1]+up[1])*half,
-                       qz - (rt[2]+up[2])*half);
-            glTexCoord2f(1.0f, 0.0f);
-            glVertex3f(qx + (rt[0]-up[0])*half, qy + (rt[1]-up[1])*half,
-                       qz + (rt[2]-up[2])*half);
-            glTexCoord2f(1.0f, 1.0f);
-            glVertex3f(qx + (rt[0]+up[0])*half, qy + (rt[1]+up[1])*half,
-                       qz + (rt[2]+up[2])*half);
-            glTexCoord2f(0.0f, 1.0f);
-            glVertex3f(qx - (rt[0]-up[0])*half, qy - (rt[1]-up[1])*half,
-                       qz - (rt[2]-up[2])*half);
+            b3r2d_uv(0.0f, 0.0f);
+            b3r2d_vertex3(qx - (rt[0]+up[0])*half, qy - (rt[1]+up[1])*half,
+                          qz - (rt[2]+up[2])*half);
+            b3r2d_uv(1.0f, 0.0f);
+            b3r2d_vertex3(qx + (rt[0]-up[0])*half, qy + (rt[1]-up[1])*half,
+                          qz + (rt[2]-up[2])*half);
+            b3r2d_uv(1.0f, 1.0f);
+            b3r2d_vertex3(qx + (rt[0]+up[0])*half, qy + (rt[1]+up[1])*half,
+                          qz + (rt[2]+up[2])*half);
+            b3r2d_uv(0.0f, 1.0f);
+            b3r2d_vertex3(qx - (rt[0]-up[0])*half, qy - (rt[1]-up[1])*half,
+                          qz - (rt[2]-up[2])*half);
         }
     }
-    glEnd();
+    b3r2d_prim_end();
+    /* ONE DRAW PER CAR -- exactly where glEnd() was.  The batcher would
+     * happily merge every car that shares a raster into one glDrawArrays, but
+     * a merged additive batch is NOT pixel-for-pixel what a run of per-car
+     * draws was on this driver (measured on the corona pass, which is the same
+     * shape: 8 px at 2/255 moved, and flushing at the old boundary put them
+     * back).  Keep the boundary; the win this wave is after is the death of
+     * glBegin/glEnd, not the merge. */
+    b3r2d_flush();
 }
 
 void b3_boostfx_pass_end(void)
 {
     if (!g.ready) return;
-    glPopAttrib();
+    b3r2d_end();      /* flush the batch BEFORE the pop takes its state away */
+    b3r_state_pop();
 }
 
 /* ======================================================================

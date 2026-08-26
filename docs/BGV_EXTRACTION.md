@@ -4,14 +4,24 @@ This document explains, step by step, how to extract the car body meshes from
 the Xbox game `Burnout 3: Takedown` `.bgv` files, and how that format was
 cracked (the game's own relinker is the ground truth — no guessing).
 
-The working extractor is `tools/extract_bgv.py` in this repo. Run it:
+The live extractor is the `cars_bgv` stage of the C pipeline,
+`tools/cextract/cx_cars_bgv.c`. In normal play you never run it by hand: the
+game materialises car meshes off the disc on demand. To produce them out of
+band:
 
 ```bash
-python3 tools/extract_bgv.py build/cars
+tools/cextract/build.sh /tmp/cxtract
+/tmp/cxtract --all-global --out build --game "<game dir>"
 ```
 
-It writes every player vehicle class to `build/cars/<CLASS>_<CarN>.obj`
-(max-detail LOD, with `v` / `vt` / `vn` and `f v/vt/vn` faces).
+`python3 tools/extract_bgv.py build/cars` still works and is the **oracle** —
+it is a forwarding shim onto the immutable Python archive that
+`tools/cextract/verify_cextract.py` diffs the C output against, byte for byte.
+
+Either way the output is every player vehicle class as
+`build/cars/<CLASS>_<CarN>.obj` (max-detail LOD, with `v` / `vt` / `vn` and
+`f v/vt/vn` faces), plus the `.hull`, `.lights`, `.panels` and `.wheels`
+sidecars the runtime reads.
 
 ---
 
@@ -165,15 +175,29 @@ the material directory at `+0x60` → `0x1C80` (format 0x0B, 512×256, name
 "compact1"). Decoding that raster is not yet implemented; it is the natural
 next step (emulate the game's texture decoder under Unicorn).
 
+> **Status (2026-08-22): done.** The paint rasters decode, and all 107 vehicles
+> render with their real liveries. The live implementation is the `cars_paint`
+> stage (`tools/cextract/cx_cars_paint.c`), with `cx_cars_lights.c` for the
+> light records; the archived Python counterpart is
+> `tools/py_extract_archive/extract_bgv_textures.py`.
+
 ---
 
 ## 11. Tools in this repo
 
 | Tool | Purpose |
 |---|---|
-| `tools/extract_bgv.py` | working extractor → OBJ (positions, UVs, normals) |
-| `tools/replicate_bgv_relinker.py` | transcribes the game's relinker `FUN_000310f0` |
-| `tools/debug_bgv_structure.py` | prints one file's full relinked structure |
+| `tools/cextract/cx_cars_bgv.c` | **the live extractor** — the `cars_bgv` stage; also writes the `.panels` sidecar incl. the `panelbb` hinge axis |
+| `tools/cextract/cx_cars_paint.c`, `cx_cars_lights.c`, `cx_cars_hull.c` | liveries, light records, the collision hull |
+| `tools/extract_bgv.py` | the **oracle**: a forwarding shim onto `tools/py_extract_archive/extract_bgv.py`, which the byte-identity gate diffs against |
+| `tools/blender/bgv_write.py` | the format the other way round: an independent reader **and a writer**, Blender-free. Its module docstring is the current field table, with a `[C]` citation per field |
+| `tools/blender/io_export_bgv.py` | Blender 4.x addon, File > Export > "Burnout 3 geometry (.bgv)" |
+| `tools/validate_bgv.py` | round-trip proof: parse→re-emit is byte-exact on all 67 shipped cars, a regenerated layout is field-exact, and the game's own relinker walks the result |
+
+The relinker transcription that this document's field offsets come from lives in
+the extractor itself; the standalone `tools/replicate_bgv_relinker.py` and
+`tools/debug_bgv_structure.py` scripts named in earlier revisions no longer
+exist.
 
 The Ghidra analysis used `build/burnout3.elf` (a correctly-mapped ELF of
 `default.xbe`, entry `0x001D2807`) via the ghidra-mcp bridge.

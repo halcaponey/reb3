@@ -91,7 +91,7 @@ void b3_physics_defaults(B3PhysicsConfig* cfg) {
     // RECONSTRUCTION FALLBACK: the XBE's compiled-in gear defaults are
     // placeholders (every ratio 5.0, which redlines all gears instantly).
     // The real per-car ratios live in Data/vdb.xml and are applied over
-    // these defaults via burnout3_car_physics.h (tools/extract_car_vdb.py);
+    // these defaults via build/cars/car_physics.bin (cxtract car_tuning);
     // this substitution only survives for the handful of vehicles with no
     // VDB overrides (COMPCAR18, HEVYCAR35, most TSPC traffic).
     if (cfg->gear[2] == 5.0f && cfg->gear[8] == 5.0f) {
@@ -1422,8 +1422,8 @@ void b3_lsdm_update(B3VehicleFull* v, float dt) {
     // front wheels free-roll from their point velocity
     for (int i = 0; i < 2; i++) {
         float pt[4], vp[4];
-        b3f_xform_point(m, v->wheel[i].local_x, v->wheel[i].attach,
-                        v->wheel[i].local_z, pt);
+        b3f_xform_point(m, v->wheel_local_x[i], v->wheel[i].attach,
+                        v->wheel_local_z[i], pt);
         b3f_point_vel(rb, pt, vp);
         float w = sqrtf(vp[0] * vp[0] + vp[1] * vp[1] + vp[2] * vp[2])
                   / v->wheel[i].radius;
@@ -1571,7 +1571,7 @@ static void b3_d460_force_pass(B3VehicleFull* v, float dt) {
         for (int i = 0; i < 4; i++) {
             B3WheelSim* w = &v->wheel[i];
             float wp[4], vp[4];
-            b3f_xform_point(m, w->local_x, w->attach, w->local_z, wp);
+            b3f_xform_point(m, v->wheel_local_x[i], w->attach, v->wheel_local_z[i], wp);
             b3f_point_vel(rb, wp, vp);
             const float* fwd = (i < 2) ? sat : m[2];
             const float* lat = (i < 2) ? sright : m[0];
@@ -1709,10 +1709,16 @@ static void b3_d460_force_pass(B3VehicleFull* v, float dt) {
 
 int (*b3_ground_probe_hook)(float, float, float, float*, float[3]) = 0;
 
+// `wheel_gate` selects retail's per-wheel ray (FUN_00123790, surface-gated
+// @0x00123799..0x0012383E) over its ungated under-body clearance ray
+// (FUN_001239C0 @0x00123EC6..0x00123F97, which calls FUN_001B2230 direct).
+// Both walk the SAME veh+0x200 soup; only the wheel one filters.
 static int b3f_ray(const B3VehicleFull* v, const float start[3],
-                   const float end[3], float* hit_t, float n[3]) {
+                   const float end[3], float* hit_t, float n[3],
+                   int wheel_gate) {
     if (v->soup_ground_ray)
-        return v->soup_ground_ray(v->soup_ground_user, start, end, hit_t, n);
+        return v->soup_ground_ray(v->soup_ground_user, start, end, hit_t, n,
+                                  wheel_gate);
     float h;
     int surface = b3_ground_probe_hook
                 ? b3_ground_probe_hook(start[0], start[1], start[2], &h, n)
@@ -1752,9 +1758,9 @@ static void b3_prepass(B3VehicleFull* v) {
         float len = (i < 2) ? v->front_len : v->rear_len;
         start_ly[i] = w->radius + w->attach;
         end_ly[i] = (w->attach - len * 0.75f) - w->radius;
-        b3f_xform_point(m, w->local_x, start_ly[i], w->local_z,
+        b3f_xform_point(m, v->wheel_local_x[i], start_ly[i], v->wheel_local_z[i],
                         start_w[i]);
-        b3f_xform_point(m, w->local_x, end_ly[i], w->local_z, end_w[i]);
+        b3f_xform_point(m, v->wheel_local_x[i], end_ly[i], v->wheel_local_z[i], end_w[i]);
     }
     // ray vector = up * -(max start y - min end y) over wheels 1 and 3
     float smax = start_ly[1];
@@ -1770,13 +1776,27 @@ static void b3_prepass(B3VehicleFull* v) {
     for (int i = 0; i < v->wheel_count; i++) {
         B3WheelSim* w = &v->wheel[i];
         float hit_t, gn[3];
-        int surf = b3f_ray(v, start_w[i], end_w[i], &hit_t, gn);
+        int surf = b3f_ray(v, start_w[i], end_w[i], &hit_t, gn,
+                           /*wheel_gate=*/1);   // FUN_001239C0 @0x00123CEF
         int hit = 0;
         float dist = 0.0f;
         if (surf >= 0) {
             if (hit_t > -1e-5f && hit_t <= 1.00001f) {
                 hit = 1;
-                dist = hit_t * raylen;
+                // FUN_00123790's tail @0x00123952..0x0012399D turns the
+                // parametric hit into a DISTANCE with THIS WHEEL'S OWN ray
+                // length -- `SUBPS start,end; MULPS; SQRTSS; MULSS [ECX]`
+                // -- not with the common `rayv` the caller built.  The two
+                // are only equal when every wheel's ray spans the same
+                // length; front/rear spring length or attach height differ
+                // on 24 of the 100 VDB cars (COMPCAR2 0.20/0.19,
+                // HEVYCAR1 0.38/0.50, ...), and using `raylen` here read
+                // the short-ray axle as 6..80 mm deeper into the road than
+                // retail does, which silently moved the bottom-out gate.
+                float dx = start_w[i][0] - end_w[i][0];
+                float dy = start_w[i][1] - end_w[i][1];
+                float dz = start_w[i][2] - end_w[i][2];
+                dist = hit_t * sqrtf(dx * dx + dy * dy + dz * dz);
             }
         }
         if (!hit) {
@@ -1818,7 +1838,9 @@ static void b3_prepass(B3VehicleFull* v) {
         float start[3] = {m[3][0], m[3][1], m[3][2]};
         float end[3] = {m[3][0], m[3][1] - 30.0f, m[3][2]};
         float hit_t, gn[3];
-        int surf = b3f_ray(v, start, end, &hit_t, gn);
+        // UNGATED: FUN_001239C0 @0x00123F00 calls FUN_001B2230 itself and
+        // never consults the surface flags [C].
+        int surf = b3f_ray(v, start, end, &hit_t, gn, /*wheel_gate=*/0);
         if (surf >= 0) {
             if (hit_t >= 0.0f && hit_t <= 1.00001f) {
                 v->ground_clear = hit_t * 30.0f;
@@ -2136,6 +2158,135 @@ int b3_rigid_body_obb_plane_contact(const B3RigidBody* rb,
     return 1;
 }
 
+// ---------------------------------------------------------------------------
+// FUN_00107950 [C] -- the SAME function, over the soup it is actually given.
+//
+// The specialisation above ("a soup of ONE surface polygon") synthesises a
+// square in the plane, CENTRED ON `plane_pt`, because a plane has no extent.
+// That is only equivalent to retail while `plane_pt` lies under the body: the
+// square's half-size is `|box dims| + 1` = 6.15 m for a car, so a caller that
+// hands it a triangle's FIRST VERTEX loses the contact as soon as the
+// triangle is bigger than that.  Measured on the shipped US_C3_V1 soup
+// (60373 tris, 20196 of them near-vertical and not loader-excluded): the
+// median wall triangle has a vertex 10.40 m from v0, p90 is 196.44 m and
+// 78.7% exceed 6.15 m.  So the plane specialisation silently reported NO
+// CONTACT for four wall faces in five.
+//
+// Retail never has that problem because it clips the REAL polygon, and it
+// does it for EVERY polygon in the soup before producing a contact:
+//
+//   @0x001079C6  each of the 3 vertices -> body space with the inverse frame
+//   @0x00107A33/5F/8B  FUN_001B09C0 slab clip, axis 0 then 2 then 1, and the
+//                polygon is dropped if fewer than 3 vertices survive
+//   @0x00107ADE  normal_sum  += poly.normal        (the poly record's +0x30)
+//   @0x00107BEB  point_sum   += frame * centroid(clipped)
+//                count++      and the surface type is republished
+//   @0x00107CBD  |normal_sum|^2 <= 2^-32 -> NO CONTACT
+//   @0x00107CF2  normal = normalize(normal_sum)
+//   @0x00107D14  point  = point_sum / count
+//   @0x00107D75  depth  = the same min-over-axes as the plane form
+//
+// So a body straddling a corner gets ONE contact whose normal is the
+// normalised SUM of the faces it touches -- and, decisively, its caller
+// FUN_00109EA0 is invoked ONCE per frame with that one contact.  A caller
+// that instead loops the soup and resolves every polygon separately applies
+// N impulses, N friction damps and N push-outs in a frame; measured on the
+// wreck path that launched the body kilometres off the track.
+// ---------------------------------------------------------------------------
+int b3_rigid_body_obb_soup_contact(const B3RigidBody* rb,
+                                   const float bbmin[3], const float bbmax[3],
+                                   const B3WorldPoly* polys, int npoly,
+                                   B3WorldContact* out) {
+    if (out) memset(out, 0, sizeof *out);          // @0x00107970 (param_10)
+    if (!polys || npoly < 1) return 0;             // @0x001079AF
+
+    // retail clips axis 0, then 2, then 1 (@0x00107A33 / 5F / 8B)
+    static const int ORDER[3] = { 0, 2, 1 };
+    float nsum[3] = { 0.0f, 0.0f, 0.0f };          // local_50
+    float psum[3] = { 0.0f, 0.0f, 0.0f };          // local_80
+    int hit = 0, count = 0;
+
+    for (int i = 0; i < npoly; i++) {
+        float poly[8][4], clipped[8][4];
+        for (int k = 0; k < 3; k++) {              // -> body space @0x001079C6
+            const float* v = polys[i].v[k];
+            for (int j = 0; j < 4; j++)
+                poly[k][j] = v[0] * rb->inv_frame[0][j]
+                           + v[1] * rb->inv_frame[1][j]
+                           + v[2] * rb->inv_frame[2][j]
+                           + rb->inv_frame[3][j];
+        }
+        int n = 3, dropped = 0;
+        for (int a = 0; a < 3; a++) {
+            const int ax = ORDER[a];
+            n = b3_np_clip_axis((const float (*)[4])poly, n, ax,
+                                bbmin[ax], bbmax[ax], clipped);
+            if (n < 3) { dropped = 1; break; }     // `cmp eax,3; jl`
+            for (int q = 0; q < n; q++)
+                for (int k = 0; k < 4; k++) poly[q][k] = clipped[q][k];
+        }
+        if (dropped) continue;
+
+        hit = 1;
+        for (int k = 0; k < 3; k++) nsum[k] += polys[i].n[k];   // @0x00107ADE
+        float cb[3] = { 0.0f, 0.0f, 0.0f };                     // @0x00107B79
+        for (int q = 0; q < n; q++)
+            for (int k = 0; k < 3; k++) cb[k] += poly[q][k];
+        const float in = 1.0f / (float)n;
+        for (int k = 0; k < 3; k++) cb[k] *= in;
+        for (int k = 0; k < 3; k++)                             // @0x00107BEB
+            psum[k] += cb[0] * rb->frame[0][k] + cb[1] * rb->frame[1][k]
+                     + cb[2] * rb->frame[2][k] + rb->frame[3][k];
+        count++;
+    }
+    if (!hit) return 0;                                          // @0x00107E78
+
+    const float n2 = nsum[0]*nsum[0] + nsum[1]*nsum[1] + nsum[2]*nsum[2];
+    if (n2 < B3_NP_NORMAL_EPS2) return 0;                        // @0x00107CBD
+    float nrm[4] = { nsum[0], nsum[1], nsum[2], 0.0f };
+    b3_normalize4(nrm);                                          // @0x00107CF2
+    float cw[4];                                                 // @0x00107D14
+    const float ic = 1.0f / (float)count;
+    for (int k = 0; k < 3; k++) cw[k] = psum[k] * ic;
+    cw[3] = 0.0f;
+
+    // the normal and the contact point in body space, @0x00107D41 / 0x00107D5B
+    float nb[3], cb[3];
+    for (int k = 0; k < 3; k++) {
+        nb[k] = nrm[0] * rb->inv_frame[0][k] + nrm[1] * rb->inv_frame[1][k]
+              + nrm[2] * rb->inv_frame[2][k];
+        cb[k] = cw[0] * rb->inv_frame[0][k] + cw[1] * rb->inv_frame[1][k]
+              + cw[2] * rb->inv_frame[2][k] + rb->inv_frame[3][k];
+    }
+    // the depth, @0x00107D75 -- identical to the plane form's tail
+    float dist[3], an[3];
+    for (int a = 0; a < 3; a++) {
+        if (nb[a] >= 0.0f) { dist[a] = cb[a] - bbmin[a]; an[a] = nb[a]; }
+        else               { dist[a] = bbmax[a] - cb[a]; an[a] = -nb[a]; }
+    }
+    float t;
+    if (dist[1] * an[0] > an[1] * dist[0]) {
+        t = (dist[2] * an[0] > an[2] * dist[0]) ? dist[0] / an[0]
+                                                : dist[2] / an[2];
+    } else {
+        t = (dist[2] * an[1] > an[2] * dist[1]) ? dist[1] / an[1]
+                                                : dist[2] / an[2];
+    }
+    if (B3_NP_MIN_PUSHOUT > t) t = B3_NP_MIN_PUSHOUT;            // @0x00107E47
+
+    if (out) {
+        for (int k = 0; k < 4; k++) {
+            out->point[k] = cw[k];
+            out->normal[k] = nrm[k];
+            out->pushout[k] = nrm[k] * t;                        // @0x00107E69
+        }
+        out->point[3] = 0.0f;
+        out->normal[3] = 0.0f;
+        out->pushout[3] = 0.0f;
+    }
+    return 1;
+}
+
 void b3_rigid_body_world_contact(B3RigidBody* rb, float mass_kg, int cls,
                                  int attach_mode, float restitution,
                                  const B3WorldContact* c,
@@ -2342,7 +2493,7 @@ static void b3_suspension_pass(B3VehicleFull* v, float dt) {
         if (w->contact == 0) {
             // droop relax (verified b3_wheel_droop) + wheel world pos
             w->prev_len = b3_wheel_droop(k, len, w->attach, dt);
-            b3f_xform_point(m, w->local_x, w->prev_len, w->local_z,
+            b3f_xform_point(m, v->wheel_local_x[i], w->prev_len, v->wheel_local_z[i],
                             w->world_pos);
         } else {
             w->bump = (0.12f < w->cur_len - w->prev_len) ? 1 : 0;
@@ -2366,7 +2517,7 @@ static void b3_suspension_pass(B3VehicleFull* v, float dt) {
             // byte 0x210 == 0: no 0.75len extension clamp, no soft clip
             float vel = (w->cur_len - w->prev_len) / dt;
             w->prev_len = w->cur_len;
-            b3f_xform_point(m, w->local_x, w->cur_len, w->local_z,
+            b3f_xform_point(m, v->wheel_local_x[i], w->cur_len, v->wheel_local_z[i],
                             w->world_pos);
             float f = -((comp - len) * k) + vel * c;
             float Fv[4];
@@ -2423,7 +2574,7 @@ static void b3_suspension_pass(B3VehicleFull* v, float dt) {
         B3WheelSim* w = &v->wheel[i];
         b3_wheel_spin_update(&w->spin, &w->omega, /*decay=*/0,
                              w->contact, dt);
-        w->frame_y = w->prev_len;   // wheel frame row3.y (visual drop)
+        v->wheel_frame_y[i] = w->prev_len;   // wheel frame row3.y (visual drop)
     }
 }
 
@@ -2522,6 +2673,9 @@ void b3_vehicle_full_init(B3VehicleFull* v, const B3PhysicsConfig* cfg,
                           const float inv_inertia_diag[3],
                           const float pos[3], float heading_rad) {
     memset(v, 0, sizeof *v);
+    /* AFTER the memset: it would zero the pointer. The frame matrix is no
+     * longer inline in B3RigidBody. */
+    b3_rigid_body_bind_frame(&v->rb, v->rb_frame_store);
     B3RigidBody* rb = &v->rb;
     float ch = cosf(heading_rad), sh = sinf(heading_rad);
     // frame rows: right / up / at, at = (sin h, 0, cos h) game-space
@@ -2569,14 +2723,14 @@ void b3_vehicle_full_init(B3VehicleFull* v, const B3PhysicsConfig* cfg,
 
     for (int i = 0; i < 4; i++) {
         B3WheelSim* w = &v->wheel[i];
-        w->local_x = wheels_xz[i][0];
-        w->local_z = wheels_xz[i][1];
+        v->wheel_local_x[i] = wheels_xz[i][0];
+        v->wheel_local_z[i] = wheels_xz[i][1];
         w->radius = radius;
         w->attach = (i < 2) ? v->front_attach : v->rear_attach;
         float len = (i < 2) ? v->front_len : v->rear_len;
         w->prev_len = w->attach - 0.75f * len;   // droop spawn
         w->cur_len = w->prev_len;
-        w->frame_y = w->prev_len;
+        v->wheel_frame_y[i] = w->prev_len;
     }
 
     // live 0x1360.. copies (FUN_00134710)

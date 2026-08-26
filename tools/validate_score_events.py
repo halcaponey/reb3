@@ -25,6 +25,11 @@ Covered:
 Run:  python3 tools/validate_score_events.py
 """
 import os
+
+# Links objects that consult build/backends.cfg; pin to the RE path so
+# this differential test is unaffected by the live backend selection.
+os.environ['B3_BACKENDS'] = '/dev/null'
+
 import struct
 import subprocess
 import sys
@@ -381,6 +386,84 @@ def run_slice(score_img, tune, crashed, respawn, racecar=None, extra=None,
             verdict[0] if verdict else None, err)
 
 
+# ----------------------------------------------------------------------
+# Cached session for run_regparm3.
+#
+# This is the sidecar's `score` path (b3_emu_score -> do_score), called on
+# every scoring contact.  Building a fresh Uc and reloading the 4.28 MB ELF
+# per call measured 6.217 ms mean in situ.  A UC_HOOK_MEM_WRITE probe over
+# randomised score images recorded ZERO writes outside the three scratch
+# regions below (scratchpad/probe_score.py), so reusing the session and
+# zeroing them reproduces a fresh instance byte for byte.  Every input --
+# fake_ctx(), param_writes(tune), the racecar bytes, CODE, SCORE -- is
+# rewritten on each call regardless.  tools/validate_score_events.py is the
+# acceptance test.
+_RP3_MAPS = ((ev.STACK_BASE, ev.STACK_SIZE), (ev.SCRATCH, ev.SCRATCH_SZ),
+             (ev.MAGIC_RET & ~(ev.PAGE - 1), ev.PAGE))
+_RP3 = {"uc": None, "extra": None, "snap": {}}
+_RP3_ZERO = b'\0' * max(ev.STACK_SIZE, ev.SCRATCH_SZ)
+
+
+def _rp3_session():
+    c = _RP3
+    if c["uc"] is not None:
+        return c["uc"]
+    uc = Uc(UC_ARCH_X86, UC_MODE_32)
+    ev.load_elf(uc, os.path.join(ROOT, ev.ELF))
+    for base, size in _RP3_MAPS:
+        uc.mem_map(base, size, UC_PROT_ALL)
+    c["extra"] = set()
+
+    def on_unmapped(uc_, access, address, size, value, user):
+        page = address & ~(ev.PAGE - 1)
+        try:
+            uc_.mem_map(page, ev.PAGE, UC_PROT_ALL)
+        except UcError:
+            return False
+        c["extra"].add(page)
+        return True
+
+    uc.hook_add(UC_HOOK_MEM_UNMAPPED, on_unmapped)
+    c["uc"] = uc
+    return uc
+
+
+def _rp3_in_scratch(addr):
+    return any(b <= addr < b + s for b, s in _RP3_MAPS)
+
+
+def _rp3_snapshot(uc, addr, length):
+    """Remember the PRISTINE bytes of any image page we are about to write.
+
+    Callers write ELF globals outside the scratch regions -- param_writes()'s
+    P_* tune parameters, fake_ctx()'s GAME_CTX, and each case's `extra`. Those
+    key sets differ from call to call, so on a reused session a global written
+    by one case would survive into the next, which a fresh instance would have
+    reloaded from the image. (That is exactly what regressed 3 of the 160
+    cases when this cache was first added.)
+
+    Capture-on-first-sight is sound: a page is either already snapshotted --
+    and therefore restored by _rp3_reset before this call -- or has never been
+    written by any previous call, so it still holds the image's own bytes.
+    """
+    snap = _RP3["snap"]
+    page = addr & ~(ev.PAGE - 1)
+    end = addr + length
+    while page < end:
+        if not _rp3_in_scratch(page) and page not in snap:
+            snap[page] = bytes(uc.mem_read(page, ev.PAGE))
+        page += ev.PAGE
+
+
+def _rp3_reset(uc):
+    for base, size in _RP3_MAPS:
+        uc.mem_write(base, _RP3_ZERO[:size])
+    for page in _RP3["extra"]:
+        uc.mem_write(page, _RP3_ZERO[:ev.PAGE])
+    for page, data in _RP3["snap"].items():
+        uc.mem_write(page, data)
+
+
 def run_regparm3(score_img, func, eax, edx, ecx, tune, racecar=None,
                  extra=None, max_steps=400000):
     """MOV EAX,imm; MOV EDX,imm; MOV ECX,imm; CALL func; RET.
@@ -395,20 +478,8 @@ def run_regparm3(score_img, func, eax, edx, ecx, tune, racecar=None,
     rel = func - (CODE + len(code) + 5)
     code += b"\xe8" + struct.pack('<i', rel) + b"\xc3"
 
-    uc = Uc(UC_ARCH_X86, UC_MODE_32)
-    ev.load_elf(uc, os.path.join(ROOT, ev.ELF))
-    uc.mem_map(ev.STACK_BASE, ev.STACK_SIZE, UC_PROT_ALL)
-    uc.mem_map(ev.SCRATCH, ev.SCRATCH_SZ, UC_PROT_ALL)
-    uc.mem_map(ev.MAGIC_RET & ~(ev.PAGE - 1), ev.PAGE, UC_PROT_ALL)
-
-    def on_unmapped(uc_, access, address, size, value, user):
-        try:
-            uc_.mem_map(address & ~(ev.PAGE - 1), ev.PAGE, UC_PROT_ALL)
-        except UcError:
-            return False
-        return True
-
-    uc.hook_add(UC_HOOK_MEM_UNMAPPED, on_unmapped)
+    uc = _rp3_session()
+    _rp3_reset(uc)
 
     mw = {}
     mw.update(fake_ctx())
@@ -425,7 +496,18 @@ def run_regparm3(score_img, func, eax, edx, ecx, tune, racecar=None,
     for a, d in (extra or {}).items():
         mw[a] = d
     for addr, data in mw.items():
+        _rp3_snapshot(uc, addr, len(data))
         uc.mem_write(addr, data)
+
+    # The trampoline at CODE is SELF-MODIFYING across calls: every call writes
+    # a different `MOV EAX/EDX/ECX imm; CALL func` there. Unicorn caches
+    # translated blocks by address, so on a reused session the second call
+    # would re-execute the FIRST call's block -- calling the previous entry
+    # with the previous immediates. That is not theoretical: it silently sent
+    # every `mark` case through FUN_00197920 instead of FUN_001979E0 and cost
+    # 3 of the 160 cases. A fresh Uc had no cache, which is why this only
+    # appeared once the session was reused.
+    uc.ctl_remove_cache(CODE, CODE + len(code) + 1)
 
     sp = ev.STACK_BASE + ev.STACK_SIZE - 0x1000
     uc.mem_write(sp, struct.pack('<I', ev.MAGIC_RET))
@@ -1401,7 +1483,10 @@ def main():
         r = subprocess.run(
             ["gcc", "-Wall", "-Wextra", "-std=c11", "-O2", "-Isrc",
              "-o", DRIVER, "tools/dump_score_events.c",
-             "src/burnout3_score_events.c", "-lm"], cwd=ROOT)
+             "src/burnout3_score_events.c",
+             # consults the backend selector; pinned to RE above
+             "src/burnout3_backend.c", "src/burnout3_emu.c",
+             "-lm"], cwd=ROOT)
         if r.returncode != 0:
             print("driver build FAILED")
             return 1

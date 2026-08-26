@@ -39,6 +39,11 @@ FRAME = ea.FRAME
 TOL = 1e-5
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# The probe links burnout3_backend.c; pin it to the RE path so a flipped
+# build/backends.cfg cannot change what this suite measures.
+os.environ['B3_BACKENDS'] = '/dev/null'
+
 BUILD = os.path.join(ROOT, "build")
 PROBE_C = os.path.join(BUILD, "ai_probe.c")
 PROBE = os.path.join(BUILD, "ai_probe")
@@ -56,8 +61,17 @@ PROBE_SRC = r'''
 #include "../src/burnout3_ai.c"
 
 static B3AiCar C;
+/* The physics vehicle C points at. B3AiCar used to inline ten of its fields
+   at their VEHICLE offsets inside a struct laid out on the RACECAR; they are
+   duplicates of B3VehicleFull's, so the view now points at the real thing --
+   which is what retail does at racecar+0x2440. VFRAME is the frame storage:
+   B3RigidBody keeps a POINTER to it (retail's v+0x204), so the bind must
+   happen after every memset and the BINDS table addresses VFRAME directly,
+   a pointer expression being no use in a static initialiser. */
+static B3VehicleFull V;
+static float VFRAME[4][4];
+static void wire_veh(void) { C.veh = &V; V.rb.frame = VFRAME; }
 static B3AiState S;
-static B3AiInputs IN;
 static float TP[3];
 static float g_max_speed, g_catchup, g_dt, g_revdot, g_gov_speed,
              g_gov_mph, g_gov_target;
@@ -94,14 +108,17 @@ static const Bind BINDS[] = {
     {"pos.x",&C.pos[0],0},{"pos.y",&C.pos[1],0},{"pos.z",&C.pos[2],0},
     {"fwd.x",&C.fwd[0],0},{"fwd.y",&C.fwd[1],0},{"fwd.z",&C.fwd[2],0},
     {"right.x",&C.right[0],0},{"right.y",&C.right[1],0},{"right.z",&C.right[2],0},
-    {"carat.x",&C.car_at[0],0},{"carat.y",&C.car_at[1],0},{"carat.z",&C.car_at[2],0},
-    {"vfwd.x",&C.veh_fwd[0],0},{"vfwd.y",&C.veh_fwd[1],0},{"vfwd.z",&C.veh_fwd[2],0},
-    {"vright.x",&C.veh_right[0],0},{"vright.y",&C.veh_right[1],0},
-    {"vright.z",&C.veh_right[2],0},
-    {"speed",&C.speed_ms,0},{"yaw",&C.yaw_rate,0},
-    {"rpm",&C.engine_rpm,0},{"uprpm",&C.change_up_rpm,0},
-    {"drift",&C.drift_state,1},{"gear",&C.gear,1},
-    {"lsdm",&C.lsdm_active,1},{"lsdmlim",&C.lsdm_limit_mph,0},
+    {"carat.x",&V.rb.dir[0],0},{"carat.y",&V.rb.dir[1],0},{"carat.z",&V.rb.dir[2],0},
+    {"vfwd.x",&VFRAME[2][0],0},{"vfwd.y",&VFRAME[2][1],0},{"vfwd.z",&VFRAME[2][2],0},
+    {"vright.x",&VFRAME[0][0],0},{"vright.y",&VFRAME[0][1],0},
+    {"vright.z",&VFRAME[0][2],0},
+    {"speed",&V.rb.vel[3],0},{"yaw",&V.rb.omega[1],0},
+    /* v+0x149C is RAD/S in retail and the cases are written in rpm, so this
+       one is converted at the drive call, not here. */
+    {"rpm",&V.trans.omega,0},{"uprpm",&V.trans.change_up_rpm,0},
+    {"drift",&V.drift_state_1524,1},{"gear",&V.trans.gear,1},
+    /* v+0x1550 is a BYTE (validate seeds it with wb); -1 selects that width */
+    {"lsdm",&V.lsdm_active_1550,-1},{"lsdmlim",&V.lsdm_limit_13AC,0},
     {"traffic",&C.traffic_class,1},{"mode",&C.race_mode,1},
     {"crasht",&C.crash_timer,0},{"freefloor",&C.free_speed_floor,1},
     {"boosting",&C.boosting,1},{"rampdone",&C.boost_ramp_done,1},
@@ -121,10 +138,10 @@ static const Bind BINDS[] = {
     {"tang",&S.target_angle,0},{"tspd",&S.target_speed,0},
     {"prevang",&S.prev_angle,0},{"cspd",&S.corner_speed,0},
     {"serr",&S.steer_err,0},
-    {"arm",&S.stuck_arm,0},{"rev",&S.reverse_timer,0},
-    {"dith",&S.dither_deadline,0},{"prevthr",&S.prev_throttle,0},
-    {"bhold",&S.brake_hold,0},{"auth",&S.steer_authority,0},
-    {"prevsteer",&S.prev_steer,0},{"sdrift",&S.drift_state,1},
+    {"arm",&V.stuck_arm_1578,0},{"rev",&V.reverse_timer_157C,0},
+    {"dith",&V.dither_1574,0},{"prevthr",&V.prev_throttle_156C,0},
+    {"bhold",&V.brake_hold_1570,0},{"auth",&V.authority_1534,0},
+    {"prevsteer",&V.steer_1408,0},{"sdrift",&V.drift_state_1524,1},
     {"tp.x",&TP[0],0},{"tp.y",&TP[1],0},{"tp.z",&TP[2],0},
     {"argmax",&g_max_speed,0},{"catchup",&g_catchup,0},{"dt",&g_dt,0},
     {"revdot",&g_revdot,0},
@@ -240,11 +257,12 @@ static void emit(void) {
            "auth=%.9g sdrift=%d gov=%.9g\n",
            S.target_angle, S.target_speed, S.corner_speed, S.steer_err,
            S.prev_angle, S.des_dir_n[0], S.des_dir_n[1], S.des_dir_n[2],
-           S.time_to_target, IN.throttle, IN.brake, IN.steer,
-           IN.throttle_raw, (int)IN.bits, IN.gear_request, IN.stop_flag,
-           IN.engage_boost, IN.commit_boost, S.stuck_arm, S.reverse_timer,
-           S.dither_deadline, S.prev_throttle, S.steer_authority,
-           S.drift_state,
+           S.time_to_target, V.throttle_1400, V.brake_1404, V.steer_1408,
+           V.throttle_raw_1414, (int)V.input_bits_13FC, V.trans.gear,
+           (int)V.stop_flag_1552,
+           C.engage_boost, (int)C.commit_boost, V.stuck_arm_1578, V.reverse_timer_157C,
+           V.dither_1574, V.prev_throttle_156C, V.authority_1534,
+           V.drift_state_1524,
            b3_ai_oor_governor(g_gov_speed, g_gov_mph, g_gov_target));
     fflush(stdout);
 }
@@ -271,7 +289,7 @@ static void emit_nav(void) {
            "auth=%.9g sdrift=%d cbout=%.9g\n",
            W.ai_wheel, g_wheel_edge, W.skip_once, W.navfail_frames,
            W.below_frames, W.last_node, W.route_alt, W.alt_t[0], W.alt_t[1],
-           W.road_dy, g_navfired, g_owfired, S.steer_authority, S.drift_state,
+           W.road_dy, g_navfired, g_owfired, V.authority_1534, V.drift_state_1524,
            g_cb_out);
     fflush(stdout);
 }
@@ -289,8 +307,9 @@ int main(void) {
     char line[8192];
     b3_ai_init();
     memset(&C, 0, sizeof C);
-    b3_ai_state_init(&S);
-    memset(&IN, 0, sizeof IN);
+    memset(&V, 0, sizeof V);
+    wire_veh();
+    b3_ai_state_init(&S, &V);
     while (fgets(line, sizeof line, stdin)) {
         char* tok = strtok(line, " \t\n\r");
         char op[64];
@@ -298,9 +317,11 @@ int main(void) {
         snprintf(op, sizeof op, "%s", tok);
         if (!strcmp(op, "reset")) {
             memset(&C, 0, sizeof C);
-            b3_ai_state_init(&S);
-            memset(&IN, 0, sizeof IN);
-            g_max_speed = g_catchup = g_revdot = 0.0f;
+            memset(&V, 0, sizeof V);
+            memset(VFRAME, 0, sizeof VFRAME);
+            wire_veh();
+            b3_ai_state_init(&S, &V);
+                    g_max_speed = g_catchup = g_revdot = 0.0f;
             g_dt = 1.0f / 60.0f;
             memset(&W, 0, sizeof W);
             g_wheel_on = g_wheel_edge = g_walk_ok = g_navfired = 0;
@@ -316,11 +337,18 @@ int main(void) {
             S.corner_speed = b3_ai_corner_speed(&S, &C, g_max_speed);
         else if (!strcmp(op, "tspeed"))  b3_ai_target_speed(&S, &C, g_catchup);
         else if (!strcmp(op, "drive"))
-            b3_ai_drive(&S, &C, &IN, g_dt, g_revdot);
+            /* cases are written in rpm; V.trans.omega holds retail's
+               RAD/S at v+0x149C, the same value seeded on retail's side.
+               Braced: this is one arm of an if/else chain. */
+            { V.trans.omega /= 9.549296f;
+              b3_ai_drive(&S, &C, g_dt, g_revdot);
+              V.trans.omega *= 9.549296f; }
         else if (!strcmp(op, "brake"))
-            b3_ai_brake(&IN, &S, &C, 1.0f);
+            b3_ai_brake(&S, &C, 1.0f);
         else if (!strcmp(op, "update"))
-            b3_ai_update(&S, &C, &IN, TP, g_max_speed, g_catchup, g_dt);
+            { V.trans.omega /= 9.549296f;
+              b3_ai_update(&S, &C, TP, g_max_speed, g_catchup, g_dt);
+              V.trans.omega *= 9.549296f; }
         else if (!strcmp(op, "gov"))     { /* emitted unconditionally */ }
         else if (!strcmp(op, "agginit")) {
             wire_world(); b3_aggro_init(&AG, AW.clock);
@@ -353,7 +381,7 @@ int main(void) {
             b3_ai_route_alt(&W, g_dt); emit_nav(); continue;
         }
         else if (!strcmp(op, "wheel")) {
-            g_wheel_edge = b3_ai_wheel_set(&W, &S, g_wheel_on);
+            g_wheel_edge = b3_ai_wheel_set(&W, &S, &V, g_wheel_on);
             emit_nav(); continue;
         }
         else if (!strcmp(op, "offworld")) {
@@ -391,7 +419,14 @@ class Probe(object):
             fh.write(PROBE_SRC)
         cc = subprocess.run(
             ["gcc", "-O1", "-std=c99", "-Wall", "-Wextra", "-Wno-unused-parameter",
-             "-o", PROBE, PROBE_C, "-lm"],
+             "-o", PROBE, PROBE_C,
+             # burnout3_ai.c now carries the ai=retail switch, so the probe
+             # links the backend selector and the bridge. B3_BACKENDS is
+             # pinned to /dev/null below so the suite always measures the RE
+             # path, whatever build/backends.cfg happens to say.
+             os.path.join(ROOT, "src", "burnout3_backend.c"),
+             os.path.join(ROOT, "src", "burnout3_emu.c"),
+             "-lm"],
             cwd=BUILD, capture_output=True, text=True)
         if cc.returncode:
             print(cc.stdout)
@@ -698,7 +733,8 @@ def run_target_speed():
         p = probe()
         p.reset()
         got = p.cmd("tspeed", tang=ang, maxspd=mx, cap=cap, drift=drift,
-                    traffic=traf, mode=mode, freefloor=ff, serr=serr,
+                    traffic=(0 if traf else 1), mode=mode, freefloor=ff,
+                    serr=serr,
                     catchup=0.0)
         fails += check(name, [("target", real, got["tspd"]),
                               ("corner", real_c, got["cspd"])])
@@ -836,9 +872,15 @@ def run_drive():
         )
         p = probe()
         p.reset()
-        got = p.cmd("drive", **cs)
-        # gear_request is a delta in the C contract (0 = leave alone)
-        mine_gear = got["gear"] if got["gear"] != 0 else float(cs["gear"])
+        # racecar+0x134C is retail's RAW class field (0 = traffic), and the
+        # transfer moves it verbatim -- so the probe must get the same raw
+        # value the emulator does, not the case table's is-traffic boolean.
+        got = p.cmd("drive", **dict(cs, traffic=0 if cs["traffic"] else 1))
+        # v+0x14C8 is compared straight now. The port used to zero it and
+        # report a "0 = leave alone" delta, which had to be undone here; with
+        # the driver writing the real vehicle it leaves the gear as retail
+        # does and only writes 1/-1 on the two swap branches.
+        mine_gear = got["gear"]
         pairs = [("thr", real["thr"], got["thr"]),
                  ("brk", real["brk"], got["brk"]),
                  ("steer", real["str"], got["str"]),
@@ -1595,8 +1637,17 @@ def run_aggro_params():
         want = "/* %s" % field
         ok = False
         for line in blk.splitlines():
-            if line.strip().startswith("/* %s" % field):
+            st = line.strip()
+            # designated form (`.field = 1.0f,`) -- the initializers were
+            # converted to it because inserting parity padding into a
+            # POSITIONAL initializer silently shifts every value by one slot.
+            if st.startswith(".%s " % field) or st.startswith(".%s=" % field):
+                txt = st.split("=", 1)[1].strip().rstrip(",")
+            elif st.startswith("/* %s" % field):
                 txt = line.split("*/", 1)[1].strip().rstrip(",")
+            else:
+                continue
+            if True:
                 try:
                     ok = abs(float(txt.rstrip("f")) - val) < 1e-9
                 except ValueError:
@@ -1735,38 +1786,56 @@ def run_route_alt():
 
 
 # name, corner speed AI+0x298, AI+0x1FC, AI+0x1F8, AI+0x213, cap, injected D
+# (name, cs, mode_1FC, target_mode, boost, cap, X, D) -- X is FUN_00174A90's
+# arc length from the car's nav node to the planner's corner node, D is
+# FUN_00174AF0's projection inside that node.  The port is handed `X - D`.
 CBRAKE_CASES = [
-    ("mode 1FC set -> hard cap",   30.0, 1, 0, 0, 88.0,  0.0),
-    ("corner speed 0 -> hard cap",  0.0, 0, 0, 0, 88.0,  0.0),
-    ("target mode 2 -> cs direct", 30.0, 0, 2, 0, 88.0,  0.0),
-    ("target mode 2 + boost x1.02",30.0, 0, 2, 1, 88.0,  0.0),
-    ("mode 2, cs above the cap",   99.0, 0, 2, 0, 88.0,  0.0),
-    ("mode 0, corner 40 m ahead",  30.0, 0, 0, 0, 88.0, -40.0),
-    ("mode 0, on the node",        30.0, 0, 0, 0, 88.0,   0.0),
-    ("mode 0, past the node",      30.0, 0, 0, 0, 88.0,   6.0),
-    ("mode 0, capped",             30.0, 0, 0, 0, 45.0, -40.0),
-    ("mode 0 + boost scale",       30.0, 0, 0, 1, 88.0, -40.0),
+    ("mode 1FC set -> hard cap",   30.0, 1, 0, 0, 88.0,   0.0,  0.0),
+    ("corner speed 0 -> hard cap",  0.0, 0, 0, 0, 88.0,   0.0,  0.0),
+    ("target mode 2 -> cs direct", 30.0, 0, 2, 0, 88.0,   0.0,  0.0),
+    ("target mode 2 + boost x1.02",30.0, 0, 2, 1, 88.0,   0.0,  0.0),
+    ("mode 2, cs above the cap",   99.0, 0, 2, 0, 88.0,   0.0,  0.0),
+    ("mode 0, corner 40 m ahead",  30.0, 0, 0, 0, 88.0,  40.0,  0.0),
+    ("mode 0, corner 300 m ahead", 30.0, 0, 0, 0, 88.0, 300.0,  0.0),
+    ("mode 0, 12 m into the node", 30.0, 0, 0, 0, 88.0,  40.0, 12.0),
+    ("mode 0, on the node",        30.0, 0, 0, 0, 88.0,   0.0,  0.0),
+    ("mode 0, past the node",      30.0, 0, 0, 0, 88.0,   0.0,  6.0),
+    ("mode 0, capped",             30.0, 0, 0, 0, 45.0,  40.0,  0.0),
+    ("mode 0 + boost scale",       30.0, 0, 0, 1, 88.0,  40.0,  0.0),
 ]
 
-# a 12-byte stub for FUN_00174AF0: MOVSS XMM0,[imm32] ; RET 8
+# 12-byte stubs: MOVSS XMM0,[imm32] ; RET n
 STUB_D = 0x005B0000
+STUB_X = 0x005B0010
 
 
-def _stub_approach(s, d):
-    """FUN_00174AF0 needs the live .bgd graph; the arithmetic under test is
-    FUN_00176150's, so inject its result.  MOVSS XMM0,[STUB_D]; RET 8 --
-    the callee-cleanup count is the real function's own (`RET 0x8`)."""
+def _stub_approach(s, x, d):
+    """Both of FUN_00176150's graph callees, stubbed with the two DISTINCT
+    distances the law consumes.
+
+    FUN_00174A90 used to be stubbed with a bare `RET` here, on the reading
+    that it had "no output we need".  It does: its XMM0 is the X in
+    `factor * (X - D) + cs` (@0x001761C4 -> @0x0017620C).  A bare RET leaves
+    XMM0 carrying whatever the last SSE instruction put there, which at that
+    point is `MOVSS XMM0,[EDI+0x298]` @0x00176169 -- the corner speed.  So the
+    oracle silently asserted `factor * (cs - D) + cs`, which is what the port
+    had, and the two agreed for the wrong reason.  Stub it honestly."""
     s.wf(STUB_D, d)
-    code = b"\xF3\x0F\x10\x05" + struct.pack("<I", STUB_D) + b"\xC2\x08\x00"
-    s.uc.mem_write(F_APPROACH, code)
-    s.uc.mem_write(F_NODE_SEEK, b"\xC3")        # its companion: plain RET
+    s.wf(STUB_X, x)
+    # FUN_00174AF0 is __fastcall with two stack args: its own `RET 0x8`.
+    s.uc.mem_write(F_APPROACH,
+                   b"\xF3\x0F\x10\x05" + struct.pack("<I", STUB_D)
+                   + b"\xC2\x08\x00")
+    # FUN_00174A90 takes everything in registers: plain `RET`.
+    s.uc.mem_write(F_NODE_SEEK,
+                   b"\xF3\x0F\x10\x05" + struct.pack("<I", STUB_X) + b"\xC3")
 
 
 def run_corner_brake():
     """FUN_00176150 -> AI+0x1D0, the corner-BRAKE law."""
     fails = 0
     print("\nFUN_00176150  corner-brake law:")
-    for name, cs, m1fc, mode, bscale, cap, d in CBRAKE_CASES:
+    for name, cs, m1fc, mode, bscale, cap, x, d in CBRAKE_CASES:
         s = ea.Session()
         ea.seed_car(s)
         s.wf(G_CB_ZERO, 0.0)
@@ -1779,13 +1848,14 @@ def run_corner_brake():
         s.wf(RC + 0x2408, cap)
         s.wu(AI + 0x1D4, ea.OTHER)              # section pointer (stubbed use)
         s.wu(AI + 0x1D8, 0)
-        _stub_approach(s, d)
+        _stub_approach(s, x, d)
         s.call(F_CORNER_BRAKE, regs={UC_X86_REG_EDI: AI})
         real = s.rf(AI + 0x1D0)
 
         p = probe()
         p.reset()
-        got = p.cmd_kv("cbrake", {"cs": cs, "cbd": d, "cbcap": cap,
+        # b3_ai_corner_brake's second argument is retail's `X - D`.
+        got = p.cmd_kv("cbrake", {"cs": cs, "cbd": x - d, "cbcap": cap,
                                   "cbmode": mode, "cb1fc": m1fc,
                                   "cbbs": bscale})
         fails += check(name, [("AI+0x1D0", real, got["cbout"])])

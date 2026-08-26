@@ -1,9 +1,10 @@
+#define _DEFAULT_SOURCE 1   /* setenv() for the track selector */
 // Burnout 3: Takedown - playable test harness
 //
 // IMPORTANT: this is NOT a decompilation of the game. The gameplay, physics and
 // rendering below are original code written to have something runnable to drive
 // the reverse engineering against. The only parts sourced from the real game are
-// the vehicle roster in burnout3_vehicle_data.h (extracted from pveh/ and
+// the vehicle roster in build/cars/roster.bin (extracted from pveh/ and
 // cross-validated against vlist.bin) and the identity strings printed at start-up.
 //
 // Real RE findings live in docs/RE_NOTES.md. Where a routine here has a genuine
@@ -26,19 +27,45 @@
  * android/app/src/main/cpp/b3_android.c.  Desktop builds never see it. */
 #include "b3_android.h"
 #endif
-#include "burnout3_vehicle_data.h"
+#ifdef __EMSCRIPTEN__
+/* WEB PORT (web/): same story -- <GL/gl.h> is gl4es' header, and this brings
+ * in the one glue call implemented by web/b3_web.c. */
+#include "b3_web.h"
+/* B3_ZONE() tags render_frame()'s passes for the web port's GL call counter --
+ * see the zone counter in b3_web.h.  Off-web it is nothing at all, so the
+ * desktop binary does not know it exists. */
+#define B3_ZONE(z) b3_web_glc_zone(z)
+/* B3_WEB_T0/T1 bracket a span of the frame loop for B3_WEB_HWPROF.  Two
+ * emscripten_get_now() calls, and only when the profile is armed -- b3_web_prof
+ * discards the sample otherwise, and the subtraction it discards is cheaper
+ * than the branch that would avoid it.  Off-web both are nothing: the desktop
+ * binary is unchanged to the byte. */
+#define B3_WEB_T0(v)      double v = b3_web_now_ms()
+#define B3_WEB_T1(slot,v) b3_web_prof((slot), b3_web_now_ms() - (v))
+#else
+#define B3_ZONE(z) ((void)0)
+#define B3_WEB_T0(v)      ((void)0)
+#define B3_WEB_T1(slot,v) ((void)0)
+#endif
+#include "burnout3_vehicle_data_runtime.h"  /* runtime: the pveh/ roster, out
+                                            * of build/cars/roster.bin       */
 #include "burnout3_vehicle_sim.h"
-#include "burnout3_car_physics.h"
+#include "burnout3_backend.h"
+#include "burnout3_emu.h"
+#include "burnout3_car_physics_runtime.h"   /* runtime: the vdb.xml tuning, out
+                                            * of build/cars/car_physics.bin  */
 #include "burnout3_gameplay.h"
 #include "burnout3_trackmesh.h"
+/* THE RENDERER: one static VBO and one shader instead of a display list and
+ * 990 per-group state changes.  There is no second path -- see
+ * src/burnout3_render.h. */
+#include "burnout3_render.h"
 #include "burnout3_collision.h"
 #include "burnout3_crash.h"
 #include "burnout3_panels.h"      /* PANELS: per-panel damage machine */
 #include "burnout3_carcol.h"
 #include "burnout3_sfx.h"   /* SFX: event sound system */
-#include "burnout3_track_paths.h"
-#include "burnout3_start_grid.h"
-#include "burnout3_traffic_data.h"
+#include "burnout3_traffic_runtime.h"
 #include "burnout3_traffic_reservations.h"
 #include "burnout3_traffic_pool.h"
 #include "burnout3_hud.h"
@@ -47,11 +74,70 @@
 #include "burnout3_td_rules.h"
 #include "burnout3_score_events.h"
 #include "burnout3_postfx.h"
+#include "burnout3_aftereffects.h"
 #include "burnout3_carfx.h"
 #include "burnout3_boostfx.h" /* BOOSTFX: exhaust flame (light type 8) */
 #include "burnout3_music.h"
 #include "burnout3_ai.h"
-#include "burnout3_props.h" /* PROPS: destructible track props */
+#include "burnout3_ai_pace_runtime.h"
+#include "burnout3_props.h"
+#include "burnout3_scenery.h" /* PROPS: destructible track props */
+#include "burnout3_frametime.h" /* PACING: retail's wall-clock frame governor */
+
+/* ===================== THE LAST glBegin SITES IN THIS FILE ==============
+ *
+ * Everything that draws every frame moved to the retained path in the fourth
+ * wave (docs/web/webprof_sweep.md).  What was left here was the tail: the
+ * mesh-missing FALLBACK boxes, the placeholder ground/road, and the frontend's
+ * own 3D chrome (the globe, the showroom backdrop, the garage floor).  They
+ * are cold or menu-rate, so they were never a call-count item -- they are here
+ * because ONE renderer means one renderer, and a stray glBegin makes gl4es
+ * re-describe its scratch VBOs and (worse) re-check the fixed-function state
+ * against the bound program.
+ *
+ * TWO RULES MADE THE CONVERSION STATE-NEUTRAL, and both are load-bearing:
+ *
+ *  1. THE MATRIX STACK IS LEFT ALONE.  b3r's vertex shader transforms with
+ *     ftransform(), which reads the fixed-function stack, so a site drawn
+ *     under a glPushMatrix/glTranslatef object transform (the traffic and car
+ *     boxes) or under its own glFrustum (the globe, the garage) keeps that
+ *     transform and needs no b3r_model() at all.  Not one coordinate moved.
+ *
+ *  2. THE STATE THE SITE INHERITED IS PUT BACK.  b3r2d_end() calls b3r_end(),
+ *     whose whole job is to leave GL where the WORLD pass left it -- depth
+ *     mask on, blend off, cull = b3r_world_cull(), colour white.  That is
+ *     right for the world and wrong for a menu screen that runs with culling
+ *     off and a blend enabled (car_select_screen leans on both: enabling
+ *     CULL_FACE under it drops faces out of the hero car).  So every
+ *     converted site brackets its batch with the SAME glPushAttrib pair the
+ *     HUD uses (burnout3_hud.c state_begin), taken AFTER the site's own state
+ *     calls so what is restored is exactly what the glBegin ran under --
+ *     including the state the old code deliberately LEAKED (the globe's
+ *     pass-1 blend, which its own next frame reads).
+ *
+ * The B3RState handed to b3r_batch_state() is not guesswork either: every
+ * tuple below was read off the live context at the site with a glGet probe
+ * (scratchpad audit build), including the five fallback sites, which needed a
+ * forced-fallback build to execute at all.
+ */
+#define B3R_BATCH_PUSH()                                                  \
+    do {                                                                  \
+        b3r_state_push();             \
+        b3r2d_begin();                                                    \
+    } while (0)
+#define B3R_BATCH_POP()                                                   \
+    do {                                                                  \
+        b3r2d_end();                                                      \
+        b3r_state_pop();                                                    \
+    } while (0)
+
+/* The ambient WORLD state every mesh-missing fallback box inherits: no
+ * texture, no blend, no alpha test, depth test and write on (the world's
+ * LEQUAL, left alone with depth_func 0), back-face culling on. */
+#define B3R_BATCH_WORLD_OPAQUE                                            \
+    { .tex = 0, .mode = B3R_TEX_NONE, .blend = B3R_BLEND_NONE,            \
+      .alpha_ref = -1.0f, .depth_mask = 1, .depth_test = 1,               \
+      .depth_func = 0, .cull = 1 }
 
 #define DEG_TO_RAD 0.01745329252f
 #define RAD_TO_DEG 57.2957795130823208764f
@@ -96,12 +182,37 @@ typedef struct { float x, y, z, w; } Quat;
 typedef struct { float m[4][4]; } Mat4;
 typedef struct { float r, g, b, a; } Color;
 
+/* ------------------------------------------------------------------ *
+ * THE PLAN LATCH -- AI+0x1F8 / AI+0x1FC and the window they index.
+ *
+ * Retail's plan stage is a LATCH advanced by an ARRIVAL TEST, not a probe:
+ * see nav_latch_step / nav_latch_plan below for the recovered law and its
+ * addresses.  Every field here is one retail slot, named for it.       [C]
+ * ------------------------------------------------------------------ */
+typedef struct {
+    int   latch;                /* AI+0x1F8: 0 entry, 1 apex, 2 exit, 4 done */
+    int   mode_1fc;             /* AI+0x1FC: 0 = a lane plan is latched      */
+    int   lane;                 /* AI+0x1F4: 0 / 2 / 4 from `rec[10] & 3`    */
+    unsigned short win[3];      /* AI+0x214 / +0x216 / +0x218                */
+    unsigned short win_section; /* the section those three nodes live in     */
+    unsigned short pub_node;    /* AI+0x210, the published target node       */
+    float radius;               /* AI+0x298, the record's `u16 +6`           */
+    unsigned char drift;        /* `rec[10] & 4`, the apex widening bit      */
+    unsigned char force;        /* AI+0x296, the one-shot forced retarget    */
+    Vec3  target;               /* AI+0x200, the published target point      */
+    int   ready;
+} B3NavLatch;
+
 typedef struct {
     Vec3 pos, vel, acc, rot;
     float speed, max_speed, accel, brake, steer;
     float health, boost, boost_meter;
     int vehicle_id, lap, position;
     float track_progress;
+    float rb_start_progress;    // racecar+0x135C: (lap + progress) at the
+                                // start line, the baseline FUN_001734C0
+                                // subtracts to get the race fraction
+    int   track_idx_hint;       // sticky station for vehicle_track_progress (+1; 0 = cold)
     float prev_progress;      // per-vehicle lap-wrap detection
     int active;
     const VehicleInfo* info;  // roster entry extracted from pveh/, may be NULL
@@ -115,7 +226,7 @@ typedef struct {
     int fsim_ready;           // 0 -> re-place the full model at pos/rot.y
                               // on the next update (spawn/respawn/recovery)
     B3PhysicsConfig cfg;      // THIS car's physics: defaults + its Data/vdb.xml
-                              // overrides (burnout3_car_physics.h)
+                              // overrides (build/cars/car_physics.bin)
     const B3CarPhysics* vdb;  // matched override table entry, NULL = fallback
     float body_len;           // from the .bgv header, world units
 
@@ -154,12 +265,21 @@ typedef struct {
     float last_hit_time;        //   race clock (-1 = never)
     B3AiState ai;
     int   ai_ready;
+    /* The B3AiCar the AI block built this frame. When ai and physics are BOTH
+     * retail the driver runs inside the physics session, so the physics call
+     * site needs the same view the AI block assembled. */
+    B3AiCar emu_ai_car;
+    int     emu_ai_car_valid;
     unsigned short nav_section;
     unsigned short nav_node;
     int   nav_ready;
     unsigned short nav_target_section;
     unsigned short nav_target_node;
     int   nav_target_ready;
+    /* AI+0x1F8/+0x1FC and their window -- the plan-stage latch.  Only the
+     * B3_NAV_AIM2 path drives it; with the switch off it stays at the
+     * FUN_00176090 reset state and nothing reads it. */
+    B3NavLatch nav_latch;
     /* racecar+0x245A, the LAST VALID NODE: FUN_001712E0 latches racecar+0x18D0
      * into it every frame the body is within 1 m of the interpolated road
      * surface, and the stuck rescue re-places at that node minus eight
@@ -169,6 +289,14 @@ typedef struct {
     unsigned short nav_last_section;
     unsigned short nav_last_node;
     int   nav_last_ready;
+    /* vehicle+0x1550, retail's "fully simulated" byte.  FUN_001049A0
+     * @0x00104A23 seeds it to 1; FUN_00105BD0 @0x00105F9C is the ONLY place
+     * it ever changes, through FUN_00106290 (set) / FUN_00106150 (clear).
+     * Carried per car because FUN_00105FC0's radius test is HYSTERETIC: it
+     * reads the PREVIOUS value to pick 19600 (stay) or 15625 (enter).
+     * rubberband_world_build seeds it to 1 until a camera exists, matching
+     * FUN_001049A0. */
+    unsigned char in_range_1550;
     /* AGGRESSION: the recovered attack/slam machine (RE_AI section 14) */
     B3AiAggro     aggro;
     B3AiAggroSpeed aggspd;
@@ -252,17 +380,134 @@ static SDL_Window* g_window = NULL;
 static SDL_GLContext g_gl_context = NULL;
 static int g_running = 1;
 static float g_delta_time = 0.016f;
+/* The ACHIEVED frame rate. The HUD's "FPS" is 1/g_delta_time, and
+ * g_delta_time is the NOMINAL 1/60 the sim always steps -- so it reads 60 no
+ * matter how slow the frame really was. */
+static float g_real_fps = 0.0f;
+/* takedowns committed this race, by anyone -- the slam scenario's stop
+ * condition, and the count the scenario suite asserts on */
+static int g_takedowns_committed = 0;
+/* ...and the PLAYER's own (attacker == car 0).  The slam scenario must gate
+ * on this, not the global count: a wreck takedown by an AI stopped the
+ * retries before the player ever landed a direct one. */
+static int g_player_takedowns = 0;
+/* B3_POST_TD_STEER: race time of the last AI-wheel 1->0 handback (-1 = none),
+ * captured in the wheel block -- the human-input block is skipped while the
+ * wheel is held, so an edge detector THERE can never see the release. */
+static float g_posttd_t0 = -1.0f;
+/* B3_SCENARIO=traffic: hold the player's controls (full throttle, straight)
+ * until this race time -- the RE avoidance is good enough now that the AI
+ * driver dodges the staged head-on and the scenario never lands a sample. */
+static float g_traffic_scen_until = -1.0f;
+static int g_traffic_scen_target = -1;   /* slot pinned against unstamp */
+/* B3_TRACK_TEST=1: the per-track drive test's in-game monitor.  Per car:
+ * minimum clearance above the collision ground, sustained-below-ground fall
+ * events, best route progress span and top speed.  Summarised as one
+ * [tracktest] line per car when B3_EXIT_AT ends the run, parsed by
+ * tools/validate_tracks.py. */
+typedef struct {
+    float min_clear;         /* car origin minus probed ground height   */
+    float below_since;       /* race time the car went under, -1 = not  */
+    int   falls;             /* sustained (>1 s) below-ground events    */
+    int   probe_misses;      /* probe found no ground under the car     */
+    float p_min, p_max;      /* route progress span                     */
+    float max_mph;
+    int   laps;
+    /* CORRIDOR EXPOSURE.  A fall is a chaotic, one-in-a-race hit: the same
+     * hole catches a different car under any perturbation, so a single
+     * fall COUNT cannot tell a fix from a reshuffle.  What can is how long
+     * the pack spends far off its own route ribbon, which is the state a
+     * fall is drawn from.  Distance is XZ to the nearest route station. */
+    float max_offroute;      /* worst XZ distance from the route line   */
+    int   off15, off30;      /* frames beyond 15 m / 30 m off it        */
+    int   av_frames, av_dead;/* avoidance-stage calls / calls with NO frame */
+} B3TrackTestCar;
+static B3TrackTestCar g_ttest[8];
+static int g_ttest_on = -1;
+
+static void track_test_sample(Vehicle* v);
+static void track_test_report(void);
+/* The ACHIEVED SIM rate, in 1/60 s ticks per second of wall clock. This, not
+ * g_real_fps, is what "is the action running at the right speed?" means:
+ * g_sim_hz / 60 is the playback rate against real time. With retail's frame
+ * governor in place (burnout3_frametime.h) it holds 60 for any render rate
+ * between ~15 and 60 fps; above 60 the frame limiter holds it there. */
+static float g_sim_hz = 0.0f;
 static float g_tdfx_real_dt = 0.016f;  // TAKEDOWN-FX: undilated frame delta
 static float g_cam_fov_deg = 60.0f;    // harness default; recovered in-game
+/* the render camera, published for the AI stage's vehicle+0x1550 test */
+static Vec3  g_oncam_eye = {0.0f, 0.0f, 0.0f};
+static float g_oncam_cos = -1.0f;      // cos of the HORIZONTAL half-angle
+static int   g_oncam_ready = 0;
                                        // camera FOV is B3_CAM_FOV = 90 [C]
 static Mat4 g_cam_view, g_cam_proj;    // this frame's matrices (tag projection)
+
+/* ---- THE VIEW FRUSTUM'S NEAR/FAR PLANES -- retail's own numbers.      [C]
+ *
+ * The harness shipped 0.1 / 5000 here, a guess.  Retail's renderer init
+ * FUN_0002ECC0 builds its three view objects (arg+0x90, arg+0x130,
+ * arg+0x310) and gives EVERY one of them the same pair, as immediate
+ * pushes into the D3D-viewport near/far setters:
+ *
+ *   FUN_001D92A0(view, near)   stores +0x80, rebuilds the depth-range
+ *   FUN_001D9360(view, far)    stores +0x84,  scale/bias at +0x8C/+0x90
+ *
+ *   0002eda6  MOVSS XMM0,[0x003b1684]      ; 0x3F000000 = 0.5
+ *   0002edae  PUSH 0x3f000000              ; near := 0.5
+ *   0002edb3  PUSH ECX / CALL 0x001d92a0
+ *   0002edc4  MOVSS XMM0,[0x003a340c]      ; 0x461C4000 = 10000.0
+ *   0002edcc  PUSH 0x461c4000              ; far  := 10000.0
+ *   0002edd1  PUSH EDX / CALL 0x001d9360
+ *   ... repeated verbatim at 0002ede6/0002edee and 0002ee22/0002ee2a
+ *       (near) and 0002ee04/0002ee0c and 0002ee40/0002ee48 (far).
+ *
+ * The sky dome agrees independently: FUN_00032580 @0x000325AB scales the
+ * dome by `DAT_004D67E0 - 1000.0` (literal at 0x003B16CC), and the dome is
+ * authored to sit just inside the far plane -- 9000 with far = 10000.
+ *
+ * WHY IT MATTERS.  The worlds are tens of kilometres across (US_M1_V1 and
+ * US_P2_V1 span 30 km x 21 km in track.obj), so 5000 cut the mountains and
+ * skylines off in mid-air.  Measured with tools/validate_draw_distance.py
+ * over all 36 shipped variants: on US_P1_V1 41.5% of the vertices inside
+ * the race frustum sit in the 5000..10000 band the old plane threw away
+ * (84.6% at the worst station), 25.1% on US_M1_V2, 34.1% on AS_C2_V2.
+ *
+ * DEPTH PRECISION GOES UP, NOT DOWN.  A 1/z depth buffer's resolution at
+ * distance d is ~ d^2 / (near * 2^bits): moving the NEAR plane 0.1 -> 0.5
+ * multiplies the available precision by 5, which more than pays for the
+ * 2x far plane (the far plane's contribution is the (1/n - 1/f) term, and
+ * 1/5000 vs 1/10000 is noise next to 1/0.1 vs 1/0.5).  Retail's own pair is
+ * the one the depth-sensitive world -- the road/decal ties documented in
+ * burnout3_trackmesh.c -- was authored against.
+ *
+ * B3_VIEW_NEAR / B3_VIEW_FAR override both at runtime (diagnostics only;
+ * unset = retail).  */
+#define B3_VIEW_NEAR_RETAIL  0.5f        /* 0x3F000000 @0x0002EDAE [C] */
+#define B3_VIEW_FAR_RETAIL   10000.0f    /* 0x461C4000 @0x0002EDCC [C] */
+
+static float b3_view_near(void) {
+    static float v = -1.0f;
+    if (v < 0.0f) {
+        const char* e = getenv("B3_VIEW_NEAR");
+        v = (e && (float)atof(e) > 0.0f) ? (float)atof(e) : B3_VIEW_NEAR_RETAIL;
+    }
+    return v;
+}
+static float b3_view_far(void) {
+    static float v = -1.0f;
+    if (v < 0.0f) {
+        const char* e = getenv("B3_VIEW_FAR");
+        v = (e && (float)atof(e) > 0.0f) ? (float)atof(e) : B3_VIEW_FAR_RETAIL;
+    }
+    return v;
+}
+
 static float g_total_time = 0.0f;
 static int g_frame_count = 0;
 
 // NOTE: the real game keeps its entity array at 0x004AE728 (stride 0x188,
 // active index at 0x004AED45) -- see docs/RE_NOTES.md section 6. These globals
 // are NOT that structure; they are this harness's own state.
-static int g_game_mode = 0;       // 0=menu, 1=race, 2=crashed, 3=finished
 static float g_time_limit = 180.0f; // 3 minute race
 static int g_lap_count = 3;
 static int g_current_lap = 0;
@@ -274,6 +519,180 @@ float g_real_clock_dbg = 0.0f;   /* undilated wall clock, debug only */
 // car; g_player is just a readable alias for that slot.
 static Vehicle g_vehicles[8] = {0};
 #define g_player (g_vehicles[0])
+
+// ---------------------------------------------------------------------------
+// backends.cfg physics=retail: map a vehicle to its slot in the emulation
+// sidecar, seeding the retail body from the port's pose the first time we see
+// it (so the emulated car starts on the real start grid, not at the origin).
+//
+// B3_EMU_CARS caps how many cars go through the emulator: each costs ~1.3 ms
+// of the 16.7 ms frame, so 6 fits and 18 does not. Uncapped slots keep running
+// the RE port, which is what makes a partial A/B possible at all -- you can
+// put the player on retail and leave the field on the port.
+// ---------------------------------------------------------------------------
+static signed char g_emu_slot[8];      // 0 = unassigned, else slot+1
+static int         g_emu_cap = -1;
+
+// Keep the emulated car's polygon soup stocked from the REAL collision world.
+//
+// Retail's own ground-poly collection (FUN_0011BC60) walks the streamed track
+// units; we have that geometry as build/collision.bin instead, so the harness
+// gathers a patch around the car and uploads it. FUN_0011AEF0 -- the chassis
+// resolve that gives the car its walls -- then runs against real triangles.
+//
+// Re-sent only when the car leaves the box we last gathered, which at racing
+// speed is a couple of uploads a second rather than 60. The stored centre is
+// in GAME space, same as everything else on this path.
+static float g_emu_soup_at[8][3];
+static int   g_emu_soup_have[8];
+
+static void b3_emu_refresh_soup(int slot, const float* P, const float* V,
+                                float radius)
+{
+    if (slot < 0 || slot >= 8) return;
+    /* Must stay well INSIDE the gather half-extent below: the patch is only
+     * valid while the car is inside it. With a 12 m resend against a 5.5 m
+     * box the car drove off its own soup after ~6 m and fell through the
+     * world; with the old 26 m box the resend was fine but the set saturated
+     * the cap instead. Both failures looked identical from the cockpit. */
+    /* B3_EMU_SOUP_RESEND overrides; 0 = re-upload every frame, which is what
+     * the port's own suspension does (it gathers fresh each step). */
+    /* Retail re-gathers EVERY frame from scratch ([C] FUN_0011BC60
+     * @0x0011BCE3 zeroes the count, called unconditionally @0x0011BF43), so
+     * any resend threshold is a harness compromise.  3.0 m was too far: the
+     * box only covers retail's query sphere out to 5.5 - 3.56 = 1.94 m, and
+     * measured over the real track a 3.0 m stale soup loses triangles in
+     * 13.7% of cases and a WALL triangle in 2.4%; at 2.0 m both are 0%. */
+    /* Retail re-gathers EVERY frame ([C] FUN_0011BC60 @0x0011BCE3 zeroes the
+     * count, called unconditionally @0x0011BF43), and now that the query is
+     * its own 2.6-3.6 m sphere rather than a 5.5 m box there is no slack left
+     * to coast on -- a stale soup would leave the car outside its own
+     * geometry within two frames.  So the default is 0: re-upload every
+     * frame, exactly as retail does.  The set is far smaller now (median 10
+     * triangles against the box's 56), so this is cheaper per frame, not
+     * dearer. */
+    float RESEND = 0.0f;
+    { static float r = -1.0f;
+      if (r < 0.0f) { const char* e = getenv("B3_EMU_SOUP_RESEND");
+                      r = e ? (float)atof(e) : 0.0f; }
+      RESEND = r; }
+    if (g_emu_soup_have[slot]) {
+        float dx = P[0] - g_emu_soup_at[slot][0];
+        float dy = P[1] - g_emu_soup_at[slot][1];
+        float dz = P[2] - g_emu_soup_at[slot][2];
+        if (dx*dx + dy*dy + dz*dz < RESEND * RESEND) return;
+    }
+    if (!b3_collision_ready()) return;
+
+    // gather in GL space (z negated), which is how the world is stored
+    const float centre[3] = { P[0], P[1], -P[2] };
+    /* The SAME box the port's own suspension gathers (see the wheel soup in
+     * vehicle_update: ground_half = {5.5, 34, 5.5}) -- a tall, narrow column
+     * around the car rather than a wide slab. The wide 26/14/26 box used to
+     * saturate B3_EMU_SOUP_CAP on every upload (every trace line read
+     * "soup 120"), and the gather then truncated arbitrarily, so the
+     * triangles actually under the wheels were frequently not among the ones
+     * sent. Retail's suspension found no ground and the car fell through the
+     * floor as soon as it moved off whatever happened to be included. */
+    static B3CollisionPoly polys[B3_EMU_SOUP_CAP];
+    /* Retail's gather applies TWO runtime filters before a poly ever reaches
+     * the soup ([C] FUN_0011BBE0: `n.y < -0.7` @0x0011BC43 (0x0039B264), and
+     * for the structure band 0x15..0x20 `dot(vel, n) > 0.5` @0x0011BC32
+     * (0x003B1684)).  b3_collision_gather applies neither, so the retail
+     * backend was handed downward-facing faces its own gather would have
+     * refused -- 7.9% of uploads carried at least one, up to 52 in a single
+     * upload.  b3_collision_gather_walls is the same walk WITH the filters;
+     * the 1.1 bound admits every normal, since the soup must still carry the
+     * GROUND for the suspension, and retail's gather has no upper bound
+     * either.  The wall/ground split happens later, in the resolve. */
+    const float gv[3] = { V[0], V[1], -V[2] };   /* GL space, like `centre` */
+    int n = b3_collision_gather_sphere(centre, radius, gv, polys,
+                                       B3_EMU_SOUP_CAP);
+    if (n <= 0) return;
+    if (n >= B3_EMU_SOUP_CAP) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "[emu] soup gather SATURATED at %d triangles -- the "
+                    "set is truncated and the ground under the car may be "
+                    "missing. Widen B3_EMU_SOUP_CAP or narrow the box.\n",
+                    B3_EMU_SOUP_CAP);
+        }
+    }
+
+    // GL -> GAME: negate z on every vertex and the normal, and swap v1/v2 to
+    // undo the swap the loader applied when it mirrored on the way in. Miss
+    // the swap and every triangle faces backwards -- the wheels see the road
+    // from underneath and the body wedges solid.
+    static float flat[B3_EMU_SOUP_CAP * 13];
+    for (int i = 0; i < n; i++) {
+        const B3CollisionPoly* q = &polys[i];
+        float* o = &flat[i * 13];
+        o[0] = q->v0[0]; o[1] = q->v0[1]; o[2] = -q->v0[2];
+        o[3] = q->v2[0]; o[4] = q->v2[1]; o[5] = -q->v2[2];   /* v2 <-> v1 */
+        o[6] = q->v1[0]; o[7] = q->v1[1]; o[8] = -q->v1[2];
+        o[9] = q->normal[0]; o[10] = q->normal[1]; o[11] = -q->normal[2];
+        o[12] = (float)q->type;
+    }
+    if (b3_emu_soup(slot, flat, n)) {
+        g_emu_soup_at[slot][0] = P[0];
+        g_emu_soup_at[slot][1] = P[1];
+        g_emu_soup_at[slot][2] = P[2];
+        g_emu_soup_have[slot] = 1;
+        if (getenv("B3_EMU_TRACE"))
+            printf("[emu] soup car %d: %d tris around (%.0f %.0f %.0f)\n",
+                   slot, n, P[0], P[1], P[2]);
+    }
+}
+
+/* Retail's ownership of a car ends the moment the harness re-places it.
+ *
+ * b3_vehicle_full_init re-seats the body, but the emulator is still driving
+ * its own copy from before the reset. Leaving the slot assigned means no new
+ * handover happens, the two integrate independently from that point, and the
+ * car runs away -- measured going 24 -> 347 mph and pinning there after a
+ * single respawn. Dropping the slot makes the next frame re-seed and hand the
+ * fresh state over, which is what keeps re <-> retail switchable at any time.
+ */
+static void b3_emu_drop_car(const Vehicle* v)
+{
+    int idx = (int)(v - &g_vehicles[0]);
+    if (idx >= 0 && idx < 8) g_emu_slot[idx] = 0;
+    ((Vehicle*)v)->fsim.emu_owned = 0;
+}
+
+static int b3_emu_slot_of(const Vehicle* v)
+{
+    if (!b3_emu_ready() && !b3_emu_init()) return -1;
+    if (g_emu_cap < 0) {
+        const char* e = getenv("B3_EMU_CARS");
+        g_emu_cap = e ? atoi(e) : 1;           // player only by default
+        if (g_emu_cap < 0) g_emu_cap = 0;
+        if (g_emu_cap > 8) g_emu_cap = 8;
+        printf("[emu] physics=retail for %d car(s) "
+               "(B3_EMU_CARS to change; ~1.3 ms each)\n", g_emu_cap);
+    }
+    int idx = (int)(v - &g_vehicles[0]);
+    if (idx < 0 || idx >= 8) return -1;
+    if (idx >= g_emu_cap) return -1;           // this car stays on the port
+    if (g_emu_slot[idx]) { ((Vehicle*)v)->fsim.emu_owned = 1;
+                           return g_emu_slot[idx] - 1; }
+
+    const float* fr = &v->fsim.rb.frame[3][0];
+
+    float yaw = atan2f(v->fsim.rb.frame[2][0], v->fsim.rb.frame[2][2]);
+    if (!b3_emu_seed(idx, fr[0], fr[1], fr[2], yaw)) return -1;
+    /* Retail takes the wheel here: push the port's state across ONCE. From
+     * now on the port only mirrors what retail computes, so it can take the
+     * wheel back on any frame with a coherent vehicle. */
+    if (!b3_emu_handover(idx, &v->fsim, (const float(*)[4])v->fsim.rb.frame))
+        return -1;
+    g_emu_slot[idx] = (signed char)(idx + 1);
+    ((Vehicle*)v)->fsim.emu_owned = 1;
+    printf("[emu] car %d -> retail physics, seeded at (%.1f %.1f %.1f) yaw %.2f\n",
+           idx, fr[0], fr[1], fr[2], yaw);
+    return idx;
+}
 static int g_num_vehicles = 6;   // real event grid = 6 (Gamedata.bgd)
 
 // Wreck rigid states, one per grid slot (src/burnout3_crash.c: the ported
@@ -301,6 +720,47 @@ static const char* g_crash_hit_id   = NULL;
  * numbers, so they are published once per frame here. */
 static float g_at_h, g_at_v;      /* veh+0x1408 / veh+0x140C          */
 static int   g_at_held;           /* pad+0x84 != 0 -> Impact Time      */
+
+/* SCRIPTED INPUT for the aftertouch acceptance test
+ * (tools/validate_aftertouch.py).  B3_TEST_AFTERTOUCH="h,v[,hold]" pins the
+ * two axes and the Impact Time button for the whole run:
+ *
+ *   h, v    veh+0x1408 / veh+0x140C, the two numbers FUN_00118410 publishes
+ *   hold    pad+0x84 -> veh+0x13FC bit 4 (default 1).  hold=0 scripts the
+ *           RELEASED state with the axes still pinned, which is the other
+ *           half of the held-vs-released experiment: retail runs the crash
+ *           at divisor 1 (0x001188D6) instead of divisor 5 (0x001188A4) and
+ *           the steer consume block is gated off with it (0x00118980).
+ *
+ * Retail drives BOTH halves -- the time divisor and the wreck steer -- off
+ * the one pad bit, so this aid does too: it is read by the b3_tdfx
+ * aftertouch request and by the wreck steer from the same call.  Inert
+ * unless the env is set.  Same class of aid as B3_TEST_CRASH_AT. */
+static int at_script(float* h, float* v, int* hold)
+{
+    static int   parsed = -1;
+    static float sh = 0.0f, sv = 0.0f;
+    static int   shold = 1;
+    if (parsed < 0) {
+        const char* e = getenv("B3_TEST_AFTERTOUCH");
+        int n = 0;
+        parsed = 0;
+        if (e) {
+            float fh = 0.0f, fv = 0.0f, fhold = 1.0f;
+            n = sscanf(e, "%f,%f,%f", &fh, &fv, &fhold);
+            if (n >= 2) {
+                sh = fh; sv = fv;
+                shold = (n >= 3) ? (fhold != 0.0f) : 1;
+                parsed = 1;
+            }
+        }
+    }
+    if (!parsed) return 0;
+    if (h)    *h    = sh;
+    if (v)    *v    = sv;
+    if (hold) *hold = shold;
+    return 1;
+}
 /* The camera basis FUN_00118410 unpacks out of veh+0x1410 to make the
  * aftertouch direction screen-relative (FUN_00117520 -> FUN_00013D10,
  * rows 0 and 2 with y flattened).  Published from render_frame. */
@@ -342,9 +802,6 @@ static float     g_tdr_wall[8];   // strongest barrier closing speed this frame
 static Vec3      g_tdr_wall_n[8]; //   its push-out normal (head-on gate)
 static int       g_tdr_ready = 0;
 
-// Camera (harness state)
-static Camera g_camera = {0};
-
 // Vehicle physics config, populated from the values recovered from the binary.
 static B3PhysicsConfig g_phys_cfg;
 
@@ -364,12 +821,21 @@ static GLuint g_track_tex[TRACKMESH_MAX_GROUPS] = {0};
 static unsigned char g_track_cutout[TRACKMESH_MAX_GROUPS] = {0};
 // Whole track baked into one display list (106k tris; immediate mode per
 // frame costs ~20ms, the list renders in ~2ms).
-static GLuint g_track_list = 0;
+
+#define B3CAR_MAX_SPANS 128
+typedef struct {
+    unsigned vbo;
+    int      nvert;
+    int      nspan;
+    int      defer_bind;          /* the caller owns the texture (glass tier) */
+    B3RVtxFmt fmt;
+    struct { int first, count; GLuint tex; } span[B3CAR_MAX_SPANS];
+} B3CarMesh;
 
 // Real vehicle meshes extracted from pveh/*.bgv (tools/extract_bgv.py, layout
 // from the game's own relinker -- see BGV_EXTRACTION.md). One display list per
 // grid slot; ymin lifts the wheels onto the road. Falls back to boxes.
-static GLuint g_car_lists[8] = {0};
+static B3CarMesh* g_car_lists[8];
 static float g_car_ymin[8] = {0};
 
 // Damage-state body variants + wheel sub-meshes (RE_NOTES 13). The .bgv body
@@ -381,16 +847,16 @@ static float g_car_ymin[8] = {0};
 // Wheels are separate origin-centred meshes drawn each frame at the attach
 // matrices stored at .bgv+0xB80 [C: FUN_0012FEE0 copies them into the damage
 // ctx the draw path consumes].
-static GLuint g_car_intact_lists[8] = {0};   // mask bit0 + lights
-static GLuint g_car_shell_lists[8] = {0};    // mask bit1 + lights
-static GLuint g_car_glass_lists[8] = {0};    // mask bit8 (built untinted)
-static GLuint g_car_wheel_lists[8] = {0};    // wheel mesh, origin-centred
+static B3CarMesh* g_car_intact_lists[8];   // mask bit0 + lights
+static B3CarMesh* g_car_shell_lists[8];    // mask bit1 + lights
+static B3CarMesh* g_car_glass_lists[8];    // mask bit8 (built untinted)
+static B3CarMesh* g_car_wheel_lists[8];    // wheel mesh, origin-centred
 // Motion-blur wheel variants: retail's draw picks S+0x1C/0x20/0x24 by
 // |wheel spin| -- slot 7 below 25 rad/s, slot 8 above, slot 9 above 50
 // [C, extract_bgv header]. Always drawing slot 7 made fast wheels read
 // as slowly rotating (wagon-wheel strobe; user report).
-static GLuint g_car_wheel_blur8[8] = {0};
-static GLuint g_car_wheel_blur9[8] = {0};
+static B3CarMesh* g_car_wheel_blur8[8];
+static B3CarMesh* g_car_wheel_blur9[8];
 /* PANELS: the damage panels of each roster car.  The .bgv part table's
  * slots 1..numBodyParts are the detachable bodywork (doors / front / rear /
  * bonnet / boot), extracted PIVOT-LOCAL to build/cars/parts/<car>/
@@ -400,7 +866,16 @@ static GLuint g_car_wheel_blur9[8] = {0};
  * EVERYTHING at the crash entry, because the ordinary entry FUN_00115130
  * stamps FUN_001253C0(1) (crumple), not (0) (detach-all).  See
  * src/burnout3_panels.h for the whole recovered chain. */
-static GLuint g_car_panel_lists[8][B3_PANEL_MAX] = {{0}};
+static B3CarMesh* g_car_panel_lists[8][B3_PANEL_MAX];
+/* CRASH-UV: a panel record set carries its OWN glass (mask 0x100, texture
+ * slot 2 -- group "m100_t2" in build/cars/parts/<car>/panel*.obj; the
+ * extractor does NOT strip it the way it strips the body's glass into
+ * <car>_glass.obj).  Those records are drawn only while a car is wrecked, so
+ * flattening them onto the car's paint page put livery art on the wreck's
+ * window geometry at exactly the moment of the crash.  Split out here and
+ * drawn in the blended glass pass, which is where FUN_00031AB0's bit8|bit9
+ * branch puts them. */
+static B3CarMesh* g_car_panel_glass_lists[8][B3_PANEL_MAX];
 static int    g_car_panel_count[8] = {0};
 static int    g_car_panel_kind[8][B3_PANEL_MAX] = {{0}};
 static float  g_car_panel_pos[8][B3_PANEL_MAX][3];  // GAME space (.bgv+0xD00)
@@ -459,6 +934,14 @@ _Static_assert(sizeof(B3RtNavLink) == 10, "route.bin nav link layout");
 _Static_assert(sizeof(B3RtNavPlan) == 12, "route.bin nav plan layout");
 
 static B3RtNavData g_nav = {0};
+
+/* nav_edges.bin: retail's per-node cumulative arc length, indexed exactly
+ * like the nav LINK array (`section->link_base + node`).  See nav_edges_load
+ * below for the provenance. */
+typedef struct { float cum_length, width_hint; } B3RtNavEdge;
+_Static_assert(sizeof(B3RtNavEdge) == 8, "nav_edges.bin record layout");
+static B3RtNavEdge* g_nav_edges = NULL;
+static unsigned int g_nav_edge_count = 0;
 
 // Input state
 static int g_keys[SDL_NUM_SCANCODES] = {0};
@@ -553,12 +1036,9 @@ static void pad_open_first(void) {
         }
     }
 }
-static int g_prev_keys[SDL_NUM_SCANCODES] = {0};
 
 // Audio
 static SDL_AudioDeviceID g_audio_dev = 0;
-static Uint8* g_audio_buf = NULL;
-static int g_audio_len = 0;
 
 // T-key gamestate dump (user-facing debug handoff)
 static int g_debug_dump_req = 0;
@@ -631,6 +1111,575 @@ static GLuint tdfx_sign_texture(int sign) {
     return cache[sign];
 }
 
+/* ================================================================= *
+ * --- loading screen (agent) ---                                    *
+ * ================================================================= *
+ *
+ * WHY IT EXISTS.  Asset materialisation is on the main thread by design
+ * (src/burnout3_isodata.h, "MAIN THREAD ONLY"), so a cold ISO boot and every
+ * race load froze the last frame for seconds.  Retail had exactly the same
+ * problem and solved it exactly this way -- a PUMP, not a thread:
+ *
+ *     FUN_00156460 [C]:   push -1.0f ; call FUN_0002F650  (draw one frame)
+ *                         call <present>
+ *                         call <is the load finished?>
+ *                         je   back to the top
+ *
+ * so the loop below is retail's loop, driven by the progress hook added to
+ * b3_iso_set_progress() and by explicit phase calls in main()'s load path.
+ *
+ * ------------------------------------------------------- THE RETAIL SCREEN
+ * FUN_0002F650 (burnout3.elf VA; .text = flat + 0x10000) is the drawer.  Its
+ * one argument is the progress fraction; <= 0 means "keep what you had"
+ * (@0x0002F76F comiss/jbe), and it is stored as a monotonic maximum in
+ * DAT_0075479C.  Everything it draws, and nothing it does not:
+ *
+ *   [C] BLACK.  @0x0002F798 Clear(count 0, rects NULL, flags 0xF3, colour 0,
+ *       Z 1.0, stencil 0).  0xF3 is the Xbox spelling of TARGET_R|G|B|A
+ *       |ZBUFFER|STENCIL.  There is no background image, no track art.
+ *   [C] Layout space 640x480 with x-scale DAT_00754C28 = 1.0 and y-scale
+ *       DAT_00754C2C = 0.9 (lazily defaulted @0x0002F696..0x0002F76A).
+ *       Every number below is pre-scale, exactly as the drawer holds it.
+ *   [C] "LOADING", a hard-coded UTF-16LE literal at 0x00386720 -- NOT a
+ *       Globalus entry.  Centred: char size 40*ys, pen y 210*ys, x measured
+ *       @0x0002F84E and centred on 320 @0x0002F868.  Colour, from the
+ *       .rdata float4 assembled @0x0002F7C7..0x0002F807:
+ *       (0.36, 0.60, 0.75, 1.0)  [0x003B2020 / 0x003B16EC / 0x003A55F8].
+ *   [C] Two full-width horizontal rules, 2 px tall, at y 205 and y 260
+ *       [0x003C84D0 / 0x003C84D4], each drawn as two halves -- x 0..320 and
+ *       x 320..640 [0x00396EB0 / 0x003B1F00] -- @0x0002FD66, 0x0002FE01 and
+ *       the two that follow.  Two halves is what a symmetric gradient looks
+ *       like; which end is bright is not recoverable from the vertex
+ *       shuffle, so the fade below is [S].
+ *   [C] The bar.  Frame: two nested 1 px outlines, (240,420)-(400,435) and
+ *       the same inset 1 px in device space (@0x0002F933 / 0x0002F9DF).
+ *       240 is DAT_00754C00, 160 the width [0x003A49FC], 420/435
+ *       [0x003B1D04 / 0x003B2010].  Colour (0.62, 0.769, 0.969, 1.0)
+ *       [0x003B201C / 0x003B2018 / 0x003B2014].
+ *   [C] The fill: two quads, inset 2 px, split at y 423.75 [0x003B200C],
+ *       x from 242 to 242 + (160-4)*progress (@0x0002FAD1 and 0x0002FC06 --
+ *       the same expression twice, once per band).  Two colours,
+ *       (0.36,0.60,0.75) and (0,0,0.10) [0x003A69C4]; which vertex takes
+ *       which is a four-way movaps shuffle, so bright-on-top is [S].
+ *   [C] The tip.  FUN_00077B20 is the screen: it runs the one-time setup
+ *       FUN_00077BC0, which picks a random tip and hands it to the text
+ *       block builder FUN_000EDDC0, then calls the drawer above every frame.
+ *       The tips are Globalus entries in threes -- question, then two body
+ *       lines.  FUN_000EDDC0's own LCG picks them (@0x000EDE75 / 0x000EDEB4,
+ *       state DAT_004D1FD8/DC):
+ *           mode 0   (rand % 14)*3 + 2262     header 2261 "HAVE YOU PLAYED..."
+ *           mode 1   (rand % 10)*3 + 2308     header 2307 "HAVE YOU TRIED..."
+ *       and FUN_00077BC0 @0x00077D28/0x00077D36 selects the mode and pushes
+ *       the matching header.  Verified against the user's own Globalus.bin:
+ *       2262..2306 is exactly 14 tips, 2308..2337 exactly 10.
+ *       Line stagger is [C] from the builder's constants at 0x004087C0:
+ *       x -= 30 and y += 33 per line.  The block ANCHOR is [S] -- retail's
+ *       (120,140) sits where "LOADING" and the upper rule are, so it belongs
+ *       to a screen state this port does not have, and the block is placed
+ *       in the clear band below the lower rule instead.
+ *
+ * [S] additions, all deliberate: the phase caption under the bar (retail
+ * shows no text there -- B3_LOADSCREEN=retail turns it off), the rule fade,
+ * the fill gradient direction, and the tip anchor.
+ *
+ * ------------------------------------------------------------- THE RULES
+ *   - Draws only when a window and a GL context exist.
+ *   - B3_LOADSCREEN=0 off, =retail hides the [S] caption, unset = on except
+ *     under the offscreen video driver, where the suites live: they parse
+ *     stdout and run a fixed wall clock, so they get the old behaviour
+ *     byte for byte unless B3_LOADSCREEN=1 asks for it explicitly.
+ *   - Prints nothing.  Not one existing log line moves or changes.
+ *   - Never opens an asset from inside the progress hook (materialisation is
+ *     locked out there); the font and metrics are forced in up front.
+ * ================================================================= */
+
+#include "burnout3_isodata.h"
+/* cx_pool.h is the extraction pipeline's parallel-for, and it is a general
+ * primitive rather than an extraction one: the LOAD path uses it too, to
+ * inflate a track's PNGs on workers while the GL uploads stay on this thread
+ * (see THE DECODE / UPLOAD SPLIT further down).  Reached through the
+ * Makefile's -I$(CX_DIR), which this target already carries. */
+#include "cx_pool.h"
+
+#define LS_XS        1.0f          /* DAT_00754C28 [C] */
+#define LS_YS        0.9f          /* DAT_00754C2C [C] */
+/* Retail glyph metrics are texture-normalised and scale by
+ * charsize * GlobalFont+0x08 (6.773046) / 256; this port's font.bin keeps
+ * them in atlas pixels, so one retail "char size" unit is this many.
+ * (docs/RE_FRONTEND.md 6.8.5 derives the same 0.687888 px/atlas px at 26.) */
+#define LS_CHARPX    (6.773046f / 256.0f)
+
+static const float LS_C_TEXT[4]  = { 0.36f,  0.600f, 0.750f, 1.0f };
+static const float LS_C_FRAME[4] = { 0.62f,  0.769f, 0.969f, 1.0f };
+static const float LS_C_FILL_LO[4] = { 0.0f, 0.0f,   0.100f, 1.0f };
+
+static int    g_ls_mode     = -1;   /* -1 undecided, 0 off, 1 on, 2 retail  */
+static int    g_ls_live     = 0;    /* init() has run                       */
+static int    g_ls_text     = 0;    /* GlobalFont + metrics are up          */
+static float  g_ls_frac     = 0.f;  /* retail's DAT_0075479C, monotonic max */
+static float  g_ls_base     = 0.f;  /* current outer phase's floor          */
+static float  g_ls_span     = 1.f;  /* ... and its share of the bar         */
+static float  g_ls_sub_base = 0.f;  /* a sub-step's floor WITHIN the phase  */
+static float  g_ls_sub_span = 1.f;  /* ... and its share of the phase       */
+static int    g_ls_outer_n  = 0;    /* 0 = free running, one job per burst  */
+static Uint32 g_ls_last     = 0;
+static Uint32 g_ls_cost     = 0;    /* smoothed ms one screen frame costs   */
+static char   g_ls_caption[80];
+static char   g_ls_tip_head[96];
+static char   g_ls_tip[3][96];
+static int    g_ls_tip_lines = 0;
+static int    g_ls_shot_done = 0;
+/* Loading-screen frames actually PRESENTED.  This is the measurement behind
+ * "the screen kept animating": a phase that shows 1 is a phase that froze,
+ * whatever the bar looked like.  Reported per phase by B3_LOADPROF. */
+static long   g_ls_frames    = 0;
+
+static int loadscreen_on(void) {
+    if (g_ls_mode < 0) {
+        const char* e  = getenv("B3_LOADSCREEN");
+        const char* vd = getenv("SDL_VIDEODRIVER");
+        if (e && *e) {
+            g_ls_mode = !strcmp(e, "0") ? 0 : (!strcmp(e, "retail") ? 2 : 1);
+        } else {
+            /* the suites run offscreen; leave them exactly as they were */
+            g_ls_mode = (vd && !strcmp(vd, "offscreen")) ? 0 : 1;
+        }
+    }
+    return g_ls_mode > 0;
+}
+
+/* ----------------------------------------------------------- primitives */
+
+static void ls_rect(float x, float y, float w, float h,
+                    const float c[4], float a) {
+    if (w <= 0.f || h <= 0.f) return;
+    b3_hud_draw_rect_px(x, y, w, h, c[0], c[1], c[2], c[3] * a);
+}
+
+/* One of retail's 1 px bar outlines.  tx/ty are the device-space thickness,
+ * which is why the y term carries the layout scale and the x term does not. */
+static void ls_outline(float x0, float y0, float x1, float y1,
+                       float tx, float ty, const float c[4], float a) {
+    ls_rect(x0, y0, x1 - x0, ty, c, a);
+    ls_rect(x0, y1 - ty, x1 - x0, ty, c, a);
+    ls_rect(x0, y0 + ty, tx, (y1 - y0) - 2.f * ty, c, a);
+    ls_rect(x1 - tx, y0 + ty, tx, (y1 - y0) - 2.f * ty, c, a);
+}
+
+/* A retail rule: two halves meeting at x 320, bright in the middle.  The
+ * split is [C]; the direction of the fade is [S]. */
+static void ls_rule(float yy, float h, float a) {
+    const int N = 16;
+    const float mid = 320.f * LS_XS;
+    for (int i = 0; i < N; i++) {
+        float t0 = (float)i / N, t1 = (float)(i + 1) / N;
+        float k  = 1.f - 0.5f * (t0 + t1);          /* 1 at centre, 0 at edge */
+        float w  = (mid / N);
+        ls_rect(mid - (i + 1) * w, yy, w, h, LS_C_FRAME, a * k);
+        ls_rect(mid + i * w,       yy, w, h, LS_C_FRAME, a * k);
+    }
+}
+
+static void ls_text(const char* s, float x, float y, float size,
+                    const float c[4], float a) {
+    if (!g_ls_text || !s || !*s) return;
+    b3_hud_draw_text(s, x, y, size * LS_CHARPX,
+                     c[0], c[1], c[2], c[3] * a);
+}
+
+static void ls_text_centred(const char* s, float cx, float y, float size,
+                            const float c[4], float a) {
+    if (!g_ls_text || !s || !*s) return;
+    ls_text(s, cx - b3_hud_text_width(s, size * LS_CHARPX) * 0.5f,
+            y, size, c, a);
+}
+
+/* ------------------------------------------------------------- the tip */
+
+/* Private Globalus read.  The shared g_globalus is loaded at the very END of
+ * main()'s sequence and this runs at the start of it, so the tip uses its own
+ * buffer and frees it -- nothing about the existing loader moves. */
+static void ls_load_tip(void) {
+    const char* path = getenv("B3_GLOBALUS");
+    unsigned char* d = NULL;
+    long n = 0;
+    FILE* f;
+    unsigned cnt;
+    int mode, tip, base, hdr;
+
+    if (!path || !*path) path = "build/Globalus.bin";
+    if (!(f = fopen(path, "rb"))) return;
+    if (fseek(f, 0, SEEK_END) == 0 && (n = ftell(f)) > 0x10
+        && fseek(f, 0, SEEK_SET) == 0 && (d = malloc((size_t)n)) != NULL
+        && fread(d, 1, (size_t)n, f) == (size_t)n) {
+        cnt = (unsigned)d[8] | ((unsigned)d[9] << 8)
+            | ((unsigned)d[10] << 16) | ((unsigned)d[11] << 24);
+    } else {
+        free(d); d = NULL; cnt = 0;
+    }
+    fclose(f);
+    if (!d) return;
+
+    /* FUN_00077BC0 @0x00077D28 / 0x00077D36, and FUN_000EDDC0's two LCG
+     * branches.  Retail's generator is a private 32-bit state this port has
+     * no reason to reproduce, so the draw is srand-seeded [S]; the tables
+     * and their sizes are [C]. */
+    mode = (rand() >> 5) & 1;
+    if (mode) { base = 2308; hdr = 2307; tip = rand() % 10; }
+    else      { base = 2262; hdr = 2261; tip = rand() % 14; }
+
+    g_ls_tip_lines = 0;
+    {   /* inline UTF-16LE -> ASCII, same fold as globalus_string() */
+        int want[4], k;
+        want[0] = hdr;
+        for (k = 0; k < 3; k++) want[k + 1] = base + tip * 3 + k;
+        for (k = 0; k < 4; k++) {
+            char* out = (k == 0) ? g_ls_tip_head : g_ls_tip[k - 1];
+            long tab = 0x10 + (long)want[k] * 4;
+            unsigned long off;
+            int m = 0;
+            out[0] = '\0';
+            if ((unsigned)want[k] >= cnt || tab + 4 > n) continue;
+            off = (unsigned long)d[tab] | ((unsigned long)d[tab + 1] << 8)
+                | ((unsigned long)d[tab + 2] << 16)
+                | ((unsigned long)d[tab + 3] << 24);
+            while ((long)off + 1 < n && m < 90) {
+                unsigned cu = (unsigned)d[off] | ((unsigned)d[off + 1] << 8);
+                if (!cu) break;
+                out[m++] = (cu < 0x20 || cu > 0x7E) ? '?' : (char)cu;
+                off += 2;
+            }
+            out[m] = '\0';
+            if (k > 0 && m > 0) g_ls_tip_lines = k;
+        }
+    }
+    free(d);
+}
+
+/* --------------------------------------------------------- one frame */
+
+static void ls_shot(int W, int H) {
+    const char* shot = getenv("B3_LOADSCREEN_SHOT");
+    const char* at   = getenv("B3_LOADSCREEN_SHOT_AT");
+    float want = at && *at ? (float)atof(at) : 0.45f;
+    unsigned char* px;
+    FILE* fp;
+    if (!shot || g_ls_shot_done || g_ls_frac < want) return;
+    if (W <= 0 || H <= 0) return;
+    px = malloc((size_t)W * H * 3);
+    if (!px) return;
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
+    if ((fp = fopen(shot, "wb")) != NULL) {
+        fprintf(fp, "P6\n%d %d\n255\n", W, H);
+        for (int y = H - 1; y >= 0; y--)
+            fwrite(px + (size_t)y * W * 3, 3, W, fp);
+        fclose(fp);
+        g_ls_shot_done = 1;
+    }
+    free(px);
+}
+
+static void b3_loadscreen_frame(int force) {
+    SDL_Event e;
+    Uint32 now;
+    int W = 0, H = 0;
+    float p, bx0, bx1, by0, by1, fx0, fx1, fy0, fym, fy1;
+
+    if (!g_ls_live || !loadscreen_on()) return;
+    if (!g_window || !g_gl_context) return;
+
+    /* THE CEILING, and why it is not just 30 Hz any more.
+     *
+     * The old rule was "at most one frame per 33 ms, measured from the start
+     * of the last one".  That is exactly right when a frame is cheap, and it
+     * degenerates when it is not: if the frame itself takes longer than 33 ms
+     * the test is true on EVERY call, and the pump runs at a 100% duty cycle
+     * -- the loading screen then costs more than the loading.  Measured, with
+     * the mesh pump added below: US_C3_V1's track parse went from 0.6 s of
+     * work to 4.1 s, of which 3.5 s was 49 loading-screen frames at ~72 ms
+     * each (headless SwiftShader, where a full-canvas clear is not free).
+     *
+     * So the budget is a SHARE of the load, not a frame rate: the next frame
+     * is allowed 33 ms after the last one ENDED, or four times however long
+     * the last one took to draw, whichever is longer.  A cheap frame (any
+     * real GPU: ~1 ms) keeps the full 30 Hz; an expensive one throttles
+     * itself to a fifth of the wall clock and the load stays the load.
+     * Forced frames -- phase changes, materialisation boundaries -- are never
+     * throttled, because those are the ones carrying new information. */
+    now = SDL_GetTicks();
+    if (!force) {
+        Uint32 gap = 33u + 3u * g_ls_cost;
+        if (now - g_ls_last < gap) return;
+    }
+    g_ls_last = now;
+
+    /* retail's pump polls before it draws (FUN_00156460's loop body) */
+    while (SDL_PollEvent(&e))
+        if (e.type == SDL_QUIT) g_running = 0;
+
+    SDL_GL_GetDrawableSize(g_window, &W, &H);
+    if (W <= 0 || H <= 0) return;
+
+    glViewport(0, 0, W, H);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_TRUE);
+    glClearColor(0.f, 0.f, 0.f, 1.f);              /* [C] Clear to black */
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    p = g_ls_frac < 0.f ? 0.f : (g_ls_frac > 1.f ? 1.f : g_ls_frac);
+
+    /* the two rules, then the word between them */
+    ls_rule(205.f * LS_YS, 2.f * LS_YS, 1.f);
+    ls_rule(260.f * LS_YS, 2.f * LS_YS, 1.f);
+    ls_text_centred("LOADING", 320.f * LS_XS, 210.f * LS_YS,
+                    40.f * LS_YS, LS_C_TEXT, 1.f);
+
+    /* The tip.  Retail's builder steps the block by (-30, +33) per line
+     * [C, 0x004087C0]; its anchor (120,140) would put the last line's ink
+     * through the upper rule and into "LOADING", so the block is lifted 30
+     * units to clear it -- same region, same stagger, moved anchor [S]. */
+    if (g_ls_tip_lines > 0) {
+        ls_text(g_ls_tip_head, 120.f * LS_XS, 78.f * LS_YS,
+                22.f * LS_YS, LS_C_TEXT, 0.75f);
+        for (int i = 0; i < g_ls_tip_lines; i++)
+            ls_text(g_ls_tip[i], (120.f - 30.f * i) * LS_XS,
+                    (110.f + 33.f * i) * LS_YS,
+                    (i == 0 ? 26.f : 22.f) * LS_YS,
+                    i == 0 ? LS_C_FRAME : LS_C_TEXT, i == 0 ? 1.f : 0.8f);
+    }
+
+    /* the bar: retail's own expressions, verbatim */
+    bx0 = 240.f * LS_XS;
+    bx1 = (240.f + 160.f) * LS_XS;
+    by0 = 420.f * LS_YS;
+    by1 = 435.f * LS_YS;
+    ls_outline(bx0, by0, bx1, by1, 1.f, 1.f, LS_C_FRAME, 1.f);
+    ls_outline(bx0 + 1.f, by0 + 1.f, bx1 - 1.f, by1 - 1.f,
+               1.f, 1.f, LS_C_FRAME, 1.f);
+
+    fx0 = bx0 + 2.f;
+    fx1 = fx0 + (160.f * LS_XS - 4.f) * p;
+    fy0 = by0 + 2.f;
+    fym = 423.75f * LS_YS;
+    fy1 = by1 - 2.f;
+    if (fx1 > fx0) {
+        const int N = 10;
+        ls_rect(fx0, fy0, fx1 - fx0, fym - fy0, LS_C_TEXT, 1.f);
+        for (int i = 0; i < N; i++) {   /* the lower band's gradient [S] */
+            float t = (float)i / (N - 1), c[4];
+            for (int k = 0; k < 4; k++)
+                c[k] = LS_C_TEXT[k] + (LS_C_FILL_LO[k] - LS_C_TEXT[k]) * t;
+            ls_rect(fx0, fym + (fy1 - fym) * ((float)i / N),
+                    fx1 - fx0, (fy1 - fym) / N, c, 1.f);
+        }
+    }
+
+    /* [S] the caption -- what is actually being built right now */
+    if (g_ls_mode == 1 && g_ls_caption[0])
+        ls_text_centred(g_ls_caption, 320.f * LS_XS, 443.f * LS_YS,
+                        16.f * LS_YS, LS_C_TEXT, 0.65f);
+
+    ls_shot(W, H);
+    SDL_GL_SwapWindow(g_window);
+    g_ls_frames++;                   /* B3_LOADPROF's per-phase frame count */
+    {   /* what this frame cost, and when it ended -- both feed the ceiling
+         * above.  Smoothed, so one slow frame does not pin the pump shut. */
+        Uint32 end = SDL_GetTicks();
+        Uint32 dt  = end - now;
+        g_ls_cost  = g_ls_cost ? (g_ls_cost * 3u + dt) / 4u : dt;
+        g_ls_last  = end;
+    }
+}
+
+/* ------------------------------------------------- B3_LOADPROF (agent) --
+ * Per-phase wall clock for the whole load, printed to STDERR and OFF unless
+ * B3_LOADPROF is set to something other than 0.
+ *
+ * WHY.  The web port's load is dominated by file I/O whose cost is invisible
+ * from a frame counter: under -sPROXY_TO_PTHREAD every read() from the game
+ * worker is a BLOCKING round trip to the main browser thread (Emscripten's
+ * _fd_read opens `if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(91,...)`),
+ * so a loader's cost is set by how many read() calls it makes, not by how many
+ * bytes it moves.  Timing the phases is the only way to see that from outside.
+ *
+ * Nothing here is on the retail path and nothing prints unless asked: with
+ * B3_LOADPROF unset not one byte of existing output moves, which is what keeps
+ * the stdout-parsing suites byte for byte as they were. */
+static int    g_lp_on = -1;
+static double g_lp_t0;
+static double g_lp_boot;
+static char   g_lp_label[64];
+static long   g_lp_frames0;
+
+static double lp_now(void) {
+    Uint64 f = SDL_GetPerformanceFrequency();
+    return f ? (double)SDL_GetPerformanceCounter() / (double)f : 0.0;
+}
+
+/* Close the open phase (if any) and open `label` (NULL just closes). */
+static void lp_mark(const char* label) {
+    if (g_lp_on < 0) {
+        const char* e = getenv("B3_LOADPROF");
+        g_lp_on = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        g_lp_boot = lp_now();
+    }
+    if (!g_lp_on) return;
+    if (g_lp_label[0])
+        fprintf(stderr, "[Burnout3] [loadprof] %-16s %8.3f s  %4ld frames\n",
+                g_lp_label, lp_now() - g_lp_t0, g_ls_frames - g_lp_frames0);
+    g_lp_label[0] = '\0';
+    if (label) snprintf(g_lp_label, sizeof g_lp_label, "%s", label);
+    else       fprintf(stderr, "[Burnout3] [loadprof] %-16s %8.3f s  %4ld frames\n",
+                       "TOTAL(since 1st)", lp_now() - g_lp_boot, g_ls_frames);
+    g_lp_t0 = lp_now();
+    g_lp_frames0 = g_ls_frames;
+}
+
+/* --------------------------------------------------------- the driver */
+
+static void ls_set(const char* caption, float frac) {
+    if (frac > g_ls_frac) g_ls_frac = frac;     /* [C] monotonic maximum */
+    if (caption && *caption) {
+        size_t k = 0;
+        while (caption[k] && k + 1 < sizeof g_ls_caption) {
+            char ch = caption[k];
+            g_ls_caption[k] = (ch >= 'a' && ch <= 'z') ? (char)(ch - 32) : ch;
+            k++;
+        }
+        g_ls_caption[k] = '\0';
+    }
+}
+
+/* ------------------------------------------------------ THE MESH PUMP HOOK
+ * The other half of retail's "pump, not a thread" answer.  b3_iso_set_progress
+ * covers the gaps BETWEEN materialisation units; this covers the inside of the
+ * one operation long enough to matter on its own -- the OBJ parse, which is
+ * 386k lines on US_C3_V1 and 1.8M on AS_M1_V1, and which froze the screen for
+ * every second of it.  See trackmesh_set_pump() in burnout3_trackmesh.h.
+ *
+ * Same re-entry guard as the iso hook, and for the same reason: the callback
+ * draws a frame, and a frame that somehow reached back into a mesh load would
+ * be parsing two files into one TrackMesh. */
+static int g_ls_pump_in = 0;
+
+static void loadscreen_mesh_pump(float frac, void* user) {
+    (void)user;
+    if (g_ls_pump_in) return;
+    if (frac < 0.f) frac = 0.f;
+    if (frac > 1.f) frac = 1.f;
+    g_ls_pump_in = 1;
+    ls_set(NULL, g_ls_base + g_ls_span * (g_ls_sub_base + g_ls_sub_span * frac));
+    b3_loadscreen_frame(0);      /* self-limits -- see THE CEILING there */
+    g_ls_pump_in = 0;
+}
+
+static void loadscreen_iso_progress(const char* stage, const char* track_id,
+                                    int index, int total, void* user) {
+    char cap[80];
+    float f;
+    (void)user;
+    if (total <= 0) return;
+    if (g_ls_outer_n <= 0) {
+        /* Free running: no phase list owns the bar, so each burst of
+         * materialisation is its own little job.  The monotonic maximum is
+         * retail's rule WITHIN one screen -- carrying it across bursts would
+         * pin the bar full for the rest of the boot, and then for the whole
+         * track load after it. */
+        if (!stage) return;              /* burst done: leave its last frame */
+        if (index == 0) g_ls_frac = 0.f;
+    }
+    f = (float)index / (float)total;
+    if (g_ls_outer_n > 0) f = g_ls_base + g_ls_span * f;
+    if (stage) {
+        if (track_id) snprintf(cap, sizeof cap, "%s  %s", track_id, stage);
+        else          snprintf(cap, sizeof cap, "%s", stage);
+    } else {
+        snprintf(cap, sizeof cap, "%s", g_ls_caption);
+    }
+    ls_set(cap, f);
+    b3_loadscreen_frame(1);
+}
+
+/* Start a screen whose progress is a known list of `n` phases. */
+static void b3_loadscreen_begin(int n) {
+    if (!g_ls_live) return;
+    g_ls_outer_n = n > 0 ? n : 0;
+    g_ls_base = 0.f;
+    g_ls_span = g_ls_outer_n ? 1.f / (float)g_ls_outer_n : 1.f;
+    g_ls_frac = 0.f;              /* a new screen starts from empty */
+    g_ls_caption[0] = '\0';
+}
+
+static void b3_loadscreen_phase(int i, const char* label) {
+    lp_mark(label);      /* B3_LOADPROF: timed whether or not the screen runs */
+    g_ls_sub_base = 0.f;                 /* a new phase owns its whole span */
+    g_ls_sub_span = 1.f;
+    if (!g_ls_live || g_ls_outer_n <= 0) return;
+    g_ls_base = (float)i / (float)g_ls_outer_n;
+    g_ls_span = 1.f / (float)g_ls_outer_n;
+    ls_set(label, g_ls_base);
+    b3_loadscreen_frame(0);
+}
+
+/* Sub-step `i` of `n` WITHIN the current phase.  A phase that loads one big
+ * file needs nothing (the mesh pump's own fraction covers its whole span); a
+ * phase that loads a fleet of them -- CAR MESHES, eight cars of eight meshes
+ * each -- needs this, or the bar reaches the end of the phase on car one and
+ * stands still through the other seven (g_ls_frac is a monotonic maximum,
+ * which is retail's rule and not negotiable). */
+static void b3_loadscreen_sub(int i, int n) {
+    if (n <= 0) { g_ls_sub_base = 0.f; g_ls_sub_span = 1.f; return; }
+    if (i < 0) i = 0;
+    if (i > n) i = n;
+    g_ls_sub_base = (float)i / (float)n;
+    g_ls_sub_span = 1.f / (float)n;
+}
+
+static void b3_loadscreen_end(void) {
+    lp_mark(NULL);       /* B3_LOADPROF: close the last phase and total up */
+    if (!g_ls_live) return;
+    g_ls_outer_n = 0;
+    g_ls_base = 0.f;
+    g_ls_span = 1.f;
+    g_ls_frac = 1.f;
+    b3_loadscreen_frame(1);
+    g_ls_frac = 0.f;              /* the next screen starts from empty */
+    g_ls_caption[0] = '\0';
+}
+
+/* Call once, after the GL context exists and before the first asset that
+ * takes real time.  Order note: this pulls b3_hud_init() forward to where
+ * the non-headless path already calls it (right before the selector), so
+ * nothing moves in the mode the suites run; it is idempotent either way. */
+static void b3_loadscreen_init(void) {
+    if (g_ls_live || !loadscreen_on()) return;
+    if (!g_window || !g_gl_context) return;
+    g_ls_live = 1;
+    srand((unsigned)SDL_GetTicks() ^ (unsigned)(size_t)g_window);
+
+#ifndef __ANDROID__
+    b3_iso_set_progress(loadscreen_iso_progress, NULL);
+#endif
+    trackmesh_set_pump(loadscreen_mesh_pump, NULL);
+    /* First frame with no text at all: on a cold boot the frontend art and
+     * the glyph metrics are exactly what the next call is about to extract. */
+    ls_set("FRONTEND", 0.f);
+    b3_loadscreen_frame(1);
+
+    b3_hud_init("build/frontend");
+    /* Forces build/frontend/font.bin in from a context where the resolver is
+     * still allowed to run a stage.  b3_hud_text_width() would otherwise take
+     * that trip from inside the progress hook, where it is locked out and the
+     * metrics loader exits the process rather than draw a zeroed table. */
+    g_ls_text = b3_hud_text_width("M", 1.f) > 0.f;
+    ls_load_tip();
+    b3_loadscreen_frame(1);
+}
+
+/* --- end loading screen (agent) --- */
+
 // ============================================================
 // Math Functions
 // ============================================================
@@ -651,15 +1700,6 @@ static Mat4 mat4_identity(void) {
     Mat4 m = {0};
     for (int i = 0; i < 4; i++) m.m[i][i] = 1.0f;
     return m;
-}
-
-static Mat4 mat4_mul(Mat4 a, Mat4 b) {
-    Mat4 r = {0};
-    for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 4; j++)
-            for (int k = 0; k < 4; k++)
-                r.m[i][j] += a.m[i][k] * b.m[k][j];
-    return r;
 }
 
 static Mat4 mat4_lookat(Vec3 eye, Vec3 target, Vec3 up) {
@@ -692,15 +1732,6 @@ static Mat4 mat4_perspective(float fov, float aspect, float near, float far) {
     return m;
 }
 
-static Vec3 transform_vec3(Mat4 m, Vec3 v) {
-    Vec3 r;
-    float w = m.m[3][0]*v.x + m.m[3][1]*v.y + m.m[3][2]*v.z + m.m[3][3];
-    r.x = (m.m[0][0]*v.x + m.m[0][1]*v.y + m.m[0][2]*v.z + m.m[0][3]) / w;
-    r.y = (m.m[1][0]*v.x + m.m[1][1]*v.y + m.m[1][2]*v.z + m.m[1][3]) / w;
-    r.z = (m.m[2][0]*v.x + m.m[2][1]*v.y + m.m[2][2]*v.z + m.m[2][3]) / w;
-    return r;
-}
-
 // ============================================================
 // Track Generation (based on game's track data)
 // ============================================================
@@ -713,34 +1744,439 @@ static Vec3 transform_vec3(Mat4 m, Vec3 v) {
 // REAL start grid sits 2.6m off this midline with matching direction (dot
 // 0.999) -- vs 24m off the 1029-point loop, which also cuts through fenced
 // roundabout geometry, so that loop is NOT the driving line (its role stays
-// open; docs/RE_BGD.md). Array rotated so index 0 = the grid (start/finish
-// at progress 0); its two section seams (127m on the start straight, 30m)
-// become straight bridges mid-route.
-#define ROUTE_COUNT B3_WALL_A_COUNT
-// Spawn index on the route: DATA-DRIVEN from the track's own start-grid
-// record (the generated header carries it per track; the old literal 298
-// was AS/C1_V1-only and even that came from the stale grid record).
-#define ROUTE_START B3_ROUTE_START
-static float g_cl[ROUTE_COUNT][3];          // route midline (AI/progress/height)
-static float g_wa[B3_WALL_A_COUNT][3];      // road-edge strands (debug overlay)
-static float g_wb[B3_WALL_B_COUNT][3];
+// open; docs/RE_BGD.md).
+/* The route/wall strands are RUNTIME data, loaded from the track's own
+ * route.bin (or, better, from the retail nav ribbon in the same file).  They
+ * used to be filled from the compiled-in B3_WALL_A/B arrays of
+ * src/burnout3_track_paths.h -- US_C3_V1's geometry -- so every other track
+ * drove, aimed, measured progress and judged "below the road" against the
+ * WRONG WORLD's route line (EU_C1_V1's road is at y 5..18 where US_C3's line
+ * sits at 139..217).  That header is GONE: it was baked GAME DATA, its two
+ * remaining consumers are served from route.bin below, and there is no
+ * compiled-in fallback left to mask a missing asset.
+ * EU_P1_V1 has 1555 stations, above the old header-sized arrays. */
+#define B3_ROUTE_MAX 4096
+static int   g_route_n = 0;                 // stations actually loaded
+static float g_cl[B3_ROUTE_MAX][3];         // route midline (AI/progress/height)
+static float g_wa[B3_ROUTE_MAX][3];         // road-edge strands
+static float g_wb[B3_ROUTE_MAX][3];
+
+/* The route polyline does not always CLOSE.  A circuit's last station joins
+ * its first; a point-to-point course's ends are kilometres apart, and pairing
+ * them lays a fake chord across the map that every nearest-station search,
+ * every aim look-ahead and every re-place then reads as road.  Retail states
+ * which it is: the nav section's `flags & 0xff`, the same bit
+ * nav_walk_local_step uses to decide whether a section wraps.  Measured over
+ * the 36 shipped variants: 28 closed ribbons whose ends are one 6 m step
+ * apart, 8 open ones (the P courses) whose ends are 6.0..9.0 km apart. */
+static int g_route_open = 0;
+static int g_route_from_nav = 0;    /* g_cl is a retail nav ribbon */
+
+/* ---- the track's own RACE LINE, route.bin's `centerline` pool -----------
+ * Gamedata.bgd's lap loop that tools/extract_bgd_paths.py scores as the race
+ * line ([S]; see that tool's `corridor()`/roles section).  It used to be
+ * COMPILED IN as B3_CENTERLINE, pinned to US_C3_V1 -- so its one live
+ * consumer, aim_blocked's "slide the aim onto the game's own race line"
+ * recovery, had to be fenced behind a 60 m relevance gate to stop it aiming
+ * cars off the map on the other 35 tracks.  route.bin has carried the same
+ * pool per track since v3 (its header's centerline_count/offset), already in
+ * the harness's GL space, so the consumer is fed from the file now and the
+ * pinning is gone.  MEASURED: US_C3_V1's pool is the header array to the
+ * printed precision, z pre-negated (file -2280.8 vs header +2277.9).
+ * 15 of the 36 shipped tracks have a race line; on the other 21 the pool is
+ * empty and the recovery simply does not arm -- which is what the 60 m gate
+ * was approximating, per track, from one track's data. */
+static float (*g_raceline)[3] = NULL;
+static int    g_raceline_n = 0;
+/* how many times the blocked-aim recovery actually retargeted onto it -- the
+ * measurement that decided this consumer was worth keeping rather than
+ * deleting with the header (B3_TRACK_TEST prints it at exit) */
+static long   g_raceline_hits = 0;
+
+/* build/tracks/<id>/grid.bin's slot record, shared by the route builder and
+ * spawn_on_grid.  Was the shape of src/burnout3_start_grid.h's compiled-in
+ * B3_START_GRID (US_C3_V1's six slots); only the STRUCT was ever port code,
+ * so the struct stayed and the data went to the file. */
+typedef struct { float pos[3]; float fwd[3]; } B3GridSlot;
+
+/* Step along the route polyline: a circuit wraps, a point-to-point course
+ * clamps at its terminus. */
+static int route_wrap(int i, int n) {
+    if (n <= 0) return 0;
+    if (!g_route_open) { i %= n; if (i < 0) i += n; return i; }
+    return i < 0 ? 0 : (i >= n ? n - 1 : i);
+}
+
+static int nav_nearest(Vec3 pos, unsigned int* out_section,
+                       unsigned int* out_node);
+static Vec3 nav_forward(unsigned int section, unsigned int node);
+static Vec3 nav_midpoint(unsigned int section, unsigned int node);
+
+/* build/tracks/<B3_TRACK>/grid.bin -- the event's start slots, pos/fwd with
+ * z pre-flipped by the extractor.  Shared by the route builder and
+ * spawn_on_grid.
+ *
+ * There is NO no-file fallback any more.  The compiled-in B3_START_GRID was
+ * US_C3_V1's six slots, so on every other track a missing grid.bin spawned
+ * the whole field in the WRONG WORLD and the symptom -- cars rescued onto the
+ * route with an arbitrary heading, AS_M1 driving the course backwards -- read
+ * as a route bug, not a missing asset.  A missing asset now says so and
+ * stops. */
+static const B3GridSlot* grid_slots(int* out_n) {
+    static B3GridSlot slots[8];
+    static int n = -1;
+    if (n < 0) {
+        n = 0;
+        const char* tid = getenv("B3_TRACK");
+        if (!tid) tid = "US_C3_V1";
+        char gp[256];
+        snprintf(gp, sizeof gp, "build/tracks/%s/grid.bin", tid);
+        FILE* gf = fopen(gp, "rb");
+        if (gf) {
+            char magic[4]; unsigned int ver = 0, cnt = 0, hasn = 0;
+            if (fread(magic, 4, 1, gf) == 1
+                && memcmp(magic, "B3GR", 4) == 0
+                && fread(&ver, 4, 1, gf) == 1 && ver == 1
+                && fread(&cnt, 4, 1, gf) == 1 && cnt >= 1 && cnt <= 8
+                && fread(&hasn, 4, 1, gf) == 1) {
+                for (unsigned i = 0; i < cnt; i++) {
+                    float rec[12]; unsigned int node;
+                    if (fread(rec, sizeof rec, 1, gf) != 1) break;
+                    if (hasn && fread(&node, 4, 1, gf) != 1) break;
+                    memcpy(slots[i].pos, rec + 0, 12);
+                    memcpy(slots[i].fwd, rec + 3, 12);
+                    n = (int)i + 1;
+                }
+                if (n)
+                    printf("[track] start grid: %d slots from %s\n", n, gp);
+            }
+            fclose(gf);
+        }
+        if (n <= 0) {
+            fprintf(stderr,
+                "[Burnout3] FATAL: no usable %s.\n"
+                "  The start grid is the event's own SPATIAL record "
+                "(.bgd param+0x3BC/+0x3C0) and there is no compiled-in copy "
+                "to fall back to.\n"
+                "  Extract it from your own dump:  tools/cextract/build.sh "
+                "&& cxtract --track %s --only start_grid --out "
+                "build/tracks/%s\n", gp, tid, tid);
+            exit(2);
+        }
+    }
+    *out_n = n;
+    return slots;
+}
+
+/* ---- THE DRIVING ROUTE, from retail's own road network ------------------
+ * route.bin's wall pools are the .bgd BOUNDARY STRIP, and the strip locator
+ * in tools/extract_bgd_paths.py is CIRCUIT-SHAPED: it trims the raw run to
+ * the sub-run that closes into a lap (`corridor()`, "sub-runs covering
+ * 0.85..1.25 lap lengths ... take the one whose ends are closest").  On a
+ * point-to-point course nothing closes, so no sub-run qualifies, the trim
+ * falls through to the untrimmed run, and the strip ships with the junk rows
+ * its 5-sample dropout tolerance bridged in at either end plus the
+ * kilometre-long chords between the pieces.  Measured offline over the 36
+ * shipped route.bin files:
+ *     EU_P2_V2  6380 m between two consecutive stations
+ *     EU_P2_V1  1250/1465 stations with no drivable surface under them,
+ *               and stations 0..637 authored AGAINST the race direction
+ *     US_P2_V1  the nearest station to start-grid slot 0 is 2006.8 m away
+ *               (the route misses the whole first half of the course)
+ *     US_C2_V1  route length 21472 m against a 4841 m lap
+ * That is the supply behind the seven failing drive tests: a 60 m corridor
+ * clamp yanking a car onto a junk station, a stuck re-place teleporting one
+ * 3.6 km across the map along a fake chord, and an aim line running down the
+ * median of a divided road.
+ *
+ * The nav graph in the same file has none of it.  Retail's road network
+ * carries per track a handful of FULL-COURSE sections -- rows whose
+ * node_count equals the network's node count -- one per carriageway plus the
+ * 50 m right-of-way envelope; each is a contiguous node-pair ribbon covering
+ * 93..107% of the route-section lap length, and each is what FUN_00175B10
+ * actually walks.  So the route is taken from them, scored with the same two
+ * measurements the extractor scores its own candidates by: how many node
+ * midpoints have NO drivable surface under them in the game's own collision
+ * world, then the mean distance of the start-grid slots from the line.  Both
+ * are measured per track; nothing here is a per-track constant.  Result over
+ * all 36 variants: every chosen ribbon is contiguous (max station step 26..53
+ * m against 5432 m before), the grid sits 2.6..33.5 m off it, and 30 of 36
+ * have ZERO off-road nodes (worst 49/1659). */
+static int init_route_from_nav(void) {
+    if (!g_nav.loaded || g_nav.section_count == 0) return 0;
+    unsigned int nmax = 0;
+    for (unsigned int s = 0; s < g_nav.section_count; s++)
+        if (g_nav.sections[s].node_count > nmax)
+            nmax = g_nav.sections[s].node_count;
+    if (nmax < 8 || nmax > B3_ROUTE_MAX) return 0;
+
+    int gn = 0;
+    const B3GridSlot* gs = grid_slots(&gn);
+    int best = -1;
+    long best_unsup = 0;
+    float best_off = 0.0f;
+    for (unsigned int s = 0; s < g_nav.section_count; s++) {
+        if (g_nav.sections[s].node_count != nmax) continue;
+        long unsup = 0;
+        for (unsigned int j = 0; j < nmax; j++) {
+            Vec3 m = nav_midpoint(s, j);
+            float gh, gnv[3];
+            /* the same test extract_bgd_paths.road_support() applies: a
+             * road-like triangle within 6 m of the point */
+            if (!b3_collision_ready()
+                || b3_ground_probe(m.x, m.y + 3.0f, m.z, &gh, gnv) < 0
+                || fabsf(gh - m.y) > 6.0f)
+                unsup++;
+        }
+        float off = 0.0f;
+        for (int k = 0; k < gn; k++) {
+            float bd = 1e30f;
+            for (unsigned int j = 0; j < nmax; j++) {
+                Vec3 m = nav_midpoint(s, j);
+                float dx = m.x - gs[k].pos[0], dz = m.z - gs[k].pos[2];
+                float d = dx * dx + dz * dz;
+                if (d < bd) bd = d;
+            }
+            off += sqrtf(bd);
+        }
+        off /= (float)(gn > 0 ? gn : 1);
+        if (best < 0 || unsup < best_unsup
+            || (unsup == best_unsup && off < best_off)) {
+            best = (int)s;
+            best_unsup = unsup;
+            best_off = off;
+        }
+    }
+    if (best < 0) return 0;
+
+    const B3RtNavSection* row = &g_nav.sections[best];
+    for (unsigned int j = 0; j < nmax; j++) {
+        const B3RtNavPair* pr = &g_nav.pairs[row->pair_base + j];
+        Vec3 a = g_nav.points[pr->point_a];
+        Vec3 b = g_nav.points[pr->point_b];
+        g_wa[j][0] = a.x; g_wa[j][1] = a.y; g_wa[j][2] = a.z;
+        g_wb[j][0] = b.x; g_wb[j][1] = b.y; g_wb[j][2] = b.z;
+        g_cl[j][0] = (a.x + b.x) * 0.5f;
+        g_cl[j][1] = (a.y + b.y) * 0.5f;
+        g_cl[j][2] = (a.z + b.z) * 0.5f;
+    }
+    g_route_n = (int)nmax;
+    g_route_open = (row->flags & 0xffu) ? 0 : 1;
+
+    /* DIRECTION.  RE_BGD 3: the race direction is start-grid slot 0's
+     * forward vector, and it is the only anchor that does not come from the
+     * array being oriented.  Reverse index order (swapping the wall sides so
+     * left/right stay meaningful) when the line runs against it. */
+    {
+        int bi = 0;
+        float bd = 1e30f;
+        for (int j = 0; j < g_route_n; j++) {
+            float dx = g_cl[j][0] - gs[0].pos[0];
+            float dz = g_cl[j][2] - gs[0].pos[2];
+            float d = dx * dx + dz * dz;
+            if (d < bd) { bd = d; bi = j; }
+        }
+        int lo = bi - 2 < 0 ? 0 : bi - 2;
+        int hi = bi + 2 >= g_route_n ? g_route_n - 1 : bi + 2;
+        float dx = g_cl[hi][0] - g_cl[lo][0];
+        float dz = g_cl[hi][2] - g_cl[lo][2];
+        if (dx * gs[0].fwd[0] + dz * gs[0].fwd[2] < 0.0f) {
+            for (int i = 0, j = g_route_n - 1; i < j; i++, j--) {
+                for (int k = 0; k < 3; k++) {
+                    float t;
+                    t = g_cl[i][k]; g_cl[i][k] = g_cl[j][k]; g_cl[j][k] = t;
+                    t = g_wa[i][k]; g_wa[i][k] = g_wb[j][k]; g_wb[j][k] = t;
+                    t = g_wb[i][k]; g_wb[i][k] = g_wa[j][k]; g_wa[j][k] = t;
+                }
+            }
+            if (g_route_n & 1) {
+                int m = g_route_n / 2;
+                for (int k = 0; k < 3; k++) {
+                    float t = g_wa[m][k];
+                    g_wa[m][k] = g_wb[m][k];
+                    g_wb[m][k] = t;
+                }
+            }
+            printf("[track] route direction REVERSED to match start-grid "
+                   "slot 0\n");
+        }
+    }
+    g_route_from_nav = 1;
+    printf("[track] route: retail nav section %d, %d nodes, %s, %ld off-road,"
+           " start grid %.1f m off\n", best, g_route_n,
+           g_route_open ? "point-to-point (open)" : "circuit (closed)",
+           best_unsup, best_off);
+    return 1;
+}
+
+static int init_paths_from_route_bin(void) {
+    const char* track = getenv("B3_TRACK");
+    if (!track) track = getenv("B3_POSTFX_TRACK");
+    if (!track) track = "US_C3_V1";
+    char path[256];
+    snprintf(path, sizeof path, "build/tracks/%s/route.bin", track);
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    struct {
+        char magic[4];
+        unsigned int version, wall_count, center_count, oncoming_count;
+        unsigned int route_count, route_start;
+        float lap_length;
+        unsigned int flags, strip_pairs;
+    } h;
+    if (fread(&h, sizeof h, 1, f) != 1 || memcmp(h.magic, "B3RT", 4) != 0
+        || h.version != 3 || h.wall_count < 8
+        || h.wall_count > B3_ROUTE_MAX) {
+        fclose(f);
+        return 0;
+    }
+    /* the two wall pools lead the geometry block.  NO z flip: route.bin
+     * stores z with the OPPOSITE sign from the compiled header arrays
+     * (measured on US_C3 station 0: file -2280.8 vs header +2277.9), i.e.
+     * the file is already in the harness's sign.  Applying the header's
+     * flip here mirrored every track's route line -- progress ran backward
+     * and all six cars read as "stuck" on the reference track. */
+    for (int side = 0; side < 2; side++) {
+        float (*dst)[3] = side ? g_wb : g_wa;
+        for (unsigned i = 0; i < h.wall_count; i++) {
+            float v3[3];
+            if (fread(v3, sizeof v3, 1, f) != 1) { fclose(f); return 0; }
+            dst[i][0] = v3[0];
+            dst[i][1] = v3[1];
+            dst[i][2] = v3[2];
+        }
+    }
+    fclose(f);
+    g_route_n = (int)h.wall_count;
+    for (int i = 0; i < g_route_n; i++) {
+        g_cl[i][0] = (g_wa[i][0] + g_wb[i][0]) * 0.5f;
+        g_cl[i][1] = (g_wa[i][1] + g_wb[i][1]) * 0.5f;
+        g_cl[i][2] = (g_wa[i][2] + g_wb[i][2]) * 0.5f;
+    }
+    /* DIRECTION: a track's wall pools may be authored against the race
+     * direction (AS_M1 was -- progress ran backward and every car read as
+     * "stuck" while driving fine).  The nav graph knows the way the event
+     * runs, so align to it: sample stations, take the nearest main-row nav
+     * node's forward, and if the majority run anti-parallel reverse the
+     * arrays (swapping the wall sides to keep left/right meaningful). */
+    if (g_nav.loaded) {
+        int votes = 0, total = 0;
+        for (int i = 8; i < g_route_n - 8; i += g_route_n / 24 + 1) {
+            float dx = g_cl[i + 4][0] - g_cl[i - 4][0];
+            float dz = g_cl[i + 4][2] - g_cl[i - 4][2];
+            float dl = sqrtf(dx * dx + dz * dz);
+            if (dl < 1e-3f) continue;
+            unsigned int bs = 0, bn = 0;
+            if (!nav_nearest((Vec3){ g_cl[i][0], g_cl[i][1], g_cl[i][2] },
+                             &bs, &bn)) continue;
+            Vec3 f = nav_forward(bs, bn);
+            float fl = sqrtf(f.x * f.x + f.z * f.z);
+            if (fl < 1e-3f) continue;
+            total++;
+            if ((f.x * dx + f.z * dz) / (fl * dl) < 0.0f) votes++;
+        }
+        printf("[track] route direction vote: %d/%d anti-parallel\n",
+               votes, total);
+        if (total >= 8 && votes * 2 > total) {
+            for (int i = 0, j = g_route_n - 1; i < j; i++, j--) {
+                for (int k = 0; k < 3; k++) {
+                    float t;
+                    t = g_cl[i][k]; g_cl[i][k] = g_cl[j][k]; g_cl[j][k] = t;
+                    /* reverse AND swap sides: wa[i] <-> wb[j] */
+                    t = g_wa[i][k]; g_wa[i][k] = g_wb[j][k]; g_wb[j][k] = t;
+                    t = g_wb[i][k]; g_wb[i][k] = g_wa[j][k]; g_wa[j][k] = t;
+                }
+            }
+            if (g_route_n & 1) {   /* middle station: swap sides in place */
+                int m = g_route_n / 2;
+                for (int k = 0; k < 3; k++) {
+                    float t = g_wa[m][k];
+                    g_wa[m][k] = g_wb[m][k];
+                    g_wb[m][k] = t;
+                }
+            }
+            printf("[track] route direction REVERSED to match the nav "
+                   "graph (%d/%d stations voted)\n", votes, total);
+        }
+    }
+    printf("[track] route/wall strands: %d stations from %s\n",
+           g_route_n, path);
+    return 1;
+}
+
+/* route.bin's `centerline` pool -- the track's own race line, in the same
+ * file and the same GL space as the wall strands the loader above reads.
+ * Layout (tools/extract_bgd_paths.write_route_bin, cx_paths.c):
+ *   +0x00 'B3RT'  +0x04 v3  +0x08 wall_count  +0x0C centerline_count ...
+ *   +0x28 wall_a[wall_count], wall_b[wall_count], centerline[centerline_count]
+ * Empty on 21 of the 36 shipped tracks (no lap loop qualified as a race
+ * line); the one consumer checks g_raceline_n and stands down. */
+static void load_raceline_from_route_bin(void) {
+    const char* track = getenv("B3_TRACK");
+    char path[256];
+    FILE* f;
+    struct {
+        char magic[4];
+        unsigned int version, wall_count, center_count, oncoming_count;
+        unsigned int route_count, route_start;
+        float lap_length;
+        unsigned int flags, strip_pairs;
+    } h;
+
+    free(g_raceline);
+    g_raceline = NULL;
+    g_raceline_n = 0;
+
+    if (!track) track = getenv("B3_POSTFX_TRACK");
+    if (!track) track = "US_C3_V1";
+    snprintf(path, sizeof path, "build/tracks/%s/route.bin", track);
+    f = fopen(path, "rb");
+    if (!f) return;
+    if (fread(&h, sizeof h, 1, f) != 1 || memcmp(h.magic, "B3RT", 4) != 0
+        || h.version != 3 || h.center_count == 0
+        || h.center_count > 1000000u) {
+        fclose(f);
+        return;
+    }
+    if (fseek(f, (long)(sizeof h + (size_t)h.wall_count * 2 * 12),
+              SEEK_SET) != 0) { fclose(f); return; }
+    g_raceline = malloc((size_t)h.center_count * 3 * sizeof(float));
+    if (!g_raceline) { fclose(f); return; }
+    if (fread(g_raceline, 3 * sizeof(float), h.center_count, f)
+        != h.center_count) {
+        free(g_raceline);
+        g_raceline = NULL;
+        fclose(f);
+        return;
+    }
+    fclose(f);
+    g_raceline_n = (int)h.center_count;
+    printf("[track] race line: %d points from %s\n", g_raceline_n, path);
+}
 
 static void init_paths(void) {
-    for (int i = 0; i < B3_WALL_A_COUNT; i++) {
-        g_wa[i][0] = B3_WALL_A[i][0];
-        g_wa[i][1] = B3_WALL_A[i][1];
-        g_wa[i][2] = -B3_WALL_A[i][2];
-    }
-    for (int i = 0; i < B3_WALL_B_COUNT; i++) {
-        g_wb[i][0] = B3_WALL_B[i][0];
-        g_wb[i][1] = B3_WALL_B[i][1];
-        g_wb[i][2] = -B3_WALL_B[i][2];
-    }
-    for (int i = 0; i < ROUTE_COUNT; i++) {
-        int j = (i + ROUTE_START) % ROUTE_COUNT;
-        g_cl[i][0] = (g_wa[j][0] + g_wb[j][0]) * 0.5f;
-        g_cl[i][1] = (g_wa[j][1] + g_wb[j][1]) * 0.5f;
-        g_cl[i][2] = (g_wa[j][2] + g_wb[j][2]) * 0.5f;
+    /* retail's own road network first, route.bin's boundary strip second --
+     * and NOTHING third.  The compiled-in third fallback was US_C3_V1's wall
+     * strands (src/burnout3_track_paths.h); on any other track it silently
+     * substituted a different world's road for the missing asset, so a broken
+     * extraction looked like a physics bug.  Now it stops and says which file
+     * is missing. */
+    load_raceline_from_route_bin();
+    if (init_route_from_nav()) return;
+    if (init_paths_from_route_bin()) return;
+    {
+        const char* tid = getenv("B3_TRACK");
+        if (!tid) tid = getenv("B3_POSTFX_TRACK");
+        if (!tid) tid = "US_C3_V1";
+        fprintf(stderr,
+            "[Burnout3] FATAL: no driving route for %s.\n"
+            "  build/tracks/%s/route.bin carries both the retail nav graph "
+            "and the .bgd boundary strip; neither was usable, and there is no "
+            "compiled-in route to fall back to.\n"
+            "  Extract it from your own dump:  tools/cextract/build.sh && "
+            "cxtract --track %s --only bgd_paths --out build/tracks/%s\n",
+            tid, tid, tid, tid);
+        exit(2);
     }
 }
 
@@ -750,11 +2186,70 @@ static void nav_free(void) {
     free(g_nav.pairs);
     free(g_nav.links);
     free(g_nav.plans);
+    free(g_nav_edges);
+    g_nav_edges = NULL;
+    g_nav_edge_count = 0;
     memset(&g_nav, 0, sizeof(g_nav));
 }
 
 static int nav_read(FILE* file, void* dst, size_t size, size_t count) {
     return count == 0 || fread(dst, size, count, file) == count;
+}
+
+/* ---- nav_edges.bin: retail's per-node cumulative arc length -------------
+ * Every index-directory row in Gamedata.bgd carries three relative pointers;
+ * extract_bgd_paths.py decodes `pair_rel` and `link_rel` into route.bin and
+ * has always left `edge_rel` undecoded, so route.bin v3 does not carry it and
+ * nav_approach_dist below had to approximate the quantity off the pair
+ * centroids.  tools/extract_nav_edges.py now ships it as a sidecar.
+ *
+ * Retail reads it in FUN_00174AF0 @0x00174AF0:
+ *     00174b06  MOV   EDX,[ECX+0x4]        ; section header +4 -> this table
+ *     00174b0f  MOVSS XMM0,[EDX+EAX*8]     ; edge[node]      (stride 8)
+ *     00174b14  SUBSS XMM0,[EDX+EAX*8-0x8] ; - edge[node-1]
+ *     00174b1f  MOVSS XMM0,[EDX+EAX*8]     ; node 0: edge[0] as-is
+ * so one node's span is the backward difference of a cumulative length. [C]
+ *
+ * Entries are indexed exactly like route.bin's nav LINK array
+ * (`section->link_base + node`), which is why the count must match
+ * g_nav.link_count -- a mismatch means the two files came from different
+ * extractor runs and the table is rejected rather than trusted. */
+static void nav_edges_load(void) {
+    free(g_nav_edges);
+    g_nav_edges = NULL;
+    g_nav_edge_count = 0;
+
+    const char* track = getenv("B3_TRACK");
+    if (!track) track = getenv("B3_POSTFX_TRACK");
+    if (!track) track = "US_C3_V1";
+    char path[512];
+    snprintf(path, sizeof path, "build/tracks/%s/nav_edges.bin", track);
+    FILE* f = fopen(path, "rb");
+    if (!f) return;                       /* optional asset: silent fallback */
+
+    struct { char magic[4]; unsigned int version, count, sections; } h;
+    if (fread(&h, sizeof h, 1, f) != 1
+        || memcmp(h.magic, "B3NE", 4) != 0
+        || h.version != 1
+        || h.count == 0 || h.count > 1000000u
+        || h.count != g_nav.link_count
+        || h.sections != g_nav.section_count) {
+        printf("nav_edges: %s is not a usable B3NE v1 asset for this nav "
+               "graph (%u edges / %u sections vs %u links / %u sections)\n",
+               path, h.count, h.sections, g_nav.link_count,
+               g_nav.section_count);
+        fclose(f);
+        return;
+    }
+    B3RtNavEdge* e = calloc(h.count, sizeof(*e));
+    if (!e || !nav_read(f, e, sizeof(*e), h.count)) {
+        free(e);
+        fclose(f);
+        return;
+    }
+    fclose(f);
+    g_nav_edges = e;
+    g_nav_edge_count = h.count;
 }
 
 static void nav_load(void) {
@@ -840,8 +2335,10 @@ static void nav_load(void) {
     g_nav.link_count = counts[3];
     g_nav.plan_count = counts[4];
     g_nav.loaded = 1;
-    printf("[Burnout3] retail nav: %u points, %u sections, %u plans\n",
-           g_nav.point_count, g_nav.section_count, g_nav.plan_count);
+    nav_edges_load();
+    printf("[Burnout3] retail nav: %u points, %u sections, %u plans%s\n",
+           g_nav.point_count, g_nav.section_count, g_nav.plan_count,
+           g_nav_edges ? ", arc-length table" : "");
 }
 
 static int nav_state_valid(unsigned int section, unsigned int node) {
@@ -968,15 +2465,47 @@ static int nav_walk_local_step(unsigned int* section, unsigned int* node,
         *node = (unsigned int)((candidate + row->node_count) % row->node_count);
         return 1;
     }
+    /* SECTION-END TRANSITION.  The link pair is retail's per-SIDE (A/B)
+     * LATERAL neighbour, NOT a longitudinal successor, and FUN_00174EE0
+     * EXECUTED settles what it does with it at a non-looped row end: try
+     * link-A (node record +4/+6), else link-B (+5/+8), switch to that
+     * section and KEEP THE CURRENT NODE INDEX -- the stored index is read
+     * into a scratch slot and never written back to the caller's cursor
+     * (0x00174F29..0x00174F69; the in-range and wrap paths do write it).
+     * Run under Unicorn on a two-ribbon graph: node 15 --+1--> node 15 in
+     * the neighbour section with the link's stored index 9 IGNORED; with
+     * neither link present the helper returns 0 and the walk stops; and at
+     * node 0 with delta -1 it still takes link-A, so the choice is not
+     * direction-dependent.
+     *
+     * The port used to ADOPT the stored index.  Measured over all 36 shipped
+     * route.bin files at the 1981 non-looped section-end transitions: the
+     * stored index differs from the current one on 92% of them, by a median
+     * of 89 nodes, and the two destinations are a MEDIAN 484.8 m apart (p90
+     * 2.6 km, max 8.8 km); 72% land more than 50 m from retail's.  So every
+     * section boundary teleported the cursor down a parallel ribbon, and the
+     * racing aim, the avoidance frame and the progress measure all followed
+     * it there.
+     *
+     * The geometry confirms the semantics independently: over all 36 tracks
+     * the link target sits 4.5..11.8 m to the SIDE with an along-track
+     * component of +0.01 m median -- and +0.01 m at the section-end nodes
+     * specifically (960 of them), where |along| exceeds |lateral| in 1% of
+     * cases.  It is a lateral neighbour everywhere, including here.    [C]
+     *
+     * The nav_state_valid() test on the CURRENT index is a harness guard
+     * retail does not have: retail accepts any non-0xFF list id and would
+     * read past a shorter neighbour row.  49 of the 1981 transitions have no
+     * home for the index in the target row; refuse those.              [S] */
     const B3RtNavLink* link = &g_nav.links[row->link_base + *node];
-    if (nav_state_valid(link->forward_section, link->forward_node)) {
+    if (link->forward_section != 0xffu
+        && nav_state_valid(link->forward_section, *node)) {
         *section = link->forward_section;
-        *node = link->forward_node;
         return 1;
     }
-    if (nav_state_valid(link->reverse_section, link->reverse_node)) {
+    if (link->reverse_section != 0xffu
+        && nav_state_valid(link->reverse_section, *node)) {
         *section = link->reverse_section;
-        *node = link->reverse_node;
         return 1;
     }
     return 0;
@@ -1261,6 +2790,141 @@ static Vec3 nav_pair_target(unsigned int section, unsigned int node, Vec3 pos) {
                   a.z + dz * factor};
 }
 
+/* ------------------------------------------------------------------ *
+ * THE RACING LINE -- FUN_001778C0 / FUN_00177B90, the within-pair lane law.
+ *
+ * `nav_pair_target` above is NOT retail's racing line.  FUN_001769E0
+ * @0x001769E0 dispatches the active target two different ways:
+ *
+ *   AI+0x1FC != 0  -> FUN_00178100 -> the 0.4..0.6 pair retention above
+ *   AI+0x1FC == 0  -> copy a PRE-BUILT point out of AI+0x220 / +0x230 /
+ *                     +0x240, built by FUN_001778C0 (targets 0 and 2) and
+ *                     FUN_00177B90 (target 1)
+ *
+ * and FUN_001772A0 @0x0017738x sets `AI+0x1FC = 1` only when the selected
+ * plan record's `flags & 3 == 0`.  Over the 4428 plan records in all 36
+ * shipped route.bin files `flags & 3` is 1 (2208) or 2 (2220) -- never 0 --
+ * so retail ALWAYS runs the pre-built points and NEVER the 0.4..0.6
+ * retention.  The midline was the fallback, not the law.               [C]
+ *
+ * The construction below is not read, it is EXECUTED: both builders run
+ * under Unicorn over a synthetic ribbon with the traversal-admissibility
+ * helpers (FUN_001785C0 / FUN_00178310) stubbed to reject, and this port
+ * matches them on 864/864 cases spanning radius 0..35000, half width
+ * 1.0/1.9/2.5, both sides and both flag states, worst |delta| 1.8e-06.
+ *
+ * That stub is the ONE thing this port does not model, and it is worth
+ * being exact about what it costs.  The nav LINK table is LATERAL, not
+ * longitudinal: on US_C3_V1 node k of section 0 links to section 1 node
+ * 266+k and section 5 node 289+k -- the parallel ribbons, i.e. the adjacent
+ * LANES at the same station.  (`forward_*`/`reverse_*` in B3RtNavLink are
+ * really the side-A / side-B lateral neighbours: FUN_00173E40's bit 1 is
+ * the side-A edge and RE_AI section 12 has FUN_00174050's bit 1 select the
+ * "forward" link, so crossing the A edge lands on the A-side ribbon.  Both
+ * builders index them with the same 0/1 that picks point_a/point_b, which
+ * is the cross-check on the whole side mapping.)  So both builders can step
+ * sideways from ribbon to ribbon before placing the point:
+ *   - FUN_001778C0 (entry/exit) walks WHILE the span stays admissible, but
+ *     its base point index is latched from the CAR'S OWN ribbon at
+ *     0x001778EF/0x0017790A and never rewritten, so the walk only changes
+ *     the normalized cross-direction -- negligible between parallel
+ *     ribbons.  This port is exact up to that.
+ *   - FUN_00177B90 (apex) only walks when FUN_00178310 rejects the car's
+ *     own ribbon over the span [apex, apex+8], and it does take the
+ *     walked-to ribbon's edge as the base.  That rejection needs a type-5
+ *     node in the span (with AI+0x1FC == 0 on this path, types 1/3
+ *     contribute nothing and type 4 contributes bit 1, not the bit 4
+ *     rejection), and a census of `links[node].aux >> 8 & 7` finds a type 5
+ *     in that span for exactly 1 of the 4428 plan records in all 36
+ *     tracks.  So the apex walk is dead in practice too; closing the last
+ *     record would need FUN_00178310's mutable AI state
+ *     (AI+0x1F0/+0x1F1/+0x291/+0x292), only partially ported -- RE_AI
+ *     section 15.6 row 3.                                              [S]
+ *
+ * Both builders share one tail: start at ONE EDGE of the node's A/B pair and
+ * step `inset` metres toward the other edge.
+ *
+ *   FUN_001778C0 @0x00177A85..0x00177B84   (targets 0 = entry, 2 = exit)
+ *       edge   = side S          (S == 1 -> point_a, else point_b)
+ *       inset  = racecar+0x2444 * clamp(AI+0x298 / DAT_0047A1DC, 0, 1)
+ *   FUN_00177B90 @0x00177FB2..0x001780D8   (target 1 = APEX)
+ *       edge   = the OTHER side
+ *       inset  = racecar+0x2444
+ *                + racecar+0x2444   when AI+0x1F3  (plan flags & 4)
+ *                + DAT_0047A1F4     when AI+0x213  (the drift flag)
+ *
+ * AI+0x213 and the corner-window EXTENSION are both dead in the shipped
+ * game, so this port is the whole law and not a subset.  FUN_001772A0
+ * @0x0017744E branches on `AI+0x1EC <= radius`, and AI+0x1EC is written
+ * exactly once in the entire binary -- `XORPS XMM1,XMM1` at 0x00175A2A into
+ * the initialiser's store at 0x00175AD6, i.e. 0.0, never touched again (a
+ * whole-program MOVSS/MOV sweep on the offset finds no other store to this
+ * object).  So the test is always true, AI+0x213 is always 0, and the
+ * segment count is `round(DAT_0047A1EC * mph/150) + DAT_0047A1E4` with both
+ * of those AI/Target ints registered as 0 in the retail vdb.xml -- the
+ * "(when drifting)" pair, 5 and -3, is unreachable.                    [C]
+ *
+ * `AI+0x298` is the plan record's `u16 +6`, and it is a corner RADIUS in
+ * metres, not a speed: `DAT_0047A1DC` is the registered AI/Target param
+ * "Corner radius to give max offset pos" = 300, and over US_C3_V1 /
+ * EU_C1_V1 / US_P1_V1 the field's log-correlation with the measured
+ * circumradius of the ribbon centreline at the plan's APEX node is
+ * 0.68 / 0.45 / 0.72, against 0.40 / -0.10 / 0.20 at the entry node.  A tight
+ * corner (radius -> 0) pulls the entry/exit aim ONTO the outside edge and a
+ * straight (radius >= 300) sets it a full half-width in.  Combined with the
+ * apex sitting a half-width off the OPPOSITE edge, that is out-in-out.  [C]
+ *
+ * `racecar+0x2444` is the per-car half width; the harness already carries it
+ * as 1.9 m for the aggression world (see aggro_world_sync), and it stays a
+ * named constant with a B3_NAV_AIM2_W override until a per-model extent
+ * table is wired.                                                       [S]
+ *
+ * DAT_0047A1DC / DAT_0047A1F4 are the registered AI/Target params "Corner
+ * radius to give max offset pos" (300) and "How far away from the true apex
+ * to move the apex point of a corner when drifting (meters)" (1), executed
+ * out of the registrar FUN_0016AFD0 and resolved in the retail Data/vdb.xml
+ * exactly as tools/emulate_sfx_params.py does for the audio block.      [C]
+ * ------------------------------------------------------------------ */
+#define B3_NAV_LANE_MAX_R   300.0f   /* DAT_0047A1DC                     [C] */
+#define B3_NAV_LANE_HALF_W  1.9f     /* racecar+0x2444                   [S] */
+#ifndef B3_NAV_AIM2_DEFAULT
+#define B3_NAV_AIM2_DEFAULT 0        /* flipped only on a measured win */
+#endif
+
+static float nav_lane_half_w(void) {
+    static float w = -1.0f;
+    if (w < 0.0f) {
+        const char* e = getenv("B3_NAV_AIM2_W");
+        w = e ? (float)atof(e) : B3_NAV_LANE_HALF_W;
+        if (w < 0.0f) w = 0.0f;
+    }
+    return w;
+}
+
+/* FUN_001778C0 / FUN_00177B90's shared tail.  `side` is retail's 1/2 code:
+ * 1 selects the pair's A point as the edge to sit on, anything else its B
+ * point.  A degenerate pair (both indices equal) borrows its neighbour's,
+ * exactly as @0x00177A63 and @0x00177FD9 do. */
+static Vec3 nav_lane_target(unsigned int section, unsigned int node,
+                            int side, float inset) {
+    const B3RtNavSection* row = &g_nav.sections[section];
+    const B3RtNavPair* pair = &g_nav.pairs[row->pair_base + node];
+    if (pair->point_a == pair->point_b) {
+        unsigned int alt = node ? node - 1u : node + 1u;
+        if (alt < (unsigned int)row->node_count)
+            pair = &g_nav.pairs[row->pair_base + alt];
+    }
+    Vec3 a = nav_point(pair->point_a);
+    Vec3 b = nav_point(pair->point_b);
+    Vec3 base = (side == 1) ? a : b;
+    Vec3 other = (side == 1) ? b : a;
+    float dx = other.x - base.x, dy = other.y - base.y, dz = other.z - base.z;
+    float len = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (!(len > 1e-5f)) return base;          /* COMISS @0x00177B31 */
+    float k = inset / len;
+    return (Vec3){base.x + dx * k, base.y + dy * k, base.z + dz * k};
+}
+
 static int nav_surface_height(unsigned int section, unsigned int node,
                               Vec3 pos, float* height) {
     if (!nav_state_valid(section, node) || !height) return 0;
@@ -1297,16 +2961,127 @@ static int nav_forward_delta(const B3RtNavSection* row, unsigned int from,
     return delta;
 }
 
+/* B3_NAV_AIM (legacy) turns the planner window on with the 0.4..0.6 midline
+ * retention; B3_NAV_AIM2 turns it on with the recovered racing line above.
+ * They are separate switches so the old measurement stays reproducible. */
+static int nav_aim_legacy(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("B3_NAV_AIM") != NULL;
+    return on;
+}
+
+static int nav_aim2_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("B3_NAV_AIM2");
+        on = e ? (*e != '0') : B3_NAV_AIM2_DEFAULT;
+    }
+    return on;
+}
+
 /* FUN_001772A0 selects the closest strictly upcoming plan.node_b in the
  * current section.  FUN_00176AF0 then moves through its A/B/C node targets
  * as its local +12-node look-ahead reaches them.  The surrounding branch and
  * lane-routing state is still recovered separately; this gives the driver's
  * normal racing aim the retail planner's longitudinal target now. */
-static int nav_plan_target_at(const Vehicle* vehicle, unsigned int section,
-                              unsigned int node, Vec3* target,
-                              float* corner_speed, unsigned int* out_section,
-                              unsigned int* out_node) {
-    if (!nav_state_valid(section, node) || g_nav.plan_count == 0) return 0;
+static float nav_approach_dist(unsigned int section, unsigned int node,
+                               Vec3 pos);
+
+/* B3_NAV_SPEED: publish the plan record's `u16 +6` to the corner-brake law as
+ * retail's FUN_00176150 does, WITHOUT taking the planner aim.  The two were
+ * welded together -- `corner_speed` could only be non-zero on the planner-aim
+ * path -- so the ceiling always fell through to the curvature scan below.
+ * OFF by default: see the units note over b3_ai_corner_brake.  This exists so
+ * the choice is a measurement rather than an assumption. */
+static int nav_plan_speed_ceiling(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("B3_NAV_SPEED");
+        on = (e && *e != '0');
+    }
+    return on;
+}
+
+/* FUN_00174A90 @0x00174A90 -- the ARC LENGTH from `from` to `to` inside one
+ * section, off the same per-node cumulative table FUN_00174AF0 reads:
+ *
+ *   x1 = to   ? edge[to-1]   : 0                          @0x00174A93
+ *   x2 = from ? edge[from-1] : 0                          @0x00174AAA
+ *   return (from <= to) ? x1 - x2                         @0x00174AC1
+ *                       : edge[node_count-1] - x2 + x1    @0x00174AD3
+ *
+ * This is the X in FUN_00176150's `factor * (X - D) + cs`, and the port did
+ * not have it at all.  The `from > to` arm is retail's own, taken whether or
+ * not the section wraps.  Without nav_edges.bin there is no table, so the
+ * fallback walks the pair-centroid polyline, which measures the same distance
+ * one chord at a time.  [C] */
+static float nav_arc_cum(const B3RtNavSection* row, unsigned int node) {
+    /* retail's `dec eax / js -> 0.0`: node 0 has no predecessor edge. */
+    if (node == 0) return 0.0f;
+    return g_nav_edges[row->link_base + node - 1].cum_length;
+}
+
+static float nav_plan_arclen(unsigned int section, unsigned int from,
+                             unsigned int to) {
+    if (!nav_state_valid(section, from) || !nav_state_valid(section, to))
+        return 0.0f;
+    const B3RtNavSection* row = &g_nav.sections[section];
+    if (g_nav_edges
+        && row->link_base + (unsigned int)row->node_count <= g_nav_edge_count) {
+        float x1 = nav_arc_cum(row, to), x2 = nav_arc_cum(row, from);
+        if (from <= to) return x1 - x2;                     /* @0x00174AC1 */
+        return nav_arc_cum(row, (unsigned int)row->node_count) - x2 + x1;
+    }
+    float total = 0.0f;
+    unsigned int walk = from;
+    for (int step = 0; step < row->node_count && walk != to; step++) {
+        unsigned int next = walk + 1;
+        if (next >= (unsigned int)row->node_count) {
+            if (!(row->flags & 0xff)) break;
+            next = 0;
+        }
+        Vec3 c0 = nav_midpoint(section, walk), c1 = nav_midpoint(section, next);
+        float dx = c1.x - c0.x, dy = c1.y - c0.y, dz = c1.z - c0.z;
+        total += sqrtf(dx * dx + dy * dy + dz * dz);
+        walk = next;
+    }
+    return total;
+}
+
+/* AI+0x1F8 and AI+0x1FC, published by the last nav_plan_target_at() that
+ * selected a plan record.  These are the two mode inputs FUN_00176150 reads,
+ * and the corner-brake call site used to hand b3_ai_corner_brake the literal
+ * 0 for both.
+ *
+ * AI+0x1F8 [C]: which of the record's THREE window nodes is the current
+ * target.  FUN_00176AF0 @0x00176F96..0x00177015 tries them in file order and
+ * publishes 0 for rec+0, 1 for rec+2, 2 for rec+4 -- the same order, and the
+ * same default (rec+4), this function already selects in.  FUN_001769E0 then
+ * copies the chosen point into AI+0x200 / AI+0x210.  It matters because
+ * FUN_00176150 only applies the distance ramp `f*(cs - D) + cs` in mode 0;
+ * modes 1 and 2 use the flat corner speed.  Mode 2 is the cruising state, so
+ * pinning the call to 0 asked for the ramp everywhere -- measured on the
+ * executed retail law that is 12 -> 48 m/s at cs = 12, D = -60.
+ *
+ * AI+0x1FC [C]: FUN_001772A0 @0x001772F8..0x0017731A sets it from the plan
+ * record's lane code, `rec[10] & 3`:  0 -> AI+0x1F4 = 0 and AI+0x1FC = 1;
+ * 1 -> 2 and 0; 2 or 3 -> 4 and 0.  Non-zero means "no corner brake at all",
+ * ceiling = the hard cap AI+0xA08.  (FUN_00176090's route reset parks a 2
+ * there and FUN_00176AF0 @0x00176C92 a 1 at a route terminator; both are
+ * transient states of the WALK, not of a selected record.)               */
+static int g_nav_target_mode = 2;      /* AI+0x1F8 */
+static int g_nav_mode_1fc    = 0;      /* AI+0x1FC */
+
+/* FUN_001772A0's record scan @0x001772C0..0x00177340: the record in THIS
+ * section whose `node_b` is the fewest forward nodes past `key`.  Retail
+ * rejects a backward delta outright on a non-looping section (it substitutes
+ * its 10000 sentinel) and wraps it on a loop; `nav_forward_delta` plus the
+ * `delta > 0` test is the same decision.  The only thing that ever differed
+ * in the port was the KEY: retail hands it AI+0x210 / AI+0x216 -- the plan
+ * chain's own cursor -- and the port handed it the car's node.        [C] */
+static int nav_plan_select(unsigned int section, unsigned int key,
+                           const B3RtNavPlan** out) {
+    if (g_nav.plan_count == 0 || !nav_state_valid(section, 0)) return 0;
     const B3RtNavSection* row = &g_nav.sections[section];
     const B3RtNavPlan* best = NULL;
     int best_delta = INT_MAX;
@@ -1316,13 +3091,48 @@ static int nav_plan_target_at(const Vehicle* vehicle, unsigned int section,
             || plan->node_a >= row->node_count
             || plan->node_b >= row->node_count
             || plan->node_c >= row->node_count) continue;
-        int delta = nav_forward_delta(row, node, plan->node_b);
+        int delta = nav_forward_delta(row, key, plan->node_b);
         if (delta > 0 && delta < best_delta) {
             best = plan;
             best_delta = delta;
         }
     }
     if (!best) return 0;
+    *out = best;
+    return 1;
+}
+
+/* FUN_001778C0 (targets 0 and 2) / FUN_00177B90 (target 1) -- the within-pair
+ * lane law, lifted out of nav_plan_target_at so the latch can pre-build all
+ * three window points the way FUN_00176AF0 @0x001770CD..0x00177185 does.
+ * `lane_bits` is the record's `flags & 3`; retail carries it as the 0/2/4
+ * code in AI+0x1F4 and branches `CMP [ESP+0x1c],2` @0x00177075, which is the
+ * same partition.                                                     [C] */
+static Vec3 nav_lane_point(unsigned int section, unsigned int node,
+                           unsigned int lane_bits, int drift, float radius,
+                           int is_apex) {
+    int side_ac = (lane_bits & 3u) == 1u ? 2 : 1;
+    float half = nav_lane_half_w();
+    if (is_apex) {
+        int side = (side_ac == 1) ? 2 : 1;
+        return nav_lane_target(section, node, side,
+                               half + (drift ? half : 0.0f));
+    }
+    float t = radius / B3_NAV_LANE_MAX_R;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;              /* MAXSS/MINSS @0x00177ABB */
+    return nav_lane_target(section, node, side_ac, half * t);
+}
+
+static int nav_plan_target_at(const Vehicle* vehicle, unsigned int section,
+                              unsigned int node, Vec3* target,
+                              float* corner_speed, float* brake_dist,
+                              unsigned int* out_section,
+                              unsigned int* out_node) {
+    if (!nav_state_valid(section, node) || g_nav.plan_count == 0) return 0;
+    const B3RtNavSection* row = &g_nav.sections[section];
+    const B3RtNavPlan* best = NULL;
+    if (!nav_plan_select(section, node, &best)) return 0;
 
     unsigned int probe = node + 12;
     if (probe >= row->node_count) {
@@ -1334,24 +3144,383 @@ static int nav_plan_target_at(const Vehicle* vehicle, unsigned int section,
         selected_node = best->node_a;
     else if (nav_forward_delta(row, probe, best->node_b) > 0)
         selected_node = best->node_b;
-    *target = nav_pair_target(section, selected_node, vehicle->pos);
-    if (corner_speed) *corner_speed = (float)best->speed;
+    /* The three window nodes are the record's three u16s in file order, and
+     * that IS retail's visit order: `node_a` = rec+0 = corner ENTRY,
+     * `node_b` = rec+2 = the APEX (and FUN_001772A0's own selection key),
+     * `node_c` = rec+4 = corner EXIT.  Proof, both halves:
+     *   - FUN_00176AF0 @0x00176F8C..0x00177015 tests rec+0 first, then the
+     *     arg slot holding rec+2, then rec+4, publishing AI+0x1F8 = 0/1/2;
+     *   - geometrically, the tightest circumradius of the ribbon centreline
+     *     between the outer two nodes lands nearest `node_b` on 65/92
+     *     (US_C3_V1), 43/51 (EU_C1_V1) and 84/132 (US_P1_V1) records.
+     * `node_b` is target 1, the one FUN_00177B90 places on the OPPOSITE
+     * ribbon edge -- so the apex really is the apex.                    [C] */
+    if (nav_aim2_enabled() && (best->flags & 3u)) {
+        /* FUN_001772A0 @0x001773xx: `flags & 3` publishes AI+0x1F4 as
+         * 0 (no lane -> AI+0x1FC = 1, the midline fallback below), 2 for
+         * code 1, or 4 for codes 2 and 3.  FUN_00176AF0 @0x001770CB then
+         * routes AI+0x1F4 == 2 to side 1 for the entry/exit pair and side 2
+         * for the apex, and anything else the other way round.  Independent
+         * check on the geometry: this mapping puts the apex target on the
+         * INSIDE of the turn for 4115 of 4313 non-straight plan records
+         * across all 36 tracks (95.4%).                                 [C] */
+        *target = nav_lane_point(section, selected_node, best->flags,
+                                 (best->flags & 4u) != 0u,
+                                 (float)best->speed,
+                                 selected_node == best->node_b);
+    } else {
+        *target = nav_pair_target(section, selected_node, vehicle->pos);
+    }
+    /* The record's `u16 +6` is a corner RADIUS in metres (see the lane law
+     * above), NOT a target speed, so it must not reach the corner-brake law
+     * as one.  The legacy B3_NAV_AIM path keeps publishing it unchanged so
+     * its old measurement still reproduces; the racing-line path leaves the
+     * ceiling to the curvature scan that is already in charge today. */
+    if (corner_speed)
+        *corner_speed = (nav_aim_legacy() || nav_plan_speed_ceiling())
+                      ? (float)best->speed : 0.0f;
+    /* FUN_00176150 brakes for AI+0x214, which FUN_001772A0 fills from the
+     * plan record's `+0` (@0x0017735E -> the @0x0017707A store), NOT from
+     * whichever of A/B/C the aim is tracking.  Both ends of the measurement
+     * are the CAR's own navigator node -- retail passes AI+0x1D8 to
+     * FUN_00174A90 and FUN_00174AF0 alike -- which is `node` here.  The port
+     * used to measure the projection at the AIM node instead. */
+    if (brake_dist)
+        *brake_dist = nav_plan_arclen(section, node, best->node_a)
+                    - nav_approach_dist(section, node, vehicle->pos);
+    g_nav_target_mode = (selected_node == best->node_a) ? 0
+                      : (selected_node == best->node_b) ? 1 : 2;
+    g_nav_mode_1fc    = ((best->flags & 3u) == 0u) ? 1 : 0;
     if (out_section) *out_section = section;
     if (out_node) *out_node = selected_node;
     return 1;
 }
 
-static int nav_plan_target(const Vehicle* vehicle, Vec3* target,
-                           float* corner_speed, unsigned int* out_section,
-                           unsigned int* out_node) {
+/* ------------------------------------------------------------------ *
+ * THE PLAN LATCH -- AI+0x1F8 advanced by an ARRIVAL TEST.
+ *
+ * The port used to pick which of a plan record's three window nodes to aim
+ * at with a `node + 12` probe, re-decided from scratch every frame.  That
+ * was GLUE, and it came from mis-siting retail's ONE use of 12: the +12 in
+ * FUN_00176AF0 @0x00176EE9 is an ACCEPTANCE GATE on the NEXT record ("is its
+ * entry within twelve nodes of where the last plan ended?"), not a cursor
+ * for the aim.  Measured, the probe sat at mode 0 in 83% of samples, which
+ * asked the corner-brake law for its distance ramp everywhere and cost about
+ * a fifth of the AI's race progress.
+ *
+ * Retail's plan stage is a LATCH.  FUN_00175B10 @0x00175E7D..0x00176014
+ * runs once per AI per frame:
+ *
+ *   d       = AI+0x200 (the LATCHED target point) - car position
+ *   near    = AI+0x296 (a one-shot forced retarget) || |d| < 0.4  [47A1D0]
+ *   fwd     = normalize(flatten_y(node forward at AI+0x1D4/+0x1D8))
+ *   arrived = |dot(fwd, d)| < 0.1 [47A1D4] ? true : near
+ *   switch (AI+0x1F8):
+ *     0: if (arrived || reached(car, AI+0x214)) { 0x1F8 = 1;             }
+ *     1: if (arrived || reached(car, AI+0x216)) { 0x1F8 = 2;             }
+ *     2: if (arrived || reached(car, AI+0x218)) { 0x1F8 = 4; 0x1FC = 2;  }
+ *     default:  no advance and NO planner call
+ *   on any advance: FUN_00176AF0 (the planner) then FUN_001787D0
+ *
+ * DAT_0047A1D0 / DAT_0047A1D4 are the registered AI/Target params "Dist to
+ * update target pos" (0.4) and "Perp dist to update target pos" (0.1), both
+ * unchanged from their defaults in retail's Data/vdb.xml -- docs/RE_AI.md's
+ * parameter table, rows +090 and +094.  NOTE for anyone re-running the
+ * emulation: the whole 0x0047A1xx block is ZERO in the ELF image, because
+ * the registrar FUN_0016AFD0 fills it at runtime, so an oracle that does not
+ * inject those two values measures P = 0 and the perpendicular arm silently
+ * disappears.                                                          [C]
+ *
+ * The perpendicular arm is what makes this a latch and not a proximity test:
+ * once the target is abeam -- the car has drawn level with it along the
+ * road -- the stage advances however far off line the car is.  A pure 0.4 m
+ * proximity test would almost never fire on a car doing 60 m/s.
+ *
+ * `reached(P, Q)` is FUN_00174A50, the wrapped node cursor: delta = P - Q,
+ * and on a looping section delta is compared against +-node_count/2 so the
+ * answer stays right across the seam.  Executed under Unicorn against this C
+ * over 4218 (node_count, loop, P, Q) cases including the 0xFFFF reset
+ * sentinels: identical everywhere.  (latch/emul_a50.py)                [C]
+ *
+ * The arrival predicate itself is executable too -- @0x00175F35..0x00175F82
+ * is self-contained once FUN_00174740 and the normalize have returned -- and
+ * matches this C on 100/100 swept (forward, delta, near) cases, including
+ * both sides of each threshold.  (latch/emul_arrive.py)                [C]
+ * ------------------------------------------------------------------ */
+#define B3_NAV_TGT_DIST  0.4f    /* DAT_0047A1D0                        [C] */
+#define B3_NAV_TGT_PERP  0.1f    /* DAT_0047A1D4                        [C] */
+
+/* FUN_00174A50 @0x00174A50 -- "P is forward-of-or-equal-to Q". */
+static int nav_cursor_reached(unsigned int section, unsigned int p,
+                              unsigned int q) {
+    const B3RtNavSection* row = &g_nav.sections[section];
+    int delta = (int)(p & 0xffffu) - (int)(q & 0xffffu);
+    if (!(row->flags & 0xff)) return delta >= 0;      /* SETGE @0x00174A7C */
+    int half = (int)((unsigned int)row->node_count >> 1);
+    if (delta < 0) half = -half;                      /* NEG   @0x00174A70 */
+    return delta < half;                              /* SETL  @0x00174A74 */
+}
+
+/* FUN_00176090 @0x00176090 -- the route reset.  Parks the latch at (2, 2)
+ * with the window's outer two nodes at the 0xFFFF sentinel and its exit at
+ * the car's own node, so the very next arrival test advances 2 -> 4 and
+ * hands the planner control. */
+static void nav_latch_reset(Vehicle* v) {
+    B3NavLatch* L = &v->nav_latch;
+    L->latch = 2;                        /* AI+0x1F8 @0x0017609F */
+    L->mode_1fc = 2;                     /* AI+0x1FC @0x001760A5 */
+    L->lane = 0;
+    L->win[0] = 0xffffu;                 /* AI+0x214 @0x001760D4 */
+    L->win[1] = 0xffffu;                 /* AI+0x216 @0x001760DB */
+    L->win[2] = (unsigned short)v->nav_node;          /* @0x001760B0 */
+    L->pub_node = (unsigned short)v->nav_node;        /* @0x001760B7 */
+    L->win_section = (unsigned short)v->nav_section;
+    L->radius = 0.0f;
+    L->drift = 0;
+    L->target = nav_state_valid(v->nav_section, v->nav_node)
+              ? nav_midpoint(v->nav_section, v->nav_node) : v->pos;
+    /* @0x00175E78: FUN_00175B10 forces the arrival flag on the frame it
+     * calls the reset, so the plan is re-taken immediately. */
+    L->force = 1;
+    L->ready = 1;
+}
+
+/* FUN_001772A0's outputs, as FUN_00176AF0 @0x00177029..0x0017707A stores
+ * them.  `lane` keeps the record's raw `flags & 3`; retail widens it to the
+ * 0/2/4 code in AI+0x1F4, which nav_lane_point's side mapping already
+ * folds in. */
+static void nav_latch_store(Vehicle* v, unsigned int section,
+                            const B3RtNavPlan* rec) {
+    B3NavLatch* L = &v->nav_latch;
+    L->win[0] = rec->node_a;             /* AI+0x214 @0x0017707A */
+    L->win[1] = rec->node_b;             /* AI+0x216 @0x0017703E */
+    L->win[2] = rec->node_c;             /* AI+0x218 @0x00177033 */
+    L->win_section = (unsigned short)section;
+    L->lane = (int)(rec->flags & 3u);
+    L->mode_1fc = (rec->flags & 3u) == 0u ? 1 : 0;    /* param_11 out */
+    L->radius = (float)rec->speed;       /* AI+0x298 @0x00177055 */
+    L->drift = (unsigned char)((rec->flags & 4u) ? 1u : 0u);
+}
+
+/* FUN_001769E0 @0x001769E0 -- copy the latched window node's point into
+ * AI+0x200 and its index into AI+0x210.  AI+0x1FC == 0 takes the PRE-BUILT
+ * lane point (AI+0x220/+0x230/+0x240); anything else falls through to
+ * FUN_00178100's 0.4..0.6 pair retention.  Latch states above 2 publish
+ * NOTHING -- the target simply stays where it was.                     [C] */
+static void nav_latch_publish(Vehicle* v) {
+    B3NavLatch* L = &v->nav_latch;
+    if (L->latch > 2) return;            /* JNZ @0x00176A02 / @0x00176AA6 */
+    unsigned int section = L->win_section;
+    unsigned int node = L->win[L->latch];
+    if (!nav_state_valid(section, node)) {
+        /* The window still holds a reset sentinel (no record selected in
+         * this section yet).  Retail's own reset leaves AI+0x218 on the
+         * car's node and 0x1FC at 2, which is this midline point.     [S] */
+        if (!nav_state_valid(v->nav_section, v->nav_node)) return;
+        L->pub_node = (unsigned short)v->nav_node;
+        L->target = nav_pair_target(v->nav_section, v->nav_node, v->pos);
+        return;
+    }
+    L->pub_node = (unsigned short)node;
+    L->target = (L->mode_1fc == 0)
+              ? nav_lane_point(section, node, (unsigned int)L->lane,
+                               L->drift, L->radius, L->latch == 1)
+              : nav_pair_target(section, node, v->pos);
+}
+
+/* FUN_00176AF0 @0x00176AF0 -- the planner, entered on every latch advance.
+ * Three arms, selected exactly as retail does:
+ *
+ *   AI+0x1FC not in {0,1}   the ROUTE arm.  FUN_001771D0 re-selects from
+ *                           AI+0x210 and writes the window and AI+0x1FC
+ *                           straight out of FUN_001772A0; LAB_00176CA3 then
+ *                           re-latches from the car's node against the
+ *                           window (exit once past the apex, else apex once
+ *                           past the entry, else entry).
+ *   AI+0x1F8 == 1           publish only  (LAB_00176E66).
+ *   AI+0x1F8 == 2           the FULL PLANNER.
+ *   AI+0x1F8 == 0 or 4      return, doing nothing  (@0x00176B26).
+ *
+ * The full planner searches from the PREVIOUS APEX (AI+0x216, @0x00176F54 --
+ * AI+0x2A6 only when the plan table is empty, which it never is here), and
+ * accepts the record only if `reached(prev_exit + 12, new_entry)` and its
+ * lane code is non-zero.  On acceptance it re-latches with the SAME two
+ * cursor tests, in entry-then-apex order, defaulting to the exit.       [C]
+ *
+ * NOT modelled: FUN_001772A0's per-selection random widening of the entry
+ * and exit nodes (@0x001776xx, FUN_00244DF0 + DAT_0047A1E4/E8), and retail's
+ * route WALK, which hops the navigator across section links.  The port's
+ * navigator advances its own (section, node) cursor elsewhere; a section
+ * change is handled by re-seating the latch, which is what FUN_00175B10
+ * @0x00175E73 does through the reset.                                  [?] */
+static void nav_latch_plan(Vehicle* v) {
+    B3NavLatch* L = &v->nav_latch;
+    unsigned int section = v->nav_section, car = v->nav_node;
+    if (!nav_state_valid(section, car)) return;
+    const B3RtNavSection* row = &g_nav.sections[section];
+    const B3RtNavPlan* rec = NULL;
+
+    if (L->mode_1fc != 0 && L->mode_1fc != 1) {          /* @0x00176B00 */
+        unsigned int key = (L->pub_node == 0xffffu
+                            || L->win_section != section) ? car : L->pub_node;
+        if (nav_plan_select(section, key, &rec))
+            nav_latch_store(v, section, rec);            /* FUN_001771D0 */
+        if (nav_state_valid(section, L->win[1])
+            && nav_cursor_reached(section, car, L->win[1]))
+            L->latch = 2;                                /* @0x00176E4E */
+        else if (nav_state_valid(section, L->win[0])
+                 && nav_cursor_reached(section, car, L->win[0]))
+            L->latch = 1;                                /* @0x00176E22 */
+        else
+            L->latch = 0;                                /* @0x00176E9A */
+        nav_latch_publish(v);
+        return;
+    }
+    if (L->latch == 1) { nav_latch_publish(v); return; } /* LAB_00176E66 */
+    if (L->latch != 2) return;                           /* @0x00176B26 */
+
+    unsigned int horizon = (unsigned int)L->win[2] + 12u;   /* @0x00176EE9 */
+    if (row->flags & 0xff) horizon %= (unsigned int)row->node_count;
+    else if (horizon + 1u > (unsigned int)row->node_count)
+        horizon = (unsigned int)row->node_count - 1u;    /* FUN_00013B80 */
+    if (nav_plan_select(section, L->win[1], &rec)        /* @0x00176F54 */
+        && (rec->flags & 3u)                             /* @0x00176F7A */
+        && nav_cursor_reached(section, horizon, rec->node_a)) {  /* @0x00176F96 */
+        nav_latch_store(v, section, rec);
+        L->mode_1fc = 0;                                 /* @0x00176FAA */
+        L->latch = nav_cursor_reached(section, rec->node_a, car) ? 0
+                 : nav_cursor_reached(section, rec->node_b, car) ? 1 : 2;
+    }
+    /* On rejection retail publishes and leaves the latch alone (@0x001771B3
+     * -> FUN_001769E0), so the car keeps tracking the exit it already has
+     * until the next advance tries again. */
+    nav_latch_publish(v);
+}
+
+/* FUN_00175B10's arrival test and advance -- see the block comment above. */
+static void nav_latch_step(Vehicle* v) {
+    B3NavLatch* L = &v->nav_latch;
+    if (g_nav.plan_count == 0 || !nav_state_valid(v->nav_section, v->nav_node))
+        return;
+    if (!L->ready || L->win_section != v->nav_section) {
+        /* First frame, or the navigator crossed a section boundary --
+         * FUN_00175B10 @0x00175B5D takes the re-seat path and calls the
+         * reset whenever AI+0x1D4 is not the car's own section. */
+        nav_latch_reset(v);
+        /* Retail consumes the forced-arrival flag on the SAME frame it
+         * resets: @0x00175E78 sets it, @0x00175EFB..0x00175FFE reads it, and
+         * the advance it forces is the 2 -> 4 that hands the planner control.
+         * Calling the planner straight from here is that advance, so the flag
+         * must be spent here too -- leaving it set would force one extra
+         * advance on the following frame. */
+        nav_latch_plan(v);
+        v->nav_latch.force = 0;
+        return;
+    }
+    if (L->latch > 2) { nav_latch_plan(v); return; }
+
+    float dx = L->target.x - v->pos.x;
+    float dy = L->target.y - v->pos.y;
+    float dz = L->target.z - v->pos.z;
+    float dist = sqrtf(dx * dx + dy * dy + dz * dz);     /* @0x00175EDC */
+    int arrived = L->force || (B3_NAV_TGT_DIST > dist);  /* COMISS @0x00175EFB */
+    L->force = 0;
+    /* FUN_00174740's node forward, flattened (@0x00175F2A zeroes the Y lane)
+     * and normalized (FUN_00011640), dotted with the FULL delta. */
+    Vec3 f = nav_forward(v->nav_section, v->nav_node);
+    float fl = sqrtf(f.x * f.x + f.z * f.z);
+    if (fl > 1e-6f) {
+        float dp = (f.x * dx + f.z * dz) / fl;
+        if (dp < B3_NAV_TGT_PERP && dp > -B3_NAV_TGT_PERP) arrived = 1;
+    }
+    if (arrived
+        || (nav_state_valid(v->nav_section, L->win[L->latch])
+            && nav_cursor_reached(v->nav_section, v->nav_node,
+                                  L->win[L->latch]))) {
+        L->latch = (L->latch == 2) ? 4 : L->latch + 1;
+        if (L->latch == 4) L->mode_1fc = 2;              /* @0x00175FB8 */
+        nav_latch_plan(v);                               /* @0x00176009 */
+    }
+}
+
+/* FUN_0016C4B0 @0x0016CDEC..0x0016CE30: the avoidance aim's FORWARD offset
+ * is multiplied by 4.0 (DAT_003B1690) unless the car has a live lane plan
+ * latched -- `AI+0x1FC == 0 && AI+0x1F8 != 0`, i.e. it is tracking a
+ * corner's apex or its exit.  The corner ENTRY (AI+0x1F8 == 0) and "no plan
+ * at all" both take the long arm, which is exactly the shape you want: look
+ * a long way ahead approaching a corner, then tighten up through it.
+ *
+ * The port modelled NEITHER arm -- it had no live modes to key on, so its
+ * lead was always the short one.  An earlier pass measured retail's long arm
+ * unconditionally and (correctly) backed it out; that measurement was of the
+ * WRONG arm, because with the modes dead the condition could never be
+ * evaluated.                                                           [C] */
+#define B3_NAV_AVOID_LEAD_X4  4.0f       /* DAT_003B1690                [C] */
+
+static int nav_avoid_lead_x4(const Vehicle* v) {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("B3_NAV_AIM2_X4");
+        on = e ? (*e != '0') : 1;
+    }
+    if (!on) return 0;
+    const B3NavLatch* L = &v->nav_latch;
+    if (!L->ready) return 1;             /* no plan -> the long arm */
+    return !(L->mode_1fc == 0 && L->latch != 0);
+}
+
+/* Read the latch out to the driver.  Everything the old probe path produced
+ * now comes from the latched record: the aim is AI+0x200 itself, and the
+ * corner-brake distance is measured to AI+0x214 (the ENTRY node of the
+ * LATCHED window), which is the slot FUN_00176150 actually brakes for. */
+static int nav_latch_target(Vehicle* v, Vec3* target, float* corner_speed,
+                            float* brake_dist, unsigned int* out_section,
+                            unsigned int* out_node) {
+    B3NavLatch* L = &v->nav_latch;
+    unsigned int section = L->win_section;
+    if (!L->ready || L->latch > 2) return 0;
+    if (section != v->nav_section) return 0;
+    /* A REAL record is latched exactly when the window nodes are real; the
+     * reset parks 0xFFFF sentinels in the outer two.  AI+0x1FC deliberately
+     * does NOT gate this: a record whose lane code is 0 sets 0x1FC = 1 and
+     * retail still aims at it, through FUN_00178100's midline retention --
+     * which is what nav_latch_publish already produced.  Failing here would
+     * drop those records back to the harness route line, which is neither
+     * retail's answer nor the port's previous one. */
+    if (!nav_state_valid(section, L->win[L->latch])
+        || !nav_state_valid(section, L->win[0])) return 0;
+    *target = L->target;
+    if (corner_speed)
+        *corner_speed = (nav_aim_legacy() || nav_plan_speed_ceiling())
+                      ? L->radius : 0.0f;
+    if (brake_dist)
+        *brake_dist = nav_plan_arclen(section, v->nav_node, L->win[0])
+                    - nav_approach_dist(section, v->nav_node, v->pos);
+    g_nav_target_mode = L->latch;        /* AI+0x1F8 */
+    g_nav_mode_1fc    = L->mode_1fc;     /* AI+0x1FC */
+    if (out_section) *out_section = section;
+    if (out_node) *out_node = L->pub_node;
+    return 1;
+}
+
+static int nav_plan_target(Vehicle* vehicle, Vec3* target,
+                           float* corner_speed, float* brake_dist,
+                           unsigned int* out_section, unsigned int* out_node) {
+    /* B3_NAV_AIM2 makes the LATCH the plan-stage authority.  The legacy
+     * B3_NAV_AIM path keeps the +12 probe so its old measurement still
+     * reproduces bit for bit. */
+    if (nav_aim2_enabled())
+        return nav_latch_target(vehicle, target, corner_speed, brake_dist,
+                                out_section, out_node);
     unsigned int section = vehicle->nav_target_section;
     unsigned int node = vehicle->nav_target_node;
     if (vehicle->nav_target_ready
         && nav_plan_target_at(vehicle, section, node, target, corner_speed,
-                              out_section, out_node))
+                              brake_dist, out_section, out_node))
         return 1;
     return nav_plan_target_at(vehicle, vehicle->nav_section, vehicle->nav_node,
-                              target, corner_speed, out_section, out_node);
+                              target, corner_speed, brake_dist, out_section,
+                              out_node);
 }
 
 static int nav_step_node(unsigned int* section, unsigned int* node, int dir) {
@@ -1366,15 +3535,23 @@ static int nav_step_node(unsigned int* section, unsigned int* node, int dir) {
         *node = (unsigned int)((candidate + row->node_count) % row->node_count);
         return 1;
     }
+    /* Same law as nav_walk_local_step's section-end transition, and the
+     * same helper behind it (FUN_00174EE0): link-A else link-B, KEEP the
+     * node index, and the choice does not depend on the walk direction --
+     * executed with delta -1 at node 0, retail still takes link-A.  This
+     * used to adopt the link's stored node index AND gate A/B on `dir`.
+     * The one caller is nav_recovery_pose_from, i.e. the stuck / crash
+     * re-place, so the old form put a recovered car a median 484.8 m from
+     * where retail would.                                             [C] */
     const B3RtNavLink* link = &g_nav.links[row->link_base + *node];
-    if (dir > 0 && nav_state_valid(link->forward_section, link->forward_node)) {
+    if (link->forward_section != 0xffu
+        && nav_state_valid(link->forward_section, *node)) {
         *section = link->forward_section;
-        *node = link->forward_node;
         return 1;
     }
-    if (dir < 0 && nav_state_valid(link->reverse_section, link->reverse_node)) {
+    if (link->reverse_section != 0xffu
+        && nav_state_valid(link->reverse_section, *node)) {
         *section = link->reverse_section;
-        *node = link->reverse_node;
         return 1;
     }
     return 0;
@@ -1440,9 +3617,10 @@ static int nav_recovery_pose_from(Vehicle* vehicle, unsigned int section,
  *                    normalize(FUN_00174740(section, node))))
  * `seg` is the node's own arc-length span, read in retail from the index
  * row's `edge` table (`row->+4`, stride 8: `edge[node] - edge[node-1]`, or
- * `edge[0]` at node 0).  route.bin v3 does not carry that table, so the
- * harness measures the same quantity off the pair centroids -- the table IS
- * the cumulative length of that polyline.  [C law, [S] for `seg`'s source.] */
+ * `edge[0]` at node 0).  route.bin v3 does not carry that table; it now
+ * arrives alongside as nav_edges.bin (tools/extract_nav_edges.py), and the
+ * pair-centroid measurement below survives only as the fallback for a track
+ * that has not been re-extracted.  [C law, [C] for `seg`'s source.] */
 static float nav_approach_dist(unsigned int section, unsigned int node,
                                Vec3 pos) {
     if (!nav_state_valid(section, node)) return 0.0f;
@@ -1454,14 +3632,229 @@ static float nav_approach_dist(unsigned int section, unsigned int node,
     if (fl < 1e-6f) return 0.0f;
     float proj = ((pos.x - a.x) * fwd.x + (pos.y - a.y) * fwd.y
                   + (pos.z - a.z) * fwd.z) / fl;
-    Vec3 c0 = nav_midpoint(section, node);
-    unsigned int nxt = node + 1;
-    if (nxt >= (unsigned int)row->node_count)
-        nxt = (row->flags & 0xff) ? 0u : (unsigned int)row->node_count - 1u;
-    Vec3 c1 = nav_midpoint(section, nxt);
-    float sx = c1.x - c0.x, sy = c1.y - c0.y, sz = c1.z - c0.z;
-    float seg = sqrtf(sx * sx + sy * sy + sz * sz);
+    float seg;
+    if (g_nav_edges && row->link_base + node < g_nav_edge_count) {
+        /* FUN_00174AF0's own source: edge[node] - edge[node-1], or edge[0]
+         * at node 0.  Exact now instead of approximated. [C] */
+        const B3RtNavEdge* e = &g_nav_edges[row->link_base + node];
+        seg = node > 0 ? e->cum_length - e[-1].cum_length : e->cum_length;
+        if (!(seg > 0.0f)) seg = 0.0f;
+    } else {
+        /* fallback when nav_edges.bin is absent: the pair-centroid polyline
+         * measures the same quantity, under-reading a curve by a chord sum. */
+        Vec3 c0 = nav_midpoint(section, node);
+        unsigned int nxt = node + 1;
+        if (nxt >= (unsigned int)row->node_count)
+            nxt = (row->flags & 0xff) ? 0u : (unsigned int)row->node_count - 1u;
+        Vec3 c1 = nav_midpoint(section, nxt);
+        float sx = c1.x - c0.x, sy = c1.y - c0.y, sz = c1.z - c0.z;
+        seg = sqrtf(sx * sx + sy * sy + sz * sz);
+    }
     return proj < seg ? proj : seg;          /* MINSS @0x00174BBA */
+}
+
+/* ------------------------------------------------------------------ *
+ * The retail CORRIDOR CONTAINMENT test and its wall push-back.
+ *
+ * FUN_00173E40 @0x00173E40 returns a 4-bit "outside" mask for a position
+ * against nav segment [node, node+1].  Its four probes are:
+ *
+ *   FUN_001744F0(node+1)  gate plane at node+1, normal cross(Pa-Pb, UP)  -> 4
+ *   FUN_00174610(node)    side-A edge, normal cross(Pa[n]-Pa[n+1], UP)   -> 1
+ *   FUN_00174680(node)    side-B edge, normal cross(Pb[n+1]-Pb[n], UP)   -> 2
+ *   FUN_00174580(node)    gate plane at node,   normal cross(Pb-Pa, UP)  -> 8
+ *
+ * each normalised by FUN_00011640 (a 4-component normalise by the xyz
+ * length) and tested as  dot(pos - origin, n) > margin.  UP is the constant
+ * float4 (0,1,0,0) @0x0040A8C0 [C].  Origins are Pa[node+1] for the bit-4
+ * and bit-1 probes and Pb[node] for the bit-2 and bit-8 probes; the caller's
+ * correction leg re-anchors on Pa[node] / Pb[node], which lies on the same
+ * edge line, so the plane is identical.
+ *
+ * NOTE ON NAMING: `point_a` is the port's RIGHT edge and `point_b` the LEFT
+ * (burnout3_full.c:8533).  Retail's own probe order is A-then-B, so the
+ * bits below are "side A" / "side B", NOT left/right.
+ *
+ * Bits 4 and 8 are computed by retail and DISCARDED by its only caller
+ * (0x00173E40 has exactly one xref, @0x00170E8A).  They are the forward /
+ * backward gate tests, and the harness uses them for what retail gets from
+ * a separate nearest-node search: locating the segment that actually
+ * contains the point.
+ *
+ * The push-back itself is the undefined function at 0x00170C60..0x001710FA:
+ *
+ *   margin = W * -0.5                          ; [0x003B16A4] = -0.5   [C]
+ *   mask   = FUN_00173E40(this, &pos, node, margin)
+ *   if (mask & 1) {                            ; TEST AL,1  @0x00170E8F
+ *       if (link[node].fwd_section != 0xFF
+ *           && FUN_00173C60(fwd_section, 1, fwd_node)) skip;   ; junction
+ *       n = normalize(FUN_00174610(node));
+ *       pos += n * -(dot(pos - Pa[node], n) + W * 0.5);  ; [0x003B1684] = 0.5
+ *   } else if (mask & 2) {                     ; TEST AL,2  @0x00170F77
+ *       ... same with link[node].rev_section, FUN_00174680, Pb[node]
+ *   }
+ *
+ * The junction skip is the whole point of the law: an edge is only a WALL
+ * when nothing connects through it.  FUN_00173C60 @0x00173C60 scans one node
+ * forward in the successor section and reports "closed" only when that
+ * node's type is 5.  On the point-to-point and multi-route city courses a
+ * large share of edges ARE openings -- pushing off them would fight the
+ * planner at every branch.  [C]
+ * ------------------------------------------------------------------ */
+
+/* [S] retail's per-car half width, racecar+0x2444.  Its neighbour +0x2448 is
+ * already modelled as the half LENGTH (B3_AV_SELF_EXT, 2.4 m), so this is the
+ * matching half width; B3_AV_CAR_WID (2.0 m) puts it at 1.0 m.  The exact
+ * field is not yet executed, so it stays a named constant with an override
+ * until a Unicorn run pins it. */
+#define B3_NAV_CORRIDOR_HALF_W 1.0f
+
+static float nav_corridor_half_w(void) {
+    static float w = -1.0f;
+    if (w < 0.0f) {
+        const char* e = getenv("B3_NAV_CORRIDOR_W");
+        w = e ? (float)atof(e) : B3_NAV_CORRIDOR_HALF_W;
+        if (w < 0.0f) w = 0.0f;
+    }
+    return w;
+}
+
+/* cross(d, UP) with UP = (0,1,0) @0x0040A8C0, then FUN_00011640's normalise.
+ * cross(d,(0,1,0)) = (-d.z, 0, d.x). [C] */
+static int nav_edge_normal(Vec3 from, Vec3 to, Vec3* out) {
+    float dx = from.x - to.x, dz = from.z - to.z;
+    float nx = -dz, nz = dx;
+    float l = sqrtf(nx * nx + nz * nz);
+    if (l < 1e-6f) return 0;
+    out->x = nx / l; out->y = 0.0f; out->z = nz / l;
+    return 1;
+}
+
+/* FUN_00173C60 @0x00173C60: scan `count` nodes forward from `node`; the span
+ * is CLOSED as soon as a node of type 5 is met, otherwise open.  Retail's
+ * push-back always passes count = 1. [C] */
+static int nav_span_open(unsigned int section, unsigned int node,
+                         int count) {
+    if (section >= g_nav.section_count) return 1;
+    const B3RtNavSection* row = &g_nav.sections[section];
+    for (int i = 0; i < count; i++) {
+        if (node >= (unsigned int)row->node_count) return 1;
+        if (nav_node_type(section, node) == 5) return 0;   /* CMP AL,5 */
+        node++;
+        if (node >= (unsigned int)row->node_count) {
+            if (!(row->flags & 0xff)) return 1;            /* not looped */
+            node = 0;
+        }
+    }
+    return 1;
+}
+
+/* FUN_00173E40's four-bit outside mask.  Returns 0 when `p` is inside the
+ * segment's quad with `margin` slack (margin is NEGATIVE in retail's caller,
+ * which shrinks the corridor by half a car width). [C] */
+static unsigned int nav_corridor_mask(unsigned int section, unsigned int node,
+                                      Vec3 p, float margin) {
+    if (!nav_state_valid(section, node)) return 0;
+    const B3RtNavSection* row = &g_nav.sections[section];
+    if (node + 1 > (unsigned int)row->node_count) return 0;
+    const B3RtNavPair* p0 = &g_nav.pairs[row->pair_base + node];
+    const B3RtNavPair* p1 = &g_nav.pairs[row->pair_base + node + 1];
+    Vec3 a0 = nav_point(p0->point_a), b0 = nav_point(p0->point_b);
+    Vec3 a1 = nav_point(p1->point_a), b1 = nav_point(p1->point_b);
+    unsigned int mask = 0;
+    Vec3 n;
+
+    /* FUN_001744F0(node+1) -> bit 4.  Skipped when the gate is degenerate
+     * (point_a == point_b), which is retail's XOR AL,AL branch @0x0017452C. */
+    if (p1->point_a != p1->point_b && nav_edge_normal(a1, b1, &n)
+        && (p.x - a1.x) * n.x + (p.y - a1.y) * n.y + (p.z - a1.z) * n.z
+           > margin)
+        mask |= 4;
+    /* FUN_00174610(node) -> bit 1, side A edge, origin Pa[node+1] */
+    if (nav_edge_normal(a0, a1, &n)
+        && (p.x - a1.x) * n.x + (p.y - a1.y) * n.y + (p.z - a1.z) * n.z
+           > margin)
+        mask |= 1;
+    /* FUN_00174680(node) -> bit 2, side B edge, origin Pb[node] */
+    if (nav_edge_normal(b1, b0, &n)
+        && (p.x - b0.x) * n.x + (p.y - b0.y) * n.y + (p.z - b0.z) * n.z
+           > margin)
+        mask |= 2;
+    /* FUN_00174580(node) -> bit 8, reversed gate at node */
+    if (p0->point_a != p0->point_b && nav_edge_normal(b0, a0, &n)
+        && (p.x - b0.x) * n.x + (p.y - b0.y) * n.y + (p.z - b0.z) * n.z
+           > margin)
+        mask |= 8;
+    return mask;
+}
+
+/* The push-back leg, 0x00170E8F..0x00171062.  Moves `p` back inside the
+ * corridor to half a car width from whichever side it escaped, unless that
+ * side opens into a connected section. Returns 1 when it moved the point. */
+static int nav_corridor_clamp(unsigned int section, unsigned int node,
+                              Vec3* p) {
+    if (!p || !nav_state_valid(section, node)) return 0;
+    const B3RtNavSection* row = &g_nav.sections[section];
+    if (node + 1 > (unsigned int)row->node_count) return 0;
+    float w = nav_corridor_half_w();
+    unsigned int mask = nav_corridor_mask(section, node, *p, -0.5f * w);
+    if (!(mask & 3)) return 0;
+
+    const B3RtNavPair* p0 = &g_nav.pairs[row->pair_base + node];
+    const B3RtNavPair* p1 = &g_nav.pairs[row->pair_base + node + 1];
+    const B3RtNavLink* link = &g_nav.links[row->link_base + node];
+    Vec3 n, origin;
+
+    if (mask & 1) {
+        if (link->forward_section != 0xff
+            && nav_span_open(link->forward_section, link->forward_node, 1))
+            return 0;                                  /* junction opening */
+        if (!nav_edge_normal(nav_point(p0->point_a), nav_point(p1->point_a),
+                             &n))
+            return 0;
+        origin = nav_point(p0->point_a);
+    } else {
+        if (link->reverse_section != 0xff
+            && nav_span_open(link->reverse_section, link->reverse_node, 1))
+            return 0;
+        if (!nav_edge_normal(nav_point(p1->point_b), nav_point(p0->point_b),
+                             &n))
+            return 0;
+        origin = nav_point(p0->point_b);
+    }
+    float d = (p->x - origin.x) * n.x + (p->y - origin.y) * n.y
+            + (p->z - origin.z) * n.z;
+    float push = -(d + 0.5f * w);                  /* [0x003B1684] = 0.5 */
+    p->x += n.x * push;
+    p->y += n.y * push;
+    p->z += n.z * push;
+    return 1;
+}
+
+/* Locate the segment that actually contains `p`, walking forward from the
+ * car's own cursor.  Retail reaches the node through a separate nearest-node
+ * search (FUN_001750C0 @0x00170E40); the harness uses FUN_00173E40's own
+ * bit-4 "past the exit gate" result, which retail computes and discards.
+ * Returns 1 and writes *out_node when a containing segment is found. */
+static int nav_segment_containing(unsigned int section, unsigned int node,
+                                  Vec3 p, int span, unsigned int* out_node) {
+    const B3RtNavSection* row;
+    if (!nav_state_valid(section, node)) return 0;
+    row = &g_nav.sections[section];
+    for (int i = 0; i < span; i++) {
+        if (node + 1 > (unsigned int)row->node_count) return 0;
+        unsigned int m = nav_corridor_mask(section, node, p, 0.0f);
+        if (!(m & 4)) {                 /* not past this segment's exit gate */
+            *out_node = node;
+            return 1;
+        }
+        node++;
+        if (node >= (unsigned int)row->node_count) {
+            if (!(row->flags & 0xff)) return 0;
+            node = 0;
+        }
+    }
+    return 0;
 }
 
 // Lane fixup for the driving route: on dual carriageways the corridor
@@ -1473,35 +3866,120 @@ static float nav_approach_dist(unsigned int section, unsigned int node,
 // is preserved, the shift is capped at 5 m, and points where the race line
 // is far off (its roundabout chord cuts fenced geometry) are left alone.
 static void route_lane_fixup(void) {
-    int moved = 0;
-    for (int i = 0; i < ROUTE_COUNT; i++) {
-        // local route direction
-        const float* a = g_cl[(i + ROUTE_COUNT - 1) % ROUTE_COUNT];
-        const float* b = g_cl[(i + 1) % ROUTE_COUNT];
-        float dx = b[0] - a[0], dz = b[2] - a[2];
-        float dl = sqrtf(dx * dx + dz * dz);
-        if (dl < 1e-6f) continue;
-        dx /= dl;
-        dz /= dl;
-        float px = -dz, pz = dx;                 // lateral unit
-        // nearest race-line point (header data is world space: z = -z here)
-        float best = 1e30f, bx = 0, bz = 0;
-        for (int r = 0; r < B3_CENTERLINE_COUNT; r++) {
-            float rx = B3_CENTERLINE[r][0] - g_cl[i][0];
-            float rz = -B3_CENTERLINE[r][2] - g_cl[i][2];
-            float d2 = rx * rx + rz * rz;
-            if (d2 < best) { best = d2; bx = rx; bz = rz; }
+    /* Nothing to fix when the route already IS a retail carriageway ribbon:
+     * this pass exists to pull the boundary strip's MIDLINE (which on a
+     * divided road is the median) onto the driven lane, and re-deciding it
+     * per point re-introduces exactly the raggedness it is meant to remove.
+     * Measured on EU_M1_V1's shipped route line, where the per-point choice
+     * alternated between nav sections 25 and 21 at stations 1213..1221 and
+     * produced a 33 m spike, two duplicate stations and four consecutive
+     * direction reversals -- the stretch on which car 0 stalled, was
+     * re-placed onto station 1215 facing the reversal, and drove the course
+     * backwards for the remaining 45 s. */
+    if (g_route_from_nav) return;
+
+    /* THE DRIVEN-LANE FIX, from the nav graph.  The extracted "race line"
+     * this function used to align to -- route.bin's centerline pool, which
+     * src/burnout3_track_paths.h baked in as B3_CENTERLINE -- turns out to
+     * run down the CORRIDOR MIDLINE (measured offline: wall-midline, route
+     * line and the race line all coincide in route.bin's space), which on a
+     * divided road is the MEDIAN between the two carriageways.  Aligning to
+     * it moved nothing, the AI's racing aim targeted the median, and the
+     * whole field sat at rlat ~+11.8 pressed against the oncoming half --
+     * the reported "AI cars drive to the right and grind the walls".  The
+     * avoidance rework did not cause it; it stopped masking it (the old
+     * band clamp happened to pull aims left).  That is also why the
+     * second-chance alignment pass this function used to end with is gone
+     * with the header: it aligned to the median, on one hard-coded track's
+     * geometry, only on the tracks where the nav pass had already failed.
+     *
+     * route.bin's nav family gives the real answer, index-aligned with the
+     * route (1013 nodes in every parallel ribbon): the FORWARD-direction
+     * ribbons are the with-race side (the oncoming ribbons run reverse node
+     * order -- the same discrimination ai_avoid_frame_from_nav uses).  Put
+     * each aim point on the midline of the WIDEST forward ribbon under
+     * 20 m: the with-race carriageway.  Data-driven, no per-track
+     * constants; points with no forward family ribbon (junction spans)
+     * fall through to the old centerline alignment below. */
+    if (g_nav.loaded) {
+        int fixed_n = 0;
+        for (int i = 0; i < g_route_n; i++) {
+            const float* pa = g_cl[(i + g_route_n - 1) % g_route_n];
+            const float* pb = g_cl[(i + 1) % g_route_n];
+            float ddx = pb[0] - pa[0], ddz = pb[2] - pa[2];
+            float ddl = sqrtf(ddx * ddx + ddz * ddz);
+            if (ddl < 1e-6f) continue;
+            ddx /= ddl; ddz /= ddl;
+            int best = -1; float best_w = 0.0f;
+            float mx = 0.0f, my = 0.0f, mz = 0.0f;
+            /* SPATIAL nearest node per section -- the first cut assumed
+             * g_cl[i] and nav node i are the same station, and only 207 of
+             * 1013 points found a forward ribbon: the two indexings differ
+             * in phase/direction.
+             *
+             * It used to track a per-section cursor and search a +-24 window
+             * around the previous route point's nearest node.  That is only
+             * valid while the route line itself is continuous, and the
+             * shipped boundary-strip routes are not: at the first
+             * kilometre-long chord the cursor is left on the far side and
+             * every later point falls outside its window, so the pass
+             * silently gives up.  Measured against the game's own printout,
+             * exactly: EU_P1_V1 620/1555, EU_P2_V1 132/1465, US_P1_V2
+             * 415/862, US_P2_V1 510/869 -- i.e. 40..91% of the aim line left
+             * on the corridor MEDIAN, which is what the pass exists to get
+             * off.  A full per-section scan is the same answer without the
+             * lock to lose (recovers those to 93%, 56%, 87% and 99%), and it
+             * runs once at load. */
+            for (unsigned int sc = 0; sc < g_nav.section_count; sc++) {
+                const B3RtNavSection* row = &g_nav.sections[sc];
+                if (row->node_count < 8) continue;
+                int nc = (int)row->node_count;
+                int bj = -1; float bd = 1e30f;
+                for (int j = 0; j < nc; j++) {
+                    const B3RtNavPair* pr = &g_nav.pairs[row->pair_base + j];
+                    Vec3 r = nav_point(pr->point_a), l = nav_point(pr->point_b);
+                    float cx2 = (r.x + l.x) * 0.5f, cz2 = (r.z + l.z) * 0.5f;
+                    float d2 = (cx2 - g_cl[i][0]) * (cx2 - g_cl[i][0])
+                             + (cz2 - g_cl[i][2]) * (cz2 - g_cl[i][2]);
+                    if (d2 < bd) { bd = d2; bj = j; }
+                }
+                if (bj < 0 || bd > 30.0f * 30.0f) continue;    /* off-span  */
+                Vec3 f = nav_forward(sc, (unsigned int)bj);
+                if (f.x * ddx + f.z * ddz <= 0.0f) continue;   /* oncoming  */
+                const B3RtNavPair* pr = &g_nav.pairs[row->pair_base + bj];
+                Vec3 r = nav_point(pr->point_a), l = nav_point(pr->point_b);
+                float w = sqrtf((l.x - r.x) * (l.x - r.x)
+                              + (l.z - r.z) * (l.z - r.z));
+                if (w > 20.0f || w < 0.5f) continue;           /* bounds    */
+                if (w > best_w) {
+                    best_w = w; best = (int)sc;
+                    mx = (r.x + l.x) * 0.5f;
+                    my = (r.y + l.y) * 0.5f;
+                    mz = (r.z + l.z) * 0.5f;
+                }
+            }
+            if (best >= 0) {
+                g_cl[i][0] = mx;
+                g_cl[i][1] = my;
+                g_cl[i][2] = mz;
+                fixed_n++;
+            }
         }
-        if (best > 12.0f * 12.0f) continue;      // diverged (chord/cut zone)
-        float lat = bx * px + bz * pz;           // lateral offset to the line
-        if (lat > 5.0f) lat = 5.0f;
-        if (lat < -5.0f) lat = -5.0f;
-        g_cl[i][0] += px * lat;
-        g_cl[i][2] += pz * lat;
-        if (lat > 1.0f || lat < -1.0f) moved++;
+        if (fixed_n) {
+            printf("[track] aim line: %d/%d points moved onto the forward "
+                   "carriageway midline (nav graph)\n", fixed_n, g_route_n);
+            return;
+        }
     }
-    printf("[Burnout3] route lane fixup: %d/%d points shifted toward the "
-           "forward race line\n", moved, ROUTE_COUNT);
+    /* No second pass.  The one that used to stand here pulled every route
+     * point up to 5 m toward the nearest B3_CENTERLINE point within 12 m --
+     * i.e. toward the corridor MEDIAN (see the note above), measured against
+     * US_C3_V1's compiled-in geometry whatever track was loaded.  On this
+     * track it moved the line onto the very median the nav pass exists to get
+     * off; on the other 35 the 12 m gate rejected every point and it did
+     * nothing at all.  There is no data-driven version of it to keep. */
+    printf("[Burnout3] route lane fixup: no forward nav ribbon under the "
+           "route line; all %d points left as loaded\n", g_route_n);
 }
 
 // ---------------------------------------------------------------------------
@@ -1560,13 +4038,38 @@ static void build_collision(void) {
     // + src/burnout3_collision.c). The 2D ColSeg grid for aim_blocked (and
     // the render-mesh fallback for mesh_collide) is derived from whichever
     // source is available.
-    int loaded = b3_collision_load("build/collision.bin");
-    if (loaded > 0)
-        printf("[Burnout3] GAME collision world: %d triangles "
-               "(build/collision.bin)\n", loaded);
-    else
-        printf("[Burnout3] collision.bin missing -- render-mesh wall "
-               "approximation in use\n");
+    /* PER-TRACK, and NOTHING ELSE.  The old second arm loaded the GLOBAL
+     * build/collision.bin, which is whatever track was extracted LAST -- with
+     * 36 tracks extracted it silently collided this race against a different
+     * circuit, and the symptom read as a physics bug rather than as a missing
+     * file.  That is the same hazard the purged headers had, so it gets the
+     * same treatment: name the file that is missing and stop. */
+    int loaded = 0;
+    char cpath[256];
+    {
+        const char* tid = getenv("B3_TRACK");
+        if (!tid) tid = "US_C3_V1";
+        snprintf(cpath, sizeof cpath, "build/tracks/%s/collision.bin", tid);
+        loaded = b3_collision_load(cpath);
+        if (loaded > 0)
+            printf("[Burnout3] collision: %s\n", cpath);
+    }
+    if (loaded <= 0) {
+        const char* tid = getenv("B3_TRACK");
+        if (!tid) tid = "US_C3_V1";
+        fprintf(stderr,
+            "[Burnout3] FATAL: no usable %s.\n"
+            "  This is the track's own collision world (the streamed.dat kd-tree\n"
+            "  soups); there is no global copy to fall back to -- the one that\n"
+            "  used to be here was whichever track was extracted LAST, so a\n"
+            "  missing file drove this race into another circuit's walls.\n"
+            "  Extract it from your own dump:  tools/cextract/build.sh && "
+            "cxtract --track %s --only collision --out build/tracks/%s\n",
+            cpath, tid, tid);
+        exit(2);
+    }
+    printf("[Burnout3] GAME collision world: %d triangles (%s)\n",
+           loaded, cpath);
     // the full vehicle pipeline's ground rays go through the harness
     // wrapper (mesh probe first, route-height placeholder fallback)
     b3_ground_probe_hook = harness_ground_probe;
@@ -1702,6 +4205,118 @@ static int aim_blocked(float ax, float az, float bx, float bz, float y) {
     return 0;
 }
 
+/* THE CLOSE-RANGE QUEUE BRAKE's trigger geometry -- see the note at its use.
+ * The pre-H4 glue tested a 9 m range and a 41-degree cone (cos > 0.75), and
+ * that cone is far wider than the lane: a car's own half-width is
+ * B3_AV_HALF_CAR = 2.6 m, which at 8 m subtends atan(2.6/8) = 18.0 deg, so
+ * cos > 0.90 (25.8 deg) is "the blocker overlaps my own body, plus a margin"
+ * -- the same shape retail's footprint band has, instead of a cone that also
+ * caught cars in the NEXT lane.
+ *
+ * BOTH numbers were swept, because they trade against each other: the RANGE
+ * sets how much the rule brakes, and braking buys wreck avoidance but costs
+ * pack progress.  180 s wreck totals from [aicrash] SUMMARY (TOTAL/RIVALS)
+ * against US_P1_V1's 90 s validate_tracks progress floor of 0.075:
+ *
+ *   rule off (pre-fix)  US_C3 6/4  EU_C1 10/6  min span 0.082  -- and 2 falls
+ *   9.0 m, cos 0.75     .........................  0.061 FAIL
+ *   9.0 m, cos 0.90     ......... EU_C1  5/3  ...  0.069 FAIL
+ *   7.0 m, cos 0.90     US_C3 6/4  EU_C1 12/9  ..  0.090 pass, EU_C1 WORSE
+ *   8.0 m, cos 0.90     US_C3 6/4  EU_C1 10/6  ..  0.097 pass   <== shipped
+ *
+ * 8.0 m is the only point measured that clears the progress floor AND leaves
+ * both wreck counts exactly where the pre-fix tree had them.
+ *
+ * WHAT IT DOES NOT DO, stated plainly: over a 180 s race US_P1_V1 still loses
+ * ONE car down the hole (the pre-fix tree lost two).  This rule only lowers
+ * the pack's EXPOSURE to that hole by keeping cars from shoving each other
+ * off the ribbon; it cannot see the hole, and the 9.0 m / cos 0.75 setting
+ * that did reach 0 falls at 180 s is the one that fails the 90 s progress
+ * floor.  The hazard itself is an aim defect -- see aim_over_gap -- and it
+ * closes for good only when the target follower's nav-graph walk lands
+ * (docs/RE_AI.md 15.6 row 3) or nav_corridor_clamp is re-anchored on retail's
+ * nearest-node search FUN_001750C0 @0x00170E40 instead of the harness's
+ * forward walk from the car's own cursor.  Enabling the aim_over_gap veto on
+ * top of this rule was MEASURED and is worse, not better: US_P1_V1 90 s goes
+ * to 1 fall and car5 to a 0.046 span.  All three constants are GLUE.   [S] */
+#define B3_QUEUE_RANGE_M  8.0f
+#define B3_QUEUE_COS      0.90f
+#define B3_QUEUE_SLOW_MS  6.0f
+
+/* ------------------------------------------------------------------------
+ * aim_over_gap -- the FLOOR question, which aim_blocked structurally cannot
+ * answer.
+ *
+ * aim_blocked asks "does the line to the pursuit point cross a WALL?", and
+ * that is the only hazard retail's aim can meet: retail's target follower
+ * walks the nav graph out of the car's OWN node (FUN_00175B10,
+ * docs/RE_AI.md 15.6 row 3), so its aim is a point on the car's own corridor
+ * -- on the car's own SURFACE -- by construction.  The harness has no graph
+ * walk: its aim is `g_track.points[idx + lead]`, sampled by an XZ-nearest
+ * projection that ignores height entirely.  Where the course stacks -- a ramp
+ * climbing over a deck -- the nearest station in XZ can be the one 39 m
+ * overhead, and the car drives at it across ground that ENDS.  Measured on
+ * US_P1_V1: two cars per 180 s race leave the lower deck at (-1510, 112,
+ * -2060) chasing route stations 233-238, which sit at y = 125.8 sixty metres
+ * away, and fall 39 m.  A barrier grid cannot see that edge because there is
+ * no barrier there -- the deck simply stops.
+ *
+ * So this walks the drivable surface along the aim ray the way the surface
+ * itself is walked offline: each sample starts its down-ray from the height
+ * the PREVIOUS sample found, so a continuous road (including a climbing ramp
+ * or a dip) stays continuous and only a real hole reads as one.  It feeds the
+ * same recovery ladder aim_blocked already feeds.
+ *
+ * GLUE, and named as such: it stands in for the unported graph walk, exactly
+ * like the aim_blocked routing beside it.  It is a pure VETO -- it can only
+ * reject an aim, never invent one -- so where the harness's aim is already on
+ * the car's surface (every closed circuit measured) it does nothing at all.
+ * ---------------------------------------------------------------------- */
+/* the ray walk's shape.  STEP is a little under the width of the narrowest
+ * carriageway this has to cross without a false hole (US_P1_V1's ribbon is
+ * 3 m and its decks 15-18 m), MAX_N bounds the cost at eight down-rays per
+ * car per frame, and MIN skips the test for aims so close that the car is
+ * already standing on the answer.                                      [S] */
+#define B3_AIM_GAP_MIN    6.0f
+#define B3_AIM_GAP_STEP   5.0f
+#define B3_AIM_GAP_MAX_N  8
+
+static long g_gap_vetoes = 0;
+
+/* OFF by default until measured; see the pack A/B in the commit note. */
+static int aim_gap_on(void) {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("B3_AIM_GAP"); v = e ? atoi(e) : 0; }
+    return v;
+}
+
+static int aim_gap_scan(float ax, float ay, float az, float bx, float bz,
+                        float* out_x, float* out_z) {
+    if (!b3_collision_ready()) return 0;
+    float dx = bx - ax, dz = bz - az;
+    float len = sqrtf(dx * dx + dz * dz);
+    if (len < B3_AIM_GAP_MIN) return 0;
+    int n = (int)(len / B3_AIM_GAP_STEP);
+    if (n > B3_AIM_GAP_MAX_N) n = B3_AIM_GAP_MAX_N;
+    if (n < 1) n = 1;
+    float last = ay, lx = ax, lz = az;
+    for (int i = 1; i <= n; i++) {
+        float u = (float)i / (float)n, gh;
+        float sx = ax + dx * u, sz = az + dz * u;
+        if (b3_ground_probe(sx, last, sz, &gh, NULL) < 0) {
+            g_gap_vetoes++;
+            if (out_x) { *out_x = lx; *out_z = lz; }
+            return 1;                    /* no floor under the line */
+        }
+        last = gh; lx = sx; lz = sz;
+    }
+    return 0;
+}
+
+static int aim_over_gap(float ax, float ay, float az, float bx, float bz) {
+    return aim_gap_scan(ax, ay, az, bx, bz, NULL, NULL);
+}
+
 // Push the car out of any nearby barrier. With the real collision world
 // loaded this is a sphere-vs-triangle test against the game's own barrier
 // polys (b3_sweep_sphere over build/collision.bin; the push-out response
@@ -1818,6 +4433,95 @@ static int tdr_wall_scrape(Vehicle* v, const float q[3], float px, float pz,
     return 1;
 }
 
+/* WOULD RETAIL EVEN SEE THIS AS A WALL?
+ *
+ * The harness has a SECOND wall-crash producer besides FUN_0011AEF0's own
+ * verdict: this sphere sweep, whose hit is handed to `tdr_wall_report` ->
+ * b3_crash_wall_eval and OR-ed into the crash decision at the `wall_fire =
+ * cfire || fire` site below.  Everything from the flattened normal onward is
+ * retail's code -- but the CONTACT ADMISSION was the sphere's, and a sphere
+ * admits geometry retail's chassis never touches:
+ *
+ *     sphere centre pos.y + 0.3, radius 1.0  ->  bottom 0.200 m BELOW the road
+ *     retail's chassis box bottom (veh+0x1E0.y under the hub plane)
+ *                                            ->  0.161 m ABOVE the road
+ *
+ * so every median curb between those two -- the 0.152588 m mode is 175 of
+ * US_C3_V1's 287 medians -- was reported to the crash trigger as a wall that
+ * retail's FUN_0011AC30 clips away entirely.  That is the user's "I am still
+ * crashing a crash when driving into short curbs".
+ *
+ * Re-testing the winning triangle with FUN_0011AC30's own two gates (the
+ * near-vertical sliver reject and the bbox clip) puts retail's admission back
+ * in front of the trigger.  Verified against the executed x86 by
+ * tools/validate_curb.py: retail registers 0 wall-contact frames on a real
+ * 0.107 m curb and 17 on a real 0.198 m one, exactly straddling the 0.161 m
+ * box floor this restores.
+ *
+ * THE PUSH-OUT IS GATED TOO, and the earlier note here saying it was not has
+ * been corrected.  Measured first (B3_WALL_SWEEP A/B, 45 s autodrive,
+ * US_C3_V1): for a full-pipeline car the push-out CANNOT torque the body --
+ * it writes v->pos only, and v->pos is re-derived from rb->frame[3] at the
+ * top of every frame, so nothing carries it into the dynamics.  The A/B shows
+ * position diverging at frame 488 and velocity only at frame 556, a 68-frame
+ * lag through the AI driver reading v->pos; a torque would have shown the
+ * same frame.  (tdr_wall_scrape, which DOES deliver impulse and torque, runs
+ * only for a body with no pipeline of its own.)
+ *
+ * What the push-out does do is TELEPORT THE RENDERED CAR sideways, by up to
+ * the sphere's penetration depth, against geometry retail's chassis never
+ * touches -- and the depth varies with the curb, which is exactly the shape
+ * of the user's "jerks into different rotations depending on the curb".
+ * Retail keeps a car off a low curb with the SUSPENSION, not with a body
+ * push, so holding the push to the faces FUN_0011AC30 admits is the retail
+ * behaviour on both counts.
+ *
+ * Clipping safety: the gate is per-face, so a tall wall (which clips the
+ * chassis box) still pushes exactly as before -- only sub-box geometry stops
+ * pushing, and that geometry is carried by the wheels instead.  The
+ * admission runs INSIDE the sweep (b3_sweep_sphere_admit) rather than on its
+ * result, so a refused curb can never mask a real wall behind it. */
+static int harness_retail_admits_wall(const Vehicle* v, int tri);
+static int harness_admit_cb(void* user, int tri) {
+    return harness_retail_admits_wall((const Vehicle*)user, tri);
+}
+/* ...but NOT while the car is a wreck.  The admission is FUN_0011AC30's, the
+ * DRIVING pipeline's contact test, and it reads the driving sim's pose
+ * (v->fsim.rb.inv_frame / half_ext / center_off).  A crashed car returns from
+ * vehicle_update before b3_vehicle_step_full ever runs, so that pose is
+ * FROZEN at the last frame before the crash: within a couple of seconds the
+ * tumbling wreck is tens of metres from it and the box test refuses every
+ * face, which silently turned mesh_collide into a no-op for wrecks (measured:
+ * 0 push-outs in 90 frames pressed against a barrier).  Retail's crashed body
+ * does not run FUN_0011AC30 at all -- its world contact is FUN_00107950 over
+ * the wreck's own box (FUN_00122D00) -- so the correct behaviour here is the
+ * unadmitted sweep this had before the curb work. */
+static int harness_admit_for(const Vehicle* v) {
+    return (v->fsim_ready && v->crashed_until <= 0.0f) ? 1 : 0;
+}
+static int harness_retail_admits_wall(const Vehicle* v, int tri) {
+    if (tri < 0) return 0;
+    if (!v->fsim_ready) return 0;
+    float gv0[3], gv1[3], gv2[3], gn[3];
+    unsigned short ty;
+    if (!b3_collision_tri_get(tri, gv0, gv1, gv2, gn, &ty, NULL)) return 0;
+    /* harness(GL) -> GAME, the same mapping harness_copy_soup applies: mirror
+     * z and swap v1/v2 so the one-sided winding survives the reflection. */
+    B3CrashPoly poly;
+    const float* src[3] = { gv0, gv2, gv1 };
+    float* dst[3] = { poly.p0, poly.p1, poly.p2 };
+    for (int i = 0; i < 3; i++) {
+        dst[i][0] = src[i][0];
+        dst[i][1] = src[i][1];
+        dst[i][2] = -src[i][2];
+        dst[i][3] = 0.0f;
+    }
+    poly.n[0] = gn[0]; poly.n[1] = gn[1]; poly.n[2] = -gn[2]; poly.n[3] = 0.0f;
+    return b3_crash_poly_admits(&poly,
+                                (const float(*)[4])v->fsim.rb.inv_frame,
+                                v->fsim.half_ext, v->fsim.center_off);
+}
+
 static void mesh_collide(Vehicle* v) {
     const float margin = 1.0f;
     if (b3_collision_ready()) {
@@ -1831,12 +4535,35 @@ static void mesh_collide(Vehicle* v) {
              * under.  The sweep also hands back the winning triangle's
              * surface type, which the wall and object triggers both read. */
             unsigned short stype = 0;
+            int htri = -1;
             float svel[3] = {v->vel.x, v->vel.y, v->vel.z};
-            if (!b3_sweep_sphere_ex(c, c, margin, 0.45f, svel, q, n, &stype))
+            /* [C] FUN_0011BBE0 @0x0011BC43 bounds the face normal only from
+             * BELOW (n.y < -0.7); the wall/ground split is FUN_0011AC30's
+             * `n.y > 0.7` (0x3B17D8).  The invented 0.45 here hid every
+             * sloped barrier from the push-out -- 11.8% of the track's
+             * structure faces -- which is how a car ends up behind one. */
+            if (!b3_sweep_sphere_admit(c, c, margin, 0.70f, svel, q, n,
+                                       &stype, &htri,
+                                       harness_admit_for(v) ? harness_admit_cb
+                                                            : NULL,
+                                       v))
                 break;
             float px = n[0], pz = n[2];
             float pl = sqrtf(px*px + pz*pz);
             if (pl < 1e-6f) break;                 // top/bottom graze
+            /* B3_WALLDBG: the POSITIVE signal.  The crossing detector alone
+             * lets a run that never touches a wall pass trivially; this
+             * counts real wall push-outs on the player, once per ~second. */
+            if (getenv("B3_WALLDBG") && v == &g_player) {
+                static float last = -10.0f;
+                static int nwall = 0;
+                nwall++;
+                if (g_race_time - last > 1.0f) {
+                    fprintf(stderr, "[wallhit] player wall contacts so far: "
+                            "%d (t=%.2f)\n", nwall, g_race_time);
+                    last = g_race_time;
+                }
+            }
             px /= pl; pz /= pl;
             float dx = c[0] - q[0], dz = c[2] - q[2];
             float dy = c[1] - q[1];
@@ -1857,8 +4584,11 @@ static void mesh_collide(Vehicle* v) {
                 // a spun car's tail hitting a barrier (omega x r never
                 // entered it); dv does.
                 int sl = (int)(v - g_vehicles);
+                /* the sweep above already admitted this face; the test is
+                 * kept for the fsim-less path, where no admission ran */
                 if (sl >= 0 && sl < 8 && v->fsim_ready
-                    && v->crashed_until <= 0.0f) {
+                    && v->crashed_until <= 0.0f
+                    && harness_retail_admits_wall(v, htri)) {
                     tdr_wall_report(v, sl, q, px, pz, vin, stype);
                     /* CRASH-PARITY item 1: FUN_00112E70's OBJECT/PROP crash
                      * trigger.  Retail routes a car (collision-handle type 0
@@ -2007,7 +4737,7 @@ static void mesh_collide(Vehicle* v) {
 static void generate_track(void) {
     // Real circuit: center line recovered from Gamedata.bgd (Bangkok, C1_V1),
     // see tools/extract_bgd_paths.py and build/bgd_walls.png for verification.
-    int num_points = ROUTE_COUNT;
+    int num_points = g_route_n;
     g_track.points = malloc(num_points * sizeof(Vec3));
     g_track.num_points = num_points;
     for (int i = 0; i < num_points; i++)
@@ -2026,7 +4756,14 @@ static void generate_track(void) {
 static float loop_closest(const float (*pts)[3], int n, float x, float z,
                           Vec3* out, int* out_seg) {
     float best = 1e30f;
-    for (int i = 0; i < n; i++) {
+    /* A POINT-TO-POINT course has no closing segment.  Joining its last
+     * station to its first lays a 6..9 km chord across the map (measured on
+     * all 8 P variants), and every query inside 60 m of that chord -- the
+     * corridor clamp, the below-route discriminator, the re-place index --
+     * binds to it instead of to the road.  Only the route line can be open;
+     * B3_ONCOMING and friends are closed by construction. */
+    int segs = (g_route_open && pts == g_cl && n > 1) ? n - 1 : n;
+    for (int i = 0; i < segs; i++) {
         const float* a = pts[i];
         const float* b = pts[(i + 1) % n];
         float abx = b[0] - a[0], abz = b[2] - a[2];
@@ -2050,9 +4787,15 @@ static float loop_closest(const float (*pts)[3], int n, float x, float z,
 // Keep a car inside the road corridor bounded by the recovered wall strips,
 // and follow the road height. The wall/center point data is the game's own;
 // this collision response is harness logic.
-static void apply_track_constraints(Vehicle* v) {
+//
+// DELIBERATELY UNCALLED. docs/PHYSICS_GLUE_LEDGER.md rests the "one wall
+// source" precondition on exactly this: mesh_collide() is reachable from
+// here and from the wreck containment only, and this arm has no caller, so
+// the segment/sphere wall path scores 0 hits in 60 s of racing. Keep it (and
+// its no-caller status) as that measurement's referent; do not delete.
+static void __attribute__((unused)) apply_track_constraints(Vehicle* v) {
     Vec3 c;
-    loop_closest(g_cl, ROUTE_COUNT, v->pos.x, v->pos.z, &c, NULL);
+    loop_closest(g_cl, g_route_n, v->pos.x, v->pos.z, &c, NULL);
 
     // Collide against the real track mesh (barriers/kerbs/buildings).
     mesh_collide(v);
@@ -2098,7 +4841,7 @@ static int harness_ground_probe(float x, float y, float z,
         }
     }
     Vec3 c;
-    loop_closest(g_cl, ROUTE_COUNT, x, zh, &c, NULL);
+    loop_closest(g_cl, g_route_n, x, zh, &c, NULL);
     (void)y;
     *out_height = c.y;
     out_normal[0] = 0.0f;
@@ -2188,7 +4931,47 @@ static void generate_ground_mesh(void) {
 // Vehicle physics (original -- the game's handling model is not yet reversed)
 // ============================================================
 
-static float find_track_progress(Vec3 pos) {
+/* STICKY per-vehicle progress.  find_track_progress is a global
+ * nearest-station search, and on a self-approaching layout (AS_M1's mixed
+ * route passes within metres of itself) it flips between branches: measured
+ * p snapping 0.41 <-> 0.99 while the cars physically drove one road, which
+ * teleported the aim across the map and thrashed the whole field between
+ * 0 and 95 mph.  The same class of bug -- and the same fix -- as the
+ * traffic pool's progress: search a window around the car's own previous
+ * station, full rescan only when cold or after a real jump (respawn).
+ * hint is stored +1 so a zeroed Vehicle reads as cold. */
+static float vehicle_track_progress(Vehicle* v) {
+    int n = g_track.num_points;
+    Vec3* pts = g_track.points;
+    if (n <= 0) return 0.0f;
+    int best = -1; float bd = 1e18f;
+    if (v->track_idx_hint > 0) {
+        int c0 = v->track_idx_hint - 1;
+        for (int k = -64; k <= 64; k++) {
+            int i = route_wrap(c0 + k, n);
+            float dx = v->pos.x - pts[i].x, dz = v->pos.z - pts[i].z;
+            float d = dx * dx + dz * dz;
+            if (d < bd) { bd = d; best = i; }
+        }
+        if (bd > 60.0f * 60.0f) best = -1;      /* jumped: rescan */
+    }
+    if (best < 0) {
+        bd = 1e18f;
+        for (int i = 0; i < n; i++) {
+            float dx = v->pos.x - pts[i].x, dz = v->pos.z - pts[i].z;
+            float d = dx * dx + dz * dz;
+            if (d < bd) { bd = d; best = i; }
+        }
+    }
+    v->track_idx_hint = best + 1;
+    return (float)best / (float)n;
+}
+
+// Superseded by the sticky vehicle_track_progress() above, and named by the
+// comment on it and by aggro_track_dist()'s as the quantised global search
+// whose branch-flipping both of them exist to avoid. Kept as those comments'
+// referent.
+static float __attribute__((unused)) find_track_progress(Vec3 pos) {
     // Find closest point on track
     int n = g_track.num_points;
     Vec3* pts = g_track.points;
@@ -2206,21 +4989,6 @@ static float find_track_progress(Vec3 pos) {
     }
     
     return (float)closest / (float)n;
-}
-
-static float get_track_normal(Vec3 pos) {
-    // Return distance from track center
-    int n = g_track.num_points;
-    Vec3* pts = g_track.points;
-    
-    float min_dist = 1e18f;
-    for (int i = 0; i < n; i++) {
-        Vec3 diff = vec3_sub(pos, pts[i]);
-        float dist = sqrtf(diff.x * diff.x + diff.z * diff.z);
-        if (dist < min_dist) min_dist = dist;
-    }
-    
-    return min_dist - g_track.width * 0.5f;
 }
 
 // Smallest signed angle a-b, wrapped to [-pi, pi].
@@ -2250,6 +5018,16 @@ static float nearest_car_ahead(const Vehicle* self) {
     return t < best ? t : best;
 }
 
+/* --- ai wreck log (agent) ---
+ * B3_AI_WRECK_LOG=1 wreck post-mortem capture.  The implementation is one
+ * block further down (it needs g_traffic / g_ai_avoid / g_carcol_dbg); these
+ * two entry points are consumed by ai_crash_note and wreck_begin_for, which
+ * come first.  Both return on their first branch when the env is unset. */
+static void awl_kind(int slot, int kind);
+static void awl_wreck(Vehicle* v, int slot, Vec3 cp, Vec3 cn, Vec3 rv,
+                      int entry);
+/* --- end ai wreck log (agent) --- */
+
 // CRASH-EVENT: start a physical wreck for a racer slot. The impact response
 // (contact impulse with torque -> spin/tumble) is the ported FUN_0011AEF0 /
 // FUN_00106720 / FUN_00106500 chain; picking the contact from the harness's
@@ -2274,6 +5052,7 @@ static void ai_crash_note(Vehicle* v, int slot) {
                g_race_time, slot, g_aicrash_n[slot],
                kind == 0 ? "takedown" : (kind == 1 ? "traffic" : "world"),
                v->sim.speed, v->pos.x, v->pos.y, v->pos.z);
+    awl_kind(slot, kind);   /* --- ai wreck log (agent) --- */
 }
 
 // The per-slot crash latch (crash_record+0x130), on the DILATED game clock.
@@ -2310,6 +5089,7 @@ static void wreck_begin_for(Vehicle* v, Vec3 contact_pt, Vec3 contact_n,
     int slot = (int)(v - g_vehicles);
     if (slot < 0 || slot >= 8) return;
     ai_crash_note(v, slot);
+    awl_wreck(v, slot, contact_pt, contact_n, rel_vel, (int)kind); /* --- ai wreck log (agent) --- */
     // TAKEDOWN-FX: the big-hit IMPACT slow-down (divisor 6 for 0.35 s,
     // FUN_00026050's window [C]). Retail's raiser of the impact flag is
     // [?]; firing it at the player's own wreck moment is the GLUE trigger
@@ -2387,13 +5167,22 @@ static void wreck_begin_for(Vehicle* v, Vec3 contact_pt, Vec3 contact_n,
 // state lives in GAME space and vehicle_update converts at the boundary:
 // pos/vel z-negated in and out, steering negated in (mirror-odd input),
 // and the ground hook maps game -> harness queries.
-#define B3_CHASSIS_SOUP_MAX 32
+/* [C] FUN_0010A8E0 @0x0010A8E0: `cmp dword ptr [soup],0x60` -- retail's
+ * chassis soup holds 96 polys, and on the 97th it sets the saturation flag
+ * DAT_00478A30 and abandons the walk.  The port held 32 and filled it in
+ * grid-cell scan order rather than by distance, so the wall directly ahead
+ * was dropped in favour of arbitrary neighbours: 12.0% of wall approaches on
+ * the real track exceed 32 filtered polys, 0.0% exceed 96. */
+#define B3_CHASSIS_SOUP_MAX 96
 #define B3_WHEEL_SOUP_MAX 1024
 static B3CrashPoly g_chassis_poly[8][B3_CHASSIS_SOUP_MAX];
 static unsigned short g_chassis_flag[8][B3_CHASSIS_SOUP_MAX];
 typedef struct {
     B3CollisionPoly poly[B3_WHEEL_SOUP_MAX];
     int count;
+    /* veh+0x215, the class byte FUN_00123790 reads @0x00123799 to decide
+     * whether its per-poly surface gate applies at all. */
+    unsigned char class_215;
 } B3WheelSoup;
 static B3WheelSoup g_wheel_soup[8];
 
@@ -2417,12 +5206,34 @@ static void harness_copy_soup(B3CrashPoly* poly, unsigned short* flag,
     }
 }
 
+/* THE WHEEL RAY'S SURFACE GATE.  Retail runs TWO rays into the same frozen
+ * soup and filters exactly one of them:
+ *   wheel_gate 1  FUN_001239C0 @0x00123CEF -> FUN_00123790, whose per-poly
+ *                 gate @0x00123799..0x0012383E [C] skips any polygon whose
+ *                 surface LOW BYTE is > 0x14 (and != 0x26) for a racing car.
+ *                 0x15..0x25 are the game's wall / non-driving surfaces
+ *                 (src/burnout3_sfx.c:1045-1062 names 0x00..0x14 and calls
+ *                 the rest walls), so a WHEEL rolls straight through them.
+ *   wheel_gate 0  the under-body 30 m clearance ray, FUN_001239C0
+ *                 @0x00123EC6..0x00123F97 [C], which calls FUN_001B2230
+ *                 itself @0x00123F00 and never looks at the flags.
+ *
+ * The port had no gate on either, so its wheels STOOD ON geometry retail's
+ * wheels pass through -- most visibly a median curb face carrying surface
+ * 0x0018 (80 such faces on US_C3_V1), which the port mounted for a 4.82 deg
+ * roll excursion at 72.9 deg/s where retail stays dead flat at 0.00 deg.
+ * Differentially measured against the real x86 substep loop by
+ * tools/validate_curb.py. */
 static int harness_soup_ground_ray(void* user, const float start[3],
                                    const float end[3], float* hit_t,
-                                   float normal[3]) {
+                                   float normal[3], int wheel_gate) {
     const B3WheelSoup* soup = user;
-    return b3_collision_ray_polys_game_space(soup->poly, soup->count, start,
-                                             end, hit_t, normal);
+    if (!wheel_gate)
+        return b3_collision_ray_polys_game_space(soup->poly, soup->count,
+                                                 start, end, hit_t, normal);
+    return b3_collision_ray_polys_game_space_wheel(soup->poly, soup->count,
+                                                   start, end, hit_t, normal,
+                                                   soup->class_215);
 }
 
 static int harness_soup_freeze(void* user, B3VehicleFull* fs) {
@@ -2435,16 +5246,71 @@ static int harness_soup_freeze(void* user, B3VehicleFull* fs) {
         B3CollisionPoly gathered[B3_CHASSIS_SOUP_MAX];
         float c[3] = { fs->rb.frame[3][0], fs->rb.frame[3][1],
                        -fs->rb.frame[3][2] };
-        float half[3] = { 4.5f, 2.5f, 4.5f };
         float svel[3] = { fs->rb.vel[0], fs->rb.vel[1], -fs->rb.vel[2] };
         B3WheelSoup* wheel_soup = &g_wheel_soup[slot];
+        /* The WHEEL soup keeps its tall box: the port's suspension casts its
+         * own rays against it and needs the ground under a car that is well
+         * above it.  The CHASSIS set below is the one the contact solve sees,
+         * and that one is retail's query exactly. */
         float ground_half[3] = {5.5f, 34.0f, 5.5f};
         wheel_soup->count = b3_collision_gather(c, ground_half,
                                                  wheel_soup->poly,
                                                  B3_WHEEL_SOUP_MAX);
-        n = b3_collision_filter_walls(wheel_soup->poly, wheel_soup->count,
-                                      c, half, svel, 0.45f, gathered,
-                                      B3_CHASSIS_SOUP_MAX);
+        /* veh+0x215 travels with the set: FUN_00123790 reads it @0x00123799
+         * to decide whether its surface gate applies (classes 1/2/3 only). */
+        wheel_soup->class_215 = fs->class_215;
+        /* [C] FUN_0011BC60 @0x0011BCD9/@0x0011BD17/@0x0011BC7A: retail's
+         * collision query is a SPHERE of |veh+0x1D0.xyz| + speed*dt centred on
+         * the frame translation -- 2.56 m at rest, 3.56 m at 60 m/s.  The port
+         * derived the chassis set from a {4.5, 2.5, 4.5} box over the wheel
+         * soup, which handed the wall response records retail never sees; the
+         * response is the MIN/MAX of the plane over EVERY wall record
+         * (FUN_0011AC30 @0x0011AE61), so a far-off face does not merely cost
+         * time, it steers the car. */
+        static B3CollisionPoly sphere_polys[B3_WHEEL_SOUP_MAX];
+        float sr = sqrtf(fs->half_ext[0]*fs->half_ext[0]
+                       + fs->half_ext[1]*fs->half_ext[1]
+                       + fs->half_ext[2]*fs->half_ext[2])
+                 + fs->rb.vel[3] * g_delta_time;   /* DAT_0060EA1C */
+        int sn = b3_collision_gather_sphere(c, sr, svel, sphere_polys,
+                                            B3_WHEEL_SOUP_MAX);
+        /* the sphere already bounded it; leave the box test inert */
+        float half[3] = { 1e9f, 1e9f, 1e9f };
+        n = b3_collision_filter_walls(sphere_polys, sn,
+                                      /* [C] FUN_0011BBE0 @0x0011BC43 has NO
+                                       * upper bound on the face normal's y --
+                                       * its only normal test is `n.y < -0.7`
+                                       * (0x0039B264).  The resolve's own
+                                       * ground/wall split is `n.y > 0.7`
+                                       * (FUN_0011AC30, 0x3B17D8, ported at
+                                       * src/burnout3_crash.c:187), so 0.70
+                                       * admits exactly the set retail treats
+                                       * as a WALL.  The port's invented 0.45
+                                       * made 11.8% of the track's structure
+                                       * faces -- every sloped barrier --
+                                       * unconditionally invisible. */
+                                      /* ...and NO upper bound, which is
+                                       * retail's own rule.  The port passed
+                                       * 0.70 here, which dropped every
+                                       * GROUND face before b3_crash_response
+                                       * saw it, so FUN_0011AEF0's ground arm
+                                       * could never run live: measured, the
+                                       * port reported contact_state_198 = 0
+                                       * for 13 frames over a real 0.198 m
+                                       * median where executed retail reports
+                                       * 2 (tools/validate_curb.py, "LIVE
+                                       * chassis filter").  The arms are
+                                       * mutually exclusive with WALL winning,
+                                       * so this cannot add a crash -- what it
+                                       * restores is retail OVERWRITING the
+                                       * contact record (+0x160/+0x170/+0x190/
+                                       * +0x194) every frame the body is over
+                                       * ground, instead of leaving the
+                                       * previous WALL record standing.
+                                       * FUN_0011AEF0 rewrites only +0x198
+                                       * unconditionally. */
+                                      c, half, svel, B3_COL_NO_NY_MAX,
+                                      gathered, B3_CHASSIS_SOUP_MAX);
         harness_copy_soup(poly, flag, gathered, n);
         fs->soup.polys = poly;
         fs->soup.flags = flag;
@@ -2498,6 +5364,11 @@ static void full_sim_reset(Vehicle* v) {
                     -v->pos.z};
     b3_vehicle_full_init(&v->fsim, &v->cfg, (const float(*)[2])wxz, radius,
                          ext, cen, inv_inertia, pos, v->rot.y);
+    /* full_init memsets the whole vehicle, and the AI driver keeps five of
+     * its own timers in there (v+0x1534..0x157C). On a respawn re-init they
+     * would come back as 0.0 -- "expired", not "idle" -- so re-arm them. */
+    b3_ai_vehicle_state_init(&v->fsim);
+    v->fsim.emu_slot = slot;   /* names this car's emulator session */
     // +0x215 VEHICLE CLASS: retail stamps 1 on the player bodies
     // (FUN_00117730) and 2/3 on the two AI racer pools (FUN_00110280);
     // only class 3 skips the steer-away envelope. The init default (1)
@@ -2537,6 +5408,10 @@ static void full_sim_reset(Vehicle* v) {
     // burnout3_vehicle_sim.c by tools/validate_td_rules.py.
     b3_wreck_set_world_resolve(b3_rigid_body_obb_plane_contact,
                                b3_rigid_body_world_contact);
+    // ...and FUN_00107950 over the WHOLE soup, which is what the live wreck
+    // pass uses (see the loop in vehicle_update).  The plane form above is
+    // kept for the single-plane fallback callers.
+    b3_wreck_set_world_soup(b3_rigid_body_obb_soup_contact);
     // Seed the body's velocity from the harness pose (harness -> game:
     // z negated) so relaunches happen AT SPEED -- the retail relaunch
     // places the car then sets speed via FUN_001204C0 (the constants at
@@ -2610,6 +5485,223 @@ static float aggro_track_dist(Vec3 pos, int lap) {
  * FUN_00172870 writes when racecar+0x2450 == 1); the road direction and the
  * along-track distance, taken from the harness route instead of the .bgd
  * node graph. */
+
+/* ======================================================================== */
+/* THE RUBBER BAND -- retail's player-relative laws (docs/RE_AI.md 17).      */
+/*                                                                          */
+/* Retail refreshes a small per-vehicle block at the TOP of every car's      */
+/* update (FUN_00104A90 @0x00104AA6 -> FUN_00106370) and three consumers     */
+/* read it: FUN_001734C0 (the catch-up), FUN_00173690 (the hard speed cap)   */
+/* and FUN_00104A90's own off-camera warp.  This port had NONE of it: the    */
+/* catch-up argument at the b3_ai_plan call site was the literal 0.0f and    */
+/* the cap was pinned to "Top speed mps", so nothing an AI car ever did      */
+/* depended on where the player was.  That is the "too easy once I am        */
+/* ahead" report, and both halves of the band were missing -- rivals never   */
+/* got the +45 m/s release while the player was a place ahead of them, and   */
+/* cars running ahead of a slow player were never pinned back.               */
+/* ======================================================================== */
+static int   g_rb_place[B3_AGGRO_MAX];       /* (i16) racecar +0x10D0, 1-based */
+static int   g_rb_mode[B3_AGGRO_MAX];        /* racecar +0x1920, 0 = the human */
+static int   g_rb_rank[B3_AGGRO_MAX];        /* vehicle +0x1558, B3AI_RANK_*   */
+static float g_rb_gap[B3_AGGRO_MAX];         /* vehicle +0x155C, 0..1          */
+static int   g_rb_pslot[B3_AGGRO_MAX];       /* vehicle +0x1554                */
+static int   g_rb_inrange[B3_AGGRO_MAX];     /* vehicle +0x1550                */
+static int   g_rb_n;
+
+/* FUN_00105FC0 @0x0010600B / @0x00106015: the squared radii, straight out of
+ * .rdata.  140 m to STAY in range, 125 m to ENTER it.                    [C] */
+#define B3_VEH_INRANGE_STAY_D2   19600.0f   /* 0x0039A850 */
+#define B3_VEH_INRANGE_ENTER_D2  15625.0f   /* 0x0039A854 */
+
+/* OFF by default: the law below is [C], but flipping it is a live behaviour
+ * change on all 36 tracks and the harness A/B did NOT show a win -- on
+ * US_C3_V1 over 90 s it took the field's mean max_mph 159.7 -> 137.7 and its
+ * min p_span 0.582 -> 0.406 (rival wall wrecks 1 -> 0), which is exactly
+ * what retail's "leash a rival that is ahead and out of sight to Min speed
+ * mps" does, but is not an improvement on the numbers this repo gates on.
+ * The measurement's own player is AI-driven (B3_AUTODRIVE) and speed-capped
+ * against ITSELF, so it is not a fair stand-in for a human pace; the flip
+ * wants a human-paced comparison before it becomes the default.  Same
+ * convention as B3_NAV_CLAMP and B3_NAV_AIM2.  B3_AI_ONCAM=1 arms it. */
+static int oncam_law_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("B3_AI_ONCAM");
+        on = (e && *e != '0');
+    }
+    return on;
+}
+static const B3AiPaceEvent* g_rb_pace;       /* DAT_0073A170's event record    */
+
+/* DAT_0073A170, the .bgd event param record FUN_00172870 reads.  Hoisted out
+ * of the AI branch because the AGGRESSION world needs the same record a stage
+ * earlier (racecar+0x23E0 == AI+0x9E0 is written from it). */
+static const B3AiPaceEvent* rb_pace(void) {
+    static int tried = 0;
+    if (!tried) {
+        const char* tid = getenv("B3_TRACK");
+        g_rb_pace = b3_ai_pace_find(tid ? tid : "US_C3_V1", getenv("B3_EVENT"));
+        tried = 1;
+    }
+    return g_rb_pace;
+}
+
+/* FUN_00194200 @0x00194200: does `a` outrank `b`?  Laps (+0x350), then
+ * checkpoints (+0x34C), then along-track distance (+0x348), then the
+ * grid-slot tiebreak (+0x19BC).  The harness's ordering key is lap +
+ * track_progress, which is the same ordering. */
+static int rb_outranks(const Vehicle* a, const Vehicle* b) {
+    if (a->lap != b->lap) return a->lap > b->lap;
+    if (a->track_progress != b->track_progress)
+        return a->track_progress > b->track_progress;
+    return (int)(a - g_vehicles) < (int)(b - g_vehicles);
+}
+
+static void rubberband_world_build(int nc) {
+    int i, k;
+    if (nc > B3_AGGRO_MAX) nc = B3_AGGRO_MAX;
+    g_rb_n = nc;
+    /* racecar+0x10D0 -- the 1-based race PLACE.  The HUD indexes
+     * `word[car+0x10D0]-1` for its ordinal (RE_FRONTEND 1239) and retail's
+     * own leader scan at 0x00058FD1 walks the car table looking for the car
+     * whose +0x10D0 equals i+1, so 1-based place is [C].  The harness already
+     * computed the same ordering inline in two places; this is that loop
+     * hoisted so the AI can read it too. */
+    for (i = 0; i < nc; i++) {
+        const Vehicle* v = &g_vehicles[i];
+        int place = 1;
+        for (k = 0; k < nc; k++) {
+            if (k == i) continue;
+            if (rb_outranks(&g_vehicles[k], v)) place++;
+        }
+        g_rb_place[i] = place;
+        /* racecar+0x1920: 0 for the human, 1 for an AI racer -- the same
+         * seeding full.c already hands the takedown module. */
+        g_rb_mode[i] = (i == 0) ? 0 : 1;
+    }
+    /* FUN_00105BD0 + FUN_00106370 for every car. */
+    for (i = 0; i < nc; i++) {
+        Vehicle* v = &g_vehicles[i];
+        int slot = 0, rank = B3AI_RANK_IS_PLAYER, ahead, pslot;
+        float gap = 0.0f, d2 = 0.0f;
+        /* @0x001063C1: the split-screen pairing is `grid_slot & 1`; with one
+         * human car in the harness every AI car pairs with car 0. */
+        pslot = (nc == 1) ? 0 : (i & 1);
+        if (pslot >= nc || g_rb_mode[pslot] != 0) pslot = 0;
+        {
+            /* vehicle+0x1560[player] -- FUN_00105BD0's SQUARED distance. */
+            const Vehicle* p = &g_vehicles[pslot];
+            float dx = v->pos.x - p->pos.x;
+            float dy = v->pos.y - p->pos.y;
+            float dz = v->pos.z - p->pos.z;
+            d2 = dx * dx + dy * dy + dz * dz;
+        }
+        /* ---- vehicle+0x1550, THE ON-CAMERA / IN-RANGE BYTE.  [C]
+         * FUN_00105FC0 @0x00105FCF..0x00106036:
+         *     if (nearest_player == 0 || v+0x216 == 0xFF) return;   // unseen
+         *     R2 = v+0x1550 ? 19600 [0x0039A850] : 15625 [0x0039A854];
+         *     if (dist2 > R2) return;                               // too far
+         *     out.in_range = 1;
+         * and FUN_00105BD0 @0x00105F9C turns a CHANGE into FUN_00106290
+         * (set) or FUN_00106150 (clear).  sqrt: 140 m to stay, 125 m to
+         * enter -- a hysteretic band, not one threshold.  Both radius pairs
+         * in FUN_00105FC0 hold the same numbers: the second pair,
+         * DAT_005A39E0 / DAT_005A39FC, is BSS seeded from 0x0039A850 / 0x54
+         * by the two reset thunks at 0x002B8D80 / 0x002B8DA0, so the
+         * ahead / behind branch on FUN_001942F0 is a no-op unless a debug
+         * menu retunes one copy.
+         * The player's own car short-circuits to 1 (FUN_00105BD0's
+         * racecar+0x1920 == 0 arm @0x00105BE8 sets cVar5 = 1).
+         * OFF by default (see oncam_law_on); B3_AI_ONCAM=1 arms it and is
+         * what pinned BOTH laws to their on-camera arms before H5. */
+        if (g_rb_mode[i] == 0 || !oncam_law_on() || !g_oncam_ready) {
+            /* the player's own car, the kill switch, and every frame before
+             * the first draw has published a camera -- all take
+             * FUN_001049A0's spawn seed, 1. */
+            v->in_range_1550 = 1;
+        } else {
+            float r2 = v->in_range_1550 ? B3_VEH_INRANGE_STAY_D2
+                                        : B3_VEH_INRANGE_ENTER_D2;
+            float ex = v->pos.x - g_oncam_eye.x;
+            float ez = v->pos.z - g_oncam_eye.z;
+            float el = sqrtf(ex * ex + ez * ez);
+            /* FUN_0019D7F0's four planes reduce, for a symmetric perspective
+             * view, to "in front and inside the horizontal half-angle"; the
+             * near plane is metres away and the far one is the radius this
+             * result already gates, so neither adds anything here. */
+            int vis = (el < 1e-3f)
+                   || ((ex * g_at_cam_fwd[0] + ez * g_at_cam_fwd[2]) / el
+                       >= g_oncam_cos);
+            float pdx = v->pos.x - g_vehicles[pslot].pos.x;
+            float pdy = v->pos.y - g_vehicles[pslot].pos.y;
+            float pdz = v->pos.z - g_vehicles[pslot].pos.z;
+            float pd2 = pdx * pdx + pdy * pdy + pdz * pdz;
+            v->in_range_1550 = (unsigned char)(vis && pd2 <= r2);
+        }
+        g_rb_inrange[i] = v->in_range_1550;
+        ahead = rb_outranks(v, &g_vehicles[pslot]);
+        b3_ai_player_rel(g_rb_mode[i], nc, i, ahead, d2, &slot, &rank, &gap);
+        if (slot >= nc || g_rb_mode[slot] != 0) slot = pslot;
+        g_rb_pslot[i] = slot;
+        g_rb_rank[i]  = rank;
+        g_rb_gap[i]   = gap;
+    }
+}
+
+/* FUN_001734C0 / FUN_00173690's input view for one car. */
+static void rubberband_in(B3AiCatchupIn* in, const Vehicle* v, int slot) {
+    memset(in, 0, sizeof *in);
+    /* @0x00173516..0x00173538: the race-progress fraction.  Retail divides
+     * the along-track distance travelled since the start baseline
+     * (racecar+0x135C) by `racecar+0x1394 * track_length` -- laps times a
+     * lap.  (lap + track_progress) is that quotient's numerator measured in
+     * laps, so this is the same number in the same units. */
+    in->dist_valid    = (g_lap_count > 0);
+    in->race_fraction = (g_lap_count > 0)
+        ? (((float)v->lap + v->track_progress) - v->rb_start_progress)
+          / (float)g_lap_count
+        : 0.0f;
+    in->mode_2450     = 0;                      /* racecar +0x2450           */
+    in->veh_valid     = 1;                      /* racecar +0x2440 != 0      */
+    /* vehicle+0x1550, "fully simulated".  This used to be the literal 1 for
+     * every car, which made the OFF-CAMERA arms of BOTH laws unreachable:
+     * FUN_00173690's `(rank == ahead) ? section_min : section_max` and
+     * FUN_001734C0's `Top speed + 45` release.  The harness does keep
+     * stepping an out-of-range car with full physics -- retail hands it to
+     * the unported rail mover FUN_00170B30 instead (RE_AI 15.6 row 13) --
+     * but the CAP and the catch-up are the same two laws either way, and
+     * they are what the rubber band is made of.  rubberband_world_build
+     * runs FUN_00105FC0's test. */
+    in->veh_in_range  = (slot >= 0 && slot < g_rb_n)
+                      ? g_rb_inrange[slot] : 1;
+    in->veh_rank      = (slot >= 0 && slot < g_rb_n)
+                      ? g_rb_rank[slot] : B3AI_RANK_BEHIND_PLAYER;
+    in->veh_gap_norm  = (slot >= 0 && slot < g_rb_n) ? g_rb_gap[slot] : 0.0f;
+    in->my_place      = (slot >= 0 && slot < g_rb_n) ? g_rb_place[slot] : 1;
+    /* DAT_003A29EC[DAT_0073BB50].  DAT_0073BB50 is BSS and the address
+     * appears in exactly ONE instruction in the whole image -- the read at
+     * 0x001735AC -- so nothing ever writes it and the index is always 0, the
+     * table's first entry, 1.  A rival is on catch-up only while its player
+     * is exactly one place ahead of it. */
+    in->place_window  = 1;
+    in->place         = g_rb_place;
+    in->race_mode     = g_rb_mode;
+    in->ncars         = g_rb_n;
+    in->race_clock    = g_race_time;            /* racecar +0x10DC           */
+}
+
+/* B3_RUBBERBAND=0 restores the pre-patch behaviour (bonus 0, cap pinned to
+ * Top speed mps) so a race can be driven with and without the band without a
+ * rebuild -- that is how the before/after numbers were taken. */
+static int rubberband_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("B3_RUBBERBAND");
+        on = (e && *e == '0') ? 0 : 1;
+    }
+    return on;
+}
+
 static void aggro_world_build(float dt) {
     int n = g_track.num_points;
     if (!g_aggro_hit_init) {
@@ -2659,7 +5751,8 @@ static void aggro_world_build(float dt) {
         /* road direction at this car (module frame: z negated) */
         if (n > 1) {
             int idx = (int)(v->track_progress * (float)n) % n;
-            Vec3 a = g_track.points[idx], b = g_track.points[(idx + 3) % n];
+            Vec3 a = g_track.points[idx];
+            Vec3 b = g_track.points[route_wrap(idx + 3, n)];
             float dx = b.x - a.x, dz = -(b.z - a.z);
             float L = sqrtf(dx * dx + dz * dz);
             if (L > 1e-4f) { c->road_dir[0] = dx / L; c->road_dir[2] = dz / L; }
@@ -2671,7 +5764,27 @@ static void aggro_world_build(float dt) {
         }
         c->speed_ms   = v->sim.speed;
         c->track_dist = aggro_track_dist(v->pos, v->lap);
-        c->aggression = 1.0f;              /* GLUE stand-in, see above */
+        /* racecar+0x23E0 == AI+0x9E0.  FUN_00172870 @0x001728DD writes it
+         * from the SAME .bgd event record the catch-up window comes from:
+         * `AI+0x9E0 = AI+0x9EC = rec[0x90] * 0.01` (RE_AI 14.8), with two
+         * special cases -- racecar+0x2450 == 1 (chase) forces 1.0, and no
+         * record at all leaves 0.0, "this car never attacks".  b3_ai_pace
+         * already carries rec[0x90]; only the wiring was missing, and the
+         * constant 1.0 handed every car on every event the maximum.
+         * When the track has no pace.bin the old 1.0 stands rather than
+         * retail's 0.0, because a missing ASSET is not the same fact as a
+         * record that says zero -- and 0.0 would silently disable the whole
+         * attack machine.  B3_AI_AGGRO_PACE=0 restores the constant. */
+        c->aggression = 1.0f;
+        {
+            static int use = -1;
+            if (use < 0) {
+                const char* e = getenv("B3_AI_AGGRO_PACE");
+                use = !(e && *e == '0');
+            }
+            if (use && rb_pace() && i > 0)
+                c->aggression = b3_ai_pace_aggression(rb_pace(), i);
+        }
         c->car_width  = 1.9f;              /* racecar+0x2444 (.bgv body box) */
         c->car_length = v->body_len > 1.0f ? v->body_len : 4.4f;  /* +0x2448 */
         c->ooc_time   = v->slam_time;      /* (rc+0x1198)+0x1598 */
@@ -2691,7 +5804,13 @@ static void aggro_world_build(float dt) {
         c->no_slam_speed = 0;
         c->drift_zone = 0;
         c->node_open  = 1;
-        c->steer_ok   = 1;
+        /* physics vehicle byte +0x1550 -- the same flag the rubber band
+         * reads; rubberband_world_build runs FUN_00105FC0's test.  It is one
+         * frame old here (aggro_world_sync runs before the AI stage), which
+         * is what retail's own ordering gives too: FUN_00105BD0 refreshes it
+         * at the TOP of each car's update, so a car later in the table sees
+         * the value the previous frame left. */
+        c->steer_ok   = g_vehicles[i].in_range_1550;
         c->player_slot = 0;
     }
     /* racecar+0x18A4[k]: our lateral offset to every other car (the table
@@ -2712,7 +5831,837 @@ static void aggro_world_build(float dt) {
     g_aggro_world.clock = g_race_time;
     g_aggro_world.dt = dt;
     g_aggro_world.track_loaded = 1;
+
+    rubberband_world_build(nc);
 }
+
+/* ================================================================= *
+ * --- race flow (agent) ---                                         *
+ * ================================================================= *
+ *
+ * Laps, finishing, positions, medals, the results screen and the
+ * on-disk progress file.  Before this block the race had no end
+ * condition but the 180 s `g_time_limit` ("Time's up!"); a lap count
+ * was tracked per car but nothing consumed it.
+ *
+ * RETAIL EVIDENCE (build/burnout3.elf + build/Globalus.bin).  Full
+ * derivation in the agent's EVIDENCE.md; the load-bearing findings:
+ *
+ *  - MEDAL ENUM  0 = none, 1 = bronze, 2 = silver, 3 = gold.  [C]
+ *    Three independent sources agree: (a) Globalus IDs are contiguous
+ *    at base 612 -- 612 "YOU FAILED TO WIN A MEDAL", 613 BRONZE,
+ *    614 SILVER, 615 GOLD; (b) the frontend texture manifest at
+ *    0x0038A360 lists Tick_MedalEmpty, Tick_MedalB, Tick_MedalS,
+ *    Tick_MedalG in that order; (c) the "unlock all" cheat at
+ *    0x0001BFD0 stores 3 into every event slot, so 3 is the maximum.
+ *
+ *  - POSITION -> MEDAL is an explicit dec-chain at 0x00062140,
+ *    reading the 0-BASED finishing position:                    [C]
+ *        0x00062143  je -> ebx = 3   ; 1st -> gold
+ *        0x00062146  je -> ebx = 2   ; 2nd -> silver
+ *        0x00062149  je -> ebx = 1   ; 3rd -> bronze
+ *        0x0006214B  xor ebx, ebx    ; 4th+ -> none
+ *    then 0x00062168 calls the submit routine below.
+ *
+ *  - MEDAL SUBMIT FUN_0001DFC0 gates on
+ *        0x0001E030  cmp ecx, ebx
+ *        0x0001E032  jge -> return          ; existing >= new
+ *    i.e. a medal is banked ONLY IF IT BEATS THE STORED ONE.   [C]
+ *    b3_raceflow_bank() reproduces exactly that test.
+ *
+ *  - The profile keeps one medal byte per event: u8[0x49] at +0x386
+ *    (73 race events) and u8[0x64] at +0x3CF (100 crash events),
+ *    sizes confirmed by the cheat's `cmp ecx,0x49` / `cmp ecx,0x64`
+ *    loops.  This port is track-driven rather than event-table
+ *    driven, so the same one-medal-per-(event) idea is keyed by
+ *    (track_id, game_type) -- see B3SaveRec.                    [S]
+ *
+ *  - IN-RACE HUD: Globalus 2002 "POS", 2003 "LAP", 1993..1998
+ *    "1st".."6th", 2033 "FINAL LAP".  Retail does show a final-lap
+ *    callout and caps a standard race at 6 racers, which is the
+ *    grid size this port already uses.                          [C]
+ *
+ *  - RESULTS SCREEN strings: 576 "RACE RESULTS", column headers
+ *    582 "NAME", 583 "BEST LAP", 584 "TOTAL TIME", 585 "TAKEDOWNS",
+ *    586 "CRASHES", ordinals 587.."1st".."8th", 601 "Finished",
+ *    602 "You failed to finish the race!", 603 + pos "YOU FINISHED
+ *    IN NTH PLACE", 612 + medal for the award line.             [C]
+ *    Every string this block draws is resolved through rf_str()
+ *    from the user's own Globalus.bin -- nothing is baked.
+ *    The pixel LAYOUT is not recoverable from the ELF (retail drives
+ *    it from frontend package data), so it follows the established
+ *    menu style of track/car select.                            [S]
+ *
+ * TWO HARD CONSTRAINTS THIS BLOCK RESPECTS:
+ *
+ *  1. THE TIMED HARNESS PATH IS UNTOUCHED.  b3_raceflow_owns_end()
+ *     returns 0 whenever B3_EXIT_AT or B3_TRACK_TEST is set, and
+ *     game_update() then runs its original two end checks verbatim,
+ *     printing the original lines.  Nothing here draws, blocks or
+ *     exits on those runs.  validate_tracks.py / validate_hud.py see
+ *     no change at all.
+ *
+ *  2. THE SAVE NEVER BYPASSES INTO THE DELETABLE ISO CACHE.  All save
+ *     I/O below uses open()/read()/write()/mkdir()/rename() -- NOT
+ *     fopen().  src/burnout3_isoshim.h only macro-redirects fopen,
+ *     access and IMG_Load, so these calls reach the real filesystem
+ *     and build/save/ is a real directory next to build/tracks/.
+ *     That is why no carve-out in burnout3_isodata.c was needed:
+ *     resolve_inner() is never consulted for the save at all.
+ */
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <errno.h>
+
+/* Every retail string this block draws is resolved by INDEX out of the
+ * user's own Globalus.bin through full.c's existing globalus_string()
+ * (line ~984) -- none is baked into the source, which is what
+ * tools/validate_no_baked_data.py enforces.  rf_str() is just the
+ * null-safe wrapper: a missing table renders "#<index>", loud and
+ * visibly wrong, never a silent English substitution. */
+static const char *rf_str(int idx) {
+    const char *s = globalus_string(idx);
+    if (s && *s) return s;
+    {
+        static char fb[16];
+        snprintf(fb, sizeof fb, "#%d", idx);
+        return fb;
+    }
+}
+
+/* Game types.  Only RACE is implemented; the enum, the save key and
+ * every completion hook already take it so Road Rage / Crash /
+ * Burning Lap slot in without a format change. */
+typedef enum {
+    B3_GT_RACE        = 0,
+    B3_GT_ROAD_RAGE   = 1,   /* not implemented */
+    B3_GT_CRASH       = 2,   /* not implemented */
+    B3_GT_BURNING_LAP = 3,   /* not implemented */
+    B3_GT_ELIMINATOR  = 4,   /* not implemented */
+    B3_GT_FACE_OFF    = 5,   /* not implemented */
+    B3_GT_GRAND_PRIX  = 6,   /* not implemented */
+    B3_GT_COUNT
+} B3GameType;
+
+/* Medal levels -- retail's own numbering, see the header note. [C] */
+typedef enum {
+    B3_MEDAL_NONE   = 0,
+    B3_MEDAL_BRONZE = 1,
+    B3_MEDAL_SILVER = 2,
+    B3_MEDAL_GOLD   = 3
+} B3Medal;
+
+#define B3_SAVE_MAGIC   "B3SV"
+#define B3_SAVE_VERSION 1u
+#define B3_SAVE_PATH    "build/save/progress.b3sv"
+#define B3_SAVE_TMP     "build/save/progress.b3sv.tmp"
+#define B3_SAVE_MAX_REC 256
+#define B3_RF_MAX_CARS  8
+
+/* ---- on-disk format ------------------------------------------------
+ * Fixed-width, little-endian-as-written (the port is x86/ARM LE only,
+ * as the rest of the .bin readers already assume).  record_size is in
+ * the header so a future record can grow without invalidating v1. */
+typedef struct {
+    unsigned char  pos;         /* 1-based finishing position, 0 = DNF   */
+    unsigned char  laps;        /* laps completed                        */
+    unsigned char  finished;    /* crossed the final finish line         */
+    unsigned char  is_player;   /* slot 0                                */
+    float          total_time;  /* seconds at finish, 0 = DNF            */
+    float          best_lap;    /* seconds, 0 = none                     */
+} B3SaveCar;
+
+typedef struct {
+    char           track_id[16];
+    unsigned int   game_type;        /* B3GameType                       */
+    unsigned int   best_position;    /* 1-based, 0 = never finished      */
+    unsigned int   medal;            /* B3Medal, monotonic (retail rule) */
+    float          best_total_time;  /* seconds, 0 = none                */
+    float          best_lap_time;    /* seconds, 0 = none                */
+    unsigned int   runs;             /* completed runs                   */
+    unsigned int   last_ncars;
+    unsigned int   last_laps;
+    unsigned int   reserved;
+    B3SaveCar      car[B3_RF_MAX_CARS];   /* standings of the last run   */
+} B3SaveRec;
+
+typedef struct {
+    char           magic[4];         /* 'B','3','S','V'                  */
+    unsigned int   version;
+    unsigned int   record_count;
+    unsigned int   record_size;
+    unsigned int   checksum;         /* FNV-1a over the record array     */
+    unsigned int   reserved[3];
+} B3SaveHdr;
+
+_Static_assert(sizeof(B3SaveCar) == 12, "B3SaveCar must stay 12 bytes");
+_Static_assert(sizeof(B3SaveRec) == 148, "B3SaveRec must stay 148 bytes");
+_Static_assert(sizeof(B3SaveHdr) == 32, "B3SaveHdr must stay 32 bytes");
+
+/* ---- live race state ---------------------------------------------- */
+typedef struct {
+    int   finished;      /* has crossed the final finish line            */
+    int   position;      /* 1-based; final once the race is settled      */
+    int   laps;          /* laps completed                               */
+    float finish_time;   /* g_race_time when it finished                 */
+    float best_lap;      /* seconds, 0 = none yet                        */
+    float lap_start;     /* g_race_time at the start of the current lap  */
+} B3RaceCar;
+
+static B3RaceCar   g_rf_car[B3_RF_MAX_CARS];
+static int         g_rf_ready;          /* per-run init done             */
+static int         g_rf_next_place = 1; /* next finishing slot to hand out */
+static int         g_rf_settled;        /* final positions assigned      */
+static int         g_rf_medal;          /* player's medal this run       */
+static int         g_rf_player_pos;     /* player's final 1-based place  */
+static int         g_rf_banked;         /* the save was written          */
+static int         g_rf_forced;         /* ended by FORCE COMPLETION      */
+static int         g_rf_row[B3_RF_MAX_CARS]; /* results rows, finishing order */
+static int         g_rf_nrow;
+static int         g_rf_improved;       /* the medal beat the stored one */
+static int         g_rf_prev_medal;     /* stored medal before this run  */
+static float       g_rf_results_t = -1.0f;  /* results screen age, <0 idle */
+static float       g_rf_final_lap_t = -1.0f;/* FINAL LAP callout age       */
+static int         g_rf_final_lap_done;
+static int         g_game_type = B3_GT_RACE;
+
+/* ---- harness gating ------------------------------------------------
+ * THE TWO ENVS THE VALIDATORS USE.  When either is set the race-flow
+ * end condition stands down completely and game_update()'s original
+ * lap/time checks are authoritative, so B3_EXIT_AT and B3_TRACK_TEST
+ * runs are byte-identical to before this block existed. */
+static int raceflow_timed_harness(void) {
+    return getenv("B3_EXIT_AT") != NULL || getenv("B3_TRACK_TEST") != NULL;
+}
+
+/* The broader "this is a test run" set -- these must never earn the
+ * user a medal.  B3_SAVE overrides in both directions: B3_SAVE=0 never
+ * writes, B3_SAVE=1 writes even under a harness env (used to
+ * demonstrate a full offscreen race). */
+static int raceflow_save_enabled(void) {
+    static const char *const harness[] = {
+        "B3_EXIT_AT", "B3_TRACK_TEST", "B3_AUTODRIVE", "B3_SCENARIO",
+        "B3_TESTDRIVE", "B3_MENU_AUTOSELECT", "B3_MENU_SHOT", "B3_SHOT",
+        "B3_SHOT_SEQ", "B3_SHOT_FRAME", "B3_SLAM_SHOT", "B3_DUMP_FRAME",
+        "B3_TELEM", "B3_PAIR_DUMP", "B3_AI_WORLD_DUMP", "B3_CARLIST_DUMP",
+        "B3_BRANCH_AUDIT", "B3_TEST_CRASH_AT", "B3_TEST_AT_TAKEDOWN",
+        "B3_TEST_AFTERTOUCH", "B3_TEST_PAD_BOOST", "B3_PACE_MAX_TICKS",
+        "B3_LOADSCREEN_SHOT", "B3_POS_DEBUG",
+        /* the two ported CHEATS-menu overrides: a forced result must
+         * never bank a medal unless the operator says so explicitly */
+        "B3_FORCE_COMPLETION", "B3_FIN_POSITION", NULL
+    };
+    const char *s = getenv("B3_SAVE");
+    int i;
+    if (s) return atoi(s) != 0;
+    for (i = 0; harness[i]; i++)
+        if (getenv(harness[i])) return 0;
+    return 1;
+}
+
+int b3_raceflow_owns_end(void) { return !raceflow_timed_harness(); }
+
+static const char *raceflow_track_id(void) {
+    const char *t = getenv("B3_TRACK");
+    return (t && *t) ? t : "US_C3_V1";
+}
+
+/* ---- save file -----------------------------------------------------
+ * open()/write()/mkdir()/rename() ONLY: see constraint 2 in the block
+ * header.  These are not redirected by the iso shim, so the file lands
+ * in the real build/save/ and survives `rm -rf build/.isocache`. */
+static unsigned int save_fnv1a(const void *p, size_t n) {
+    const unsigned char *b = (const unsigned char *)p;
+    unsigned int h = 2166136261u;
+    size_t i;
+    for (i = 0; i < n; i++) { h ^= b[i]; h *= 16777619u; }
+    return h;
+}
+
+static int         g_rf_recs_loaded;
+static B3SaveRec   g_rf_rec[B3_SAVE_MAX_REC];
+static unsigned    g_rf_nrec;
+
+static void save_load(void) {
+    B3SaveHdr h;
+    int fd;
+    ssize_t got;
+
+    if (g_rf_recs_loaded) return;
+    g_rf_recs_loaded = 1;
+    g_rf_nrec = 0;
+
+    fd = open(B3_SAVE_PATH, O_RDONLY);
+    if (fd < 0) return;                       /* no save yet: not an error */
+    got = read(fd, &h, sizeof h);
+    if (got != (ssize_t)sizeof h
+        || memcmp(h.magic, B3_SAVE_MAGIC, 4) != 0
+        || h.version != B3_SAVE_VERSION
+        || h.record_size != sizeof(B3SaveRec)
+        || h.record_count > B3_SAVE_MAX_REC) {
+        fprintf(stderr, "[Burnout3] save: %s is not a usable B3SV v%u file, "
+                "ignoring\n", B3_SAVE_PATH, B3_SAVE_VERSION);
+        close(fd);
+        return;
+    }
+    got = read(fd, g_rf_rec, (size_t)h.record_count * sizeof(B3SaveRec));
+    close(fd);
+    if (got != (ssize_t)((size_t)h.record_count * sizeof(B3SaveRec))) {
+        fprintf(stderr, "[Burnout3] save: %s truncated, ignoring\n",
+                B3_SAVE_PATH);
+        return;
+    }
+    if (save_fnv1a(g_rf_rec, (size_t)h.record_count * sizeof(B3SaveRec))
+        != h.checksum) {
+        fprintf(stderr, "[Burnout3] save: %s failed checksum, ignoring\n",
+                B3_SAVE_PATH);
+        return;
+    }
+    g_rf_nrec = h.record_count;
+    printf("[Burnout3] save: %u record%s from %s\n", g_rf_nrec,
+           g_rf_nrec == 1 ? "" : "s", B3_SAVE_PATH);
+}
+
+/* Write the whole table through a temp file + rename, so a crash mid
+ * write cannot leave a half record behind. */
+static int save_store(void) {
+    B3SaveHdr h;
+    int fd;
+    size_t body = (size_t)g_rf_nrec * sizeof(B3SaveRec);
+
+    mkdir("build", 0777);
+    if (mkdir("build/save", 0777) != 0 && errno != EEXIST) {
+        fprintf(stderr, "[Burnout3] save: cannot create build/save (%s)\n",
+                strerror(errno));
+        return 0;
+    }
+    memcpy(h.magic, B3_SAVE_MAGIC, 4);
+    h.version      = B3_SAVE_VERSION;
+    h.record_count = g_rf_nrec;
+    h.record_size  = (unsigned int)sizeof(B3SaveRec);
+    h.checksum     = save_fnv1a(g_rf_rec, body);
+    memset(h.reserved, 0, sizeof h.reserved);
+
+    fd = open(B3_SAVE_TMP, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "[Burnout3] save: cannot write %s (%s)\n",
+                B3_SAVE_TMP, strerror(errno));
+        return 0;
+    }
+    if (write(fd, &h, sizeof h) != (ssize_t)sizeof h
+        || (body && write(fd, g_rf_rec, body) != (ssize_t)body)) {
+        fprintf(stderr, "[Burnout3] save: short write to %s\n", B3_SAVE_TMP);
+        close(fd);
+        return 0;
+    }
+    close(fd);
+    if (rename(B3_SAVE_TMP, B3_SAVE_PATH) != 0) {
+        fprintf(stderr, "[Burnout3] save: cannot rename into %s (%s)\n",
+                B3_SAVE_PATH, strerror(errno));
+        return 0;
+    }
+    return 1;
+}
+
+static B3SaveRec *save_find(const char *track_id, int gt) {
+    unsigned i;
+    save_load();
+    for (i = 0; i < g_rf_nrec; i++)
+        if (g_rf_rec[i].game_type == (unsigned)gt
+            && strncmp(g_rf_rec[i].track_id, track_id,
+                       sizeof g_rf_rec[i].track_id) == 0)
+            return &g_rf_rec[i];
+    return NULL;
+}
+
+/* The medal a (track, game type) currently holds -- what track select
+ * puts on the event row.  0 when the pair has never been raced. */
+int b3_raceflow_medal_for(const char *track_id, int game_type) {
+    const B3SaveRec *r;
+    if (!track_id || !*track_id) return B3_MEDAL_NONE;
+    r = save_find(track_id, game_type);
+    return r ? (int)r->medal : B3_MEDAL_NONE;
+}
+
+/* The 32x32 event-row chip for a medal level, or 0 for "no medal"
+ * (callers keep their own bullet then).  Names and ordering are
+ * retail's frontend manifest at 0x0038A360: Tick_MedalEmpty,
+ * Tick_MedalB, Tick_MedalS, Tick_MedalG. [C] */
+GLuint b3_raceflow_medal_chip(int medal) {
+    static GLuint chip[4];
+    static int loaded;
+    if (!loaded) {
+        loaded = 1;
+        chip[B3_MEDAL_NONE]   = 0;   /* Tick_MedalEmpty is deliberately
+                                      * not used: an unraced row keeps
+                                      * the port's existing bullet */
+        chip[B3_MEDAL_BRONZE] =
+            b3_hud_load_texture("build/frontend/Tick_MedalB.png");
+        chip[B3_MEDAL_SILVER] =
+            b3_hud_load_texture("build/frontend/Tick_MedalS.png");
+        chip[B3_MEDAL_GOLD]   =
+            b3_hud_load_texture("build/frontend/Tick_MedalG.png");
+    }
+    return chip[medal & 3];
+}
+
+/* ---- position -> medal, retail's dec-chain @0x00062140 [C] ---------
+ * `place` here is 1-BASED (retail's is 0-based; the shift is the only
+ * difference). */
+static int raceflow_medal_for_place(int place) {
+    switch (place) {
+    case 1:  return B3_MEDAL_GOLD;
+    case 2:  return B3_MEDAL_SILVER;
+    case 3:  return B3_MEDAL_BRONZE;
+    default: return B3_MEDAL_NONE;
+    }
+}
+
+/* ---- per-run lifecycle --------------------------------------------- */
+static void raceflow_begin(void);
+void b3_raceflow_reset(void) { raceflow_begin(); }
+
+static void raceflow_begin(void) {
+    int i;
+    memset(g_rf_car, 0, sizeof g_rf_car);
+    for (i = 0; i < B3_RF_MAX_CARS; i++) g_rf_car[i].position = 0;
+    g_rf_next_place   = 1;
+    g_rf_settled      = 0;
+    g_rf_medal        = B3_MEDAL_NONE;
+    g_rf_player_pos   = 0;
+    g_rf_banked       = 0;
+    g_rf_forced       = 0;
+    g_rf_improved     = 0;
+    g_rf_prev_medal   = B3_MEDAL_NONE;
+    g_rf_results_t    = -1.0f;
+    g_rf_final_lap_t  = -1.0f;
+    g_rf_final_lap_done = 0;
+    g_rf_ready        = 1;
+}
+
+/* Called from the existing per-vehicle lap-wrap detection.  v->lap has
+ * already been incremented.  Laps <= 0 are the grid's phantom lap (a
+ * car spawned behind the start line starts at lap -1), not a timed one. */
+void b3_raceflow_on_lap(const Vehicle *v) {
+    int slot = (int)(v - g_vehicles);
+    B3RaceCar *rc;
+    float lap_time;
+
+    if (slot < 0 || slot >= B3_RF_MAX_CARS) return;
+    if (!g_rf_ready) raceflow_begin();
+    rc = &g_rf_car[slot];
+    /* A car that has taken the flag keeps driving until the race ends;
+     * those extra laps are not part of its result. */
+    if (rc->finished) return;
+    if (v->lap <= 0) { rc->lap_start = g_race_time; return; }
+
+    lap_time = g_race_time - rc->lap_start;
+    rc->lap_start = g_race_time;
+    rc->laps = v->lap;
+    if (lap_time > 0.0f && (rc->best_lap <= 0.0f || lap_time < rc->best_lap))
+        rc->best_lap = lap_time;
+}
+
+/* Rank the cars that did NOT finish, appending them after the
+ * finishers in current race order.  This is the projection retail uses
+ * when a race is force-completed: the field keeps the order it is
+ * standing in.  rb_outranks() is the port's [C] ordering (laps, then
+ * along-track progress, then grid slot). */
+static void raceflow_settle(void) {
+    int order[B3_RF_MAX_CARS], n = 0, i, j;
+
+    if (g_rf_settled) return;
+    g_rf_settled = 1;
+
+    for (i = 0; i < g_num_vehicles && i < B3_RF_MAX_CARS; i++)
+        if (!g_rf_car[i].finished) order[n++] = i;
+
+    for (i = 1; i < n; i++) {           /* insertion sort, n <= 8 */
+        int key = order[i];
+        for (j = i - 1;
+             j >= 0 && rb_outranks(&g_vehicles[key], &g_vehicles[order[j]]);
+             j--)
+            order[j + 1] = order[j];
+        order[j + 1] = key;
+    }
+    for (i = 0; i < n; i++) {
+        g_rf_car[order[i]].position = g_rf_next_place++;
+        g_rf_car[order[i]].laps     = g_vehicles[order[i]].lap > 0
+                                    ? g_vehicles[order[i]].lap : 0;
+    }
+}
+
+/* Fold this run into the save table.  Reproduces retail's
+ * FUN_0001DFC0 gate: the medal is stored ONLY IF IT BEATS the stored
+ * one (0x0001E030 `cmp ecx,ebx` / `jge return`).  Times and best
+ * position improve independently; the standings always record the
+ * latest run. */
+static void raceflow_bank(void) {
+    const char *tid = raceflow_track_id();
+    B3SaveRec *r;
+    int i;
+
+    save_load();
+    r = save_find(tid, g_game_type);
+    if (!r) {
+        if (g_rf_nrec >= B3_SAVE_MAX_REC) {
+            fprintf(stderr, "[Burnout3] save: table full (%d records), "
+                    "this result is not stored\n", B3_SAVE_MAX_REC);
+            return;
+        }
+        r = &g_rf_rec[g_rf_nrec++];
+        memset(r, 0, sizeof *r);
+        snprintf(r->track_id, sizeof r->track_id, "%s", tid);
+        r->game_type = (unsigned)g_game_type;
+    }
+    g_rf_prev_medal = (int)r->medal;
+
+    if ((unsigned)g_rf_medal > r->medal) {      /* retail's strict-better */
+        r->medal = (unsigned)g_rf_medal;
+        g_rf_improved = 1;
+    }
+    if (g_rf_player_pos > 0
+        && (r->best_position == 0 || (unsigned)g_rf_player_pos < r->best_position))
+        r->best_position = (unsigned)g_rf_player_pos;
+
+    /* A FORCE COMPLETION result is not a real race time: the player did
+     * not run the lap count, so its clock must never become the record. */
+    if (!g_rf_forced) {
+        if (g_rf_car[0].finished && g_rf_car[0].finish_time > 0.0f
+            && (r->best_total_time <= 0.0f
+                || g_rf_car[0].finish_time < r->best_total_time))
+            r->best_total_time = g_rf_car[0].finish_time;
+
+        if (g_rf_car[0].best_lap > 0.0f
+            && (r->best_lap_time <= 0.0f
+                || g_rf_car[0].best_lap < r->best_lap_time))
+            r->best_lap_time = g_rf_car[0].best_lap;
+    }
+
+    r->runs++;
+    r->last_ncars = (unsigned)g_num_vehicles;
+    r->last_laps  = (unsigned)g_lap_count;
+    memset(r->car, 0, sizeof r->car);
+    for (i = 0; i < g_num_vehicles && i < B3_RF_MAX_CARS; i++) {
+        r->car[i].pos        = (unsigned char)g_rf_car[i].position;
+        r->car[i].laps       = (unsigned char)g_rf_car[i].laps;
+        r->car[i].finished   = (unsigned char)(g_rf_car[i].finished ? 1 : 0);
+        r->car[i].is_player  = (unsigned char)(i == 0);
+        r->car[i].total_time = g_rf_car[i].finish_time;
+        r->car[i].best_lap   = g_rf_car[i].best_lap;
+    }
+
+    if (!raceflow_save_enabled()) {
+        printf("[Burnout3] race flow: test-harness run, save suppressed "
+               "(set B3_SAVE=1 to force)\n");
+        return;
+    }
+    if (save_store()) {
+        g_rf_banked = 1;
+        printf("[Burnout3] save: wrote %s (%u record%s)\n", B3_SAVE_PATH,
+               g_rf_nrec, g_rf_nrec == 1 ? "" : "s");
+    }
+}
+
+/* The whole end-of-race sequence, fired the moment the player crosses
+ * the final finish line. */
+static void raceflow_finish_race(void) {
+    static const char *const MEDAL_NAME[4] = { "none", "bronze", "silver", "gold" };
+
+    raceflow_settle();
+    g_rf_player_pos = g_rf_car[0].position;
+    /* B3_FIN_POSITION: retail's own CHEATS-menu item "FIN. POSITION"
+     * (FUN_000769f0 @0x000769F0, the same menu that carries "FORCE
+     * COMPLETION" / "FIN. SCORE" / "FIN. TIME") [C].  Debug only --
+     * it is in the save-suppression list, so it cannot silently earn
+     * anyone a medal. */
+    {
+        const char *fp = getenv("B3_FIN_POSITION");
+        int forced = fp ? atoi(fp) : 0;
+        if (forced > 0 && forced != g_rf_player_pos) {
+            int k, was = g_rf_player_pos;
+            if (forced > g_num_vehicles) forced = g_num_vehicles;
+            printf("[Burnout3] race flow: FIN. POSITION override %d -> %d\n",
+                   was, forced);
+            /* SWAP, never just assign: two cars must not share a place. */
+            for (k = 1; k < g_num_vehicles && k < B3_RF_MAX_CARS; k++)
+                if (g_rf_car[k].position == forced) {
+                    g_rf_car[k].position = was;
+                    break;
+                }
+            g_rf_player_pos      = forced;
+            g_rf_car[0].position = forced;
+        }
+    }
+    g_rf_medal      = raceflow_medal_for_place(g_rf_player_pos);
+    g_state         = FINISHED;
+
+    /* the pre-existing line, kept verbatim */
+    printf("[Burnout3] Race finished! Time: %.1fs\n", g_race_time);
+    printf("[Burnout3] race flow: finished %d/%d, medal %s\n",
+           g_rf_player_pos, g_num_vehicles, MEDAL_NAME[g_rf_medal & 3]);
+
+    raceflow_bank();
+    g_rf_results_t = 0.0f;
+}
+
+/* Called at the end of game_update() while the race is running. */
+void b3_raceflow_update(void) {
+    int i;
+
+    if (!b3_raceflow_owns_end()) return;    /* timed harness owns the end */
+    if (!g_rf_ready) raceflow_begin();
+    if (g_state != RACING) return;
+
+    /* FINAL LAP callout: retail has one (Globalus 2033). [C] */
+    if (!g_rf_final_lap_done && g_lap_count > 1
+        && g_player.lap == g_lap_count - 1) {
+        g_rf_final_lap_done = 1;
+        g_rf_final_lap_t    = 0.0f;
+    }
+
+    /* B3_FORCE_COMPLETION=<race seconds>: end the race there and settle
+     * the field from where it is standing.  Retail's CHEATS menu has
+     * this exact item (FUN_000769f0 @0x000769F0) [C]; here it also
+     * keeps an offscreen gate run short. */
+    {
+        static float force_at = -2.0f;
+        if (force_at < -1.0f) {
+            const char *e = getenv("B3_FORCE_COMPLETION");
+            force_at = e ? (float)atof(e) : -1.0f;
+        }
+        if (force_at > 0.0f && g_race_time >= force_at) {
+            printf("[Burnout3] race flow: FORCE COMPLETION at %.2fs\n",
+                   g_race_time);
+            g_rf_forced = 1;
+            raceflow_settle();
+            for (i = 0; i < g_num_vehicles && i < B3_RF_MAX_CARS; i++) {
+                g_rf_car[i].finished    = 1;
+                g_rf_car[i].finish_time = g_race_time;
+                if (g_rf_car[i].laps == 0)
+                    g_rf_car[i].laps = g_vehicles[i].lap > 0
+                                     ? g_vehicles[i].lap : 0;
+            }
+            raceflow_finish_race();
+            return;
+        }
+    }
+
+    for (i = 0; i < g_num_vehicles && i < B3_RF_MAX_CARS; i++) {
+        Vehicle *v = &g_vehicles[i];
+        if (!v->active || g_rf_car[i].finished) continue;
+        if (v->lap < g_lap_count) continue;
+        g_rf_car[i].finished    = 1;
+        g_rf_car[i].position    = g_rf_next_place++;
+        g_rf_car[i].laps        = v->lap;
+        g_rf_car[i].finish_time = g_race_time;
+        printf("[Burnout3] race flow: car%d finished in position %d "
+               "(%.2fs)\n", i, g_rf_car[i].position, g_race_time);
+        if (i == 0) { raceflow_finish_race(); return; }
+    }
+}
+
+/* HUD feed fix-ups.  The port already draws POS and LAP (elem_position
+ * / elem_lap); this only clamps the lap readout to the real count and
+ * freezes the position once the race is over, so the plate does not
+ * read "4/3" on the last crossing. */
+void b3_raceflow_hud_adjust(int *lap, int *pos) {
+    /* Inert on B3_EXIT_AT / B3_TRACK_TEST so those runs draw exactly
+     * the pixels they drew before this block existed. */
+    if (!b3_raceflow_owns_end()) return;
+    if (lap && g_lap_count > 0 && *lap > g_lap_count) *lap = g_lap_count;
+    if (pos && g_rf_settled && g_rf_player_pos > 0) *pos = g_rf_player_pos;
+}
+
+/* The FINAL LAP callout string, or NULL.  Globalus 2033. [C] */
+const char *b3_raceflow_callout(float *age, float *life) {
+    if (!b3_raceflow_owns_end()) return NULL;   /* harness draws as before */
+    if (g_rf_final_lap_t < 0.0f) return NULL;
+    g_rf_final_lap_t += g_tdfx_real_dt;
+    if (g_rf_final_lap_t > 2.5f) { g_rf_final_lap_t = -1.0f; return NULL; }
+    if (age)  *age  = g_rf_final_lap_t;
+    if (life) *life = 2.5f;
+    return rf_str(2033);
+}
+
+/* ---- results screen ------------------------------------------------
+ * Layout is [S]: retail drives it from frontend package data that the
+ * ELF does not describe, so this follows the port's established menu
+ * style (the same helpers, font and panel geometry as track select).
+ * The TEXT and the COLUMN SET are [C] -- Globalus 576 / 582..586 /
+ * 587.. / 601 / 602 / 603.. / 612.. as listed in the block header. */
+int b3_raceflow_results_active(void) { return g_rf_results_t >= 0.0f; }
+
+static const char *rf_time_str(float s, char *buf, size_t n) {
+    int m;
+    if (s <= 0.0f) { snprintf(buf, n, "--:--.--"); return buf; }
+    m = (int)(s / 60.0f);
+    snprintf(buf, n, "%d:%05.2f", m, (double)(s - (float)m * 60.0f));
+    return buf;
+}
+
+void b3_raceflow_results_draw(void) {
+    static GLuint medal_tex[4];
+    static int    medal_loaded;
+    float y, a;
+    int i;
+    char buf[32];
+
+    if (g_rf_results_t < 0.0f) return;
+    g_rf_results_t += g_tdfx_real_dt;
+    a = g_rf_results_t < 0.4f ? g_rf_results_t / 0.4f : 1.0f;
+
+    if (!medal_loaded) {
+        medal_loaded = 1;
+        medal_tex[B3_MEDAL_NONE]   = 0;
+        medal_tex[B3_MEDAL_BRONZE] =
+            b3_hud_load_texture("build/frontend/MedalBronze.png");
+        medal_tex[B3_MEDAL_SILVER] =
+            b3_hud_load_texture("build/frontend/MedalSilver.png");
+        medal_tex[B3_MEDAL_GOLD]   =
+            b3_hud_load_texture("build/frontend/MedalGold.png");
+    }
+
+    /* dim the frozen world, then the panel */
+    b3_hud_draw_rect_px(0, 0, 640, 480, 0.f, 0.f, 0.f, 0.62f * a);
+    b3_hud_draw_rect_px(52, 40, 536, 400, 0.05f, 0.07f, 0.10f, 0.90f * a);
+    b3_hud_draw_rect_px(52, 40, 536, 3, 0.95f, 0.62f, 0.10f, a);
+
+    /* title: Globalus 576 "RACE RESULTS" */
+    b3_hud_draw_text(rf_str(576), 76, 56, 0.78f,
+                     0.98f * a, 0.72f * a, 0.16f * a, a);
+
+    /* column headers: 582 NAME, 583 BEST LAP, 584 TOTAL TIME  [C] */
+    b3_hud_draw_text(rf_str(582), 108, 100, 0.40f,
+                     0.55f * a, 0.65f * a, 0.75f * a, a);
+    b3_hud_draw_text(rf_str(583), 330, 100, 0.40f,
+                     0.55f * a, 0.65f * a, 0.75f * a, a);
+    b3_hud_draw_text(rf_str(584), 452, 100, 0.40f,
+                     0.55f * a, 0.65f * a, 0.75f * a, a);
+    b3_hud_draw_rect_px(76, 114, 488, 1, 0.4f * a, 0.5f * a, 0.6f * a, a);
+
+    /* Standings read top-down in FINISHING ORDER, not slot order. */
+    {
+        int ord[B3_RF_MAX_CARS] = {0}, nord = 0, k;
+        for (k = 0; k < g_num_vehicles && k < B3_RF_MAX_CARS; k++)
+            ord[nord++] = k;
+        for (k = 1; k < nord; k++) {
+            int key = ord[k], j2 = k - 1;
+            while (j2 >= 0
+                   && g_rf_car[ord[j2]].position > g_rf_car[key].position) {
+                ord[j2 + 1] = ord[j2];
+                j2--;
+            }
+            ord[j2 + 1] = key;
+        }
+        memcpy(g_rf_row, ord, sizeof ord);
+        g_rf_nrow = nord;
+    }
+
+    y = 124;
+    for (i = 0; i < g_rf_nrow; i++) {
+        int slot = g_rf_row[i];
+        int me   = (slot == 0);
+        int p    = g_rf_car[slot].position;
+        float br = me ? 1.0f : 0.72f;
+        const Vehicle *v = &g_vehicles[slot];
+        const char *nm;
+
+        if (me)
+            b3_hud_draw_rect_px(76, y - 3, 488, 26,
+                                0.16f * a, 0.22f * a, 0.30f * a, a);
+
+        /* ordinal: Globalus 587 + (pos-1) -> "1st".."8th"  [C] */
+        if (p >= 1 && p <= 8)
+            b3_hud_draw_text(rf_str(587 + p - 1), 84, y, 0.52f,
+                             0.98f * a * br, 0.78f * a * br, 0.22f * a * br, a);
+
+        /* identity: the roster entry, never a Globalus display string */
+        nm = (v->info && v->info->class_code) ? v->info->class_code : "CAR";
+        snprintf(buf, sizeof buf, "%s %d", nm, slot + 1);
+        b3_hud_draw_text(buf, 132, y, 0.46f,
+                         br * a, br * a, br * a, a);
+
+        b3_hud_draw_text(rf_time_str(g_rf_car[slot].best_lap, buf, sizeof buf),
+                         330, y, 0.44f, br * a, br * a, br * a, a);
+
+        if (g_rf_car[slot].finished)
+            b3_hud_draw_text(rf_time_str(g_rf_car[slot].finish_time, buf,
+                                         sizeof buf),
+                             452, y, 0.44f, br * a, br * a, br * a, a);
+        else
+            /* Globalus 602 is the DNF line; the column just shows laps */
+            b3_hud_draw_text(rf_time_str(0.0f, buf, sizeof buf),
+                             452, y, 0.44f, 0.5f * a, 0.5f * a, 0.5f * a, a);
+        y += 30;
+    }
+
+    /* the player's outcome: 603 + (pos-1), then 612 + medal  [C] */
+    y = 124 + 30.0f * (float)(g_num_vehicles < B3_RF_MAX_CARS
+                              ? g_num_vehicles : B3_RF_MAX_CARS) + 14.0f;
+    b3_hud_draw_rect_px(76, y - 4, 488, 1, 0.4f * a, 0.5f * a, 0.6f * a, a);
+    if (g_rf_car[0].finished && g_rf_player_pos >= 1 && g_rf_player_pos <= 6)
+        b3_hud_draw_text(rf_str(603 + g_rf_player_pos - 1), 84, y + 10,
+                         0.50f, 0.95f * a, 0.95f * a, 0.95f * a, a);
+    else
+        b3_hud_draw_text(rf_str(602), 84, y + 10, 0.50f,
+                         0.95f * a, 0.7f * a, 0.7f * a, a);
+
+    b3_hud_draw_text(rf_str(612 + (g_rf_medal & 3)), 84, y + 36, 0.56f,
+                     0.98f * a, 0.80f * a, 0.20f * a, a);
+    if (medal_tex[g_rf_medal & 3])
+        b3_hud_draw_quad_px(medal_tex[g_rf_medal & 3], 496, y + 4, 60, 60, a);
+
+    if (g_rf_medal != B3_MEDAL_NONE && !g_rf_improved && g_rf_banked)
+        b3_hud_draw_text("(BEST ALREADY HELD)", 84, y + 62, 0.34f,
+                         0.55f * a, 0.62f * a, 0.70f * a, a);
+
+    /* B3_RESULTS_SHOT=<path.ppm>: one frame once the fade is done, the
+     * same P6 bottom-up capture B3_MENU_SHOT writes. */
+    {
+        static int shot_done;
+        const char *shot = getenv("B3_RESULTS_SHOT");
+        if (shot && !shot_done && g_rf_results_t > 1.2f) {
+            GLint vp[4];
+            unsigned char *px;
+            shot_done = 1;
+            glGetIntegerv(GL_VIEWPORT, vp);
+            px = (unsigned char *)malloc((size_t)vp[2] * vp[3] * 3);
+            if (px) {
+                FILE *fp;
+                glReadPixels(0, 0, vp[2], vp[3], GL_RGB, GL_UNSIGNED_BYTE, px);
+                fp = fopen(shot, "wb");
+                if (fp) {
+                    int yy;
+                    fprintf(fp, "P6\n%d %d\n255\n", vp[2], vp[3]);
+                    for (yy = vp[3] - 1; yy >= 0; yy--)
+                        fwrite(px + (size_t)yy * vp[2] * 3, 3, (size_t)vp[2], fp);
+                    fclose(fp);
+                    printf("[Burnout3] results screenshot -> %s\n", shot);
+                }
+                free(px);
+            }
+        }
+    }
+}
+
+/* Dismissed by the player, or auto-dismissed on an unattended run so a
+ * headless race cannot hang forever. */
+void b3_raceflow_results_tick(void) {
+    if (g_rf_results_t < 0.0f) return;
+    if (getenv("B3_AUTODRIVE") && g_rf_results_t > 8.0f) {
+        printf("[Burnout3] race flow: results dismissed (autodrive)\n");
+        g_running = 0;
+    }
+}
+
+void b3_raceflow_results_dismiss(void) {
+    if (g_rf_results_t < 0.0f) return;
+    printf("[Burnout3] race flow: results dismissed\n");
+    g_running = 0;
+}
+/* --- end race flow (agent) --- */
 
 /* AI AVOIDANCE (RE_AI section 15): the ported FUN_0016C450 chain.  Defined
  * after the traffic section (it reads g_traffic / the route helpers); the
@@ -2729,6 +6678,18 @@ typedef struct {
 } B3AiAvoidOut;
 static void ai_avoid_update(Vehicle* v, int slot, int corner,
                             Vec3* target, float* ceiling, B3AiAvoidOut* out);
+
+/* --- ai wreck log (agent) ---
+ * The remaining B3_AI_WRECK_LOG entry points; they need B3AiAvoidOut, which
+ * is the typedef immediately above.  See the implementation block. */
+static void awl_queue(const Vehicle* v, int who, float d);
+static void awl_avoid(int slot, const B3AiAvoidOut* out);
+static void awl_sample(Vehicle* v, int slot, float ceiling,
+                       float nav_corner_speed, float nav_brake_dist,
+                       int nav_target_mode, int nav_mode_1fc, int aim_lost,
+                       const Vec3* target, float curve);
+static void awl_summary(void);
+/* --- end ai wreck log (agent) --- */
 
 /* FUN_001714F0 + FUN_00179760 + FUN_00171650, as one call: put the car on the
  * nav graph `back` nodes behind `section/node`, zero the physics accumulators
@@ -2788,14 +6749,16 @@ static int nav_replace_car(Vehicle* v, unsigned int section, unsigned int node,
         v->vel = (Vec3){sinf(yaw) * speed_ms, 0.0f, -cosf(yaw) * speed_ms};
         v->sim.speed = speed_ms;
     }
-    v->fsim_ready = 0;              /* re-init zeroes v+0xF0..+0x13C        */
+    v->fsim_ready = 0;
+    b3_emu_drop_car(v);   /* retail must re-take a re-placed car */              /* re-init zeroes v+0xF0..+0x13C        */
+    b3_emu_drop_car(v);   /* retail must re-take a re-placed car */
     /* FUN_00179760: navigator +0x1D8 = 0xFFFF and the aggression sub-object
      * back to idle; FUN_0018CB60's take path zeroes the direction block. */
     v->nav_target_ready = 0;
     memset(v->ai.des_dir, 0, sizeof v->ai.des_dir);
     memset(v->ai.des_dir_n, 0, sizeof v->ai.des_dir_n);
     if (v->aggro_ready) b3_aggro_init(&v->aggro, g_race_time);
-    v->ai.reverse_timer = -1.0f;
+    v->fsim.reverse_timer_157C = -1.0f;
     v->stuck_time = 0.0f;
     v->stuck_ref = v->pos;
     v->stuck_ref_time = g_race_time;
@@ -2819,10 +6782,25 @@ static int route_replace_car(Vehicle* v, int back, float speed_ms) {
     int slot = (int)(v - g_vehicles);
     int n2 = g_track.num_points;
     if (n2 <= 0 || slot < 0 || slot >= 8) return 0;
-    int idx = (int)(find_track_progress(v->pos) * n2);
-    int bi = ((idx - back) % n2 + n2) % n2;
+    int idx = (int)(vehicle_track_progress(v) * n2);
+    int bi = route_wrap(idx - back, n2);
     Vec3 rp = g_track.points[bi];
-    Vec3 rq = g_track.points[(bi + 1) % n2];
+    /* HEADING OVER A SPAN, not one station step.  A single
+     * station-to-successor difference is whatever the last point of the line
+     * happens to be, and one bad point turns the re-place round: measured on
+     * EU_M1_V1, car 0 stalled at station 1223, was re-placed onto station
+     * 1215 whose successor lay 14.7 m BACK down the course, and drove the
+     * circuit backwards for the remaining 45 s of the run at the AI's
+     * min-speed floor (progress 0.710 -> 0.632, a steady 44-45 mph =
+     * B3_AI_MIN_SPEED_MPS).  Four stations is ~24 m of route, longer than
+     * any single-station artefact and shorter than the tightest corner. */
+    int fi = route_wrap(bi + 4, n2);
+    if (fi == bi) fi = route_wrap(bi + 1, n2);   /* open-course terminus */
+    Vec3 rq = g_track.points[fi];
+    if (fi == bi) {                              /* degenerate line */
+        rq = rp;
+        rq.z -= 1.0f;
+    }
     float yaw = atan2f(rq.x - rp.x, -(rq.z - rp.z));
     v->pos = rp;
     {   float gh, gn[3];
@@ -2836,12 +6814,18 @@ static int route_replace_car(Vehicle* v, int back, float speed_ms) {
         v->sim.speed = speed_ms;
     }
     v->fsim_ready = 0;
+    /* The stuck rescue re-places the car. Under physics=retail the emulator
+     * is still integrating the OLD state -- the falling one that triggered
+     * the rescue -- so ownership has to be released or retail never learns
+     * the car moved and keeps falling for the rest of the race. This is the
+     * fallback rescue path; nav_replace_car already does it. */
+    b3_emu_drop_car(v);
     /* FUN_00179760's navigator reset applies whichever placement is used. */
     v->nav_target_ready = 0;
     memset(v->ai.des_dir, 0, sizeof v->ai.des_dir);
     memset(v->ai.des_dir_n, 0, sizeof v->ai.des_dir_n);
     if (v->aggro_ready) b3_aggro_init(&v->aggro, g_race_time);
-    v->ai.reverse_timer = -1.0f;
+    v->fsim.reverse_timer_157C = -1.0f;
     v->stuck_time = 0.0f;
     v->stuck_ref = v->pos;
     v->stuck_ref_time = g_race_time;
@@ -2855,13 +6839,140 @@ static int b3_nav_respawn(void) {
     return on;
 }
 
+static void track_test_sample(Vehicle* v) {
+    if (g_ttest_on < 0) {
+        g_ttest_on = getenv("B3_TRACK_TEST") != NULL;
+        for (int i = 0; i < 8; i++) {
+            g_ttest[i].min_clear = 1e9f;
+            g_ttest[i].below_since = -1.0f;
+            g_ttest[i].p_min = 2.0f;
+            g_ttest[i].p_max = -1.0f;
+        }
+    }
+    if (!g_ttest_on) return;
+    int slot = (int)(v - g_vehicles);
+    if (slot < 0 || slot >= 8) return;
+    B3TrackTestCar* t = &g_ttest[slot];
+    float gh, gn[3];
+    /* Space discipline, learned twice on this probe: v->pos is HARNESS
+     * space, the physics frame is GAME space, and b3_ground_probe takes
+     * GL/harness z.  The first sampler passed harness coords through the
+     * game-space wrapper and probed the MIRRORED map; the second read the
+     * wrapper's route-line FALLBACK (which reports the ribbon height, tens
+     * of metres above a launched car) as "-39 m below ground".  The ray
+     * itself spans only +4/-26 m around the car, so a MISS -- no surface
+     * anywhere in that column -- IS the falling-through signal, and it is
+     * counted only while the car is not in its crash window (the wreck
+     * tumble is harness-owned and may legitimately fly). */
+    float gx = v->fsim_ready ? v->fsim.rb.frame[3][0] : v->pos.x;
+    float gy = v->fsim_ready ? v->fsim.rb.frame[3][1] : v->pos.y;
+    float gz = v->fsim_ready ? -v->fsim.rb.frame[3][2] : v->pos.z;
+    int crashed = (v->crashed_until > 0.0f);
+    {   /* corridor exposure, see the struct note */
+        Vec3 rc;
+        loop_closest(g_cl, g_route_n, gx, gz, &rc, NULL);
+        float od = sqrtf((gx - rc.x) * (gx - rc.x) + (gz - rc.z) * (gz - rc.z));
+        if (!crashed) {
+            if (od > t->max_offroute) t->max_offroute = od;
+            if (od > 15.0f) t->off15++;
+            if (od > 30.0f) t->off30++;
+        }
+    }
+    if (b3_ground_probe(gx, gy, gz, &gh, gn) < 0) {
+        if (!crashed) {
+            t->probe_misses++;
+            /* a MISS alone is not a fall: Silver Lake's jumps put a car
+             * more than the ray's 26 m above the valley floor for seconds
+             * at 150 mph (measured: 174-200 miss samples per healthy car).
+             * The discriminator is the ROUTE height at this XZ -- a jumper
+             * is above its road, a car falling through the world is below
+             * it.  Only sustained BELOW-ROUTE misses count. */
+            Vec3 rc;
+            loop_closest(g_cl, g_route_n, gx, gz, &rc, NULL);
+            if (gy < rc.y - 8.0f) {
+                if (t->below_since < 0.0f) t->below_since = g_race_time;
+                else if (g_race_time - t->below_since > 1.5f) {
+                    t->falls++;
+                    fprintf(stderr, "[fall] car%d t=%.2f pos=(%.1f %.1f %.1f)"
+                            " route_y=%.1f\n", slot, g_race_time,
+                            gx, gy, gz, rc.y);
+                    t->below_since = g_race_time + 3600.0f;  /* once */
+                }
+            } else {
+                t->below_since = -1.0f;
+            }
+        }
+    } else {
+        float clear = gy - gh;
+        if (!crashed && clear < t->min_clear) t->min_clear = clear;
+        t->below_since = crashed ? -1.0f : t->below_since;
+        if (clear > -2.0f) t->below_since = -1.0f;
+    }
+    /* progress ADVANCEMENT, wrap-aware: track_progress wraps 1 -> 0 at the
+     * start line, so a min/max span reads ~1.0 for any car that crosses it.
+     * Accumulate forward deltas instead (p_max repurposed as the sum). */
+    float p = v->track_progress;
+    if (p >= 0.0f && p <= 1.0f) {
+        if (t->p_min > 1.5f) { t->p_min = p; t->p_max = 0.0f; }
+        else {
+            float dlt = p - t->p_min;
+            if (dlt < -0.5f) dlt += 1.0f;      /* wrapped forward */
+            if (dlt > 0.0f && dlt < 0.2f) t->p_max += dlt;
+            t->p_min = p;
+        }
+    }
+    float mph = v->sim.speed * 2.2369363f;
+    if (mph > t->max_mph) t->max_mph = mph;
+    if (v->lap > t->laps) t->laps = v->lap;
+}
+
+static void track_test_report(void) {
+    if (g_ttest_on != 1) return;
+    for (int i = 0; i < g_num_vehicles && i < 8; i++) {
+        const B3TrackTestCar* t = &g_ttest[i];
+        printf("[tracktest] car%d falls=%d probe_miss=%d min_clear=%.2f "
+               "p_span=%.3f laps=%d max_mph=%.0f off_max=%.0f off15=%d "
+               "off30=%d av_dead=%d av_frames=%d\n",
+               i, t->falls, t->probe_misses,
+               t->min_clear > 1e8f ? -99.0f : t->min_clear,
+               t->p_max,
+               t->laps, t->max_mph, t->max_offroute, t->off15, t->off30,
+               t->av_dead, t->av_frames);
+    }
+    /* the blocked-aim race-line recovery: how many aims it actually moved.
+     * Kept as a printed measurement because it is the evidence that decided
+     * whether this consumer of the purged B3_CENTERLINE header was worth
+     * re-sourcing from route.bin or simply deleting. */
+    printf("[tracktest] raceline points=%d aim_recoveries=%ld\n",
+           g_raceline_n, g_raceline_hits);
+}
+
 static void vehicle_update(Vehicle* v, float dt) {
     if (!v->active) return;
+    track_test_sample(v);
+
+    /* emu_ai_car_valid is PER FRAME: it means "the AI block below built a
+     * fresh racecar view this frame", which is what licenses the combined
+     * b3_emu_step_ai path (the retail driver runs inside the physics
+     * session).  It used to be set on the first AI-driven frame and never
+     * cleared, so after the takedown cinematic's AI wheel-hold ended, the
+     * human's every frame still stepped through the combined path -- the
+     * retail driver kept the wheel forever, steering dead, throttle "working"
+     * only because the AI floors it.  That is "I lose directional control
+     * after the takedown cinematic completes", reproduced with
+     * B3_POST_TD_STEER: 3 s of full lock produced omega.y = 0.00 and
+     * steer1408 pinned at 0.000 until this line. */
+    v->emu_ai_car_valid = 0;
 
     // Per-vehicle inputs: keyboard for the player, center-line following for AI.
     float throttle = 0.0f, brake = 0.0f, steer_input = 0.0f;
     int boost = 0;
-    int ai_game_steer = 0;
+    /* AFTERTOUCH ("Impact Time"): the RAW boost bit, snapshotted before the
+     * crashed-state input override below zeroes `boost`.  Retail's
+     * FUN_00118410 @0x0011889A tests veh+0x13FC & 4 -- pad+0x84 -- directly
+     * off the pad, and crashing never clears it, so the aftertouch gate must
+     * NOT read the throttle/brake-suppressed copy.                      [C] */
+    int boost_raw = 0;
     float ai_target_ms = -1.0f;   // AI speed target (racecar+0x23C4 analog)
     float ai_reverse_ms = 0.0f;   // >0: back out at this speed (the sim's
                                   // scalar speed cannot go negative, so the
@@ -2899,7 +7010,20 @@ static void vehicle_update(Vehicle* v, float dt) {
          * restored the steering authority. */
         int want = (tst.active && tst.divisor > 1)
                  || g_race_time < v->ai_wheel_until;
-        int edge = b3_ai_wheel_set(&v->aiw, &v->ai, want);
+        int edge = b3_ai_wheel_set(&v->aiw, &v->ai, &v->fsim, want);
+        if (getenv("B3_WHEEL_DBG")) {
+            static int prev = -1; static float lastp = -10.0f;
+            if (v->aiw.ai_wheel != prev || (v->aiw.ai_wheel
+                                            && g_race_time - lastp > 1.0f)) {
+                fprintf(stderr, "[wheel] t=%.2f ai_wheel=%d (tst.active=%d "
+                        "divisor=%d until=%.2f) auth=%.2f drift=%d "
+                        "steer1408=%.2f\n", g_race_time, v->aiw.ai_wheel,
+                        tst.active, tst.divisor, v->ai_wheel_until,
+                        v->fsim.authority_1534, v->fsim.drift_state_1524,
+                        v->fsim.steer_1408);
+                prev = v->aiw.ai_wheel; lastp = g_race_time;
+            }
+        }
         if (edge == B3_AI_WHEEL_TAKE) {
             /* FUN_00179760: navigator +0x1D8 = 0xFFFF (re-seed the target
              * cursor) and the aggression sub-object back to idle. */
@@ -2909,9 +7033,39 @@ static void vehicle_update(Vehicle* v, float dt) {
             memset(v->ai.des_dir_n, 0, sizeof v->ai.des_dir_n);
         }
         td_ai_wheel = v->aiw.ai_wheel;
+        if (edge == B3_AI_WHEEL_GIVE && getenv("B3_POST_TD_STEER"))
+            g_posttd_t0 = g_race_time;
     }
 
     if (v == &g_player && !autodrive && !td_ai_wheel) {
+        /* B3_POST_TD_STEER: the "I lose directional control after the
+         * takedown cinematic" reproduction.  After the wheel handback, hold
+         * full throttle + full left for 3 s and log the yaw response the
+         * steering actually produces.  A healthy car yaws at ~1 rad/s; a car
+         * whose control was not handed back reads ~0. */
+        static int ptd = -1;
+        if (ptd < 0) ptd = getenv("B3_POST_TD_STEER") != NULL;
+        if (ptd) {
+            if (g_posttd_t0 >= 0.0f && g_race_time - g_posttd_t0 < 3.0f) {
+                throttle = 1.0f;
+                steer_input = getenv("B3_POST_TD_RIGHT") ? 1.0f : -1.0f;
+                static float lastlog = -1.0f;
+                if (g_race_time - lastlog > 0.25f) {
+                    fprintf(stderr, "[posttd] t=%.2f (+%.2f) steer=%+.0f -> "
+                            "omega.y=%.3f spd=%.1f auth=%.2f drift=%d "
+                            "crash_in=%.2f\n", g_race_time,
+                            g_race_time - g_posttd_t0, steer_input,
+                            v->fsim.rb.omega[1],
+                            v->fsim.rb.vel[3], v->fsim.authority_1534,
+                            v->fsim.drift_state_1524,
+                            v->crashed_until - g_race_time);
+                    fprintf(stderr, "[posttd2] owned=%d c212=%d pos=(%.1f %.1f)\n",
+                            v->fsim.emu_owned, (int)v->fsim.contact_212,
+                            v->fsim.rb.frame[3][0], v->fsim.rb.frame[3][2]);
+                    lastlog = g_race_time;
+                }
+            }
+        }
         if (g_keys[SDL_SCANCODE_W] || g_keys[SDL_SCANCODE_UP]) throttle = 1.0f;
         if (g_keys[SDL_SCANCODE_S] || g_keys[SDL_SCANCODE_DOWN]) brake = 1.0f;
         if (g_keys[SDL_SCANCODE_A] || g_keys[SDL_SCANCODE_LEFT]) steer_input = -1.0f;
@@ -2925,9 +7079,15 @@ static void vehicle_update(Vehicle* v, float dt) {
             if (pad_btn(SDL_CONTROLLER_BUTTON_DPAD_LEFT))  steer_input = -1.0f;
             if (pad_btn(SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) steer_input = 1.0f;
             if (rt > throttle) throttle = rt;
-            if (pad_btn(SDL_CONTROLLER_BUTTON_A)) throttle = 1.0f;
             if (lt > brake) brake = lt;
             if (pad_btn(SDL_CONTROLLER_BUTTON_B)) brake = 1.0f;
+            /* RETAIL XBOX LAYOUT: RT accelerates, LT brakes, and A is BOOST --
+             * pad+0x84, which is also the Impact Time button held during a
+             * crash.  A was bound to a SECOND throttle here, so a player doing
+             * the retail thing (hold A through the wreck) got throttle, not
+             * aftertouch.  X keeps boost too, so the previous binding still
+             * works for anyone used to it. */
+            if (pad_btn(SDL_CONTROLLER_BUTTON_A)) boost = 1;
             if (pad_btn(SDL_CONTROLLER_BUTTON_X)) boost = 1;
         }
 #ifdef __ANDROID__
@@ -2947,6 +7107,16 @@ static void vehicle_update(Vehicle* v, float dt) {
         static int testdrive = -1;
         if (testdrive < 0) testdrive = getenv("B3_TESTDRIVE") != NULL;
         if (testdrive) throttle = 1.0f;
+        /* AFTERTOUCH REAL-INPUT LEG (tools/validate_aftertouch.py section 5).
+         * Holds the BOOST button from the SAME local the keyboard and the pad
+         * write, so a test exercises every stage downstream of the SDL read --
+         * including the crashed-state input override further down. The older
+         * at_script() aid injects far past that override and so could not see
+         * it; that blind spot is what let the aftertouch divisor ship broken
+         * on the real path while the scripted suite stayed green. */
+        static int padboost = -1;
+        if (padboost < 0) padboost = getenv("B3_TEST_PAD_BOOST") != NULL;
+        if (padboost) boost = 1;
     } else {
         // AI racer driver. Structure follows the real driver FUN_00105340
         // (reached via dispatcher FUN_00104D30 when racecar+0x134C != 0 and
@@ -2965,11 +7135,42 @@ static void vehicle_update(Vehicle* v, float dt) {
          * gates -- RE_AI 16. */
         (void)nav_target_update(v, v->aiw.route_alt,
                                 v->aggro_ready && v->aggro.state == 4);
+        /* FUN_00175B10's plan latch, once per AI per frame, in the same slot
+         * of the frame retail runs the target follower.  It has to be here
+         * and not inside nav_plan_target(): the arrival test is a state
+         * ADVANCE, so it must fire exactly once whether or not the aim path
+         * below ends up reading it. */
+        if (nav_aim2_enabled()) {
+            nav_latch_step(v);
+            /* B3_NAV_LATCH=1: one line per AI car per frame, so an A/B can
+             * say WHERE the plan stage is rather than inferring it from lap
+             * times.  `1f8` is the latch, `1fc` the lane mode, `win` the
+             * three window nodes and `d` the distance to the latched point. */
+            if (getenv("B3_NAV_LATCH")) {
+                const B3NavLatch* L = &v->nav_latch;
+                float ldx = L->target.x - v->pos.x;
+                float ldz = L->target.z - v->pos.z;
+                fprintf(stderr,
+                        "[latch] t=%.2f car%d sec%d/%d 1f8=%d 1fc=%d "
+                        "win=%u/%u/%u pub=%u lane=%d d=%.2f rdy=%d\n",
+                        g_race_time, (int)(v - g_vehicles),
+                        (int)v->nav_section, (int)v->nav_node,
+                        L->latch, L->mode_1fc, (unsigned)L->win[0],
+                        (unsigned)L->win[1], (unsigned)L->win[2],
+                        (unsigned)L->pub_node, L->lane,
+                        sqrtf(ldx * ldx + ldz * ldz), L->ready);
+            }
+        }
         int n = g_track.num_points;
-        int idx = (int)(find_track_progress(v->pos) * n);
+        int idx = (int)(vehicle_track_progress(v) * n);
         int lead = 5 + (int)(v->sim.speed * 0.10f);
-        Vec3 target = g_track.points[(idx + lead) % n];
+        Vec3 target = g_track.points[route_wrap(idx + lead, n)];
         float nav_corner_speed = 0.0f;
+        float nav_brake_dist = 0.0f;
+        /* AI+0x1F8 / AI+0x1FC as of whichever nav_plan_target() call below
+         * selected a record.  2 / 0 until one does: that is FUN_00176090's
+         * reset state, the value a car carries before its first plan. */
+        int nav_target_mode = 2, nav_mode_1fc = 0;
         unsigned int aim_section = v->nav_section, aim_node = v->nav_node;
         /* FUN_001772A0's planner window, behind B3_NAV_AIM=1 and OFF by
          * default.  It was effectively dead before this wave -- the nav
@@ -2984,17 +7185,32 @@ static void vehicle_update(Vehicle* v, float dt) {
          * to steer the harness away from ("the corridor MIDLINE runs down
          * the median ... cars wedge in it").  Rivals lose about a third of
          * their race distance and gain about ten wall crashes per 180 s.
-         * The selection itself is retail's; what is missing is the LANE
-         * offset that decides where inside the pair the racing line runs
-         * (FUN_00173E40 / FUN_00174610 / FUN_00174680's no-go offsets, still
-         * unported).  Until those land the route line -- which
-         * `route_lane_fixup` has already pulled onto the game's own forward
-         * race line -- is the better aim. */
-        static int nav_aim = -1;
-        if (nav_aim < 0) nav_aim = getenv("B3_NAV_AIM") != NULL;
-        if (nav_aim)
-            (void)nav_plan_target(v, &target, &nav_corner_speed,
-                                  &aim_section, &aim_node);
+         * The selection itself is retail's; what was missing is the LANE
+         * offset that decides where inside the pair the racing line runs.
+         *
+         * B3_NAV_AIM2 answers "what is missing" -- and it was never the
+         * no-go offsets: FUN_001769E0 only reaches
+         * FUN_00178100's 0.4..0.6 retention when the plan record has NO lane
+         * (`flags & 3 == 0`), which never happens in a shipped route.bin.
+         * The real aim is FUN_001778C0 / FUN_00177B90's edge + inset
+         * construction -- see the lane law next to nav_lane_target. */
+        if (nav_aim_legacy() || nav_aim2_enabled()) {
+            if (nav_plan_target(v, &target, &nav_corner_speed,
+                                &nav_brake_dist, &aim_section, &aim_node)) {
+                nav_target_mode = g_nav_target_mode;   /* AI+0x1F8 */
+                nav_mode_1fc    = g_nav_mode_1fc;      /* AI+0x1FC */
+            }
+        } else if (nav_plan_speed_ceiling()) {
+            /* the planner's SPEED without the planner's AIM: the throwaway
+             * target is deliberate -- only the corner value, its brake
+             * distance and the corner node survive. */
+            Vec3 plan_aim_unused = target;
+            if (nav_plan_target(v, &plan_aim_unused, &nav_corner_speed,
+                                &nav_brake_dist, &aim_section, &aim_node)) {
+                nav_target_mode = g_nav_target_mode;   /* AI+0x1F8 */
+                nav_mode_1fc    = g_nav_mode_1fc;      /* AI+0x1FC */
+            }
+        }
 
         // Wall-grind ARM (GLUE trigger, retail action): the driver's own
         // 5 mph stuck rule (FUN_00105340 @0x001054AF) cannot see a car
@@ -3031,7 +7247,7 @@ static void vehicle_update(Vehicle* v, float dt) {
             agg_aim_live = (_s >= 0 && _s < g_aggro_world.ncars
                             && v->aggro_ready && v->aggro.aim_valid);
         }
-        Vec3 nearpt = g_track.points[(idx + 2) % n];
+        Vec3 nearpt = g_track.points[route_wrap(idx + 2, n)];
         if (agg_aim_live) { nearpt = target; }
         float offx = nearpt.x - v->pos.x, offz = nearpt.z - v->pos.z;
         float offline = sqrtf(offx * offx + offz * offz);
@@ -3048,30 +7264,51 @@ static void vehicle_update(Vehicle* v, float dt) {
         // own forward race line (Gamedata.bgd 0x1ABF20 -- it passes the
         // junction barriers on the open side by design), then slide the
         // aim laterally / closer until the ray is clear.
-        if (aim_blocked(v->pos.x, v->pos.z, target.x, target.z,
-                        v->pos.y + 0.5f)) {
+        if (g_raceline_n > 0
+            && aim_blocked(v->pos.x, v->pos.z, target.x, target.z,
+                           v->pos.y + 0.5f)) {
+            /* THE TRACK'S OWN race line, route.bin's centerline pool, loaded
+             * by load_raceline_from_route_bin() and already in GL space.
+             * This used to read B3_CENTERLINE out of src/burnout3_track_paths.h
+             * -- US_C3_V1's line, compiled in, consulted on every track -- so
+             * it needed a 60 m relevance gate to stop it aiming cars off the
+             * map elsewhere.  The line now comes from the loaded track's own
+             * file, so on the 21 tracks whose pool is empty g_raceline_n is 0
+             * and the recovery does not arm, and on the other 15 the nearest
+             * point is by construction on THIS track.  The 60 m gate is KEPT,
+             * both because it is now a meaningful "this car is still near its
+             * own race line" test and because keeping it makes US_C3_V1 --
+             * whose file pool is the old array to the printed precision --
+             * bit-for-bit the behaviour it had before. */
             int rbest = 0;
             float rbd = 1e30f;
-            for (int ri = 0; ri < B3_CENTERLINE_COUNT; ri++) {
-                float rdx = B3_CENTERLINE[ri][0] - v->pos.x;
-                float rdz = -B3_CENTERLINE[ri][2] - v->pos.z;   // z = -z
+            for (int ri = 0; ri < g_raceline_n; ri++) {
+                float rdx = g_raceline[ri][0] - v->pos.x;
+                float rdz = g_raceline[ri][2] - v->pos.z;
                 float rd2 = rdx * rdx + rdz * rdz;
                 if (rd2 < rbd) { rbd = rd2; rbest = ri; }
             }
-            for (int ra = 6; ra <= 14; ra += 4) {
-                const float* rp =
-                    B3_CENTERLINE[(rbest + ra) % B3_CENTERLINE_COUNT];
-                if (!aim_blocked(v->pos.x, v->pos.z, rp[0], -rp[2],
+            for (int ra = 6; rbd < 60.0f * 60.0f && ra <= 14; ra += 4) {
+                const float* rp = g_raceline[(rbest + ra) % g_raceline_n];
+                if (!aim_blocked(v->pos.x, v->pos.z, rp[0], rp[2],
                                  v->pos.y + 0.5f)) {
                     target.x = rp[0];
-                    target.z = -rp[2];
+                    target.z = rp[2];
+                    g_raceline_hits++;
                     break;
                 }
             }
         }
+        int aim_lost = 0;
+        /* THE FLOOR TEST joins the WALL test here, and the recovery ladder
+         * below serves both: an aim across a hole is exactly as unusable as
+         * an aim through a barrier, and the lateral / halfway candidates the
+         * ladder tries are the right answers to both.  See aim_over_gap. */
         if (aim_blocked(v->pos.x, v->pos.z, target.x, target.z,
-                        v->pos.y + 0.5f)) {
-            Vec3 rn = g_track.points[(idx + lead + 2) % n];
+                        v->pos.y + 0.5f)
+            || (aim_gap_on() && aim_over_gap(v->pos.x, v->pos.y, v->pos.z,
+                                             target.x, target.z))) {
+            Vec3 rn = g_track.points[route_wrap(idx + lead + 2, n)];
             Vec3 rd = vec3_normalize(vec3_sub(rn, target));
             float px = -rd.z, pz = rd.x;
             static const float offs[] = {4, -4, 8, -8, 12, -12, 16, -16};
@@ -3087,7 +7324,10 @@ static void vehicle_update(Vehicle* v, float dt) {
                     float tx = base.x + px * offs[oi];
                     float tz = base.z + pz * offs[oi];
                     if (!aim_blocked(v->pos.x, v->pos.z, tx, tz,
-                                     v->pos.y + 0.5f)) {
+                                     v->pos.y + 0.5f)
+                        && !(aim_gap_on()
+                             && aim_over_gap(v->pos.x, v->pos.y, v->pos.z,
+                                             tx, tz))) {
                         target.x = tx;
                         target.z = tz;
                         found = 1;
@@ -3095,15 +7335,67 @@ static void vehicle_update(Vehicle* v, float dt) {
                     }
                 }
             }
+            /* NOTHING REACHABLE.  Every candidate the ladder offers is over
+             * the same hole, which is the state a car on a dead-end deck is
+             * in: the route it is chasing is on another surface entirely.
+             * The aim then becomes the last point on the ray that still HAS
+             * a floor -- the edge, never past it -- and the car is dropped to
+             * the speed retail gives a car it has decided is off its route
+             * (FUN_001204C0's respawn takes "Min speed mps" x 0.44704,
+             * docs/RE_AI.md 8; the port has that constant already as
+             * B3_AI_RESCUE_SPEED_MS).  Retail's own answer to this state is
+             * to RE-PLACE the car eight nodes back; capping the demand is the
+             * conservative half of that, and it is what turns a 158 mph
+             * launch off the edge into a car that stops at it.        [S] */
+            if (!found && aim_gap_on()) {
+                float ex, ez;
+                if (aim_gap_scan(v->pos.x, v->pos.y, v->pos.z,
+                                 target.x, target.z, &ex, &ez)) {
+                    target.x = ex;
+                    target.z = ez;
+                    aim_lost = 1;
+                }
+            }
         }
         float want = atan2f(target.x - v->pos.x, -(target.z - v->pos.z));
         float err = angle_diff(want, v->rot.y);
 
+        /* Retail's corridor push-back, 0x00170C60..0x001710FA.  The aim has
+         * been chosen by the route line and the two aim_blocked fallbacks by
+         * now; this is the stage that keeps it off the walls.  The route line
+         * is the nav ribbon MIDLINE, so on a track whose ribbon straddles a
+         * median or whose corridor narrows under a bridge the look-ahead
+         * point can sit outside the drivable quad -- which is what steers a
+         * rival into the barrier and holds it there grinding.
+         *
+         * Retail anchors this on the node nearest the point; the harness
+         * walks forward from the car's own cursor using FUN_00173E40's bit-4
+         * gate result.  The 24-node span covers the widest look-ahead
+         * (lead = 5 + speed*0.10, ~14 stations at 88 m/s) with margin.
+         *
+         * OFF by default: this is a live behaviour change on all 36 tracks
+         * and it has NOT been A/B measured yet (the drive suite held the game
+         * lock while it was written).  tools/validate_ai_quality.py exists to
+         * make that measurement -- flip the default only once it shows the
+         * rival wall-crash count DOWN and p_span not worse. */
+        static int nav_clamp = -1;
+        if (nav_clamp < 0) {
+            const char* e = getenv("B3_NAV_CLAMP");
+            nav_clamp = (e && *e != '0');
+        }
+        if (nav_clamp && v->nav_ready && g_nav.loaded) {
+            unsigned int cnode;
+            if (nav_segment_containing(v->nav_section, v->nav_node,
+                                       target, 24, &cnode))
+                (void)nav_corridor_clamp(v->nav_section, cnode, &target);
+        }
+
         // Upcoming corner sharpness: heading change of the line over the
         // braking horizon (GLUE measurement feeding the real speed map).
-        Vec3 a0 = g_track.points[(idx + 2) % n];
-        Vec3 a1 = g_track.points[(idx + 8) % n];
-        Vec3 a2 = g_track.points[(idx + 14 + (int)(v->sim.speed * 0.20f)) % n];
+        Vec3 a0 = g_track.points[route_wrap(idx + 2, n)];
+        Vec3 a1 = g_track.points[route_wrap(idx + 8, n)];
+        Vec3 a2 = g_track.points[route_wrap(idx + 14
+                                            + (int)(v->sim.speed * 0.20f), n)];
         float h01 = atan2f(a1.x - a0.x, -(a1.z - a0.z));
         float h12 = atan2f(a2.x - a1.x, -(a2.z - a1.z));
         float curve = fabsf(angle_diff(h12, h01));
@@ -3125,23 +7417,34 @@ static void vehicle_update(Vehicle* v, float dt) {
                  * to 0.4 x cs on top of the node -- a permanent 4..9 mph
                  * crawl, because FUN_00105340's stuck detector is disarmed
                  * below a zero target speed. */
-                float dd = nav_approach_dist(aim_section, aim_node, v->pos);
-                ceiling = b3_ai_corner_brake(nav_corner_speed, dd,
+                ceiling = b3_ai_corner_brake(nav_corner_speed, nav_brake_dist,
                                              /*boost_scale=*/0,
                                              B3_AI_TOP_SPEED_MPS,
-                                             /*target_mode=*/0,
-                                             /*mode_1fc=*/0);
+                                             nav_target_mode, nav_mode_1fc);
             } else {
                 int horiz = 8 + (int)(v->sim.speed * 0.55f);
                 if (horiz > 70) horiz = 70;
                 ceiling = B3_AI_TOP_SPEED_MPS;
+                /* Window turning = SUM of per-segment |heading change|, not
+                 * the difference of two 4-station chords: an S-curve's
+                 * opposite bends cancel in the chord measure, aliasing the
+                 * window to "straight" (US_C1_V1's crest S at nodes 232..238
+                 * read as curve 0 and launched a 39 m/s car off the open
+                 * deck edge).  For monotonic bends the sum equals the old
+                 * measure; it only tightens where bends alternate. */
+                float seg_h[80];
+                int nh = horiz + 8;
+                if (nh > 79) nh = 79;
+                for (int li = 2; li <= nh; li++) {
+                    Vec3 p0 = g_track.points[route_wrap(idx + li, n)];
+                    Vec3 p1 = g_track.points[route_wrap(idx + li + 1, n)];
+                    seg_h[li] = atan2f(p1.x - p0.x, -(p1.z - p0.z));
+                }
                 for (int li = 2; li < horiz; li += 3) {
-                    Vec3 c0 = g_track.points[(idx + li) % n];
-                    Vec3 c1 = g_track.points[(idx + li + 4) % n];
-                    Vec3 c2 = g_track.points[(idx + li + 8) % n];
-                    float ha = atan2f(c1.x - c0.x, -(c1.z - c0.z));
-                    float hb = atan2f(c2.x - c1.x, -(c2.z - c1.z));
-                    float cv = fabsf(angle_diff(hb, ha)) * RAD_TO_DEG;
+                    float cv = 0.0f;
+                    for (int j = li; j < li + 8 && j < nh; j++)
+                        cv += fabsf(angle_diff(seg_h[j + 1], seg_h[j]));
+                    cv *= RAD_TO_DEG;
                     float k2 = cv / B3_AI_ANGLE_MIN_SPEED_DEG;
                     if (k2 > 1.0f) k2 = 1.0f;
                     float lim = B3_AI_TOP_SPEED_MPS
@@ -3151,49 +7454,128 @@ static void vehicle_update(Vehicle* v, float dt) {
                     if (lim < ceiling) ceiling = lim;
                 }
             }
+            static int speed_dbg = -1;
+            if (speed_dbg < 0) speed_dbg = getenv("B3_AI_SPEED_DBG") != NULL;
+            if (speed_dbg && ((int)(g_race_time * 60.0f) % 15) == 0)
+                fprintf(stderr, "[aispd] car%d t=%.2f idx=%d spd=%.1f "
+                        "ceil=%.1f cs=%.1f bd=%.1f pos=(%.0f %.0f %.0f)\n",
+                        (int)(v - g_vehicles), g_race_time, idx, v->sim.speed,
+                        ceiling, nav_corner_speed, nav_brake_dist,
+                        v->pos.x, v->pos.y, v->pos.z);
             ceiling = b3_ai_avoid_speed_cap(ceiling, nearest_car_ahead(v));
-            /* Queue behind a nearly-stopped racer dead ahead.  This is GLUE
-             * -- retail's close-range rule is FUN_0016C4B0's ladder, which
-             * floors at "Speed when car is <10m away" = 26.2 m/s and relies
-             * on the avoidance stage steering AROUND (RE_AI 15.4) -- and the
-             * harness needs it because its pack does not spread.  But the
-             * zero it writes VIOLATES a retail invariant, and that is worth
-             * recording: FUN_00172E80 returns min(Min speed + t*S, S, cap),
-             * so S = 0 makes the whole demand 0, and FUN_00105340's stuck
-             * detector is then disarmed by its own second test
-             * (`COMISS [ECX+0x23C4],0 / JBE` @0x001054DA) -- the 1 s arm
-             * never starts and the 2 s reverse burst never fires.  Retail's
-             * own design guarantees S > 0 (AI+0x1D0 is
-             * (1+factor)*corner_speed + factor*|D|, RE_AI 16), so nothing
-             * here is ported: it is GLUE covering for a pack that does not
-             * spread.  The zero stays anyway, because both alternatives were
-             * MEASURED over 180 s races and both are worse -- deleting the
-             * rule doubles the wall crashes (26 -> 56) as the pack rear-ends
-             * itself, and flooring it at 5 mph (44 crashes) still creeps into
-             * the car in front.  What actually breaks the deadlock is the
-             * harness's own position-based wall-grind arm below, which drops
-             * the driver into its retail reverse burst after 2.5 s of not
-             * moving.  The real fix is the lateral spread FUN_0016C450 is
-             * supposed to produce (RE_AI 14.11).
-             * The 12 m/s cap the wall-grind glue used to raise is gone. */
-            float ffx = sinf(v->rot.y), ffz = -cosf(v->rot.y);
-            for (int qi = 0; qi < g_num_vehicles; qi++) {
-                const Vehicle* q = &g_vehicles[qi];
-                if (q == v || !q->active) continue;
-                if (q->sim.speed > 6.0f) continue;
-                float qx = q->pos.x - v->pos.x, qz = q->pos.z - v->pos.z;
-                float qd = sqrtf(qx * qx + qz * qz);
-                if (qd < 9.0f && qd > 0.1f
-                    && (qx * ffx + qz * ffz) / qd > 0.75f) {
-                    ceiling = 0.0f;
-                    break;
+            /* the lost-car cap, set by the aim chain above when no reachable
+             * look-ahead point exists at all -- see the note there. */
+            if (aim_lost && ceiling > B3_AI_RESCUE_SPEED_MS)
+                ceiling = B3_AI_RESCUE_SPEED_MS;
+            /* THE CLOSE-RANGE QUEUE BRAKE, and why it is back with a FLOOR.
+             *
+             * The rule: a racer whose speed has fallen under 6 m/s sitting
+             * inside 9 m of this car's own forward cone (cos > 0.75) caps the
+             * demand.  It is GLUE -- retail's close-range rule is
+             * FUN_0016C4B0's ladder, whose `dmin < 10` rung floors at "Speed
+             * when car is <10m away" = 26.2 m/s and which relies on the
+             * avoidance stage STEERING AROUND (RE_AI 15.4).  The port already
+             * runs that ladder in world space (b3_ai_avoid_speed_cap above,
+             * retail's own 26.2 / 40 / 60 over nearest_car_ahead's 30 m
+             * cone), so everything this rule adds is the part BELOW 26.2 --
+             * the part retail buys with steering the port cannot yet produce.
+             *
+             * IT WAS RETIRED, AND THE RETIREMENT WAS HALF RIGHT.  The zero it
+             * used to write does violate a retail invariant: FUN_00172E80
+             * returns min(Min speed + t*S, S, cap), so S = 0 drives the whole
+             * demand to 0, and retail's own target-speed law never permits
+             * that -- `AI+0x9C4 = max(AI+0x9C4, racecar+0x2450 == 1 ? 0 :
+             * "Min speed mps")` @0x00172739 floors it, and FUN_00105340's
+             * stuck detector reads that floor through
+             * `COMISS [ECX+0x23C4],0 / JBE` @0x001054DA.               [C]
+             *
+             * But the retirement replaced the zero with NOTHING, and the two
+             * variants it measured were the two that cannot show the
+             * difference.  Measured again here, 180 s, US_P1_V1 / US_P1_V2 /
+             * US_P2_V1, matched:
+             *
+             *   floor 26.2 (spd_10)  BIT-IDENTICAL to deleting the rule --
+             *                        confirming the earlier finding, and
+             *                        showing only that the ladder had already
+             *                        capped at 26.2, not that it had capped
+             *                        BELOW it;
+             *   floor 0 / 5.0 / 8.9408  ALL BIT-IDENTICAL to each other, and
+             *                        all three fix US_P1_V1.
+             *
+             * So the effective range is (0, 26.2), the exact value inside it
+             * does not matter, and the value with retail provenance is the
+             * one retail hands a car it has decided is off its route:
+             * FUN_001204C0's respawn speed, "Min speed mps" x 0.44704 =
+             * 8.9408 m/s, already in the port as B3_AI_RESCUE_SPEED_MS
+             * (docs/RE_AI.md 8).  That keeps S > 0, so the invariant above
+             * holds and the stuck detector still arms.
+             *
+             * WHAT IT COSTS, measured on the retirement's OWN matched pack
+             * A/B (h4_pack/packmetrics.py, 180 s, US_C3_V1 / EU_C1_V1 /
+             * AS_C2_V1, mean): rival contacts 7 -> 3, side 2 -> 1, rival
+             * wrecks 3 -> 2, wall wrecks 2 -> 1, near-neighbour lateral
+             * separation 6.52 -> 7.13 m, commit rate 18.7% -> 18.9%.  It does
+             * not cost anything -- every pack number improves, and AS_C2_V1
+             * comes out bit-identical because the rule never fires there.
+             *
+             * WHAT IT BUYS on US_P1_V1, 180 s: sustained below-route falls
+             * 2 -> 0, ground-probe misses 202 -> 15, worst distance from the
+             * route ribbon 60 -> 35 m.  Both falls were the same hole -- see
+             * aim_over_gap for what is actually down there.
+             *
+             * AND WHAT IT COST UNTIL THE CONE WAS TIGHTENED.  Restored with
+             * the pre-H4 glue's own 9 m / cos 0.75 trigger it fired for 639
+             * of car0's 5400 frames on US_P1_V1 -- 12% of the race pinned at
+             * 20 mph -- which bunched the field hard enough that
+             * validate_tracks' "every car advances" check failed at 90 s
+             * (spans 0.078 0.198 0.190 0.222 0.062 0.061 against a 0.075
+             * floor).  Note that was never one car being braked: car5's span
+             * collapsed 0.264 -> 0.061 with the rule firing on it ZERO times.
+             * It was the whole pack queueing.  Two retail-flavoured narrowings
+             * were tried and BOTH made it worse -- skipping wrecked blockers
+             * (type 5 vs type 6, RE_AI 15.1) gave 0.063/0.072/0.134/0.292/
+             * 0.094/0.085, and also skipping already-armed stuck ones gave
+             * 0.058/0.070/... -- because they only change WHICH car is last.
+             * What fixed it was making the cone the car's own width instead
+             * of 41 degrees (B3_QUEUE_RANGE_M / B3_QUEUE_COS): US_P1_V1 90 s
+             * min span 0.061 -> 0.090 against the 0.075 floor, with falls
+             * still 0.  For reference the pre-fix tree scored 0.082 on that
+             * same check, so this is now further clear of the floor than the
+             * code it replaces.                                        [S] */
+            {
+                float ffx = sinf(v->rot.y), ffz = -cosf(v->rot.y);
+                for (int qi = 0; qi < g_num_vehicles; qi++) {
+                    const Vehicle* q = &g_vehicles[qi];
+                    if (q == v || !q->active) continue;
+                    if (q->sim.speed > B3_QUEUE_SLOW_MS) continue;
+                    float qx = q->pos.x - v->pos.x, qz = q->pos.z - v->pos.z;
+                    float qd = sqrtf(qx * qx + qz * qz);
+                    if (qd < B3_QUEUE_RANGE_M && qd > 0.1f
+                        && (qx * ffx + qz * ffz) / qd > B3_QUEUE_COS) {
+                        awl_queue(v, qi, qd); /* --- ai wreck log (agent) --- */
+                        if (ceiling > B3_AI_RESCUE_SPEED_MS)
+                            ceiling = B3_AI_RESCUE_SPEED_MS;
+                        break;
+                    }
                 }
             }
         }
 
         // ---- RECOVERED AI DRIVER (src/burnout3_ai.c, validate_ai 161/161):
         // FUN_0016AE20 -> FUN_00171E30 -> FUN_001724F0 -> FUN_00105340.
-        if (!v->ai_ready) { b3_ai_state_init(&v->ai); v->ai_ready = 1; }
+        if (!v->ai_ready) {
+            b3_ai_state_init(&v->ai, &v->fsim);
+            /* FUN_00172870 @0x00172937: AI+0x9E8 = pace_record[grid][0x93]
+             * * 0.01, the fraction of the race this car keeps its catch-up
+             * licence for.  The record is .bgd event data, extracted by
+             * tools/gen_ai_pace.py; the grid slot is the harness's own car
+             * index (the same value it hands b3_td_set_car).  With no record
+             * retail's default is 0 (@0x001728F0) -- catch-up expires on the
+             * first frame, which is exactly what this port did before. */
+            v->ai.catchup_window =
+                b3_ai_pace_catchup_window(rb_pace(), (int)(v - g_vehicles));
+            v->ai_ready = 1;
+        }
         // ---- RECOVERED AGGRESSION MACHINE (RE_AI section 14):
         // FUN_00169540 -> aim override (FUN_0016AE20 @0x0016AE2C reads the
         // machine's aim point) + FUN_0016AF10 -> FUN_00172FA0 speed +
@@ -3257,41 +7639,63 @@ static void vehicle_update(Vehicle* v, float dt) {
             B3AiAvoidOut av;
             ai_avoid_update(v, agg_slot, curve > 0.25f, &target, &ceiling,
                             &av);
+            awl_avoid(agg_slot, &av); /* --- ai wreck log (agent) --- */
             (void)av;
         }
         if (v->fsim_ready) {
             B3RigidBody* arb = &v->fsim.rb;
             B3AiCar ac;
-            B3AiInputs ain;
             memset(&ac, 0, sizeof ac);
+            /* Retail's racecar+0x2440. The driver reads speed, heading,
+             * yaw rate, gear, rpm, the LSDM gate and the frame rows straight
+             * out of the vehicle, so the AI view points at it instead of
+             * carrying ten copies. */
+            ac.veh = &v->fsim;
+            /* racecar+0x10/0x30/0x40 -- the RACECAR's own transform. The
+             * harness has one body per car, so it takes the vehicle's. */
             for (int j = 0; j < 3; j++) {
                 ac.pos[j]       = arb->frame[3][j];
                 ac.right[j]     = arb->frame[0][j];
                 ac.fwd[j]       = arb->frame[2][j];
-                ac.veh_right[j] = arb->frame[0][j];
-                ac.veh_fwd[j]   = arb->frame[2][j];
-                ac.car_at[j]    = arb->dir[j];
             }
-            ac.speed_ms       = arb->vel[3];
-            ac.yaw_rate       = arb->omega[1];
-            ac.engine_rpm     = v->fsim.trans.omega * 9.549296f;
-            ac.change_up_rpm  = v->fsim.trans.change_up_rpm;
-            ac.drift_state    = v->fsim.drift_state_1524;
-            ac.gear           = v->fsim.trans.gear;
-            ac.lsdm_limit_mph = v->fsim.lsdm_limit_13AC;
             ac.race_mode      = 1;
+            /* racecar+0x134C, retail's RAW class field: 0 IS the traffic
+             * class (retail's dispatcher sends 0x134C == 0 to the traffic
+             * driver).  Every Vehicle here is a racer -- traffic lives in
+             * g_traffic -- so this is 1, matching aggro's car_class.  It was
+             * left at 0 by the memset, which classified the player's own car
+             * as traffic: capped at 50 mph and denied the throttle
+             * derivation. */
+            ac.traffic_class  = 1;
             ac.crash_timer    = (v->crashed_until > 0.0f) ? 0.0f : 1.0f;
             ac.boosting       = v->bar.boosting;
             ac.clock          = g_race_time;
             ac.ooc_window = (v->slam_time >= 0.0f
                         && g_race_time <= v->slam_time + B3_TOTAL_OOC_TIME_S);
+            /* racecar+0x23F8 == AI+0x9F8, read by the driver FUN_00105340
+             * @0x0010561A / @0x001056CE -- the out-of-control envelope's
+             * mode.  FUN_00172870 @0x00172937 writes it from the SAME .bgd
+             * pace record: `AI+0x9F8 = (s8) rec[0x95]`, with 1 as the
+             * no-record default (@0x001728F0) and 2 in the chase arm.  It is
+             * per grid slot AND per event -- US_C3_V1's OFFSGRCF gives slot 1
+             * mode 1 and slots 2..5 mode 2 -- and the constant 2 handed every
+             * car the 0.1 steering authority that only mode 2 gets, where
+             * modes 0 and 1 get 0.05 and hold the previous input.
+             * With no pace.bin the old constant stands; see aggression. */
             ac.ooc_mode = 2;
+            {
+                const B3AiPaceEvent* pe = rb_pace();
+                int gs = (int)(v - g_vehicles);
+                if (pe && gs >= 0 && gs < B3_AI_PACE_SLOTS
+                    && gs < (int)pe->n_opp)
+                    ac.ooc_mode = (int)(signed char)pe->slot[gs].mode;
+            }
             float tp[3] = { target.x, arb->frame[3][1], -target.z };
             // GLUE trigger, real action: the harness's position-based
             // wall-grind detector arms the driver's own reverse burst
             // (v+0x157C = 2.0), which the 5 mph rule cannot see.
-            if (v->stuck_time > B3_AI_STUCK_ARM_S && v->ai.reverse_timer < 0.0f) {
-                v->ai.reverse_timer = B3_AI_REVERSE_S;
+            if (v->stuck_time > B3_AI_STUCK_ARM_S && v->fsim.reverse_timer_157C < 0.0f) {
+                v->fsim.reverse_timer_157C = B3_AI_REVERSE_S;
                 v->stuck_time = 0.0f;
             }
             // Stuck RESCUE (FUN_00170820 @0x001708EE [C-disasm], RE_AI 16):
@@ -3364,10 +7768,100 @@ static void vehicle_update(Vehicle* v, float dt) {
                     }
                 }
             }
-            b3_ai_update(&v->ai, &ac, &ain, tp, ceiling, 0.0f, dt);
             /* FUN_001724F0's own order: the aggression leg REPLACES the
-             * corner-law speed, then the Min speed mps floor, then the
-             * driver runs again on the new demand. */
+             * corner-law speed, then the Min speed mps floor -- and only
+             * THEN does the driver run, once.  This used to run the whole
+             * chain (driver included) and then drive a second time on the
+             * new demand; FUN_00105340's launch dither is stateful across
+             * calls, so the second one inverted the first and held the
+             * throttle at zero. */
+            /* ---- THE RUBBER BAND.  Retail's order inside FUN_00171A10 is
+             * FUN_00173690 (the hard cap AI+0xA08) first, then the target
+             * speed FUN_001724F0, whose tail calls FUN_001734C0 behind the
+             * gates at 0x001726CF / 0x001726E6.  b3_ai_plan_rb runs the whole
+             * chain ONCE with the catch-up in that position -- running it
+             * twice would double-apply b3_ai_target_angle's stateful
+             * 2.4/8.1 deg per frame slew limiter.
+             *
+             * DOES THE ARMED CATCH-UP BYPASS THE CORNER BRAKE?  YES -- AND SO
+             * DOES RETAIL'S.  The ceiling above reaches the demand only
+             * through FUN_00172E80's `S`; FUN_001734C0 then returns
+             * `spd + 45` (0x003B1770) on top of that, and NOTHING re-clamps
+             * it.  Read out of the instruction stream: after the
+             * `call 0x1734C0` @0x001726EE the result goes straight to
+             * AI+0x9C4 @0x001726F3 and the only things that touch it again
+             * are `max(AI+0x9C4, "Min speed mps")` @0x00172739 and the
+             * steering-error cut @0x00172600 -- there is no MINSS against
+             * AI+0x780 or AI+0xA08 on that path.  (The one MINSS in the tail,
+             * @0x001725E6, is the `bl` arm, and `bl` is only set when
+             * vehicle+0x1550 == 0, i.e. the car is NOT fully simulated --
+             * unreachable here, see rubberband_in.)  FUN_00171A10's own tail
+             * after `call 0x1724F0` @0x00171B99 is FUN_00171D90 plus the
+             * AI+0xA04 test and nothing else.
+             *
+             * The consequence is measurable offline and is retail's, not a
+             * port defect: with the licence armed the demand is at least
+             * "Min speed mps" + 45 = 65 m/s, and FUN_00105340 only brakes at
+             * `speed > demand + 13.4112` (30 mph, 0x003B1A5C), so an armed
+             * rival cannot brake below 78.4 m/s (175 mph) whatever this
+             * ceiling says.  Do NOT "fix" this into a min-chain: retail's own
+             * limiters on it are the place window (1) and the pace record's
+             * catch-up fraction, both of which this port already applies. */
+            {
+                B3AiCatchupIn rb;
+                int rb_slot = (int)(v - g_vehicles);
+                rubberband_in(&rb, v, rb_slot);
+                if (rubberband_on()) {
+                    /* FUN_00172BC0 / FUN_00172D20 with no per-section factor
+                     * table return "Min speed mps" (@0x00172D05) and "Top
+                     * speed mps" (@0x00172E65); the harness has no such
+                     * table, so those are the section bounds here. */
+                    b3_ai_speed_cap(&v->ai, &rb, g_vehicles[0].sim.speed,
+                                    b3_ai_params.min_speed_mps,
+                                    b3_ai_params.top_speed_mps);
+                    b3_ai_plan_rb(&v->ai, &ac, tp, ceiling,
+                                  v->ai.speed_cap, &rb);
+                } else {
+                    b3_ai_plan(&v->ai, &ac, tp, ceiling, 0.0f);
+                }
+                if (getenv("B3_RB_DBG")
+                    && ((int)(g_race_time * 60.0f) % 30) == 0)
+                    fprintf(stderr,
+                            "[rb] t=%.2f car%d place=%d rank=%d gap=%.2f "
+                            "frac=%.3f/%.2f exp=%d cap=%.1f bonus=%.1f "
+                            "tgt=%.1f spd=%.1f\n",
+                            g_race_time, rb_slot, rb.my_place, rb.veh_rank,
+                            rb.veh_gap_norm, rb.race_fraction,
+                            v->ai.catchup_window, v->ai.catchup_expired,
+                            v->ai.speed_cap, v->ai.catchup_bonus,
+                            v->ai.target_speed, v->sim.speed);
+                /* H5 MODE DUMP: the live value of every mode/state input the
+                 * ported AI laws consume, so the port's side of the
+                 * differential is read from the running game rather than
+                 * inferred.  One line per car every half second. */
+                if (getenv("B3_AI_MODES")
+                    && ((int)(g_race_time * 60.0f) % 30) == 0) {
+                    float pdx = v->pos.x - g_vehicles[0].pos.x;
+                    float pdz = v->pos.z - g_vehicles[0].pos.z;
+                    fprintf(stderr,
+                            "[modes] t=%.2f car%d 1550=%d d=%.0f rank=%d "
+                            "gap=%.2f m2450=%d rmode=%d cls=%d exp=%d "
+                            "cap=%.1f bonus=%.1f tmode=%d m1fc=%d ooc=%d cs=%.1f "
+                            "ceil=%.1f aggro=%.2f aggst=%d altw=%d "
+                            "tgt=%.1f spd=%.1f\n",
+                            g_race_time, rb_slot, (int)v->in_range_1550,
+                            sqrtf(pdx * pdx + pdz * pdz), rb.veh_rank,
+                            rb.veh_gap_norm, rb.mode_2450, ac.race_mode,
+                            ac.traffic_class, v->ai.catchup_expired,
+                            v->ai.speed_cap, v->ai.catchup_bonus,
+                            nav_target_mode, nav_mode_1fc, ac.ooc_mode,
+                            nav_corner_speed,
+                            ceiling,
+                            g_aggro_cars[agg_slot].aggression,
+                            v->aggro.state, v->aiw.route_alt,
+                            v->ai.target_speed, v->sim.speed);
+                }
+            }
             if (v->aggspd.mode != 0) {
                 float m = b3_ai_aggro_speed(&v->aggspd, &g_aggro_world,
                                             agg_slot,
@@ -3376,17 +7870,30 @@ static void vehicle_update(Vehicle* v, float dt) {
                 if (m < b3_ai_params.min_speed_mps)
                     m = b3_ai_params.min_speed_mps;
                 v->ai.target_speed = m;
-                b3_ai_drive(&v->ai, &ac, &ain, dt,
-                            v->ai.des_dir_n[0] * ac.right[0]
-                          + v->ai.des_dir_n[1] * ac.right[1]
-                          + v->ai.des_dir_n[2] * ac.right[2]);
             }
+            b3_ai_dispatch(&v->ai, &ac, dt,
+                        v->ai.des_dir_n[0] * ac.right[0]
+                      + v->ai.des_dir_n[1] * ac.right[1]
+                      + v->ai.des_dir_n[2] * ac.right[2], 1);
+            v->emu_ai_car = ac;          /* for the combined retail step */
+            v->emu_ai_car_valid = 1;
             b3_ai_boost_latch(&v->aggspd, g_race_time);
             agg_boost = v->aggspd.wants_boost;
-            throttle      = ain.throttle;
-            brake         = ain.brake;
-            steer_input   = ain.steer;
-            ai_game_steer = 1;
+            /* the RAW throttle: b3_vehicle_step_full is where the port
+             * implements FUN_00104D30's input glue, and that glue derives
+             * v+0x1400 = min(1, raw * v[0x13BC]) itself.  Handing it the
+             * already-derived v+0x1400 scaled the throttle by v[0x13BC]
+             * (4.0) a second time, which the clamp then hid at full
+             * throttle and distorted everywhere else. */
+            throttle      = v->fsim.throttle_raw_1414;
+            if (v == &g_player && g_race_time < g_traffic_scen_until) {
+                throttle = 1.0f; brake = 0.0f; steer_input = 0.0f;
+            }
+            if (getenv("B3_THR_DBG") && v == &g_player)
+                fprintf(stderr, "[thr] after AI: fsim.thr=%.2f (slot0)\n",
+                        v->fsim.throttle_1400);
+            brake         = v->fsim.brake_1404;
+            steer_input   = v->fsim.steer_1408;
             // racecar+0x2419 comes from the recovered FUN_00171D90 latch
             // now; the GLUE heuristic is the fallback when the aggression
             // machine is idle.
@@ -3394,8 +7901,6 @@ static void vehicle_update(Vehicle* v, float dt) {
                           || (fabsf(err) < 0.15f && curve < 0.2f
                               && v->sim.speed > 25.0f);
             ai_target_ms  = -1.0f;   // governor OFF (audit verdict item 2)
-            if (ain.gear_request != 0)
-                v->fsim.trans.gear = ain.gear_request;
             {   /* B3_AI_WHY=1: one line per car per second naming every term
                  * that can hold a rival at a standstill.  Diagnostic only. */
                 static int why = -1;
@@ -3407,15 +7912,22 @@ static void vehicle_update(Vehicle* v, float dt) {
                            "auth %.2f aim %.1f\n",
                            g_race_time, agg_slot, v->sim.speed, ceiling,
                            v->ai.target_speed, v->ai.corner_speed,
-                           nav_corner_speed,
-                           nav_approach_dist(aim_section, aim_node, v->pos),
-                           ain.throttle, ain.brake, ain.steer,
-                           v->ai.reverse_timer, v->ai.stuck_arm,
+                           nav_corner_speed, nav_brake_dist,
+                           v->fsim.throttle_1400, v->fsim.brake_1404,
+                           v->fsim.steer_1408,
+                           v->fsim.reverse_timer_157C, v->fsim.stuck_arm_1578,
                            v->fsim.trans.gear, v->crashed_until,
-                           v->ai.steer_authority,
+                           v->fsim.authority_1534,
                            sqrtf((target.x - v->pos.x) * (target.x - v->pos.x)
                                + (target.z - v->pos.z) * (target.z - v->pos.z)));
             }
+            /* --- ai wreck log (agent) ---
+             * One 10 Hz ring entry, here at the tail of the AI arm so that
+             * throttle/brake/steer are the ones b3_ai_dispatch just wrote. */
+            awl_sample(v, agg_slot, ceiling, nav_corner_speed, nav_brake_dist,
+                       nav_target_mode, nav_mode_1fc, aim_lost, &target,
+                       curve);
+            /* --- end ai wreck log (agent) --- */
         }
     }
 
@@ -3427,6 +7939,18 @@ static void vehicle_update(Vehicle* v, float dt) {
     // damping, and FUN_0011AEF0 keeps resolving chassis contacts (see
     // RE_NOTES 16). The wreck sim below mirrors that with the ported
     // impulse/damping laws around the verified integrator.
+    //
+    // AFTERTOUCH: snapshot the live boost bit HERE -- after both input
+    // branches (human at "v == &g_player && !autodrive", AI below it) have
+    // written `boost`, and before the crashed-state override a few lines down
+    // clears it.  That override cuts throttle/brake/boost so a wreck neither
+    // burns nor drains the meter, but retail's Impact Time gate
+    // (FUN_00118410 @0x0011889A) reads the RAW pad bit veh+0x13FC & 4, which
+    // crashing never touches.  Reading the suppressed copy instead made
+    // `crashed && held` unsatisfiable -- the whole slow-mo was dead on the
+    // pad.  Snapshotting at this point (not inside the human branch) also
+    // keeps the aftertouch alive under B3_AUTODRIVE.                    [C]
+    boost_raw = boost;
     if (v->crashed_until > 0.0f) {
         // Recovery clock (1:1): retail stamps 5 GAME seconds on the DILATED
         // clock (FUN_00198E60 @0x00198F65: racecar+0x10DC = clock + 5.0). At
@@ -3498,10 +8022,13 @@ static void vehicle_update(Vehicle* v, float dt) {
                 if (!b3_nav_respawn()
                     || !nav_replace_car(v, rs, rn, 3, 13.4112f)) {
                     int n2 = g_track.num_points;
-                    int ni = (int)(find_track_progress(v->pos) * n2);
-                    int back = (ni - 3 + n2) % n2;
+                    int ni = (int)(vehicle_track_progress(v) * n2);
+                    int back = route_wrap(ni - 3, n2);
                     Vec3 rp = g_track.points[back];
-                    Vec3 rq = g_track.points[(back + 1) % n2];
+                    /* heading over a SPAN, as in route_replace_car */
+                    int fwd_i = route_wrap(back + 4, n2);
+                    if (fwd_i == back) fwd_i = route_wrap(back + 1, n2);
+                    Vec3 rq = g_track.points[fwd_i];
                     v->pos = rp;
                     {
                         float gh, gn[3];
@@ -3515,6 +8042,7 @@ static void vehicle_update(Vehicle* v, float dt) {
                                     -cosf(v->rot.y) * 13.4112f};
                     v->sim.speed = 13.4112f;
                     v->fsim_ready = 0;
+                    b3_emu_drop_car(v);
                 }
                 // User 2026-08-13: IMMEDIATE control after a crash
                 // reset (no AI handover); the car is already placed on a
@@ -3585,7 +8113,26 @@ static void vehicle_update(Vehicle* v, float dt) {
         // impact hit (divisor 6) at the wreck moment, and divisor-5
         // aftertouch while the BOOST button is held (FUN_00118410 [C]).
         // A plain crash tumbles at full speed and weight.
-        b3_tdfx_set_aftertouch(v->crashed_until > 0.0f, boost);
+        {
+            /* One pad bit drives both halves in retail: veh+0x13FC bit 4
+             * (pad+0x84) is what 0x0011889A tests for the divisor AND what
+             * 0x00118980 feeds the steer gate.  The scripted-input aid
+             * therefore overrides both from one place.
+             *
+             * THE BUG THIS FIXES: `boost` is forced to 0 a few hundred lines
+             * up, in the same `g_race_time < v->crashed_until` branch that
+             * cuts throttle and pins the brake -- so on the REAL input path
+             * `crashed && held` was unsatisfiable and Impact Time could never
+             * engage.  Only the scripted at_script() aid, which overrides
+             * at_hold AFTER that point, ever saw a held button, which is why
+             * the suite was green while the pad did nothing.  Retail keeps
+             * reading the live pad bit through the crash, so read the raw
+             * snapshot -- now the single source the steer half (g_at_held)
+             * takes too, so the two can never disagree again.           [C] */
+            int at_hold = boost_raw;
+            (void)at_script(NULL, NULL, &at_hold);
+            b3_tdfx_set_aftertouch(v->crashed_until > 0.0f, at_hold);
+        }
     }
 
     // Deferred takedown commit: the attacker must stay clear of a crash for
@@ -3641,7 +8188,7 @@ static void vehicle_update(Vehicle* v, float dt) {
                 ground = gy;
             } else {
                 Vec3 c;
-                loop_closest(g_cl, ROUTE_COUNT, v->pos.x, v->pos.z, &c, NULL);
+                loop_closest(g_cl, g_route_n, v->pos.x, v->pos.z, &c, NULL);
                 ground = c.y;
             }
             // CRASH-CINEMA: AFTERTOUCH.  The old block here drove
@@ -3687,25 +8234,20 @@ static void vehicle_update(Vehicle* v, float dt) {
                 g_at_v = az;
                 /* pad+0x84: the same BOOST button the driving path reads,
                  * and the one FUN_00118410 @0x0011889A tests to request the
-                 * divisor-5 slow-mo. */
-                g_at_held = (g_keys[SDL_SCANCODE_SPACE]
-                             || (g_pad && pad_btn(SDL_CONTROLLER_BUTTON_X)))
-                            ? 1 : 0;
-                /* TEST AID: B3_TEST_AFTERTOUCH="h,v" pins the two
-                 * aftertouch axes and holds Impact Time, so a headless
-                 * run can exercise the whole chain (same class of aid as
-                 * B3_TEST_CRASH_AT). */
+                 * divisor-5 slow-mo.  ONE source for both halves -- this used
+                 * to re-read the keyboard/pad itself while the divisor half
+                 * read the crash-suppressed `boost`, so the steer worked (the
+                 * reticle tracked the stick) while the slow-mo never fired. */
+                g_at_held = boost_raw;
+                /* TEST AID: B3_TEST_AFTERTOUCH="h,v[,hold]" -- see
+                 * at_script().  `hold` defaults to 1 so the old two-field
+                 * form keeps its meaning; hold=0 scripts the RELEASED
+                 * state with the axes still pinned. */
                 {
-                    static int tat = -1;
-                    static float th, tv;
-                    if (tat < 0) {
-                        const char* e = getenv("B3_TEST_AFTERTOUCH");
-                        tat = (e && sscanf(e, "%f,%f", &th, &tv) == 2)
-                              ? 1 : 0;
-                    }
-                    if (tat) {
+                    float th, tv; int thold = 1;
+                    if (at_script(&th, &tv, &thold)) {
                         ax = th; az = tv;
-                        g_at_h = ax; g_at_v = az; g_at_held = 1;
+                        g_at_h = ax; g_at_v = az; g_at_held = thold;
                     }
                 }
 
@@ -3804,9 +8346,35 @@ static void vehicle_update(Vehicle* v, float dt) {
                 int nsoup = b3_collision_gather_walls(
                     center, half, velocity, 0.6f, soup,
                     B3_CHASSIS_SOUP_MAX);
-                for (int poly = 0; poly < nsoup; poly++)
-                    b3_wreck_world_contact(wk, soup[poly].v0,
-                                           soup[poly].normal);
+                /* ONE narrow phase over the WHOLE soup, ONE resolve -- which
+                 * is what FUN_00122D00 does (@0x00122F81 calls FUN_00109EA0
+                 * exactly once).  This loop used to call the SINGLE-PLANE
+                 * form once per polygon, handing it `soup[poly].v0` as the
+                 * plane point.  Two defects in one line:
+                 *
+                 *  (a) the plane form has no polygon, so it fabricates a
+                 *      square of half-size |box dims| + 1 = 6.15 m CENTRED ON
+                 *      the point it is given.  A triangle's first vertex is
+                 *      not under the car: on the shipped US_C3_V1 soup the
+                 *      median near-vertical face has a vertex 10.40 m from
+                 *      v0 and 78.7% exceed 6.15 m, so four wall faces in five
+                 *      produced NO CONTACT AT ALL.
+                 *  (b) resolving per polygon applies N impulses, N friction
+                 *      damps and N push-outs in a frame where retail applies
+                 *      one.  With (a) fixed on its own that launched the
+                 *      wreck over a kilometre off the track.
+                 *
+                 * b3_rigid_body_obb_soup_contact is FUN_00107950 as written:
+                 * it clips the real triangles, sums the clipping faces'
+                 * normals and averages their centroids into one contact. */
+                B3WorldPoly wp[B3_CHASSIS_SOUP_MAX];
+                for (int poly = 0; poly < nsoup; poly++) {
+                    memcpy(wp[poly].v[0], soup[poly].v0, sizeof wp[poly].v[0]);
+                    memcpy(wp[poly].v[1], soup[poly].v1, sizeof wp[poly].v[1]);
+                    memcpy(wp[poly].v[2], soup[poly].v2, sizeof wp[poly].v[2]);
+                    memcpy(wp[poly].n,    soup[poly].normal, sizeof wp[poly].n);
+                }
+                b3_wreck_world_contact_soup(wk, wp, nsoup);
             }
             b3_wreck_update(wk, ground, dt);
             /* PANELS: one frame of the per-panel damage machine off the
@@ -3904,7 +8472,7 @@ static void vehicle_update(Vehicle* v, float dt) {
             v->rot.z = wk->roll;
             v->sim.speed = 0.0f;             // drivetrain is parked
             v->speed = wk->vel[3];
-            v->track_progress = find_track_progress(v->pos);
+            v->track_progress = vehicle_track_progress(v);
             v->prev_progress = v->track_progress;
             return;                          // the wreck owns the motion
         }
@@ -3999,6 +8567,83 @@ static void vehicle_update(Vehicle* v, float dt) {
         // per rendered frame with the frame-locked dt (period/divisor).
         // The old fixed-tick accumulator beat against the frame rate and
         // needed render interpolation to hide it; both are gone.
+        /* backends.cfg physics=retail: hand this car's frame to the game's
+         * OWN pipeline under emulation instead of the recovered C. The
+         * emulator keeps the retail vehicle struct resident between frames,
+         * so this is a step, not a re-seed. Falls back silently to the port
+         * for any car the sidecar will not take (and permanently if it
+         * dies), because dropping a frame of physics is worse than running
+         * the port's version of it. */
+        int stepped = 0;
+        if (b3_backend_get(B3_FEAT_PHYSICS) == B3_BACKEND_RETAIL) {
+            /* Retail drives the RACING car only.
+             *
+             * FUN_0011BE50 branches on veh+0x210 and the crashed side runs a
+             * different solver (FUN_00123000) that never reaches the soup
+             * collision at all -- "the crashed path is NOT the racing
+             * pipeline", RE_NOTES. The harness owns the wreck: its own
+             * aftertouch, tumble and containment. Leaving retail to step a
+             * wrecked car means neither side holds it up, and it free-falls
+             * for the rest of the race -- measured pinning at -155 m/s
+             * (which reads as "347 mph" on the HUD) after the first crash.
+             *
+             * So ownership follows retail's own split: the port takes the
+             * wheel back for the crash and hands a fresh state over when the
+             * car is racing again. */
+            int crashed = (v->crashed_until > 0.0f);
+            int slot = crashed ? -1 : b3_emu_slot_of(v);
+            if (crashed) b3_emu_drop_car(v);
+            if (slot >= 0) {
+                const float* P = &v->fsim.rb.frame[3][0];
+                /* [C] FUN_0011BC60 @0x0011BCD9/@0x0011BD17/@0x0011BC7A:
+                 * r = |veh+0x1D0.xyz| + veh[0xBC] * dt. */
+                {
+                    const float* he = v->fsim.half_ext;
+                    float r = sqrtf(he[0]*he[0] + he[1]*he[1] + he[2]*he[2])
+                            + v->fsim.rb.vel[3] * dt;
+                    b3_emu_refresh_soup(slot, P, &v->fsim.rb.vel[0], r);
+                }
+                /* The port's own soup is frozen inside its step, which we are
+                 * about to skip. Freeze it anyway so everything on this side
+                 * that consults v->soup (the dump, the crash gate, the
+                 * harness's own probes) sees the world rather than an empty
+                 * set -- that emptiness is what made the port believe the car
+                 * was airborne. */
+                if (v->fsim.soup_freeze)
+                    v->fsim.soup_freeze(v->fsim.soup_user, &v->fsim);
+                /* Hand retail the port's OWN struct bytes. B3VehicleFull is
+                 * byte-identical to the game's vehicle object over the retail
+                 * window, so nothing is marshalled -- the field-by-field
+                 * translation this used to need is gone. The 4x4 rides along
+                 * separately because retail keeps it in its own object. */
+                /* Scatter-copy: hand retail the 82 RECOVERED ranges of our
+                 * own struct -- same offsets on both sides, nothing converted
+                 * -- and leave the ~81% of its vehicle object we have not
+                 * recovered exactly as the emulator seeded it. Blasting the
+                 * whole window there instead replaces that seed with zeros and
+                 * hangs the substep loop. */
+                if (getenv("B3_THR_DBG") && slot == 0)
+                    fprintf(stderr, "[thr] into physics: %.2f\n", throttle);
+                /* Both retail: run the driver INSIDE this session, the way
+                 * retail does, instead of shuttling its fields between two. */
+                if (b3_backend_get(B3_FEAT_AI) == B3_BACKEND_RETAIL
+                    && v->emu_ai_car_valid) {
+                    if (b3_emu_step_ai(slot, v->bar.boosting, dt,
+                                       &v->emu_ai_car, &v->ai,
+                                       &v->fsim, v->fsim.rb.frame)) {
+                        b3_vehicle_full_refresh_derived(&v->fsim);
+                        stepped = 1;
+                    }
+                } else
+                if (b3_emu_step_ranges(slot, throttle, brake, steer_input,
+                                       v->bar.boosting, dt,
+                                       &v->fsim, v->fsim.rb.frame)) {
+                    b3_vehicle_full_refresh_derived(&v->fsim);
+                    stepped = 1;
+                }
+            }
+        }
+        if (!stepped)
         b3_vehicle_step_full(&v->fsim, throttle, brake,
                              /* HANDEDNESS: with the display mirror in the
                               * projection (see render_frame), screen-left is
@@ -4007,6 +8652,41 @@ static void vehicle_update(Vehicle* v, float dt) {
                               * always game-space. */
                              steer_input,
                              v->bar.boosting, dt);
+    }
+    if (getenv("B3_WALLDBG") && v == &g_player) {
+        /* Pop-through detector.  b3_sweep_sphere_ex's front-face test means a
+         * car that ends a frame on the BACK side of a one-sided wall face can
+         * never be pushed back out -- the contact that would do it is the one
+         * the test rejects.  Flag the state and how deep it is. */
+        static Vec3 wprev; static int have = 0;
+        float pc[3] = { v->pos.x, v->pos.y + 0.3f, v->pos.z };
+        if (have) {
+            float pa[3] = { wprev.x, wprev.y + 0.3f, wprev.z };
+            float hp[3], wn[3];
+            if (b3_segment_crosses_wall(pa, pc, 0.45f, hp, wn)) {
+                float sd = 0.0f;
+                b3_nearest_wall_signed(pc, 2.0f, 0.45f, &sd, NULL);
+                fprintf(stderr, "[wall] CROSSED a wall face t=%.2f spd=%.1f "
+                        "from=(%.1f %.1f) to=(%.1f %.1f) step=%.2f n=(%.2f %.2f) "
+                        "now_signed=%.3f\n",
+                        g_race_time, v->fsim.rb.vel[3], wprev.x, wprev.z,
+                        v->pos.x, v->pos.z,
+                        sqrtf((v->pos.x-wprev.x)*(v->pos.x-wprev.x)
+                            + (v->pos.z-wprev.z)*(v->pos.z-wprev.z)),
+                        wn[0], wn[2], sd);
+            }
+        }
+        wprev = v->pos; have = 1;
+    }
+    if (getenv("B3_TRAJ") && v == &g_player) {
+        /* per-frame trajectory, for diffing one physics backend against the
+         * other on identical AI commands (docs/RE_AI.md, the dispatcher note) */
+        fprintf(stderr, "[traj] f=%d t=%.3f in(thr=%.7f brk=%.7f str=%.7f) "
+                "pos=%.7f %.7f %.7f vel=%.7f %.7f %.7f spd=%.7f gear=%d\n",
+                g_frame_count, g_race_time, throttle, brake, steer_input,
+                v->fsim.rb.frame[3][0], v->fsim.rb.frame[3][1],
+                v->fsim.rb.frame[3][2], v->fsim.rb.vel[0], v->fsim.rb.vel[1],
+                v->fsim.rb.vel[2], v->fsim.rb.vel[3], v->fsim.trans.gear);
     }
     if (getenv("B3_DBG") && v == &g_player) {
         float gh, gn[3];
@@ -4075,10 +8755,23 @@ static void vehicle_update(Vehicle* v, float dt) {
             int nsub = 1 + (int)(mlen / 0.6f);
             if (nsub > 8) nsub = 8;
             Vec3 goal = v->pos;
+            /* Advance by the per-substep DELTA from the position the previous
+             * substep left, instead of re-interpolating from prev_pos every
+             * time.  Re-interpolating overwrote v->pos before each test, so
+             * every push-out except the last substep's was thrown away: the
+             * sweep still DETECTED the contact (its stated job) but the car
+             * kept its uncorrected path and could finish the frame behind a
+             * one-sided face -- and once behind it, b3_sweep_sphere_ex's
+             * front-face test rejects the very contact that would push it
+             * back out, so nothing recovers it.  That is the "pop through the
+             * wall".  Carrying the correction forward costs nothing and keeps
+             * this a detector: the RESPONSE is still retail's. */
+            float dx2 = (goal.x - prev_pos.x) / (float)nsub;
+            float dz2 = (goal.z - prev_pos.z) / (float)nsub;
+            v->pos.x = prev_pos.x; v->pos.z = prev_pos.z;
             for (int s2 = 1; s2 <= nsub; s2++) {
-                float t = (float)s2 / (float)nsub;
-                v->pos.x = prev_pos.x + (goal.x - prev_pos.x) * t;
-                v->pos.z = prev_pos.z + (goal.z - prev_pos.z) * t;
+                v->pos.x += dx2;
+                v->pos.z += dz2;
                 mesh_collide(v);
             }
         }
@@ -4100,7 +8793,7 @@ static void vehicle_update(Vehicle* v, float dt) {
 
     {
         Vec3 c;
-        loop_closest(g_cl, ROUTE_COUNT, v->pos.x, v->pos.z, &c, NULL);
+        loop_closest(g_cl, g_route_n, v->pos.x, v->pos.z, &c, NULL);
         float dcx = v->pos.x - c.x, dcz = v->pos.z - c.z;
         float dc = sqrtf(dcx * dcx + dcz * dcz);
         if (dc > 60.0f && dc > 1e-6f) {
@@ -4131,7 +8824,7 @@ static void vehicle_update(Vehicle* v, float dt) {
         if (!v->nav_ready
             || nav_node_dist2(v->nav_section, v->nav_node, v->pos) > 625.0f)
             (void)nav_update_vehicle(v);
-        loop_closest(g_cl, ROUTE_COUNT, v->pos.x, v->pos.z, &road, NULL);
+        loop_closest(g_cl, g_route_n, v->pos.x, v->pos.z, &road, NULL);
         (void)nav_surface_height(v->nav_section, v->nav_node, v->pos,
                                  &road.y);
         int slot = (int)(v - g_vehicles);
@@ -4203,11 +8896,12 @@ static void vehicle_update(Vehicle* v, float dt) {
     v->speed = v->sim.speed;
 
     // Update track progress
-    v->track_progress = find_track_progress(v->pos);
+    v->track_progress = vehicle_track_progress(v);
 
     // Lap detection (per-vehicle wrap of the progress fraction)
     if (v->prev_progress > 0.9f && v->track_progress < 0.1f && v->speed > 5.0f) {
         v->lap++;
+        b3_raceflow_on_lap(v);                              /* race flow (agent) */
         if (v == &g_player) {
             g_current_lap = v->lap;
             printf("[Burnout3] Lap %d/%d completed!\n", g_current_lap, g_lap_count);
@@ -4226,12 +8920,25 @@ static void vehicle_update(Vehicle* v, float dt) {
 // and direction are the game's own path data.
 static void spawn_on_grid(Vehicle* v, int slot) {
     // Real start grid: position + forward vector per slot straight from the
-    // game's OFFSGRCF spatial record (burnout3_start_grid.h, [C]). The real
+    // game's OFFSGRCF spatial record (.bgd param+0x3BC/+0x3C0, [C]). The real
     // event grid is 6 cars.
-    const B3GridSlot* g = &B3_START_GRID[slot % B3_START_GRID_COUNT];
+    /* Runtime start grid: build/tracks/<B3_TRACK>/grid.bin, pos/fwd with z
+     * pre-flipped by the extractor.  It used to have a compiled-in fallback,
+     * src/burnout3_start_grid.h's B3_START_GRID -- US_C3_V1's six slots -- and
+     * on every other track a missing grid.bin therefore spawned the field in
+     * the WRONG WORLD: the rescue snapped them onto the route with an
+     * arbitrary heading, and on AS_M1 the whole field drove the course
+     * BACKWARD (progress 0.416 -> 0.414 -> wrap 0.99) while the
+     * route-direction vote read 0/24 -- the line was fine, the spawn was not.
+     * That header is gone; grid_slots() now fails loudly instead.  It is
+     * shared with init_route_from_nav, so the route's own direction and
+     * candidate scoring are anchored on the same slots. */
+    int rt_n = 0;
+    const B3GridSlot* rt_grid = grid_slots(&rt_n);
+    const B3GridSlot* g = &rt_grid[slot % rt_n];
     v->pos = (Vec3){g->pos[0], g->pos[1] + 0.5f, g->pos[2]};
     // Harness overflow beyond 6 slots: offset an extra row back.
-    if (slot >= B3_START_GRID_COUNT) {
+    if (slot >= rt_n) {
         v->pos.x -= g->fwd[0] * 40.0f;
         v->pos.z -= g->fwd[2] * 40.0f;
     }
@@ -4245,9 +8952,11 @@ static void spawn_on_grid(Vehicle* v, int slot) {
     // permanently ranking ahead of the player, so the place indicator
     // could never show better than 3rd. Slots behind the wrap start at
     // lap -1 so the launch crossing lands everyone on lap 0 together.
-    v->track_progress = find_track_progress(v->pos);
+    v->track_progress = vehicle_track_progress(v);
     v->prev_progress = v->track_progress;
     v->lap = (v->track_progress > 0.5f) ? -1 : 0;
+    /* racecar+0x135C, the baseline FUN_001734C0 subtracts (@0x0017351B). */
+    v->rb_start_progress = (float)v->lap + v->track_progress;
 }
 
 // Pick the Nth player-class vehicle out of the extracted roster, skipping
@@ -4276,7 +8985,17 @@ static const VehicleInfo* roster_player_car(int nth) {
 
 static void load_real_track(void) {
     const char* path = getenv("B3_TRACK_OBJ");
-    if (!path) path = "build/track.obj";
+    char tpath[256];
+    const char* tid = getenv("B3_TRACK");
+    if (!tid) tid = "US_C3_V1";
+    if (!path) {
+        /* PER-TRACK, and NOTHING ELSE.  The old fallback was the GLOBAL
+         * build/track.obj -- whichever track was extracted LAST -- so a
+         * missing mesh silently drew, and ground-probed, a different world.
+         * Same hazard as the purged headers, same treatment. */
+        snprintf(tpath, sizeof tpath, "build/tracks/%s/track.obj", tid);
+        path = tpath;
+    }
     if (trackmesh_load(&g_real_track, path) == 0) {
         g_have_real_track = 1;
         printf("[Burnout3] REAL track geometry: %d verts, %d tris from %s\n",
@@ -4285,6 +9004,17 @@ static void load_real_track(void) {
                g_real_track.min[0], g_real_track.max[0],
                g_real_track.min[1], g_real_track.max[1],
                g_real_track.min[2], g_real_track.max[2]);
+    } else if (!getenv("B3_TRACK_OBJ")) {
+        fprintf(stderr,
+            "[Burnout3] FATAL: no usable %s.\n"
+            "  This is the track's own render mesh (static.dat + streamed.dat);\n"
+            "  there is no global copy to fall back to -- the one that used to\n"
+            "  be here was whichever track was extracted LAST, so a missing\n"
+            "  file drew, and ground-probed, a different world.\n"
+            "  Extract it from your own dump:  tools/cextract/build.sh && "
+            "cxtract --track %s --only track --out build/tracks/%s\n",
+            path, tid, tid);
+        exit(2);
     } else {
         printf("[Burnout3] no real track at %s (run tools/extract_track.py); "
                "falling back to the placeholder circuit\n", path);
@@ -4345,6 +9075,12 @@ static void b3_gamma_build(void) {
 // must NOT be touched), 0 when it could not be.
 static int b3_gamma_in_gl = 0;
 
+// AFTEREFFECTS: 1 while the FBO effects chain owns the frame, i.e. between
+// b3_afx_frame_begin() and b3_afx_frame_end(). All three hooks in
+// render_frame() are guarded on it, so a build that cannot make FBOs keeps
+// the older grab-based postfx path unchanged.
+static int g_afx_on = 0;
+
 // The fallback: apply the same table to a captured RGBA buffer. Only reached
 // when the GL pass is unavailable.
 static void b3_gamma_apply_rgba(unsigned char* px, int n) {
@@ -4357,23 +9093,66 @@ static void b3_gamma_apply_rgba(unsigned char* px, int n) {
     }
 }
 
-// Upload one PNG (a decoded game texture) as a GL texture. Returns 0 on failure.
-// *cutout is set when >35% of texels are fully transparent (fences, foliage).
-static GLuint load_gl_texture(const char* path, int* cutout) {
-    SDL_Surface* img = IMG_Load(path);
-    if (!img) return 0;
-    SDL_Surface* rgba = SDL_ConvertSurfaceFormat(img, SDL_PIXELFORMAT_ABGR8888, 0);
-    SDL_FreeSurface(img);
-    if (!rgba) return 0;
+/* ---------------------------------------------- THE DECODE / UPLOAD SPLIT
+ * A track's texture set is 177 PNGs on US_C3_V1 and the warm cost of loading
+ * it was 0.21 s -- libpng inflating them one after another on the thread that
+ * also owns the GL context.  The inflate is pure CPU over a file the decoder
+ * opens itself; the upload is GL and may not leave this thread.  So the two
+ * halves are separated: b3_tex_decode() is what a worker runs, b3_tex_upload()
+ * is what the GL thread runs, and load_gl_texture() below is the two of them
+ * back to back for every caller that only ever wants one image.
+ *
+ * THE PATH RULE, and it is the reason this is safe at all.  b3_iso_resolve()
+ * is MAIN THREAD ONLY (burnout3_isodata.h): its return buffers are an
+ * unsynchronised ring and a miss runs a whole extraction stage.  A worker
+ * therefore never resolves anything -- the caller resolves on this thread,
+ * copies the answer, and the worker opens THAT.  b3_tex_decode() reaches the
+ * real SDL_image entry point as `(IMG_Load)(...)`: a function-like macro is
+ * not expanded when its name is not followed by `(`, so the parentheses step
+ * around the isoshim's redirect rather than fighting it.
+ */
+typedef struct {
+    char         path[512];     /* ALREADY RESOLVED -- see THE PATH RULE */
+    SDL_Surface* rgba;          /* the worker's output, NULL on failure  */
+    int          cutout;
+} B3TexJob;
 
-    if (cutout) {
+static void b3_tex_decode(B3TexJob* j) {
+    SDL_Surface* img = (IMG_Load)(j->path);
+    SDL_Surface* rgba;
+    if (!img) { j->rgba = NULL; return; }
+    rgba = SDL_ConvertSurfaceFormat(img, SDL_PIXELFORMAT_ABGR8888, 0);
+    SDL_FreeSurface(img);
+    j->rgba = rgba;
+    if (!rgba) return;
+    {   /* the cut-out probe: >35% fully transparent texels */
         long clear = 0, total = (long)rgba->w * rgba->h;
         const unsigned char* px = rgba->pixels;
         for (long i = 0; i < total; i++)
             if (px[i * 4 + 3] == 0) clear++;
-        *cutout = total > 0 && clear * 100 > total * 35;
+        j->cutout = total > 0 && clear * 100 > total * 35;
     }
+}
 
+static GLuint b3_tex_upload(SDL_Surface* rgba);
+
+// Upload one PNG (a decoded game texture) as a GL texture. Returns 0 on failure.
+// *cutout is set when >35% of texels are fully transparent (fences, foliage).
+static GLuint load_gl_texture(const char* path, int* cutout) {
+    B3TexJob j;
+    GLuint tex;
+    snprintf(j.path, sizeof j.path, "%s", b3_iso_resolve(path));
+    j.rgba = NULL;
+    j.cutout = 0;
+    b3_tex_decode(&j);
+    if (!j.rgba) return 0;
+    if (cutout) *cutout = j.cutout;
+    tex = b3_tex_upload(j.rgba);
+    SDL_FreeSurface(j.rgba);
+    return tex;
+}
+
+static GLuint b3_tex_upload(SDL_Surface* rgba) {
     GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
@@ -4381,7 +9160,6 @@ static GLuint load_gl_texture(const char* path, int* cutout) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_GENERATE_MIPMAP, GL_TRUE);
     /* GLUE (display quality): anisotropic filtering. The BILLBOARD wave
      * proved the perceived "flicker" on roadside boards is pure texture
      * aliasing at grazing view angles (6.9% strongly-reversing pixels with
@@ -4403,10 +9181,67 @@ static GLuint load_gl_texture(const char* path, int* cutout) {
             glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT,
                             maxaniso);
     }
+    b3r_tex_mipmap_pre();
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rgba->w, rgba->h, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, rgba->pixels);
-    SDL_FreeSurface(rgba);
+    b3r_gen_mipmap();
+    /* B3_TEXDBG=1: report any texture that is NOT a power of two.  WebGL 1
+     * cannot mipmap one and cannot REPEAT one -- either leaves the texture
+     * INCOMPLETE, which a sampler in an active program turns into a rejected
+     * draw rather than a black pixel.  Desktop GL has neither restriction. */
+    if (getenv("B3_TEXDBG")) {
+        int w = rgba->w, h = rgba->h;
+        int pot = w > 0 && h > 0 && (w & (w - 1)) == 0 && (h & (h - 1)) == 0;
+        if (!pot)
+            fprintf(stderr, "[texdbg] NPOT texture %u: %dx%d\n", tex, w, h);
+    }
+    /* GL_GENERATE_MIPMAP is GL 1.4 / GLES1: it does not exist in GLES2, and
+     * therefore not in WebGL either.  Asking for it there is INVALID_ENUM,
+     * the chain never gets built, and a GL_LINEAR_MIPMAP_LINEAR minifier on
+     * a texture with no chain is MIPMAP-INCOMPLETE -- which samples black.
+     * glGenerateMipmap() after the upload is the GL 3.0 / GLES2 spelling of
+     * the same thing, and it is what every target here uses now.
+     * The surface belongs to the CALLER now -- load_gl_texture() frees it,
+     * and the batch loader below frees it after its own upload. */
     return tex;
+}
+
+/* ------------------------------------------------- THE BATCH TEXTURE LOAD
+ * Decode N images on the worker pool, upload them here in INDEX ORDER, and
+ * hand back one GL name per job.  Every path in `jobs` must already be
+ * resolved (THE PATH RULE above).
+ *
+ * Why it is chunked rather than one big parallel-for: a whole track's set
+ * decoded at once is every texture resident as RGBA at the same moment (177
+ * of them on US_C3_V1, up to 4 MB each), and holding that peak buys nothing
+ * -- a chunk of 4 per worker already keeps every worker fed.  The chunk
+ * boundary is also where the loading screen gets a frame, so the phase that
+ * used to be one silent 0.21 s block now animates through it.
+ *
+ * Upload order is deliberately the serial order: GL names are handed out by
+ * glGenTextures in the sequence the old loop used, so nothing downstream that
+ * happens to depend on a name's value can notice this change.
+ */
+static void b3_tex_decode_job(void* ctx, int i) {
+    b3_tex_decode(&((B3TexJob*)ctx)[i]);
+}
+
+static void b3_tex_load_batch(B3TexJob* jobs, GLuint* out, int n) {
+    int chunk = 4 * cx_pool_workers();
+    int base;
+    if (chunk < 1)  chunk = 1;
+    if (chunk > 32) chunk = 32;
+    for (base = 0; base < n; base += chunk) {
+        int m = n - base < chunk ? n - base : chunk;
+        int i;
+        cx_pool_for(m, b3_tex_decode_job, jobs + base);
+        for (i = 0; i < m; i++) {
+            B3TexJob* j = &jobs[base + i];
+            out[base + i] = j->rgba ? b3_tex_upload(j->rgba) : 0;
+            if (j->rgba) { SDL_FreeSurface(j->rgba); j->rgba = NULL; }
+        }
+        loadscreen_mesh_pump((float)(base + m) / (float)n, NULL);
+    }
 }
 
 // SIGNS: trackmesh's frame-texture resolver calls back here, because the image
@@ -4424,23 +9259,59 @@ static unsigned b3_track_frame_texture(const char* path, void* user) {
 static void load_track_textures(void) {
     if (!g_have_real_track) return;
     int loaded = 0, missing = 0;
+    /* PASS 1, on this thread: the de-duplicated path list, and the ONE place
+     * b3_iso_resolve() is called -- which is also where a cold cache
+     * materialises the whole textures/ stage, with the progress hook drawing
+     * through it exactly as before.  `uniq[g]` is the job index group g's
+     * texture ended up at, or -1 for a group with no texture at all. */
+    B3TexJob* jobs = NULL;
+    GLuint*   tex_of = NULL;
+    int*      uniq = NULL;
+    int       njobs = 0;
+    jobs   = (B3TexJob*)calloc((size_t)g_real_track.group_count, sizeof *jobs);
+    tex_of = (GLuint*)calloc((size_t)g_real_track.group_count, sizeof *tex_of);
+    uniq   = (int*)malloc((size_t)g_real_track.group_count * sizeof *uniq);
+    /* group_count 0 is a broken track, not an allocation failure, and
+     * calloc(0) may legally hand back NULL -- so the test is about a track
+     * that HAS groups and could not be indexed. */
+    if (g_real_track.group_count > 0 && (!jobs || !tex_of || !uniq)) {
+        free(jobs); free(tex_of); free(uniq);
+        fprintf(stderr, "[Burnout3] REAL textures: out of memory\n");
+        return;
+    }
     for (int g = 0; g < g_real_track.group_count; g++) {
         const char* path = g_real_track.groups[g].texture;
-        if (!path[0]) { missing++; continue; }
-        GLuint tex = 0;
-        int cutout = 0, found = 0;
+        uniq[g] = -1;
+        if (!path[0]) continue;
         for (int h = 0; h < g; h++) {
             if (strcmp(g_real_track.groups[h].texture, path) == 0) {
-                tex = g_track_tex[h];
-                cutout = g_track_cutout[h];
-                found = 1;
+                uniq[g] = uniq[h];
                 break;
             }
         }
-        if (!found) {
-            tex = load_gl_texture(path, &cutout);
-            if (tex) loaded++;
+        if (uniq[g] < 0) {
+            uniq[g] = njobs;
+            snprintf(jobs[njobs].path, sizeof jobs[njobs].path, "%s",
+                     b3_iso_resolve(path));
+            njobs++;
         }
+    }
+
+    /* PASS 2: decode on the pool, upload here, in index order. */
+    b3_tex_load_batch(jobs, tex_of, njobs);
+
+    /* PASS 3, on this thread: bind the groups back to what came out.  The
+     * counters are what the old single loop produced -- `loaded` is unique
+     * textures that uploaded, `missing` is groups without one. */
+    for (int j = 0; j < njobs; j++)
+        if (tex_of[j]) loaded++;
+    for (int g = 0; g < g_real_track.group_count; g++) {
+        const char* path = g_real_track.groups[g].texture;
+        GLuint tex;
+        int cutout;
+        if (!path[0]) { missing++; continue; }
+        tex    = tex_of[uniq[g]];
+        cutout = jobs[uniq[g]].cutout;
         if (!tex) missing++;
         g_track_tex[g] = tex;
         // TRACK-BLEND: whether a world texture's alpha channel means
@@ -4457,12 +9328,15 @@ static void load_track_textures(void) {
         // families, because this harness bakes one display list and cannot
         // reproduce the game's far-to-near transparent pass (FUN_001ADD60).
         // STATIC-WORLD-2: the alpha state is now decided entirely by
-        // trackmesh_group_state() from the material flag word, using the
+        // trackmesh_group_material() from the material flag word, using the
         // explicit have_material presence flag. `cutout` survives only as the
         // fallback for a group the MTL carried no record for.
         g_track_cutout[g] = (unsigned char)cutout;
         trackmesh_set_group_texture(&g_real_track, g, tex);
     }
+    free(jobs);
+    free(tex_of);
+    free(uniq);
     // SIGNS: a frame-cycling material carries one texture PER FRAME (material
     // +0x0C is a pointer ARRAY the ticker indexes by frame index), so the base
     // pass above resolved only frame 0. Load the rest through the same loader.
@@ -4472,103 +9346,23 @@ static void load_track_textures(void) {
            "%d animation frames\n",
            loaded, missing, g_real_track.group_count, animframes);
 
-    // Bake the whole textured track into a display list.
-    g_track_list = glGenLists(1);
-    glNewList(g_track_list, GL_COMPILE);
-    int ngroups = g_real_track.group_count > 0 ? g_real_track.group_count : 1;
-    // STATIC-WORLD-2: the world's alpha test is GREATER 64/255, not 0.5 --
-    // D3DRS_ALPHAFUNC/ALPHAREF are set once by the world setup FUN_00038D10
-    // (0x0003901B / 0x00038FEE). trackmesh_group_state() sets it per group.
-    glAlphaFunc(GL_GREATER, TRACKMESH_ALPHA_REF);
-    for (int g = 0; g < ngroups; g++) {
-        int first = 0, count = g_real_track.triangle_count;
-        GLuint tex = 0;
-        if (g_real_track.group_count > 0) {
-            first = g_real_track.groups[g].first_triangle;
-            count = g_real_track.groups[g].triangle_count;
-            tex = g_track_tex[g];
-        }
-        if (count <= 0) continue;
-        // STATIC-WORLD-2: a material whose UV scroll the animated-material
-        // ticker FUN_0019B1E0 advances (US_C3_V1: `Arrows`, the wrong-way
-        // chevron boards) cannot be baked -- its texture coordinates change
-        // every frame. trackmesh_draw_scroll() draws those below.
-        // SIGNS: the animated-material ticker FUN_0019B1E0 has TWO arms.
-        // `uv_scroll_rate > 0` is only the scroll one (US_C3_V1: `Arrows`).
-        // Its other arm FRAME-CYCLES the bound texture -- the SLOW/DOWN
-        // accident boards, the warning signs, the flags, the water -- and
-        // those cannot be baked either, because the display list would freeze
-        // the texture BIND. trackmesh_group_animated() covers both.
-        if (g_real_track.group_count > 0
-            && trackmesh_group_animated(&g_real_track, g))
-            continue;
-        // Decal layer: material flag bit 0x400 selects D3DRS_ZWRITEENABLE=0
-        // (FUN_000393C0 @0x00039AF5..0x00039B1B [C]); the loader already
-        // hoists these groups last, matching the game's material-major
-        // decals-last order. The paint lives in the texture's ALPHA channel,
-        // so the layer draws source-alpha BLENDED (the ambient blend preset,
-        // SRC_ALPHA/ONE_MINUS_SRC_ALPHA [S]) -- alpha-TESTING it fills the
-        // shapes solid white. All three compile into the display list.
-        // STATIC-WORLD-2: depth mask, blend, alpha test and the texture
-        // bind are the game's own per-material render state -- see
-        // trackmesh_group_state() for the state-by-state citations. The two
-        // alpha bits used to be swapped here, which drew the tree-shadow
-        // sheets alpha-tested and opaque instead of blended at their
-        // material's 0.6 alpha scalar (the black roads in build/dump013.png).
-        trackmesh_group_state(&g_real_track, g, tex, g_track_cutout[g]);
-        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-        glBegin(GL_TRIANGLES);
-        for (int t = first; t < first + count; t++) {
-            const unsigned* idx = g_real_track.indices + (size_t)t * 3;
-            for (int k = 0; k < 3; k++) {
-                const float* p = g_real_track.positions + (size_t)idx[k] * 3;
-                if (tex) {
-                    const float* uv = g_real_track.uvs + (size_t)idx[k] * 2;
-                    // TRACK-BLEND: rgb = 2 * tex * vertexColour is what every
-                    // world pixel shader computes (PS_COMBINEROUTPUT_
-                    // SHIFTLEFT_1 on the stage-0 RGB output word, 0x000100C0
-                    // in all six D3DPIXELSHADERDEFs). trackmesh_load already
-                    // applied the doubling, so this is a plain MODULATE.
-                    // Without it the world loses every bit of its baked
-                    // lighting and reads uniformly flat and bright.
-                    // Classes 8 and 9 (foliage, props, cones) have no
-                    // D3DCOLOR register in their vertex declaration, so the
-                    // game never reads the stored colour for them -- draw
-                    // those at full white.
-                    // STATIC-WORLD-2: w carries the material's alpha scalar
-                    // (+0x20). Under GL_MODULATE the fragment alpha is
-                    // texture.a * primary.a, which is the class-6 output alpha
-                    // tex.a * C0.a exactly.
-                    {
-                        float vc[4];
-                        trackmesh_group_vertex_color(&g_real_track, g,
-                                                     idx[k], vc);
-                        glColor4fv(vc);
-                    }
-                    glTexCoord2f(uv[0], uv[1]);
-                } else {
-                    // Flat shade from the face normal so untextured groups
-                    // stay legible.
-                    const float* p0 = g_real_track.positions + (size_t)idx[0] * 3;
-                    const float* p1 = g_real_track.positions + (size_t)idx[1] * 3;
-                    const float* p2 = g_real_track.positions + (size_t)idx[2] * 3;
-                    float ux = p1[0]-p0[0], uy = p1[1]-p0[1], uz = p1[2]-p0[2];
-                    float vx = p2[0]-p0[0], vy = p2[1]-p0[1], vz = p2[2]-p0[2];
-                    float nx = uy*vz - uz*vy, ny = uz*vx - ux*vz, nz = ux*vy - uy*vx;
-                    float len = sqrtf(nx*nx + ny*ny + nz*nz);
-                    float shade = len > 1e-6f ? (0.35f + 0.65f * fabsf(ny / len)) : 0.5f;
-                    glColor3f(shade * 0.75f, shade * 0.78f, shade * 0.82f);
-                }
-                glVertex3f(p[0], p[1], p[2]);
-            }
-        }
-        glEnd();
+    // THE WORLD GOES INTO ONE STATIC INTERLEAVED VBO, merged by texture.
+    //
+    // What used to be here was a display-list bake: 990 glBegin/glEnd blocks,
+    // one per material group, each replaying its own texture bind and alpha
+    // state.  gl4es could not batch a single pair of them (no two adjacent
+    // groups share a (texture, state) tuple), so the web port spent 15 474
+    // WebGL calls and 1 281 draws a frame on this one pass -- 58% of the
+    // frame's whole call budget.  b3r_track_build() collapses the 934 opaque
+    // groups to one draw per texture and keeps the 56-group decal/blended tail
+    // in order; see src/burnout3_render.c for why that is the only reordering
+    // the world's draw order permits.
+    if (!b3r_init()) {
+        fprintf(stderr, "[Burnout3] FATAL: the retained renderer needs GL 2.0 "
+                "(VBOs + GLSL); this context has neither.\n");
+        return;
     }
-    glDepthMask(GL_TRUE);       // restore after the decal tail
-    glDisable(GL_BLEND);
-    glDisable(GL_TEXTURE_2D);
-    glDisable(GL_ALPHA_TEST);
-    glEndList();
+    b3r_track_build(&g_real_track, g_track_tex, g_track_cutout);
 }
 
 // UNDERBODY: the .bgv record texture slot (rec+0x1A) that means "the shared
@@ -4586,24 +9380,199 @@ static void load_track_textures(void) {
 // Slots 2/3/4 land in exactly the intact/cracked/shattered order
 // FUN_000300A0 stamps into rec+0x1A, which is the anchor that pins the whole
 // table.  See tools/extract_bgv.py's `record` section for the full chain.
-#define B3_BGV_TEX_UNDERSIDE 1
+#define B3_BGV_TEX_PAINT         0
+#define B3_BGV_TEX_UNDERSIDE     1
+#define B3_BGV_TEX_GLASS         2   // "UnbrokenGlass"
+#define B3_BGV_TEX_GLASS_CRACKED 3   // "CrackedGlass"
+#define B3_BGV_TEX_GLASS_SMASHED 4   // "SmashedGlass"
 
-// The page itself lives in Data/Global.txd, decoded to PNG by
-// tools/extract_txd.py -- ONE 512x256 chassis raster (exhausts, transmission
-// tunnel, diff, subframes) shared by every car, loaded on first use.  A build
-// without it falls back to the car's paint page, i.e. the old behaviour.
-static GLuint car_underside_texture(void) {
-    static int tried;
-    static GLuint tex;
-    if (!tried) {
-        tried = 1;
-        tex = load_gl_texture("build/frontend/VehicleUnderside.png", NULL);
-        if (!tex)
-            printf("[Burnout3] build/frontend/VehicleUnderside.png missing "
-                   "(run tools/extract_txd.py) -- car undersides fall back "
-                   "to the paint page\n");
+// CRASH-UV: the whole five-entry array, not just the underside.  ctx+0x334 is
+// indexed by rec+0x1A for EVERY record the draw walks, and only entry 0 is the
+// car's own paint page:
+//
+//     00031abd  MOVZX EAX, byte ptr [EBX + 0x1a]            ; record tex slot
+//     00031ac5  MOV   EAX, dword ptr [ESI + EAX*0x4 + 0x334]; ctx table
+//     00031ad3  MOV   [0x0075db70], EAX                     ; bound texture
+//
+// and entries 1..4 are the four shared Global.txd pages, written verbatim at
+// the tail of the car draw-context builder:
+//
+//     000317c0  MOV EAX,[0x004d61b4] / MOV [EDI + 0x338],EAX   ; slot 1
+//     000317cb  MOV ECX,[0x004d61a8] / MOV [EDI + 0x33c],ECX   ; slot 2
+//     000317d7  MOV EDX,[0x004d61ac] / MOV [EDI + 0x340],EDX   ; slot 3
+//     000317e3  MOV EAX,[0x004d61b0] / MOV [EDI + 0x344],EAX   ; slot 4
+//
+// (0x004D61B4 = "VehicleUnderside", 0x004D61A8 = "UnbrokenGlass",
+//  0x004D61AC = "CrackedGlass", 0x004D61B0 = "SmashedGlass" -- the name
+//  lookups in the car-system init at 0x0002F260.)                        [C]
+//
+// Collapsing slots 2..4 onto the paint page is what put livery art on the
+// wreck's window geometry: the .bgv panel records include their OWN glass
+// (mask 0x100, slot 2 -- see build/cars/parts/<car>/panel*.obj, group
+// "m100_t2"), and those records are drawn ONLY while a car is wrecked, so the
+// smear appeared exactly at the crash.  All four pages are decoded to PNG by
+// tools/extract_txd.py; a build missing one falls back to the paint page,
+// i.e. the old behaviour.
+static GLuint car_global_texture(int slot) {
+    static const char* const kPath[5] = {
+        NULL,
+        "build/frontend/VehicleUnderside.png",
+        "build/frontend/UnbrokenGlass.png",
+        "build/frontend/CrackedGlass.png",
+        "build/frontend/SmashedGlass.png",
+    };
+    static GLuint tex[5];
+    static int tried[5];
+    if (slot < 1 || slot > 4) return 0;
+    if (!tried[slot]) {
+        tried[slot] = 1;
+        tex[slot] = load_gl_texture(kPath[slot], NULL);
+        if (!tex[slot])
+            printf("[Burnout3] %s missing (run tools/extract_txd.py) -- .bgv "
+                   "texture slot %d falls back to the paint page\n",
+                   kPath[slot], slot);
     }
-    return tex;
+    return tex[slot];
+}
+
+/* CRASH-UV: which records of an OBJ a list is built from, and who owns the
+ * bind.  The .bgv record mask bit8|bit9 is GLASS (two draw calls per record
+ * in FUN_00031AB0, FUN_000300A0 retargets the tier) and the extractor keeps
+ * the mask in the group name: "m<mask>_t<slot>" for panels, "glass_m<mask>"
+ * for the body glass.  A group whose texture slot is 2..4 IS that record's
+ * glass, which is the split the harness needs: glass draws in the blended
+ * pass through b3_carfx_glass_begin, everything else in the body pass. */
+#define B3CAR_LIST_ALL        0
+#define B3CAR_LIST_NO_GLASS   1   /* slots 0..1 only */
+#define B3CAR_LIST_GLASS_ONLY 2   /* slots 2..4 only */
+#define B3CAR_LIST_DEFER_BIND 4   /* caller binds: lets the damage tier move */
+
+/* ============================================ THE CAR MESH, RETAINED =======
+ * What this replaces is a DISPLAY LIST per body / shell / panel / glass /
+ * wheel -- 23 list objects and ~120 glCallList sites -- each of which gl4es
+ * had to replay as immediate mode into its per-attribute scratch VBOs, at
+ * 12-15 real WebGL calls per draw.  Measured on the shipped web build, the
+ * cars and the traffic were ~1 950 of the ~3 030 calls a frame left after the
+ * world moved.
+ *
+ * The geometry is static -- the damage states are DISCRETE MESH VARIANTS
+ * (mask bit0 intact, mask bit1 shell, one per panel record), selected at draw
+ * time, not deformed -- so it belongs in a static VBO exactly as the world
+ * does.  What the display list also recorded, and a bare VBO does not, is the
+ * per-`usemtl` TEXTURE BIND: hence the span table, which is that bind list
+ * with the geometry range it covers.
+ *
+ * The vertex layout is the union of what the two consumers read.  The
+ * recovered carfx program (src/burnout3_carfx.c B3FX_VS) reads gl_Vertex,
+ * gl_Normal, gl_MultiTexCoord0 and gl_Color; the traffic bodies have no
+ * normals and the glass meshes take their colour from one glColor4f the
+ * caller sets.  A channel the source mesh does not carry is simply absent
+ * from the format, and then the fixed-function default applies -- which is
+ * what the old list did too, by not emitting that call.
+ */
+/* Draw one, reproducing the display list's own state stream: a bind (or a
+ * glDisable) per span, then the span, then the list's trailing disable. */
+/* B3_GLERR=1 -- check glGetError around each car draw.  Resolved ONCE: this
+ * sits inside a per-span loop inside a per-car loop, and a getenv there is a
+ * strlen-per-environment-entry scan every frame. */
+static int car_glerr_on(void) {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("B3_GLERR"); v = e && *e != '0'; }
+    return v;
+}
+
+static void car_mesh_draw(const B3CarMesh* m) {
+    if (!m || !m->vbo) return;
+    /* WHICH PROGRAM, AND WITH WHICH MATRIX.  Under fixed function neither
+     * question existed: a mesh with no program drew through the FF stage, and
+     * ftransform() read the matrix stack at draw time so a wheel's own
+     * push/rotate was picked up for free.  Neither is true any more --
+     * a draw with no program bound falls through to the FF stage where
+     * generic attribute 0 aliases gl_Vertex (untextured geometry, no error),
+     * and a program's transform is a uniform that has to be refreshed per
+     * DRAW, because the panels and the wheels each push a matrix after the
+     * body pass began. */
+    if (b3_carfx_program_bound()) {
+        b3_carfx_sync_matrices();
+    } else {
+        b3r_use_flat(0, 1.0f, 1.0f, 1.0f, 1.0f);
+        /* b3r_sync() UPLOADS THROUGH THE RETAINED PROGRAM'S UNIFORM LOCATIONS,
+         * and glUniform* always writes to whatever program is CURRENTLY BOUND.
+         * Calling it here with the carfx program bound therefore wrote b3r's
+         * matrices into whichever carfx uniform happened to occupy the same
+         * location INDEX -- location numbering is per-program, and the two
+         * shaders share none of their uniforms.
+         *
+         * It used to be called unconditionally, one line below this branch.
+         * On the desktop the collision happened to land somewhere harmless, so
+         * the car looked right; the WebGL compiler numbers uniforms
+         * differently, the matrix landed on something load-bearing, and the
+         * car body collapsed to a flat slab -- correct data, correct buffers,
+         * correct attribute locations, a draw the driver accepted without a
+         * single GL error, and the wrong picture.  The identical geometry
+         * rendered perfectly through the retained program a few lines away,
+         * which is what finally placed the fault in the uniforms rather than
+         * in the vertices. */
+        b3r_sync();
+    }
+    b3r_state_dump(b3_carfx_program_bound() ? "car/carfx" : "car/flat");
+    /* B3_GLERR=1: WebGL VALIDATES a draw against the bound buffer's size and
+     * rejects the whole call with INVALID_OPERATION; desktop GL does not, and
+     * reads whatever happens to be there.  So a span that runs past its VBO is
+     * INVISIBLE on the web and fine on the desktop -- exactly the class of
+     * defect a web-to-web gate cannot see.  One-shot, off by default. */
+    if (car_glerr_on()) {
+        static int said;
+        GLenum e0 = glGetError();
+        if (e0 != GL_NO_ERROR && !said) {
+            said = 1;
+            fprintf(stderr, "[glerr] PENDING 0x%X before the car draw\n", e0);
+        }
+    }
+    b3r_arrays_fmt(&m->fmt);
+    for (int i = 0; i < m->nspan; i++) {
+        if (!m->defer_bind) {
+            if (!b3_carfx_program_bound())
+                b3r_use_flat(m->span[i].tex, 1.0f, 1.0f, 1.0f, 1.0f);
+            glBindTexture(GL_TEXTURE_2D, m->span[i].tex);
+        }
+        /* Clear IMMEDIATELY before the draw so the check after it cannot be
+         * blamed on an earlier call: Emscripten's GL layer records errors of
+         * its OWN into GL.lastError (a bad object handle, say) and glGetError
+         * returns those too, so a stale one reads exactly like a rejected
+         * draw. */
+        if (car_glerr_on()) while (glGetError() != GL_NO_ERROR) { }
+        glDrawArrays(GL_TRIANGLES, m->span[i].first, m->span[i].count);
+        if (car_glerr_on()) {
+            static int shown;
+            GLenum e = glGetError();
+            if (e != GL_NO_ERROR && shown < 8) {
+                shown++;
+                fprintf(stderr, "[glerr] car draw span %d/%d first %d count %d "
+                        "vbo %u nvert %d tex %u defer %d carfx %d "
+                        "fmt(uv %d nrm %d col %d n_col %d stride %d) -> 0x%X\n",
+                        i, m->nspan, m->span[i].first, m->span[i].count,
+                        m->vbo, m->nvert, m->span[i].tex, m->defer_bind,
+                        b3_carfx_program_bound(), m->fmt.off_uv, m->fmt.off_nrm,
+                        m->fmt.off_col, m->fmt.n_col, m->fmt.stride, e);
+            }
+        }
+    }
+    /* WAS glDisable(GL_TEXTURE_2D) -- and it is not a valid capability in
+     * GLES2, so on WebGL every car draw raised INVALID_ENUM.  255 of them a
+     * frame, which is over Chrome's per-context reporting limit: the browser
+     * printed "too many errors, no more errors will be reported for this
+     * context" and STOPPED, taking the messages that mattered with it.  It was
+     * dead anyway -- "textured or not" is uMode/st.tex in the shader now, and
+     * this call has had nothing to switch off since the fixed-function pipeline
+     * went. */
+}
+
+static void car_mesh_free(B3CarMesh** pm) {
+    if (!pm || !*pm) return;
+    if ((*pm)->vbo) b3r_vbo_free((*pm)->vbo);
+    free(*pm);
+    *pm = NULL;
 }
 
 // Build a shaded display list for one extracted car OBJ. The geometry is the
@@ -4611,48 +9580,78 @@ static GLuint car_underside_texture(void) {
 // the .bgv "compact1" paint raster is decoded for the whole-car livery only).
 // use_color=0 leaves glColor to the caller (used by the glass list so the
 // verified FUN_000300A0 tints can be applied at draw time).
-static GLuint car_list_from_obj(const char* path, GLuint tex, int use_color,
-                                float* ymin_out) {
+static B3CarMesh* car_list_from_obj_ex(const char* path, GLuint tex,
+                                       int use_color, float* ymin_out,
+                                       int flags) {
     TrackMesh m;
-    if (trackmesh_load(&m, path) != 0) return 0;
+    if (trackmesh_load(&m, path) != 0) return NULL;
     if (ymin_out) *ymin_out = m.min[1];
 
-    GLuint list = glGenLists(1);
-    glNewList(list, GL_COMPILE);
-    // UNDERBODY: one bind per `usemtl b3tex<slot>` span, not one per mesh.
-    // The extractor tags every record span with its .bgv texture slot, and
-    // slot B3_BGV_TEX_UNDERSIDE is the shared VehicleUnderside chassis page
-    // (see the block above this function).  Binding the paint page for it
-    // made the car's belly sample the livery -- mirrored sponsor decals and
-    // tail-light art smeared over the underside, which is what showed the
-    // moment a car flipped.  Slots 2..4 (the glass tiers) deliberately keep
-    // the paint bind: the harness draws glass from the separate _glass.obj
-    // list through the recovered carfx glass shader, which never samples
-    // those pages.  An OBJ with no `usemtl` (traffic bodies, or a build/cars
-    // predating the extractor change) has group_count 0 and takes exactly
-    // the old single-bind path.
+    /* CRASH-UV: an OBJ with no `usemtl` predates the extractor's slot tags,
+     * so its records cannot be split by pass.  Treat the whole mesh as the
+     * body (slot 0) rather than guessing: NO_GLASS keeps it, GLASS_ONLY finds
+     * nothing.  Without this a stale build/cars would draw every panel twice,
+     * once opaque and once blended. */
+    if (m.group_count == 0 && (flags & B3CAR_LIST_GLASS_ONLY)) {
+        trackmesh_free(&m);
+        return NULL;
+    }
+
+    /* Resolve every shared page this mesh needs before anything else.  There
+     * is no display list left to accidentally bake the upload into, but
+     * car_global_texture() caches and this keeps the loop below branch-free. */
+    for (int g = 0; g < m.group_count; g++) {
+        int slot = -1;
+        if (sscanf(m.groups[g].material, "b3tex%d", &slot) == 1)
+            car_global_texture(slot);
+    }
+
+    /* 11 floats: pos3 uv2 nrm3 col3.  The colour is the flat face shade,
+     * which was a glColor3f PER TRIANGLE -- three equal corner colours are
+     * the same primitive, and the component COUNT stays 3 because that is
+     * part of the vertex format the driver compiles its path from. */
+    const int STRIDE = 11;
+    B3CarMesh* cm = (B3CarMesh*)calloc(1, sizeof(B3CarMesh));
+    float* buf = (float*)malloc((size_t)m.triangle_count * 3
+                                * STRIDE * sizeof(float));
+    if (!cm || !buf) { free(cm); free(buf); trackmesh_free(&m); return NULL; }
+
     int ngroups = m.group_count > 0 ? m.group_count : 1;
+    long cursor = 0;
+    /* B3_CARLIST_DUMP=1 -- one machine-readable line per emitted span, so the
+     * page/uv invariant can be asserted without a human looking at a car.
+     * tools/validate_car_texture_slots.py consumes it. */
+    const char* dump = getenv("B3_CARLIST_DUMP");
     for (int g = 0; g < ngroups; g++) {
         int first = 0, count = m.triangle_count;
         GLuint gtex = tex;
+        int slot = B3_BGV_TEX_PAINT;
         if (m.group_count > 0) {
             first = m.groups[g].first_triangle;
             count = m.groups[g].triangle_count;
             if (count <= 0) continue;
-            int slot = -1;
-            if (tex && sscanf(m.groups[g].material, "b3tex%d", &slot) == 1
-                    && slot == B3_BGV_TEX_UNDERSIDE) {
-                GLuint u = car_underside_texture();
-                if (u) gtex = u;
-            }
+            slot = -1;
+            if (sscanf(m.groups[g].material, "b3tex%d", &slot) != 1)
+                slot = B3_BGV_TEX_PAINT;
+            /* CRASH-UV: the record/pass split.  A slot-2..4 record is glass. */
+            int is_glass = (slot >= B3_BGV_TEX_GLASS
+                            && slot <= B3_BGV_TEX_GLASS_SMASHED);
+            if ((flags & B3CAR_LIST_NO_GLASS) && is_glass) continue;
+            if ((flags & B3CAR_LIST_GLASS_ONLY) && !is_glass) continue;
+            /* CRASH-UV: slots 1..4 are the SHARED Global.txd pages, never
+             * this car's livery (0x00031AC5 / 0x000317C0..E8, above). */
+            GLuint u = car_global_texture(slot);
+            if (u) gtex = u;
         }
-        if (gtex) {
-            glEnable(GL_TEXTURE_2D);
-            glBindTexture(GL_TEXTURE_2D, gtex);
-        } else {
-            glDisable(GL_TEXTURE_2D);
-        }
-        glBegin(GL_TRIANGLES);
+        if (dump)
+            printf("[carlist] %s g=%d slot=%d tris=%d tex=%u paint=%u "
+                   "uv=%d flags=%d\n",
+                   path, g, slot, count,
+                   (unsigned)((flags & B3CAR_LIST_DEFER_BIND) ? 0u : gtex),
+                   (unsigned)tex, m.uvs ? 1 : 0, flags);
+        if (cm->nspan >= B3CAR_MAX_SPANS) break;
+        cm->span[cm->nspan].first = (int)cursor;
+        cm->span[cm->nspan].tex   = gtex;
         for (int t = first; t < first + count; t++) {
             const unsigned* idx = m.indices + (size_t)t * 3;
             const float* p0 = m.positions + (size_t)idx[0] * 3;
@@ -4664,32 +9663,82 @@ static GLuint car_list_from_obj(const char* path, GLuint tex, int use_color,
             float len = sqrtf(nx*nx + ny*ny + nz*nz);
             float shade = 0.75f;
             if (len > 1e-9f) {
-                // Fixed light, double-sided: the Z-mirror (RE_NOTES 12)
-                // flipped triangle winding, so one-sided diffuse left most
-                // panels at the floor term -- cars rendered near-black.
+                /* Fixed light, double-sided: the Z-mirror (RE_NOTES 12)
+                 * flipped triangle winding, so one-sided diffuse left most
+                 * panels at the floor term -- cars rendered near-black. */
                 shade = 0.60f + 0.40f * fabsf(
                         (nx*0.30f + ny*0.85f + nz*0.42f) / len);
             }
-            if (use_color) glColor3f(shade, shade, shade);
             for (int k = 0; k < 3; k++) {
                 unsigned vi = idx[k];
-                if (gtex && m.uvs)
-                    glTexCoord2f(m.uvs[(size_t)vi * 2],
-                                 m.uvs[(size_t)vi * 2 + 1]);
-                // CARFX: the .bgv's real per-vertex normals drive the
-                // specular reflect() -- without them the streak degrades to
-                // flat facets (docs/RE_CARFX.md, has_normals load-bearing).
-                if (m.normals)
-                    glNormal3fv(m.normals + (size_t)vi * 3);
-                glVertex3fv(m.positions + (size_t)vi * 3);
+                float* o = buf + cursor * STRIDE;
+                o[0] = m.positions[(size_t)vi * 3 + 0];
+                o[1] = m.positions[(size_t)vi * 3 + 1];
+                o[2] = m.positions[(size_t)vi * 3 + 2];
+                /* emit the texcoord whenever the mesh HAS one, not only when
+                 * this mesh binds a texture -- the recovered car shader
+                 * samples uTex at gl_TexCoord[0] unconditionally, so a draw
+                 * that leaves it unset inherits the last one written */
+                o[3] = m.uvs ? m.uvs[(size_t)vi * 2]     : 0.0f;
+                o[4] = m.uvs ? m.uvs[(size_t)vi * 2 + 1] : 0.0f;
+                /* the .bgv's real per-vertex normals drive the specular
+                 * reflect() -- without them the streak degrades to flat
+                 * facets (docs/RE_CARFX.md, has_normals load-bearing) */
+                o[5] = m.normals ? m.normals[(size_t)vi * 3 + 0] : 0.0f;
+                o[6] = m.normals ? m.normals[(size_t)vi * 3 + 1] : 0.0f;
+                o[7] = m.normals ? m.normals[(size_t)vi * 3 + 2] : 0.0f;
+                o[8] = o[9] = o[10] = shade;
+                cursor++;
             }
         }
-        glEnd();
+        cm->span[cm->nspan].count = (int)cursor - cm->span[cm->nspan].first;
+        if (cm->span[cm->nspan].count > 0) cm->nspan++;
     }
-    glDisable(GL_TEXTURE_2D);
-    glEndList();
+    int had_uvs = m.uvs != NULL;
+    int had_nrm = m.normals != NULL;
     trackmesh_free(&m);
-    return list;
+
+    /* A filter can select nothing (a panel with no glass records).  Report
+     * that as "no mesh" so the callers' existing `if (!mesh) continue` guards
+     * keep working instead of drawing an empty one every frame. */
+    if (cursor == 0) { free(buf); free(cm); return NULL; }
+
+    cm->nvert       = (int)cursor;
+    cm->defer_bind  = (flags & B3CAR_LIST_DEFER_BIND) ? 1 : 0;
+    cm->fmt.stride  = STRIDE;
+    cm->fmt.off_uv  = had_uvs ? 3 : -1;
+    cm->fmt.off_nrm = had_nrm ? 5 : -1;
+    cm->fmt.off_col = use_color ? 8 : -1;
+    cm->fmt.n_col   = 3;
+    if (getenv("B3_MESHDBG")) {
+        /* What the LOADER built, before any GL state can be blamed.  A mesh
+         * that differs here differs in the data, not in the renderer -- which
+         * is the first fork any desktop-vs-web geometry difference has to take
+         * and the one that is cheapest to get wrong by assumption. */
+        float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+        for (long v = 0; v < (long)cursor; v++)
+            for (int k = 0; k < 3; k++) {
+                float c = buf[v * STRIDE + k];
+                if (c < lo[k]) lo[k] = c;
+                if (c > hi[k]) hi[k] = c;
+            }
+        fprintf(stderr, "[meshdbg] %s verts %ld spans %d uv %d nrm %d col %d "
+                "bbox x[%.2f %.2f] y[%.2f %.2f] z[%.2f %.2f]\n",
+                path ? path : "?", (long)cursor, cm->nspan,
+                had_uvs, had_nrm, use_color,
+                lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
+    }
+    cm->vbo = b3r_vbo_upload(buf, cursor * STRIDE, 0);
+    cm->fmt.vbo = cm->vbo;
+    free(buf);
+    if (!cm->vbo) { free(cm); return NULL; }
+    return cm;
+}
+
+static B3CarMesh* car_list_from_obj(const char* path, GLuint tex,
+                                    int use_color, float* ymin_out) {
+    return car_list_from_obj_ex(path, tex, use_color, ymin_out,
+                                B3CAR_LIST_ALL);
 }
 
 // Parse the extractor's .wheels sidecar: wheel radius (.bgv+0x18) and the
@@ -4741,17 +9790,27 @@ static int load_car_wheels(int slot, const char* cls, const char* base) {
 static void load_car_meshes(void) {
     for (int i = 0; i < g_num_vehicles; i++) {
         const VehicleInfo* info = g_vehicles[i].info;
+        /* loading screen (agent): one car is one sub-step of the CAR MESHES
+         * phase, so the bar crosses the phase over the fleet instead of
+         * jumping to the end on the first car. */
+        b3_loadscreen_sub(i, g_num_vehicles);
         if (!info) continue;
         char base[32], path[160];
         snprintf(base, sizeof(base), "%s", info->file);
         char* dot = strrchr(base, '.');
         if (dot) *dot = '\0';
 
-        // Paint livery: real game texture, color variant picked by grid slot
+        // Paint livery: real game texture, color variant picked by grid
+        // slot; the PLAYER honours the car-select screen's choice
         // (the real color choice lives in the menus; slot-based pick is
         // harness convention).
         GLuint tex = 0;
-        for (int k = i % 8; k >= 0 && !tex; k--) {
+        int pfirst = i % 8;
+        if (i == 0) {
+            const char* pv = getenv("B3_PLAYER_PAINT");
+            if (pv && *pv) pfirst = atoi(pv) & 7;
+        }
+        for (int k = pfirst; k >= 0 && !tex; k--) {
             snprintf(path, sizeof(path), "build/cars/%s_%s_p%d.png",
                      info->class_code, base, k);
             tex = load_gl_texture(path, NULL);
@@ -4772,7 +9831,13 @@ static void load_car_meshes(void) {
         g_car_shell_lists[i] = car_list_from_obj(path, tex, 1, NULL);
         snprintf(path, sizeof(path), "build/cars/%s_%s_glass.obj",
                  info->class_code, base);
-        g_car_glass_lists[i] = car_list_from_obj(path, 0, 0, NULL);
+        /* CRASH-UV: DEFER_BIND -- the glass page is the damage tier, chosen
+         * at draw time (FUN_000300A0), so it cannot be baked into the list.
+         * The list now carries its texcoords either way; without them the
+         * carfx glass shader sampled one frozen texel of whatever texture the
+         * previously replayed list had left bound. */
+        g_car_glass_lists[i] = car_list_from_obj_ex(
+                path, 0, 0, NULL, B3CAR_LIST_DEFER_BIND);
         snprintf(path, sizeof(path), "build/cars/%s_%s_wheel.obj",
                  info->class_code, base);
         g_car_wheel_lists[i] = car_list_from_obj(path, tex, 1, NULL);
@@ -4851,8 +9916,16 @@ static void load_car_meshes(void) {
                     snprintf(ppath, sizeof(ppath),
                              "build/cars/parts/%s_%s/panel%d_kind%d.obj",
                              info->class_code, base, k, kind);
-                    g_car_panel_lists[i][k] =
-                        car_list_from_obj(ppath, tex, 1, NULL);
+                    /* CRASH-UV: the panel's body records and its own glass
+                     * records go to two lists and two passes -- opaque body,
+                     * then the blended tier-tinted glass (FUN_00031AB0's
+                     * bit8|bit9 branch).  Drawing them together bound the
+                     * livery to slot-2 window geometry. */
+                    g_car_panel_lists[i][k] = car_list_from_obj_ex(
+                            ppath, tex, 1, NULL, B3CAR_LIST_NO_GLASS);
+                    g_car_panel_glass_lists[i][k] = car_list_from_obj_ex(
+                            ppath, 0, 0, NULL,
+                            B3CAR_LIST_GLASS_ONLY | B3CAR_LIST_DEFER_BIND);
                     if (k + 1 > pn) pn = k + 1;
                 }
                 fclose(pf);
@@ -4894,8 +9967,9 @@ static void load_car_meshes(void) {
 }
 
 // ============================================================
-// Traffic -- the game's own C1_V1 race-mode traffic data
-// (burnout3_traffic_data.h, tools/extract_traffic.py; docs/RE_BGD.md 4-6):
+// Traffic -- the game's own race-mode traffic data, loaded per track from
+// build/tracks/<id>/traffic.bin (src/burnout3_traffic_runtime.h,
+// tools/extract_traffic.py + tools/cextract/cx_traffic.c; docs/RE_BGD.md 4-6):
 //   * car set: mode block 0's 0x18-stride id records -- the same record
 //     layout the traffic manager FUN_001A13F0 walks before FUN_001A4260
 //     appends ".btv" and loads each car through the .bgv relinker [C chain,
@@ -4906,7 +9980,7 @@ static void load_car_meshes(void) {
 //     direction (opposite winding to the race line).
 // Traffic vehicles use the REDUCED 9-param config (registrar FUN_00134AC0,
 // mass + suspension; per-car values from Data/vdb.xml in
-// burnout3_car_physics.h). The retail road-agent pass is now located:
+// build/cars/car_physics.bin). The retail road-agent pass is now located:
 // FUN_0019F560 sets speed, FUN_0019F1C0 advances its path cursor, and
 // FUN_0019FFA0 generates the target transform from four clamped path rows,
 // each holding two point IDs. The retail descriptor is now known as pair rows,
@@ -4925,6 +9999,10 @@ typedef struct {
     Vec3  pos;
     B3RigidBody rb;
     B3RigidBody trailer_rb;
+    /* frame backing for both bodies: the 4x4 is not inline any more.
+     * Bound in traffic_reset_pose(). */
+    float rb_frame_store[4][4];
+    float trailer_rb_frame_store[4][4];
     float yaw;
     float speed;          // m/s along its lane
     float mass_kg;        // reduced config +0xB8 (Data/vdb.xml, 9-param set)
@@ -4935,6 +10013,13 @@ typedef struct {
                           // same recovery constant as FUN_00198E60's write)
     int   active;
     int   pool_request;
+    /* FUN_001A8EE0's pending reassignment. agent+0x48 attempts, the selection
+     * at agentref+0x118/+0x11C, and the source switch row at +0x160. */
+    int   branch_attempts;
+    unsigned int branch_row_armed;   /* the row the budget was last re-armed on */
+    int   branch_sel_path;      /* -1 = no selection pending */
+    float branch_sel_cursor;
+    float branch_switch_row;
     int   pool_owner;
     int   pool_agent;
     /* TRAFFIC-MIX.  A pool request is not one car: FUN_001A6070 walks the
@@ -4965,8 +10050,18 @@ typedef struct {
     float seg_t;
     unsigned short path_id; // FUN_0019FFA0 descriptor index (RIDX source)
     float path_cursor;      // road-agent +0x30 cursor, in descriptor rows
-    signed char path_dir;   // +1 along the path, -1 against it (the
-                            // request's `direction` byte -> ONCOMING)
+    signed char path_dir;   // travel sense along the descriptor rows.  ALWAYS
+                            // +1: FUN_0019F1C0 @0x0019F21D advances the agent
+                            // cursor (+0x30) by `speed*dt/rowlen` and its row
+                            // loop only ever does `iVar2 = iVar2 + 1`, so a
+                            // retail traffic agent has no reverse walk at all.
+                            // Kept as a field for the [tfc] census.      [C]
+    signed char branch_side; // the port's stand-in for agent+0x4C, the LANE-
+                            // CHANGE side (FUN_001A0750 @0x001A07A0 picks link
+                            // column 2 when it is set and 3 when it is not, and
+                            // FUN_001A8EE0 @0x001A8F2E flashes body+0x175 bit 2
+                            // vs bit 0 -- the two indicator lamps).  Not a
+                            // travel sense.                              [?]
     float path_lateral;     // road-agent +0x34, blended within each pair
     int   reservation_ahead;  // road-agent +0x44: next agent on this path
     float avoid_nudge;        // road-agent +0x1C: the persisted avoid dv
@@ -5076,28 +10171,28 @@ _Static_assert(sizeof(B3TrafficMixRoad) == 32,
 static TrafficCar g_traffic[B3_TRAFFIC_N];
 static int g_traffic_n = 0;                          // 0 = disabled/absent
 static B3TrafficPool g_traffic_pool;
-static B3CarHull  g_traffic_hull[B3_TRAFFIC_CAR_COUNT];
-static int        g_traffic_hull_ok[B3_TRAFFIC_CAR_COUNT] = {0};
+static B3CarHull  g_traffic_hull[B3_TRAFFIC_CAR_MAX];
+static int        g_traffic_hull_ok[B3_TRAFFIC_CAR_MAX] = {0};
 /* CRASH-SHOW H1b: FUN_00146530's per-traffic-car pass-voice state
  * ([ESI+0x24] cur, [ESI+0x28] prev, [ESI+0x6] cooldown). */
 static B3SfxPassState g_pass_state[B3_TRAFFIC_N];
-static GLuint g_traffic_lists[B3_TRAFFIC_CAR_COUNT] = {0};
-static float g_traffic_ymin[B3_TRAFFIC_CAR_COUNT] = {0};
+static B3CarMesh* g_traffic_lists[B3_TRAFFIC_CAR_MAX];
+static float g_traffic_ymin[B3_TRAFFIC_CAR_MAX] = {0};
 // Traffic wheels (same .bgv-family records, shared relinker [C]; their
 // omission left traffic wheel-less and sunk to the body skirt, dump 023).
-static GLuint g_traffic_wheel_lists[B3_TRAFFIC_CAR_COUNT] = {0};
-static float  g_traffic_wheel_pos[B3_TRAFFIC_CAR_COUNT][6][3];
-static int    g_traffic_wheel_mirror[B3_TRAFFIC_CAR_COUNT][6];
-static int    g_traffic_wheel_count[B3_TRAFFIC_CAR_COUNT] = {0};
-static float  g_traffic_wheel_radius[B3_TRAFFIC_CAR_COUNT] = {0};
+static B3CarMesh* g_traffic_wheel_lists[B3_TRAFFIC_CAR_MAX];
+static float  g_traffic_wheel_pos[B3_TRAFFIC_CAR_MAX][6][3];
+static int    g_traffic_wheel_mirror[B3_TRAFFIC_CAR_MAX][6];
+static int    g_traffic_wheel_count[B3_TRAFFIC_CAR_MAX] = {0};
+static float  g_traffic_wheel_radius[B3_TRAFFIC_CAR_MAX] = {0};
 static float  g_traffic_spin[B3_TRAFFIC_N] = {0};      // rad, presentation
 static Vec3   g_traffic_prev[B3_TRAFFIC_N];            // for spin distance
-static float g_traffic_len[B3_TRAFFIC_CAR_COUNT] = {0};
+static float g_traffic_len[B3_TRAFFIC_CAR_MAX] = {0};
 // Spawn slots aligned with the oncoming direction. The table carries BOTH
 // race directions (docs/RE_BGD.md 4); a Forward event's oncoming traffic
 // uses the subset whose heading runs WITH the reverse loop -- the rest
 // would U-turn across the racing lane.
-static int g_traffic_slots[B3_TRAFFIC_SPAWN_COUNT];
+static int g_traffic_slots[B3_TRAFFIC_SPAWN_MAX];
 static int g_traffic_nslots = 0;
 static B3TrafficPathData g_traffic_paths = {0};
 
@@ -5124,7 +10219,7 @@ static float traffic_mass(const char* id) {
 // what the harness used to do -- puts every one of them outside the
 // outermost lane, which is the "traffic is not on the road" report.
 
-static float g_trailer_axle_z[B3_TRAFFIC_CAR_COUNT] = {0};
+static float g_trailer_axle_z[B3_TRAFFIC_CAR_MAX] = {0};
 static int traffic_legacy(void);
 
 static void traffic_paths_free(void) {
@@ -5327,6 +10422,25 @@ static void traffic_paths_load(void) {
     g_traffic_paths.reservation_owner = malloc(
         (size_t)total * sizeof(*g_traffic_paths.reservation_owner));
     if (!g_traffic_paths.reservation_owner) goto fail;
+    if (getenv("B3_BRANCH_AUDIT")) {
+        unsigned hist[5] = {0,0,0,0,0}, rows = 0, colhist[4] = {0,0,0,0};
+        for (unsigned pi = 0; pi < g_traffic_paths.path_count; pi++) {
+            const B3TrafficPath* pp = &g_traffic_paths.paths[pi];
+            for (unsigned r = 0; r < pp->count; r++) {
+                const B3TrafficPathLink* lk =
+                    &g_traffic_paths.links[pp->pair_base + r];
+                unsigned set = 0;
+                for (int c = 0; c < 4; c++)
+                    if (lk->target_path[c] != 0xff) { set++; colhist[c]++; }
+                hist[set]++; rows++;
+            }
+        }
+        fprintf(stderr, "[branch-audit] %u rows | columns set per row: "
+                "0=%u 1=%u 2=%u 3=%u 4=%u | per-column totals: "
+                "c0=%u c1=%u c2=%u c3=%u\n", rows,
+                hist[0], hist[1], hist[2], hist[3], hist[4],
+                colhist[0], colhist[1], colhist[2], colhist[3]);
+    }
     g_traffic_paths.loaded = 1;
     printf("[Burnout3] retail traffic paths: %u points, %u paths, %u rows, %u pool windows\n",
            g_traffic_paths.point_count, g_traffic_paths.path_count,
@@ -5413,31 +10527,13 @@ static void traffic_path_sample(unsigned int path_id, float cursor,
 static int traffic_path_advance(TrafficCar* t, float metres) {
     const B3TrafficPath* path = &g_traffic_paths.paths[t->path_id];
     float remain = metres > 0.0f ? metres : 0.0f;
-    if (t->path_dir < 0) {
-        /* ONCOMING: run the agent DOWN its descriptor rows. */
-        while (remain > 1e-4f && t->path_cursor > 0.0f) {
-            unsigned int row = (unsigned int)floorf(t->path_cursor);
-            float fraction = t->path_cursor - (float)row;
-            if (fraction <= 1e-6f) {
-                if (row == 0) break;
-                row--;
-                fraction = 1.0f;
-            }
-            float segment =
-                g_traffic_paths.distances[(path->pair_base + row + 1) * 2]
-              - g_traffic_paths.distances[(path->pair_base + row) * 2];
-            if (segment < 1e-4f) { t->path_cursor = (float)row; continue; }
-            float available = fraction * segment;
-            if (available > remain) {
-                t->path_cursor -= remain / segment;
-                remain = 0.0f;
-            } else {
-                t->path_cursor = (float)row;
-                remain -= available;
-            }
-        }
-        return t->path_cursor <= 0.0f;
-    }
+    /* THERE IS NO REVERSE WALK.  FUN_0019F1C0 @0x0019F21D..0x0019F27A is the
+     * whole mover:
+     *     agent+0x30 = agent+0x2c * dt / agent+0x20 + agent+0x30;   (ADD)
+     *     while (row < rows && 1.0 <= frac) { row = row + 1; ... }  (INC)
+     *     if (agent+0x30 > rows) agent+0x46 = 0;                    (retire)
+     * -- one sign, one direction, no branch on any sense flag.  An agent walks
+     * its descriptor rows UPWARD and retires past the last one, always.  [C] */
     while (remain > 1e-4f && t->path_cursor < (float)(path->count - 1)) {
         unsigned int row = (unsigned int)floorf(t->path_cursor);
         if (row >= path->count - 1) break;
@@ -5458,6 +10554,228 @@ static int traffic_path_advance(TrafficCar* t, float metres) {
         }
     }
     return t->path_cursor >= (float)(path->count - 1);
+}
+
+static unsigned int traffic_rng_u32(void);
+
+/* FUN_001A0750 -- the branch SELECTOR, and FUN_001A8EE0's switch-row wait.
+ *
+ * Recovered from the decompiler (bridge on 127.0.0.1:8089). Retail does not
+ * retire an agent at a descriptor end when it can hand it to a successor:
+ *
+ *   FUN_001A8EE0  if no selection is pending and agent+0x48 (the branch
+ *                 attempt count) is non-zero, call the selector and spend one
+ *                 attempt; once a selection exists, WAIT until the agent's
+ *                 persistent cursor (agent+0x30) reaches the source switch row
+ *                 (+0x160), then commit through FUN_001A9040.
+ *   FUN_001A0750  scan rows [cur .. cur+1] -- or cur+3 while the attempt count
+ *                 is < 2 -- clamped to the last row, walking DOWN, and take
+ *                 the first row whose column is populated. Outputs the target
+ *                 descriptor (+0x118), the target cursor (+0x11C) and the
+ *                 switch row (+0x160).
+ *   FUN_001A9040  commits, and RE-DRAWS the lane fraction from the manager
+ *                 RNG as 0.5 + (draw%1000 - 500) * 0.0002. It does not carry
+ *                 the old lateral across the switch.
+ *
+ * The COLUMN is not random. FUN_001A0750 picks it from two agent booleans:
+ *     col = agent+0x4C ? (flag ? 0 : 2) : (flag ? 1 : 3)
+ * with flag = (agent+0x4B >> 2) & 1. This track's rows make the mapping
+ * plain: of 4838 rows, 2911 carry exactly one populated column, 3 carry two,
+ * none carry more, and the per-column totals are c0=1 c1=6 c2=1455 c3=1455.
+ * So flag == 0 is the ordinary case and agent+0x4C is a clean two-way split --
+ * the agent's DIRECTION, one column per travel sense, which is what a
+ * directional junction looks like in the data.
+ */
+/* CORRECTION.  The branch budget does NOT come from racecar+0x1920.
+ *
+ * This harness used to seed `branch_attempts = (race_mode == 0)`, citing
+ * "FUN_001A20F0 @0x001A2365-0x001A23EC seeds agent+0x48 from the selected
+ * racecar's +0x1920".  That read the wrong object.  `LEA ESI,[ESP+0x4B0]`
+ * @0x001A2342 makes ESI a per-LOCAL-VIEW record built on FUN_001A20F0's own
+ * stack -- stride 0x70 @0x001A243E, handed to FUN_001A6B40 as its param_2 by
+ * `LEA EDX,[ESP+0x494]` @0x001A260F -- so the `MOV byte [ESI+0x48],1/0`
+ * @0x001A2398 / @0x001A23EC writes record+0x68, which FUN_001A6B40 reads as
+ * `*(char *)(pfVar9 + 6)` to decide whether that VIEW takes part in its 275 m
+ * residency test.  It is not an agent field and has nothing to do with
+ * branching.  With the budget wrongly pinned at 0 the selector never ran, no
+ * successor was ever pending, and every traffic car died at its path
+ * terminus -- wherever that terminus happened to be, including 16 m in front
+ * of the player.
+ *
+ * The real writer of the agent's +0x48 is FUN_001A09F0 @0x001A0A85
+ * (`MOV byte ptr [EBX+0x48],CL`, CL from FUN_001A6680), and FUN_0019F1C0
+ * calls FUN_001A09F0 on every ROW CROSSING -- the arm guarded by
+ * `agent+0x4B & 1`, the bit its row-walk loop sets.  So the budget is
+ * re-supplied from the junction data as the agent drives, all race long; it
+ * is not a per-race constant.  FUN_001A8E80 @0x001A8ECB clears it back to 0
+ * once a selection is actually committed.
+ *
+ * The harness has no junction records, so it re-arms one attempt per row
+ * crossing, which is the same cadence: a row that carries no link in the
+ * agent's direction column yields no selection anyway. */
+#define B3_TRAFFIC_BRANCH_ATTEMPTS_PER_ROW 1
+
+/* FUN_001A0750 @0x001A0788..0x001A07A0, with the ordinary flag clear:
+ *     col = agent+0x4C ? 2 : 3
+ * The two columns are a LANE-CHANGE PAIR, not a travel sense.  On US_C3_V1
+ * every row of path 0 carries a col-2 link to path 1 and every row of path 1 a
+ * col-3 link back to path 0 (lat +20.9 <-> +15.1, the with-race carriageway),
+ * and the same for 2<->3, 15<->16, 17<->18 -- col 2 steps toward the median,
+ * col 3 toward the kerb.  Both members of each pair run the SAME way in the
+ * world, so the column cannot be the direction.                          [C] */
+#define B3_BRANCH_COL(side) ((side) < 0 ? 3 : 2)
+
+/* THE JUNCTION COLUMNS.
+ *
+ * FUN_001A0750 @0x001A0788..0x001A07A0 picks the column from TWO agent
+ * booleans, not one:
+ *     if (agent+0x4C == 0) col = (flag == 0) * 2 + 1;    ->  3 : 1
+ *     else                 col = ((flag != 0) - 1) & 2;  ->  2 : 0
+ * with flag = (agent+0x4B >> 2) & 1, the bit FUN_001A8E80 @0x001A8ED5 clears
+ * once a selection built from it is committed.  So each travel sense has TWO
+ * columns: a `flag == 0` one and a `flag == 1` one.
+ *
+ * This harness only ever reached the `flag == 0` pair, 2 and 3 -- and on this
+ * track those are ADJACENT-LANE links: 2910 of them, every single one pointing
+ * at the sibling path's SAME row, 3.68 m to 7.36 m away (median 6.00 m, none
+ * over 8 m).  They are lane changes WITHIN one carriageway, not across the
+ * road: col 2 on p0 targets p1 and col 3 on p1 targets p0 (lat +20.9 <->
+ * +15.1, both running WITH the race), and the mirror pair 2 <-> 3 sits on the
+ * far carriageway (+9.2 <-> +3.4, both AGAINST).  Col 2 steps toward the
+ * median and col 3 toward the kerb.  The seven links in columns 0 and 1 are
+ * the road network's real junctions:
+ *
+ *     col1 p0  r287 -> p13 r0        col0 p2  r204 -> p14 r0
+ *     col1 p4  r171 -> p20 r0        col1 p5  r235 -> p15 r181  (TERMINUS)
+ *     col1 p12 r100 -> p0  r301  (TERMINUS)
+ *     col1 p15 r172 -> p4  r0        col1 p19 r489 -> p4  r182  (TERMINUS)
+ *
+ * Three of them sit on a path's LAST row -- they are what stops a car dying
+ * at the end of a spur -- and `p12 r100 -> p0 r301` is the exact terminus at
+ * which the reported 16 m pop happened.  Every junction handover is 4.61 m to
+ * 8.78 m horizontally with |dy| <= 0.17 m, i.e. one road row: committing one
+ * cannot look like a teleport.
+ *
+ * CORRECTION: agent+0x4C is NOT a travel sense.  A path does not carry
+ * traffic in both senses -- FUN_0019F1C0 walks every agent one way (see
+ * traffic_path_advance) and the network is directed, so p0 carries with-race
+ * traffic and only with-race traffic.  What +0x4C selects is WHICH SIDE the
+ * car changes lane toward, and FUN_001A8EE0 @0x001A8F2E says so out loud: on
+ * a selection it sets body+0x175 bit 2 when +0x4C is clear and bit 0 when it
+ * is set -- the two INDICATOR LAMPS.  [C]
+ *
+ * [?] no write to agent+0x4C was located, so which of 0/1 (and of 2/3) a
+ * given car takes is still unrecovered; the harness keys it to the pool
+ * request's row-order bit, which is arbitrary but stable and splits the
+ * population the way an unrecovered per-agent boolean would.  It does not
+ * matter for the junction pair: no terminal row in this track's data has both
+ * junction columns populated, so trying 1 then 0 reaches exactly the link
+ * retail would. */
+#define B3_BRANCH_JUNCTION_COL_A 1
+#define B3_BRANCH_JUNCTION_COL_B 0
+
+static void traffic_branch_select_col(TrafficCar* t, int col, int spend)
+{
+    const B3TrafficPath* path;
+    unsigned int cur, hi, row, count;
+
+    /* FUN_0019F1C0's row-walk sets agent+0x4B bit 0 and then calls
+     * FUN_001A09F0, which re-writes agent+0x48 from the junction record.  The
+     * harness's equivalent of "bit 0 got set" is the integer part of the
+     * cursor changing. */
+    {
+        unsigned int now = (unsigned int)floorf(t->path_cursor);
+        if (now != t->branch_row_armed) {
+            t->branch_row_armed = now;
+            if (t->branch_attempts < B3_TRAFFIC_BRANCH_ATTEMPTS_PER_ROW)
+                t->branch_attempts = B3_TRAFFIC_BRANCH_ATTEMPTS_PER_ROW;
+        }
+    }
+    if (t->branch_sel_path >= 0) return;
+    if (spend && t->branch_attempts <= 0) return;
+    if (!g_traffic_paths.links || t->path_id >= g_traffic_paths.path_count) return;
+    path  = &g_traffic_paths.paths[t->path_id];
+    count = path->count;
+    if (count < 2) return;
+
+    cur = (unsigned int)floorf(t->path_cursor);
+    if (cur >= count) return;
+    hi = cur + (t->branch_attempts < 2 ? 3u : 1u);
+    if (hi >= count) hi = count - 1u;
+
+    for (row = hi; ; row--) {
+        const B3TrafficPathLink* lk = &g_traffic_paths.links[path->pair_base + row];
+        unsigned char dst = lk->target_path[col];
+        if (dst != 0xff && dst < g_traffic_paths.path_count
+            && g_traffic_paths.paths[dst].count >= 2) {
+            unsigned int tgt = lk->target_row[col];
+            float switch_row, sel_cursor;
+            if (row + 1u < count) {           /* the ordinary arm */
+                switch_row = (float)row;
+                sel_cursor = (float)tgt;
+            } else {                          /* on the last row: back off <= 4 */
+                unsigned int back = (row > cur) ? (row - cur - 1u) : 0u;
+                if (back > 4u) back = 4u;
+                switch_row = (float)(row - back);
+                sel_cursor = (tgt <= back) ? 0.0f : (float)(tgt - back);
+            }
+            if (sel_cursor > (float)(g_traffic_paths.paths[dst].count - 1))
+                sel_cursor = (float)(g_traffic_paths.paths[dst].count - 1);
+            t->branch_sel_path   = (int)dst;
+            t->branch_sel_cursor = sel_cursor;
+            t->branch_switch_row = switch_row;
+            if (spend) t->branch_attempts--;
+            return;
+        }
+        if (row == cur) break;
+    }
+}
+
+static void traffic_branch_select(TrafficCar* t)
+{
+    traffic_branch_select_col(t, B3_BRANCH_COL(t->branch_side), 1);
+}
+
+/* The terminus look, FUN_001A6B40 @0x001A6DBC's `body+0x118 == 0` test: the
+ * only question retail asks before destroying the car is whether a successor
+ * is already selected.  Ask the lane column and then the junction columns,
+ * without spending the per-row budget -- at the descriptor end there is no
+ * later row to spend it on, and retail's own selection would already exist. */
+static void traffic_branch_select_terminus(TrafficCar* t)
+{
+    traffic_branch_select_col(t, B3_BRANCH_COL(t->branch_side), 0);
+    if (t->branch_sel_path < 0)
+        traffic_branch_select_col(t, B3_BRANCH_JUNCTION_COL_A, 0);
+    if (t->branch_sel_path < 0)
+        traffic_branch_select_col(t, B3_BRANCH_JUNCTION_COL_B, 0);
+}
+
+/* FUN_001A8EE0's commit arm + FUN_001A9040. Returns 1 if the agent moved. */
+static int traffic_branch_commit(TrafficCar* t, int slot)
+{
+    if (t->branch_sel_path < 0) return 0;
+    if (t->path_dir < 0) {
+        if (t->path_cursor > t->branch_switch_row) return 0;
+    } else {
+        if (t->path_cursor < t->branch_switch_row) return 0;
+    }
+    if (getenv("B3_SPAWN_TRACE")) {
+        Vec3 a, at, b, bt;
+        traffic_path_sample(t->path_id, t->path_cursor, t->path_lateral, &a, &at);
+        traffic_path_sample((unsigned)t->branch_sel_path, t->branch_sel_cursor,
+                            t->path_lateral, &b, &bt);
+        printf("[branch] t=%.2f slot %d path %u->%d cursor %.1f->%.1f dir %d "
+               "jump %.1f m\n", g_race_time, slot, (unsigned)t->path_id,
+               t->branch_sel_path, t->path_cursor, t->branch_sel_cursor,
+               t->path_dir, sqrtf((b.x-a.x)*(b.x-a.x) + (b.z-a.z)*(b.z-a.z)));
+    }
+    t->path_id     = (unsigned int)t->branch_sel_path;
+    t->path_cursor = t->branch_sel_cursor;
+    /* FUN_001A9040 re-draws the lane fraction from the manager RNG */
+    t->path_lateral = 0.5f
+        + ((float)(int)(traffic_rng_u32() % 1000u) - 500.0f) * 0.0002f;
+    t->branch_sel_path = -1;
+    return 1;
 }
 
 static float traffic_path_distance(unsigned int path_id, float cursor) {
@@ -5503,6 +10821,14 @@ static void traffic_reservations_rebuild(void) {
 // Frame at (segment, t): centre point, height and unit tangent.
 static void route_frame(int seg, float t, float* cx, float* cy, float* cz,
                         float* tx, float* tz) {
+    /* The oncoming polyline is PER TRACK and may be empty: AS_M1_V1/V2 ship
+     * traffic.bin with zero oncoming points.  With the table compiled in
+     * that could not happen, so every walker below indexed it unguarded. */
+    if (!B3_ONCOMING_USABLE) {
+        *cx = 0.0f; *cy = 0.0f; *cz = 0.0f; *tx = 0.0f; *tz = -1.0f;
+        return;
+    }
+    if (seg < 0 || seg >= B3_ONCOMING_COUNT) seg = 0;
     const float* a = B3_ONCOMING[seg];
     const float* b = B3_ONCOMING[(seg + 1) % B3_ONCOMING_COUNT];
     float ax = b[0] - a[0], az = b[2] - a[2];
@@ -5521,6 +10847,12 @@ static void route_frame(int seg, float t, float* cx, float* cy, float* cz,
 // extractor used for the lane table (s = tx*(z-cz) - tz*(x-cx)).
 static float route_project(float x, float z, int from, int win,
                            int* out_seg, float* out_t, float* out_lat) {
+    if (!B3_ONCOMING_USABLE) {
+        if (out_seg) *out_seg = 0;
+        if (out_t)   *out_t = 0.0f;
+        if (out_lat) *out_lat = 0.0f;
+        return 1e30f;
+    }
     float best = 1e30f;
     int bs = from;
     float bt = 0.0f;
@@ -5553,6 +10885,7 @@ static float route_project(float x, float z, int from, int win,
 // Walk `adv` metres along the polyline from (seg,t) in direction dir.
 static void route_advance(int seg, float t, int dir, float adv,
                           int* oseg, float* ot) {
+    if (!B3_ONCOMING_USABLE) { *oseg = seg; *ot = t; return; }
     float remain = adv > 0.0f ? adv : 0.0f;
     int i = seg;
     float u = t;
@@ -5608,13 +10941,14 @@ static void traffic_lane_of(TrafficCar* t, int lane) {
          * it calls the two lanes the RACERS THEMSELVES OCCUPY "oncoming".
          * Proof, all in this repo's own recovered data and independent of
          * any runtime:
-         *   - the game's six START-GRID slots (burnout3_start_grid.h, the
+         *   - the game's six START-GRID slots (build/tracks/<id>/grid.bin, the
          *     .bgd SPATIAL record @0xa000 read by the game's own parser
          *     FUN_0018B250 [C]) project onto the route polyline at lateral
          *     +14.29 +21.44 +15.55 +21.72 +14.87 +21.42 -- i.e. exactly the
          *     lanes the table lists as 14.559 and 20.831 -- and all six face
          *     the DESCENDING polyline direction (fwd . asc_tangent = -1.00);
-         *   - the game's own race line (burnout3_track_paths.h @0xc0930)
+         *   - the game's own race line (route.bin's centerline pool, .bgd
+         *     @0xc0930 on this track)
          *     spans lateral +11.4..+24.1, median +14.7, and its tangent dots
          *     the ascending polyline tangent at -1.000 over its whole length;
          *   - so DESCENDING polyline index IS the race direction, and the
@@ -5649,14 +10983,375 @@ static void traffic_lane_of(TrafficCar* t, int lane) {
  * query supplies the same identity the retail streamer writes at +0x216.
  * On a 0->1 transition FUN_001213C0 clears the force/impulse accumulators;
  * outside every unit the base update is skipped. */
+static int traffic_pop_level(void) {
+    /* B3_TRAFFIC_POP=1 logs only what the PLAYER can see -- the `active`
+     * transitions, i.e. the pool creating and destroying a body.  =2 adds the
+     * `streamed` transitions, which are NOT visibility: traffic_render() gates
+     * on `active` alone, so a car that leaves the streamed collision units
+     * keeps being drawn and keeps moving; only its rigid body stops.  The
+     * first pop trace was taken at the `streamed` hook and therefore missed
+     * every real disappearance (traffic_pool_release_slot logged nothing) and
+     * mislabelled the re-seed of a slot as a SPAWN. */
+    static int level = -1;
+    if (level < 0) {
+        const char* e = getenv("B3_TRAFFIC_POP");
+        level = e ? (atoi(e) > 0 ? atoi(e) : 1) : 0;
+    }
+    return level;
+}
+
+/* The pool's view of the player, published so the trace can carry it: an
+ * in-view retire is only ever explicable with the window the pool thought the
+ * player was in -- and with the travel-sense flag, which inverts the whole
+ * request dispatch.  Defined here rather than beside traffic_request_stamps()
+ * so the trace can read it; the recovery that explains it is there. */
+static int g_traffic_pool_forward = 1;   /* manager+0x363BC, FUN_001A3EA0 */
+static unsigned int g_pool_dbg_progress = 0;
+static unsigned int g_pool_dbg_window = 0;
+
+static void traffic_pop_log(const TrafficCar* t, const char* what) {
+    /* B3_TRAFFIC_POP: every appear/disappear with the distance to the
+     * player.  A transition inside retail's 160 m view gate is the report. */
+    if (!traffic_pop_level()) return;
+    float dx = t->pos.x - g_player.pos.x, dz = t->pos.z - g_player.pos.z;
+    fprintf(stderr, "[tpop] t=%.2f %s car=%d cls=%d dist=%.0f pos=(%.0f %.0f)"
+            " path=%u row=%.0f win=%u prog=%u fwd=%d ppos=(%.0f %.0f)\n",
+            g_race_time, what, (int)(t - g_traffic), t->car,
+            sqrtf(dx*dx + dz*dz), t->pos.x, t->pos.z,
+            (unsigned)t->path_id, t->path_cursor,
+            g_pool_dbg_window, g_pool_dbg_progress, g_traffic_pool_forward,
+            g_player.pos.x, g_player.pos.z);
+}
+
+/* THE VIEW GATE, FUN_001A6070 @0x001A64E5..0x001A6566.
+ *
+ * The one rule retail has against traffic materialising in front of you, and
+ * the harness had none of it.  After FUN_001A2B20 @0x001A641C has built the
+ * body -- after the class/model/paint/speed draws, so the RNG stream is
+ * already spent -- the manager walks the LOCAL VIEW list it was handed and,
+ * for the first view closer than 160.0 m, calls FUN_001A75A0 @0x001A6566,
+ * which frees the body (and its trailer) straight back to the pool.  Retail
+ * pays for the car and throws it away rather than let it appear in shot.
+ *
+ *   MOVAPS XMM2,[ESI+0xa0]        @0x001A64EE  the new body's position
+ *   SUBPS  XMM0,XMM2              @0x001A64FD  view - body, 4 lanes
+ *   XORPS/MOVSS [ESP+0x54]        @0x001A6505  the Y lane is zeroed
+ *   MULPS/SHUFPS/ADDSS x2         ..0x001A6528 dx*dx + 0 + dz*dz  (w excluded)
+ *   SQRTSS                        @0x001A6531
+ *   COMISS 160.0,[ESP+0x38] / JA  @0x001A6550  cull iff dist < 160.0
+ *   DAT_003A49FC = 0x43200000 = 160.0f                                   [C]
+ *
+ * The list is param_4/param_5 of FUN_001A6070, threaded down unchanged from
+ * FUN_001AA100 @0x001AA5B3 (`LEA EAX,[EBP+0x126948]` = &DAT_00735348, count
+ * `*(DAT_0073552C+0x3EC)`) through FUN_001A28B0 -> FUN_001A3470 @0x001A35AE
+ * and FUN_001A5FE0 @0x001A604E.  It is one 16-byte record per LOCAL VIEW --
+ * FUN_0018D0E0 @0x0018D172 hands a racer `&DAT_00735348 + local_index*0x10`
+ * -- whose first field is a pointer to an aligned vec4.  This harness renders
+ * exactly one local view, so the list is g_player.  [?] the vec4 could be the
+ * car origin or its camera's; nothing in the image settles it, and the two
+ * differ by the chase-cam offset, which is small against 160 m.
+ *
+ * Note which paths carry the list and which do not: the two per-frame refresh
+ * arms do, but the STREAMING-SECTION load does not -- FUN_001A3AE0 case 1
+ * @0x001A3BA2 pushes 0,0,0, so count == 0 and the loop is skipped.  A section
+ * that streams in ahead of the player fills freely, which costs nothing
+ * because it is far away by construction. */
+#define B3_TRAFFIC_VIEW_GATE_M 160.0f      /* DAT_003A49FC [C] */
+
+static int traffic_view_gate_reject(const TrafficCar* t) {
+    float dx = t->pos.x - g_player.pos.x;
+    float dz = t->pos.z - g_player.pos.z;
+    return sqrtf(dx * dx + dz * dz) < B3_TRAFFIC_VIEW_GATE_M;
+}
+
+/* IS THIS BODY ON THE PLAYER'S SCREEN RIGHT NOW?
+ *
+ * RETAIL NEEDS NO SUCH TEST, AND THAT IS EXACTLY WHY THE PORT DOES.
+ *
+ * Retail has three ways to retire a traffic body and not one of them is a
+ * distance:
+ *     FUN_001A3470 @0x001A38BA   the request stopped being stamped
+ *     FUN_001A6B40 @0x001A6DC4   the descriptor end, successor absent
+ *     FUN_00114910 @0x00114CE0   promotion to a real vehicle
+ * and when the free list runs dry it REFUSES THE SPAWN rather than evict a
+ * live body -- FUN_001A2B20 @0x001A2B48/@0x001A2B5E returns 0 on an empty
+ * head or a one-deep list (and @0x001A2B7C when a class-7 request cannot get
+ * its three), whereupon FUN_001A6070 @0x001A6423 `TEST ESI,ESI / JE
+ * 0x001A6586` abandons the whole placement run at the function exit.  There
+ * is no eviction path in the image at all.                              [C]
+ *
+ * So retail is safe by construction: its only residency retire fires a
+ * median 429 m from the road the spawn arm is filling [S], and this port
+ * measures the same thing at runtime (the UNSTAMP arm's nearest release over
+ * a 175 s US_C1_V1 race is 301 m, median 398 m, none of them in front of the
+ * player).  What is NOT safe is the harness's own GLUE -- the not-seen
+ * backstop and the wreck reseed -- which fire wherever the car happens to
+ * be.  Those were confined to bodies outside retail's 160 m SPAWN gate, on
+ * the assumption that the gate doubles as a visibility horizon.  It does
+ * not: traffic_render() draws every `active` agent with no distance cull at
+ * all, under a far plane of 10 000 m (0x461C4000 @0x0002EDCC [C]), so a
+ * body deleted at 160.1 m dead ahead is a car the player is looking at when
+ * it blinks out.  Measured: 13 of 147 backstop releases in the forward cone,
+ * 5 of them inside 200 m.
+ *
+ * The predicate is the harness's existing on-camera test, unchanged --
+ * FUN_0019D7F0's four x/z planes reduced, for a symmetric perspective view,
+ * to "in front of the eye and inside the horizontal half-angle" (see the
+ * rubberband in_range_1550 site, which publishes g_oncam_eye /
+ * g_at_cam_fwd / g_oncam_cos from the frame's own lookat).  Before the first
+ * draw has published a camera nothing has been shown, so the answer is no
+ * and the pre-existing behaviour stands. */
+static int traffic_on_camera(const TrafficCar* t) {
+    float ex, ez, el;
+    if (!g_oncam_ready) return 0;
+    ex = t->pos.x - g_oncam_eye.x;
+    ez = t->pos.z - g_oncam_eye.z;
+    el = sqrtf(ex * ex + ez * ez);
+    if (el < 1e-3f) return 1;
+    return (ex * g_at_cam_fwd[0] + ez * g_at_cam_fwd[2]) / el >= g_oncam_cos;
+}
+
+/* --- traffic pop log (agent) --------------------------------------------
+ * B3_TFC_POP_LOG=1 -- EVERY traffic appearance and disappearance, carrying
+ * the one number retail's rule is written in.
+ *
+ * WHY IT EXISTS.  The user report is "sometimes cars (dis)appear in front of
+ * me on longer races".  The pre-existing B3_TRAFFIC_POP trace prints a range
+ * and a cause, which is enough to see THAT a car popped but not enough to
+ * settle WHY: it carries no bearing (so "in front of me" cannot be separated
+ * from "behind me"), no pool occupancy (so the standing pool-pressure
+ * hypothesis cannot be tested), and no running totals (so a 180 s race has to
+ * be re-counted by hand every time).  This block adds those three and nothing
+ * else -- it does not change, reorder or suppress a single [tpop] line.
+ *
+ * THE VERDICT COLUMN is retail's own gate, FUN_001A6070 @0x001A64E5: the
+ * horizontal distance from the local view to the body, culled below 160.0 m
+ * (DAT_003A49FC).  `gate=IN` therefore means "retail would have refused to
+ * let this body exist here", and an IN transition is by definition a pop the
+ * player can be shown.  `cone` narrows that to the forward half of the view
+ * (|bearing| <= 45 deg off the car's nose), which is the half the user's
+ * "in front of me" is actually about.
+ *
+ * NOTHING HERE IS ON THE DECISION PATH.  Every entry point leads with
+ * b3_tpl_on(), which resolves getenv exactly once; with the env unset there
+ * is no float work, no counter update and no output, so a run without it is
+ * byte-for-byte the run before this block existed.
+ *
+ * ORDER WITHIN A POOL PASS:
+ *   b3_tpl_note(.., "CULL",   "view-gate")  <- retail paying for a body and
+ *                                              throwing it away unseen
+ *   b3_tpl_note(.., "SPAWN",  <policy>)     <- the body that survived the gate
+ *   b3_tpl_starve()                         <- the free list said no
+ *   b3_tpl_note(.., "RETIRE", g_pool_release_why)
+ *   b3_tpl_note(.., "RESEED", <seeder>)     <- the non-pool seeders, which
+ *                                              reach traffic_reset_pose
+ * ---------------------------------------------------------------------- */
+#define B3_TPL_WHYS 24
+#define B3_TPL_CONE_DEG 45.0f
+
+static struct {
+    char  why[B3_TPL_WHYS][24];
+    int   n;
+    int   total[B3_TPL_WHYS];
+    int   inview[B3_TPL_WHYS];      /* d < 160 m: retail's own gate       */
+    int   incone[B3_TPL_WHYS];      /* and inside the forward 90 deg      */
+    int   oncam[B3_TPL_WHYS];       /* actually being drawn to the player */
+    float oncam_near[B3_TPL_WHYS];
+    float nearest[B3_TPL_WHYS];
+    int   starve;                   /* pool free list empty on a request  */
+    int   pool_hi;                  /* live-body high-water mark          */
+} g_tpl;
+
+/* Set around the pool seeder so traffic_reset_pose's RESEED hook does not
+ * double-report a pool spawn, and by each non-pool seeder so its line names
+ * the seeder that ran (same shape as g_pool_release_why on the retire side). */
+static int g_tpl_in_pool_seed = 0;
+static const char* g_tpl_seed_why = "?";
+
+static int b3_tpl_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("B3_TFC_POP_LOG");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return v;
+}
+
+/* live physical bodies held by the pool -- the pool-pressure column */
+static int b3_tpl_pool_live(void) {
+    int live = 0;
+    for (int i = 0; i < g_traffic_pool.physical_count; i++)
+        if (g_traffic_pool.physical_live[i]) live++;
+    return live;
+}
+
+static int b3_tpl_bucket(const char* kind, const char* why) {
+    char key[24];
+    snprintf(key, sizeof key, "%.6s:%.16s", kind, why);
+    for (int i = 0; i < g_tpl.n; i++)
+        if (strcmp(g_tpl.why[i], key) == 0) return i;
+    if (g_tpl.n >= B3_TPL_WHYS) return -1;
+    snprintf(g_tpl.why[g_tpl.n], sizeof g_tpl.why[0], "%s", key);
+    g_tpl.nearest[g_tpl.n] = 1e30f;
+    g_tpl.oncam_near[g_tpl.n] = 1e30f;
+    return g_tpl.n++;
+}
+
+static void b3_tpl_note(const TrafficCar* t, const char* kind,
+                        const char* why) {
+    float dx, dz, d, brg;
+    int live, act = 0, bucket, inview, incone, oncam;
+    if (!b3_tpl_on() || !t) return;
+    dx = t->pos.x - g_player.pos.x;
+    dz = t->pos.z - g_player.pos.z;
+    d  = sqrtf(dx * dx + dz * dz);
+    /* same convention as the driver's own steering error and awl_bearing_deg:
+     * bearing of the offset off the player car's nose, degrees, signed. */
+    brg = angle_diff(atan2f(dx, -dz), g_player.rot.y) * RAD_TO_DEG;
+    live = b3_tpl_pool_live();
+    for (int i = 0; i < g_traffic_n; i++) if (g_traffic[i].active) act++;
+    if (live > g_tpl.pool_hi) g_tpl.pool_hi = live;
+    inview = d < B3_TRAFFIC_VIEW_GATE_M;
+    incone = inview && fabsf(brg) <= B3_TPL_CONE_DEG;
+    /* the column the fix is actually judged on: retail's 160 m gate answers
+     * "would retail have refused to CREATE here", the camera answers "is the
+     * player being SHOWN this body", and only the second one can be seen. */
+    oncam = traffic_on_camera(t);
+    bucket = b3_tpl_bucket(kind, why);
+    if (bucket >= 0) {
+        g_tpl.total[bucket]++;
+        if (inview) g_tpl.inview[bucket]++;
+        if (incone) g_tpl.incone[bucket]++;
+        if (oncam) {
+            g_tpl.oncam[bucket]++;
+            if (d < g_tpl.oncam_near[bucket]) g_tpl.oncam_near[bucket] = d;
+        }
+        if (d < g_tpl.nearest[bucket]) g_tpl.nearest[bucket] = d;
+    }
+    fprintf(stderr,
+            "[tfcpop] t=%7.2f %-6s slot=%3d car=%-10s d=%6.1f brg=%+7.1f "
+            "gate=%-3s cone=%d cam=%d pool=%3d/%3d act=%3d why=%-16s "
+            "pos=(%7.1f %7.1f) path=%u row=%.1f win=%u prog=%u fwd=%d\n",
+            g_race_time, kind, (int)(t - g_traffic),
+            B3_TRAFFIC_CARS[t->car].id, d, brg,
+            inview ? "IN" : "OUT", incone, oncam, live,
+            g_traffic_pool.physical_count, act, why,
+            t->pos.x, t->pos.z, (unsigned)t->path_id, t->path_cursor,
+            g_pool_dbg_window, g_pool_dbg_progress, g_traffic_pool_forward);
+}
+
+static void b3_tpl_starve(void) {
+    if (!b3_tpl_on()) return;
+    g_tpl.starve++;
+}
+
+static void b3_tpl_summary(void) {
+    int sp = 0, spv = 0, spm = 0, rt = 0, rtv = 0, rtm = 0;
+    if (!b3_tpl_on()) return;
+    fprintf(stderr,
+            "\n[tfcpop] ================================ SUMMARY  "
+            "race clock %.2f s\n"
+            "[tfcpop] gate = retail FUN_001A6070 @0x001A64E5, 160.0 m "
+            "horizontal; cone = that AND |bearing| <= %.0f deg;\n"
+            "[tfcpop] cam  = the body was ON THE PLAYER'S SCREEN when it "
+            "happened -- the only column a pop report is about\n",
+            g_race_time, (double)B3_TPL_CONE_DEG);
+    for (int i = 0; i < g_tpl.n; i++) {
+        fprintf(stderr, "[tfcpop]   %-24s n=%5d  in-view=%4d  in-cone=%4d  "
+                "ON-CAMERA=%4d  nearest=%.1f m (on-camera %.1f m)\n",
+                g_tpl.why[i], g_tpl.total[i],
+                g_tpl.inview[i], g_tpl.incone[i], g_tpl.oncam[i],
+                g_tpl.nearest[i] > 1e29f ? -1.0 : (double)g_tpl.nearest[i],
+                g_tpl.oncam_near[i] > 1e29f ? -1.0
+                                            : (double)g_tpl.oncam_near[i]);
+        if (strncmp(g_tpl.why[i], "SPAWN:", 6) == 0
+            || strncmp(g_tpl.why[i], "RESEED", 6) == 0) {
+            sp += g_tpl.total[i]; spv += g_tpl.inview[i];
+            spm += g_tpl.oncam[i];
+        } else if (strncmp(g_tpl.why[i], "RETIRE", 6) == 0) {
+            rt += g_tpl.total[i]; rtv += g_tpl.inview[i];
+            rtm += g_tpl.oncam[i];
+        }
+    }
+    fprintf(stderr,
+            "[tfcpop]   APPEAR total %d, IN-VIEW %d, ON-CAMERA %d\n"
+            "[tfcpop]   VANISH total %d, IN-VIEW %d, ON-CAMERA %d\n"
+            "[tfcpop]   pool high-water %d/%d bodies, free-list starve %d\n",
+            sp, spv, spm, rt, rtv, rtm,
+            g_tpl.pool_hi, g_traffic_pool.physical_count, g_tpl.starve);
+}
+/* --- end traffic pop log (agent) --- */
+
+/* THE RENDER/COLLISION ASYMMETRY, and the reason it existed.
+ *
+ * traffic_render() draws every `active` agent; carcol_pass() admits an agent
+ * only when `active && streamed && hull_ok`.  So every frame an agent spends
+ * with `streamed == 0` is a frame the player can SEE a car and DRIVE THROUGH
+ * it -- the user's report, and the same shape as the wreck drive-through
+ * fixed earlier.
+ *
+ * BOTH HALVES OF THAT ASYMMETRY ARE RETAIL'S.  [C]
+ *
+ * The render half: `+0x242C` -- the latch FUN_00120F30 raises and lowers
+ * from `+0x216` @0x00120F6E / @0x00120F91 -- has exactly three readers in
+ * the image (FUN_00112170 @0x0011218D and @0x001121BE, the collision
+ * helper; FUN_001213C0 @0x001213C0, the enter-a-unit accumulator clear; and
+ * FUN_00120F30's own arms @0x00120F4F / @0x00120F9D / @0x00120FBC).
+ * NOTHING on a draw path reads it, so retail does NOT hide an out-of-unit
+ * agent.
+ *
+ * The collision half: FUN_00114610, the car-vs-car PAIR FILTER, rejects the
+ * pair when a body's collision-object TYPE is one of {0,1,2,4,6,7} AND that
+ * body's `+0x216 == -1`:
+ *
+ *     ... || (*(char *)(*(int *)(EDI + 0xc) + 0x216) != -1)     @0x001146F2
+ *     ... || (*(char *)(*(int *)(ESI + 0xc) + 0x216) != -1)     @0x00114719
+ *
+ * TYPE 3 -- the live traffic handle -- IS NOT IN THAT SET, so retail pairs
+ * the player against an out-of-unit LIVE traffic car and only vetoes wrecks
+ * (promoted to type 4) and racers.  The port vetoed every traffic car; that
+ * is fixed at the carcol_pass() admission, where the full citation lives.
+ *
+ * So retail's render gate stands and its collision gate stands ONCE IT IS
+ * SCOPED, and what is left for this function is the PREDICATE that decides
+ * which side of the residency line an agent is on.
+ *
+ * Retail's predicate is b3_collision_unit_at_xz(): FUN_0019D7F0's four XZ
+ * half-planes, no Y, no ray (see burnout3_collision.h).  It answers "is this
+ * body over the loaded world", and for a car on a road it is always true.
+ * The port asked "is there a polygon under this body in a 30 m window",
+ * which is false over every hole in the soup.  Measured offline on the
+ * shipped assets (tools/validate_traffic_align.py --deck-audit) at
+ * 5.24%..50.15% of traffic-path cross-sections per track (median 21.56%,
+ * 22.20% over 1,635,310 samples; 85% of the misses are XZ cells with no
+ * triangle at ANY height).  Restricted to the cross-sections within retail's
+ * own 160 m view gate of the race route -- the ones the player can actually
+ * be shown -- this predicate change takes the out-of-unit population from
+ * 11.50% to 6.20% of 603,761 samples.
+ *
+ * THE 6.20% RESIDUAL IS A DATA GAP, NOT A LAW.  Those points lie outside
+ * every unit's extent in collision.bin, i.e. outside the collision world the
+ * extractor produced, while the traffic paths and track.obj both cover them.
+ * Retail's units tile the visible world, so retail never reaches this state
+ * in shot; ours do not, and no runtime predicate can invent the polygons.
+ * That is the extraction follow-up (cx_collision.c emitting the +0x70
+ * footprints).  With the type-scoped veto in place the residual no longer
+ * costs a live car its COLLISION -- only its body update -- so it is a
+ * measurement, not a defect the player can feel.
+ *
+ * The ground height the old probe also returned was never used here: the
+ * body plane comes from t->pos.y in the carcol_synth_rb() below. */
 static int traffic_stream_refresh(TrafficCar* t) {
     unsigned char unit = 0xff;
-    float height, normal[3];
-    int in_unit = b3_ground_probe_unit(t->pos.x, t->pos.y + 3.0f, t->pos.z,
-                                       &height, normal, &unit) >= 0;
+    int in_unit = b3_collision_unit_at_xz(t->pos.x, t->pos.z, &unit);
     if (!in_unit) unit = 0xff;
     t->stream_unit = unit;
     if (unit == 0xff) {
+        /* NOT a disappearance: the renderer never looks at `streamed`.  Only
+         * B3_TRAFFIC_POP=2 shows these, and they are tagged so they can no
+         * longer be counted as pops. */
+        if (t->streamed && traffic_pop_level() >= 2)
+            traffic_pop_log(t, "body-off(stream)");
         t->streamed = 0;
         t->asleep = 1;
         return 0;
@@ -5667,9 +11362,24 @@ static int traffic_stream_refresh(TrafficCar* t) {
         memset(t->rb.imp_force, 0, sizeof(t->rb.imp_force));
         memset(t->rb.imp_torque, 0, sizeof(t->rb.imp_torque));
         memset(t->rb.deflection, 0, sizeof(t->rb.deflection));
+        if (traffic_pop_level() >= 2) traffic_pop_log(t, "body-on(stream)");
         t->streamed = 1;
     }
     if (t->trailer < 0) t->asleep = 0;
+    return 1;
+}
+
+/* THE ONE PLACE THE CAR-CONTACT ADMISSION IS DECIDED.
+ *
+ * carcol_pass() calls it to build its body list and the [tfc] census prints
+ * it as `col`, so the telemetry can never disagree with the solver about
+ * which drawn car the player can actually hit -- which is the whole subject
+ * of tools/validate_traffic_align.py --run's `drawn => collidable`
+ * assertion.  The retail citation (FUN_00114610's type-scoped `+0x216 == -1`
+ * veto, @0x001146F2 / @0x00114719) is at the carcol_pass() call site. */
+static int traffic_carcol_admits(const TrafficCar* t) {
+    if (!t->active || !g_traffic_hull_ok[t->car]) return 0;
+    if (t->crashed_until > g_race_time && !t->streamed) return 0;  /* type 4 */
     return 1;
 }
 
@@ -5688,12 +11398,14 @@ static void traffic_trailer_target(const TrafficCar* t, Vec3* out) {
 static void traffic_tow_sleep_refresh(TrafficCar* t) {
     if (!t->streamed || t->trailer < 0 || !t->trailer_linked) return;
     unsigned char unit = 0xff;
-    float height, normal[3];
     Vec3 target;
     int was_asleep = t->asleep;
     traffic_trailer_target(t, &target);
-    if (b3_ground_probe_unit(target.x, target.y + 3.0f, target.z,
-                             &height, normal, &unit) < 0)
+    /* the TOWED partner's own +0x216, by the same FUN_0019D7F0 footprint
+     * test the tractor uses -- a trailer over a hole in the soup is not
+     * out of the world, and sleeping the rig for it parked articulated
+     * traffic on the road with no body under it. */
+    if (!b3_collision_unit_at_xz(target.x, target.z, &unit))
         unit = 0xff;
     t->trailer_stream_unit = unit;
     /* FUN_00120F30 writes both body+0x20E bytes together: either partner
@@ -5713,6 +11425,8 @@ static void traffic_tow_sleep_refresh(TrafficCar* t) {
 }
 
 static void traffic_reset_pose(TrafficCar* t) {
+    b3_rigid_body_bind_frame(&t->rb, t->rb_frame_store);
+    b3_rigid_body_bind_frame(&t->trailer_rb, t->trailer_rb_frame_store);
     /* The road's own cruise speed when the spawn policy supplied one (retail
      * runs 30..60 mph per carriageway on US_C3_V1); the flat 50 mph cap only
      * where it did not. */
@@ -5742,6 +11456,11 @@ static void traffic_reset_pose(TrafficCar* t) {
     t->asleep = 1;
     t->trailer_stream_unit = 0xff;
     t->trailer_linked = t->trailer >= 0;
+    /* --- traffic pop log (agent) --- every NON-pool seeder (traffic_place,
+     * traffic_path_seed) reaches this function and makes a car visible; the
+     * pool seeder reaches it too, but its own SPAWN line is emitted after
+     * the view gate has had its say, so it is excluded here. */
+    if (!g_tpl_in_pool_seed) b3_tpl_note(t, "RESEED", g_tpl_seed_why);
     (void)traffic_stream_refresh(t);
     // reset the articulation so a recycled tractor does not drag its
     // trailer across the map
@@ -5773,6 +11492,10 @@ static void traffic_reset_pose(TrafficCar* t) {
 // fallback stays available when a track has no extracted RIDX traffic paths.
 static void traffic_place(TrafficCar* t, int lane, const Vec3* ref,
                           float arc, int sign) {
+    /* This legacy seeder rides the oncoming polyline, which is per-track and
+     * can be empty.  Retire the agent rather than drop a collidable body at
+     * the world origin, where nothing is drawn. */
+    if (!B3_ONCOMING_USABLE) { t->active = 0; return; }
     traffic_lane_of(t, lane);
     t->cruise_ms = 0.0f;      // legacy seeder: no road policy behind this car
     int rs = 0;
@@ -5798,6 +11521,17 @@ static void traffic_place(TrafficCar* t, int lane, const Vec3* ref,
  * the event's own spawn seed, then let FUN_0019F1C0-compatible cursor motion
  * carry that agent to this segment's terminal retirement. */
 static int traffic_path_seed(TrafficCar* t, int spawn) {
+    /* FUN_001A20F0 @0x001A2365-0x001A23EC seeds agent+0x48 from the selected
+     * racecar's +0x1920:  TEST EAX,EAX / JNZ -> the arm that stores 0.  So
+     * the count is 1 only when +0x1920 == 0, and racecar+0x1920 == 1 is
+     * NORMAL RACING (B3AiCar.race_mode). During a race retail therefore hands
+     * traffic agents ZERO branch attempts and FUN_0019F1C0 retires them at the
+     * descriptor end -- which is what this harness already did. The mechanism
+     * below is recovered and correct, and it stays inert in a race because
+     * retail's own gate says so. */
+    t->branch_attempts = B3_TRAFFIC_BRANCH_ATTEMPTS_PER_ROW;
+    t->branch_row_armed = 0xffffffffu;
+    t->branch_sel_path = -1;
     float best = 1e30f;
     t->cruise_ms = 0.0f;      // legacy seeder: no road policy behind this car
     unsigned int best_path = 0, best_row = 0;
@@ -5822,6 +11556,10 @@ static int traffic_path_seed(TrafficCar* t, int spawn) {
     if (best == 1e30f) return 0;
     t->spawn = spawn;
     traffic_lane_of(t, spawn);
+    /* The legacy seeder has no request behind it, so it takes the descriptor's
+     * own sense (the only one retail has) and the default lane-change side. */
+    t->path_dir = 1;
+    t->branch_side = 1;
     t->path_id = (unsigned short)best_path;
     t->path_cursor = (float)best_row;
     static unsigned int lateral_rng = 0x6d2b79f5u;
@@ -5932,6 +11670,32 @@ static int traffic_mix_pick_model(int cls) {
     if (!group || group->entry_count == 0 || group->weight_total == 0)
         return -1;
     if (group->entry_count == 1) return (int)group->entry_base;
+    /* traffic=retail: FUN_001A5E30 itself, over the port's own weights and
+     * sharing the manager RNG. Single-entry lists short-circuit WITHOUT a
+     * draw on both sides, so the switch must sit after that test or the two
+     * streams would diverge by one. */
+    if (b3_backend_get(B3_FEAT_TRAFFIC) == B3_BACKEND_RETAIL) {
+        static unsigned w[64];
+        unsigned n = group->entry_count < 64 ? group->entry_count : 64;
+        for (unsigned i = 0; i < n; i++)
+            w[i] = g_traffic_paths.mix_entries[group->entry_base + i].weight;
+        int r = b3_emu_traffic_model(&g_traffic_rng_state, &g_traffic_rng_carry,
+                                     cls, group->weight_total, w, n);
+        /* Range-check before it becomes an index. An out-of-range value here
+         * is read straight into mix_entry_car[] and then B3_TRAFFIC_CARS[],
+         * which segfaults several frames later in traffic_pool_place -- a
+         * long way from the reply that caused it. */
+        if (r != -2) {
+            if (r < 0) return -1;
+            if ((unsigned)r >= n) {
+                fprintf(stderr, "[emu] tmodel: index %d outside %u entries\n",
+                        r, n);
+                b3_backend_demote(B3_FEAT_TRAFFIC, "model index out of range");
+                return -1;
+            }
+            return (int)(group->entry_base + (unsigned)r);
+        }
+    }
     draw = traffic_rng_u32() % group->weight_total;
     for (unsigned int index = 0; index < group->entry_count; index++) {
         acc += g_traffic_paths.mix_entries[group->entry_base + index].weight;
@@ -5942,7 +11706,14 @@ static int traffic_mix_pick_model(int cls) {
 
 /* FUN_001A5F90 @0x001A5F90: `rng % 100` against the eight percentage bytes. */
 static int traffic_mix_pick_paint(const B3TrafficMixEntry* entry) {
-    unsigned int draw = traffic_rng_u32() % 100u, acc = 0;
+    unsigned int draw, acc = 0;
+    /* traffic=retail: FUN_001A5F90 itself, same shared RNG. */
+    if (b3_backend_get(B3_FEAT_TRAFFIC) == B3_BACKEND_RETAIL) {
+        int r = b3_emu_traffic_paint(&g_traffic_rng_state,
+                                     &g_traffic_rng_carry, entry->colours);
+        if (r != -2) return (r >= 0 && r < 8) ? r : 0;
+    }
+    draw = traffic_rng_u32() % 100u;
     for (int index = 0; index < 8; index++) {
         acc += entry->colours[index];
         if (draw <= acc) return index;
@@ -5957,7 +11728,18 @@ static int traffic_mix_pick_paint(const B3TrafficMixEntry* entry) {
  * property of the request, which is exactly what the old seeder discarded. */
 static int traffic_pool_seed_at(TrafficCar* t, unsigned int path_id,
                                 float cursor, const B3TrafficMixRoad* road,
-                                int reverse) {
+                                int row_order_desc) {
+    /* FUN_001A20F0 @0x001A2365-0x001A23EC seeds agent+0x48 from the selected
+     * racecar's +0x1920:  TEST EAX,EAX / JNZ -> the arm that stores 0.  So
+     * the count is 1 only when +0x1920 == 0, and racecar+0x1920 == 1 is
+     * NORMAL RACING (B3AiCar.race_mode). During a race retail therefore hands
+     * traffic agents ZERO branch attempts and FUN_0019F1C0 retires them at the
+     * descriptor end -- which is what this harness already did. The mechanism
+     * below is recovered and correct, and it stays inert in a race because
+     * retail's own gate says so. */
+    t->branch_attempts = B3_TRAFFIC_BRANCH_ATTEMPTS_PER_ROW;
+    t->branch_row_armed = 0xffffffffu;
+    t->branch_sel_path = -1;
     Vec3 point, tangent;
     float limit;
     if (!traffic_paths_active() || path_id >= g_traffic_paths.path_count)
@@ -6003,16 +11785,49 @@ static int traffic_pool_seed_at(TrafficCar* t, unsigned int path_id,
                         &point, &tangent);
     t->pos = (Vec3){point.x, point.y + 0.5f, point.z};
     t->yaw = atan2f(tangent.x, -tangent.z);
-    /* ONCOMING.  Every pool request carries a `direction` byte
-     * ({first_row,last_row,path_id,direction}, FUN_001A28B0's TDESC window
-     * table).  It was extracted but never applied, so every car drove its
-     * path forwards and the game had NO oncoming traffic: over 172
-     * player-vs-traffic contacts the closing speed was always pspd MINUS
-     * tspd (player 159.5 - traffic 39.9 = 119.6), never the sum, so the
-     * player could not reach FUN_001121F0's 150 mph gate and could not
-     * crash into traffic at all (user report). */
-    t->path_dir = (signed char)(reverse ? -1 : 1);
-    if (reverse) t->yaw += 3.14159265f;
+    /* THE OPPOSITION IS IN THE ROAD NETWORK, NOT IN A PER-AGENT FLAG.
+     *
+     * The extracted path set is a DIRECTED road graph: parallel carriageway
+     * paths are authored running opposite ways, so walking every agent
+     * FORWARD along its own descriptor already produces two-way traffic.
+     * Measured over US_C3_V1's own traffic_paths.bin, sampling each path
+     * where it runs within 30 m of the route polyline and dotting its
+     * forward tangent with the race direction (= descending polyline index,
+     * the sense the start grid and the race line both face):
+     *     path  0 lat +20.9  +1.00 WITH      path  2 lat  +9.2  -0.99 AGAINST
+     *     path  1 lat +15.1  +0.99 WITH      path  3 lat  +3.4  -0.99 AGAINST
+     *     path 17 lat +15.4  +0.98 WITH      path 15 lat  +4.2  -0.96 AGAINST
+     *     path 18 lat +20.9  +0.99 WITH      path 16 lat  +9.9  -0.97 AGAINST
+     * -- the racers' own two lanes run with the race and the far carriageway
+     * runs against it, in the data, with no runtime flag involved.        [S]
+     *
+     * THE ROW ORDER IS NOT A TRAVEL SENSE.  A request is
+     * {first_row,last_row,...} and this seeder used to read
+     * `first_row > last_row` as "drive this one backwards".  FUN_001A6070
+     * @0x001A6098 opens by SORTING that pair:
+     *     local_74 = param_2; iStack_70 = param_1;
+     *     if (param_1 < param_2) { local_74 = param_1; iStack_70 = param_2; }
+     * and every later use is of the min/max, so the order reaches nothing at
+     * all in retail.                                                      [C]
+     * FUN_0019F1C0 says the same thing from the other end: the mover has no
+     * reverse walk to hand it to.                                         [C]
+     *
+     * It reads instead as the order the range is met ALONG THE RACE, which is
+     * why the fabricated flag landed on the oncoming carriageway.  The share
+     * of stamping requests written DESCENDING, split by whether their path
+     * runs with or against the race:
+     *     US_C3_V1   with-race 22/79 (28%)    against-race  54/77 (70%)
+     *     EU_C3_V1   with-race  8/56 (14%)    against-race  49/65 (75%)
+     *     AS_C1_V1   with-race 15/140 (11%)   against-race 103/148 (70%)
+     * -- so the flag turned around roughly seven of every ten oncoming
+     * agents and left the racers' own lanes alone, and the player saw traffic
+     * running WITH him on both sides of the road.                         [S]
+     *
+     * The bit still selects the lane-change link column, which is where the
+     * harness had been reading it and which is not a direction (see
+     * B3_BRANCH_COL); the travel sense is now the descriptor's own. */
+    t->path_dir = 1;
+    t->branch_side = (signed char)(row_order_desc ? -1 : 1);
     route_project(t->pos.x, t->pos.z, 0, -1, &t->seg, &t->seg_t, NULL);
     traffic_reset_pose(t);
     return 1;
@@ -6021,13 +11836,110 @@ static int traffic_pool_seed_at(TrafficCar* t, unsigned int path_id,
 static int g_pool_trace_nowindow = 0;
 static int g_pool_trace_acquire = 0, g_pool_trace_seedfail = 0, g_pool_trace_cover = 0;
 
+/* THE POOL'S PROGRESS MUST BE A PROPERTY OF THE CAR'S POSITION.
+ *
+ * Retail asks the racer for it through a virtual call
+ * (FUN_001A28B0 @0x001A29B0: `MOV EAX,[ECX]` / `CALL [EAX+0x18]`), and feeds
+ * the result to FUN_001A33B0's +-1 window stepper.  This harness used to read
+ * `vehicle->nav_section/nav_node` -- the AI RIBBON CURSOR -- and take the
+ * anchor of whatever node that cursor happened to be on.  That cursor is
+ * documented, three hundred lines above, as being able to sit on a DIFFERENT
+ * RIBBON from the car: US_C3's graph is five parallel 1013-node lane rows
+ * (route.bin sections 3..7, flags bit 0, anchors 0..1012) plus three junction
+ * rows -- section 0 with 89 nodes carrying anchors 289..377, section 1 with
+ * 791 nodes carrying 23..813, section 2 with 60 nodes carrying 27..86 -- and
+ * the walker's own comments record cursors landing "193 m ahead" and "0.65 of
+ * a lap away".  A node index only means an anchor inside its own row, so a
+ * cursor that has slipped onto a junction row reports a progress that has
+ * nothing to do with where the car is.
+ *
+ * Measured consequence, from the eight in-view DESPAWN(unstamp) events: every
+ * one of them was a request whose window sits 387 m to 502 m ALONG THE ROUTE
+ * from the row it killed, fired while the player was 102 m to 145 m from that
+ * row.  Reconstructing the player's real window from those distances against
+ * route.bin's anchors gives 25/26 where the pool was stamping for 28-30,
+ * 27-30 where it was stamping for 31-33, and 29-33 where it was stamping for
+ * 0-2 -- a consistent lead of about three windows, i.e. ~570 m of route.  The
+ * spawn/retire separation the shipped table is built around is exactly that
+ * size, so a lead of three windows lands the retire arm precisely on the road
+ * the player is driving.  Nothing in the traffic code could cause it; the
+ * progress was simply not the car's.
+ *
+ * So take the anchor of the nearest node on a MAIN CIRCUIT row (flags bit 0),
+ * which is a pure function of the car's position and cannot lead or lag.  The
+ * search is windowed around the last accepted node -- the car moves at most a
+ * couple of nodes per frame -- and falls back to the full sweep when the
+ * cache is cold or the car has been moved (crash respawn, reset).  On a track
+ * whose graph has no flagged rows the old cursor path stands. */
+#define B3_POOL_PROGRESS_WINDOW 48u        /* nodes each way; ~300 m of route */
+
 static int traffic_pool_progress(const Vehicle* vehicle, unsigned int* progress) {
-    unsigned int section = vehicle->nav_section;
-    unsigned int node = vehicle->nav_node;
-    if (!nav_state_valid(section, node)
-        && !nav_nearest(vehicle->pos, &section, &node))
-        return 0;
-    *progress = g_nav.links[g_nav.sections[section].link_base + node].anchor;
+    static unsigned short cache_node[8];
+    static unsigned char cache_ok[8];
+    int slot = (int)(vehicle - g_vehicles);
+    unsigned int best_section = 0, best_node = 0;
+    float best = 1e30f;
+    int found = 0;
+    if (!g_nav.loaded) return 0;
+    for (unsigned int section = 0; section < g_nav.section_count; section++) {
+        const B3RtNavSection* row = &g_nav.sections[section];
+        unsigned int lo = 0, hi = row->node_count;
+        if (!(row->flags & 1u)) continue;          /* junction row: skip */
+        if (slot >= 0 && slot < 8 && cache_ok[slot]) {
+            unsigned int c = cache_node[slot];
+            lo = c > B3_POOL_PROGRESS_WINDOW ? c - B3_POOL_PROGRESS_WINDOW : 0;
+            hi = c + B3_POOL_PROGRESS_WINDOW + 1;
+            if (hi > row->node_count) hi = row->node_count;
+        }
+        for (unsigned int node = lo; node < hi; node++) {
+            Vec3 center = nav_midpoint(section, node);
+            float dx = center.x - vehicle->pos.x;
+            float dy = center.y - vehicle->pos.y;
+            float dz = center.z - vehicle->pos.z;
+            float d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 < best) {
+                best = d2; best_section = section; best_node = node; found = 1;
+            }
+        }
+    }
+    /* cache cold, or the car jumped (respawn / lap wrap): sweep the rows */
+    if (found && best > 3600.0f && slot >= 0 && slot < 8 && cache_ok[slot]) {
+        found = 0;
+        cache_ok[slot] = 0;
+        best = 1e30f;
+        for (unsigned int section = 0; section < g_nav.section_count;
+             section++) {
+            const B3RtNavSection* row = &g_nav.sections[section];
+            if (!(row->flags & 1u)) continue;
+            for (unsigned int node = 0; node < row->node_count; node++) {
+                Vec3 center = nav_midpoint(section, node);
+                float dx = center.x - vehicle->pos.x;
+                float dy = center.y - vehicle->pos.y;
+                float dz = center.z - vehicle->pos.z;
+                float d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 < best) {
+                    best = d2; best_section = section; best_node = node;
+                    found = 1;
+                }
+            }
+        }
+    }
+    if (!found) {
+        /* no flagged rows at all: the pre-existing cursor path */
+        unsigned int section = vehicle->nav_section;
+        unsigned int node = vehicle->nav_node;
+        if (!nav_state_valid(section, node)
+            && !nav_nearest(vehicle->pos, &section, &node))
+            return 0;
+        *progress = g_nav.links[g_nav.sections[section].link_base + node].anchor;
+        return 1;
+    }
+    if (slot >= 0 && slot < 8) {
+        cache_node[slot] = (unsigned short)best_node;
+        cache_ok[slot] = 1;
+    }
+    *progress =
+        g_nav.links[g_nav.sections[best_section].link_base + best_node].anchor;
     return 1;
 }
 
@@ -6047,6 +11959,19 @@ static void traffic_pool_release_slot(int slot) {
                d, dx*fx + dz*fz, traffic->path_dir, traffic->path_cursor,
                g_pool_release_why);
     }
+    /* The visible disappearance.  `active` is what traffic_render() reads, so
+     * this -- not the `streamed` flag -- is the transition a pop report is
+     * about, and it had no instrumentation at all. */
+    if (traffic->active && strcmp(g_pool_release_why, "view-gate") != 0) {
+        /* "view-gate" is retail deleting a car it created and never showed
+         * (FUN_001A6070 @0x001A6566), so it is not a disappearance and does
+         * not belong in the pop trace. */
+        char tag[48];
+        snprintf(tag, sizeof tag, "DESPAWN(%s)", g_pool_release_why);
+        traffic_pop_log(traffic, tag);
+        /* --- traffic pop log (agent) --- */
+        b3_tpl_note(traffic, "RETIRE", g_pool_release_why);
+    }
     if (traffic->pool_request >= 0 && traffic->pool_agent >= 0)
         (void)b3_traffic_pool_release(&g_traffic_pool, slot,
                                       traffic->pool_agent);
@@ -6057,6 +11982,7 @@ static void traffic_pool_release_slot(int slot) {
     traffic->pool_seen = 0;
     traffic->trailer_ready = 0;
     traffic->trailer_linked = 0;
+    g_pool_release_why = "?";      /* so the next site cannot inherit a tag */
 }
 
 /* FUN_001A6610 @0x001A6610 -> FUN_001A4150 @0x001A4150: the manager refuses to
@@ -6084,7 +12010,7 @@ static void traffic_pool_place(int owner, unsigned int request_index, int seq,
                                const B3TrafficMixRoad* road,
                                unsigned int path_id, unsigned int low,
                                unsigned int high, float spacing, int index,
-                               int reverse) {
+                               int row_order_desc) {
     int physical_slot;
     int agent_slot;
     TrafficCar* traffic;
@@ -6103,40 +12029,38 @@ static void traffic_pool_place(int owner, unsigned int request_index, int seq,
         }
     }
     step = traffic_rng_f() * spacing;
-    /* Seed from the end the agent will travel AWAY from: a request carries
-     * {first_row,last_row,direction} and `low`/`high` are just their min and
-     * max, so a REVERSE agent -- which walks its cursor DOWN and retires at
-     * row 0 -- has to start at the high end.  Seeding it at `low` like a
-     * forward agent made it retire on the very frame it spawned
-     * (measured: "spawn slot 20 ... / despawn ... dir -1 cursor 0.0 why
-     * path-end" in the same frame), which respawned it immediately: 6102
-     * path-end retirements in 60 s, nearly all dir -1. */
-    if (reverse) {
-        row = (float)high - (float)index * step;
-        row -= ((float)high - row) * (2.0f * traffic_rng_f() - 1.0f) * 0.30f;
-    } else {
-        row = (float)low + (float)index * step;
-        row += row * (2.0f * traffic_rng_f() - 1.0f) * 0.30f;
-    }
+    /* FUN_001A6070 @0x001A6240..0x001A6338 seeds from the LOW end, always: it
+     * has already min/max'd the pair (@0x001A6098) and its accumulator starts
+     * at `local_74` -- the min -- so there is no "seed from the far end" arm to
+     * mirror.  The high-end branch that used to live here existed only to stop
+     * a fabricated reverse agent retiring on its spawn frame; with the reverse
+     * walk gone (see traffic_pool_seed_at) so is its reason to exist.     [C] */
+    row = (float)low + (float)index * step;
+    row += row * (2.0f * traffic_rng_f() - 1.0f) * 0.30f;
     if (row < (float)low) row = (float)low;
     if (row > (float)high) row = (float)high;
     if (traffic_row_taken(path_id, (unsigned int)row)) return;
     g_pool_trace_cover++;
     if (!b3_traffic_pool_acquire(&g_traffic_pool, &physical_slot, &agent_slot)
-        || physical_slot < 0 || physical_slot >= g_traffic_n)
+        || physical_slot < 0 || physical_slot >= g_traffic_n) {
+        b3_tpl_starve();   /* --- traffic pop log (agent) --- */
         return;
+    }
     g_pool_trace_acquire++;
     traffic = &g_traffic[physical_slot];
     /* Seed FIRST: traffic_pool_seed_at() ends in traffic_reset_pose(), which
      * clears the pool bookkeeping (see the note there).  Stamping the
      * reservation afterwards is what keeps it. */
-    if (!traffic_pool_seed_at(traffic, path_id, row, road, reverse)) {
+    g_tpl_in_pool_seed = 1;   /* --- traffic pop log (agent) --- */
+    if (!traffic_pool_seed_at(traffic, path_id, row, road, row_order_desc)) {
+        g_tpl_in_pool_seed = 0;                 /* traffic pop log (agent) */
         g_pool_trace_seedfail++;
         (void)b3_traffic_pool_release(&g_traffic_pool, physical_slot,
                                       agent_slot);
         traffic->active = 0;
         return;
     }
+    g_tpl_in_pool_seed = 0;   /* --- traffic pop log (agent) --- */
     if (getenv("B3_SPAWN_TRACE")) {
         float dx = traffic->pos.x - g_player.pos.x;
         float dz = traffic->pos.z - g_player.pos.z;
@@ -6151,6 +12075,159 @@ static void traffic_pool_place(int owner, unsigned int request_index, int seq,
     traffic->pool_owner = owner;
     traffic->pool_agent = agent_slot;
     traffic->pool_seen = 1;
+    /* FUN_001A6070 @0x001A6550: created, then thrown away if it landed inside
+     * a local view's 160 m.  It sits AFTER the reservation for the same reason
+     * retail's sits after FUN_001A2B20 -- the body has to exist before it can
+     * be destroyed, and traffic_pool_release_slot() is the port's FUN_001A75A0.
+     * All the draws are already spent, so the RNG stream is identical either
+     * way and validate_traffic_mix is unaffected. */
+    if (traffic_view_gate_reject(traffic)) {
+        g_pool_release_why = "view-gate";
+        traffic_pool_release_slot(physical_slot);
+        /* --- traffic pop log (agent) --- retail paying for a body and
+         * throwing it away unseen: NOT a pop, and counted separately. */
+        b3_tpl_note(traffic, "CULL", "view-gate");
+        return;
+    }
+    traffic_pop_log(traffic, "SPAWN");
+    /* --- traffic pop log (agent) --- */
+    b3_tpl_note(traffic, "SPAWN", road ? "mix-road" : "one-per-request");
+}
+
+/* ============ THE REQUEST DIRECTION SPLIT, FUN_001A3470 @0x001A34AC ========
+ *
+ * A pool request is not always a spawner.  Its DIRECTION byte, together with
+ * the manager's travel-sense flag at +0x363BC, sends it to one of two arms:
+ *
+ *     001a34be  TEST AL,AL                 ; AL = request->direction
+ *     001a34c0  JNZ  001a34ce
+ *     001a34c2  MOV  ECX,[ESP+0x28]        ; the manager
+ *     001a34c6  CMP  byte [ECX+0x363BC],AL
+ *     001a34cc  JNZ  001a34ec              ; dir 0, flag != 0  -> STAMP
+ *     001a34ce  CMP  AL,1  / JZ
+ *     001a34d2  CMP  AL,2  / JNZ 001a3611  ; not 0/1/2         -> UNSTAMP
+ *     001a34da  MOV  EAX,[ESP+0x28]
+ *     001a34de  MOV  CL,[EAX+0x363BC]
+ *     001a34e6  JNZ  001a3611              ; dir 1/2, flag != 0-> UNSTAMP
+ *     001a34ec  ...                        ; STAMP: bits + FUN_001A6070
+ *
+ * The STAMP arm sets the row range's occupancy bits and populates it.  The
+ * UNSTAMP arm @0x001A3611 clears them and TEARS DOWN the bodies standing in
+ * the range (FUN_001A75A0 @0x001A38BA), unless the other racer's bit still
+ * claims the row.
+ *
+ * PROVENANCE OF +0x363BC.  It is written in exactly four places, all found by
+ * scanning the image for the displacement (six accesses, two of them the
+ * reads above):
+ *     FUN_001A3EA0 @0x001A3F1F   MOV byte [EAX+0x363BC],1   -- the manager
+ *                                CONSTRUCTOR, the same function that seeds the
+ *                                RNG with 0xFD462907/0x02B9D6F8 (@0x001A3EA7,
+ *                                @0x001A3EB1), so the INITIAL value is 1.
+ *     FUN_001A3110 @0x001A3159   SETC AL / MOV [EBP+0x363BC],AL
+ *                    @0x001A3173 MOV byte [EBP+0x363BC],0
+ *                    @0x001A317C MOV byte [EBP+0x363BC],1
+ * FUN_001A3110 runs only when FUN_001A33B0 reports that a racer's window byte
+ * CHANGED, and it writes `old < new` -- i.e. +0x363BC is 1 when the racer is
+ * moving FORWARD through the window sequence and 0 when moving backward, with
+ * the two wrap cases (@0x001A3164: new window 0 or 1 -> 1, else 0) covering
+ * count-1 -> 0 and 0 -> count-1.  A car driving a race forwards therefore
+ * holds it at 1 for the whole event.  [C]
+ *
+ * So, forwards:  direction 0 SPAWNS, directions 1 and 2 RETIRE.
+ *
+ * This is what the harness was missing, and it is the whole pop-out.  The
+ * harness spawned from ALL 332 requests and retired a car when the request
+ * that MADE it left the 3-window set -- two windows after it spawned, while
+ * the car was still 62 m to 154 m away.  Retail never does that: every row is
+ * spawned by one request and retired by a DIFFERENT one a median of 4 windows
+ * later, so the tear-down happens a median of 429 m from the road the spawn
+ * arm is filling (min 78 m, max 615 m over the shipped table; only 3 of 34
+ * window groups have any retire row within 160 m of their own spawn set, and
+ * those are artefacts of using the spawn centroid as the player's position).
+ * That separation IS retail's answer to "never despawn in shot" -- it needs no
+ * distance rule because the data already keeps the two arms apart.  [S]
+ *
+ * Population, re-derived under the split over the shipped table: per 3-window
+ * group min 5, max 22, mean 12.0 (it was min 9, max 43, mean 23.4 when every
+ * request spawned).  Still non-zero for every group and far inside the pool.
+ *
+ * TRAVEL SENSE.  `direction != 0` used to double as the oncoming flag; under
+ * the split every spawning request has direction 0, so the sense has to come
+ * from the only other per-request datum -- the ORDER of first_row/last_row,
+ * which FUN_001A6070 discards by taking their min and max.  The shipped
+ * spawn requests split 92 ascending / 78 descending, which is what a two-way
+ * road network looks like.  [?] inferred from the table, not from an
+ * instruction: no write to the agent's own +0x4C sense flag was located. */
+/* FUN_001A3470's STAMP/UNSTAMP dispatch, @0x001A34AC..0x001A34EC.
+ * (g_traffic_pool_forward is defined up beside traffic_pop_log so the pop
+ * trace can print it.) */
+static int traffic_request_stamps(const B3TrafficPoolRequest* request) {
+    if (request->direction == 0) return g_traffic_pool_forward != 0;
+    if (request->direction == 1 || request->direction == 2)
+        return g_traffic_pool_forward == 0;
+    return 0;                      /* @0x001A34D4: anything else UNSTAMPS */
+}
+
+/* FUN_001A3470's UNSTAMP arm @0x001A3611..0x001A38CD: clear the range and
+ * retire the bodies standing in it.  Retail walks the manager's row-owner map
+ * (DAT_00649B7C) rather than the body list and stops at the first unowned row;
+ * the harness keeps no such map, so it tests the condition the map encodes --
+ * a live agent whose cursor is inside the range.  Sweeping the whole range
+ * rather than a contiguous run can only retire MORE, never fewer, and the two
+ * differ only hundreds of metres from the player.
+ *
+ * THE CLAIM GUARD, and why the sweep is DEFERRED to the end of the pass.
+ * 833 (path,row) cells of the shipped table are covered by a stamping request
+ * AND an unstamping one inside the same 3-window group (21 of the 34 groups
+ * have some).  Retail's tear-down carries a guard for exactly that collision
+ * -- @0x001A3745 it spares a body whose row is still claimed by the OTHER
+ * racer's bit in DAT_00498D80, the same complement FUN_001A4150 tests -- but
+ * with one local view that bit is never set, so the outcome would fall out of
+ * whichever arm happened to run last.  If that were the spawn arm, the row
+ * would be destroyed and re-created EVERY FRAME.  The guard's intent is "do
+ * not destroy what a live request still claims", and pool_seen is this
+ * harness's expression of that claim, so the sweep runs after the stamping
+ * walk and spares anything claimed in the same pass.  [?] a generalisation of
+ * retail's two-bit guard to the harness's one-bit claim: it cannot be read off
+ * an instruction, and it is what keeps the 833 collision cells stable instead
+ * of churning. */
+static unsigned int g_pool_unstamp[1024];
+static int g_pool_unstamp_n = 0;
+
+static void traffic_request_unstamp(unsigned int request_index) {
+    const B3TrafficPoolRequest* request =
+        &g_traffic_paths.pool_requests[request_index];
+    unsigned int low = request->first_row < request->last_row
+                     ? request->first_row : request->last_row;
+    unsigned int high = request->first_row < request->last_row
+                      ? request->last_row : request->first_row;
+    for (int slot = 0; slot < g_traffic_n; slot++) {
+        TrafficCar* traffic = &g_traffic[slot];
+        unsigned int row;
+        if (!traffic->active || traffic->pool_request < 0) continue;
+        if (traffic->path_id != request->path_id) continue;
+        if (traffic->path_cursor < 0.0f) continue;
+        row = (unsigned int)traffic->path_cursor;
+        if (row < low || row > high) continue;
+        if (traffic->pool_seen) continue;          /* claimed this pass */
+        /* SCENARIO GUARD (harness-only): B3_SCENARIO=traffic teleports the
+         * player at this car, which JUMPS the position-derived progress and
+         * shifts the request windows -- unstamping the very target one
+         * frame before impact ("0 player-vs-traffic contacts" on both
+         * backends).  The pool law is retail; the observer jump is not.
+         * While the scenario's 2 s control window holds, its target slot
+         * is exempt from window release.  Inert outside B3_SCENARIO. */
+        if (slot == g_traffic_scen_target
+            && g_race_time < g_traffic_scen_until) continue;
+        g_pool_release_why = "unstamp";
+        traffic_pool_release_slot(slot);
+    }
+}
+
+static void traffic_request_unstamp_flush(void) {
+    for (int i = 0; i < g_pool_unstamp_n; i++)
+        traffic_request_unstamp(g_pool_unstamp[i]);
+    g_pool_unstamp_n = 0;
 }
 
 /* FUN_001A3470 @0x001A3470 walks a request's row range one manager-record
@@ -6167,6 +12244,12 @@ static void traffic_pool_assign_request(int owner, unsigned int request_index) {
     if (request_index >= g_traffic_paths.pool_request_count) return;
     request = &g_traffic_paths.pool_requests[request_index];
     if (request->path_id >= g_traffic_paths.path_count) return;
+    if (!traffic_request_stamps(request)) {
+        if (g_pool_unstamp_n
+            < (int)(sizeof g_pool_unstamp / sizeof g_pool_unstamp[0]))
+            g_pool_unstamp[g_pool_unstamp_n++] = request_index;
+        return;
+    }
     path = &g_traffic_paths.paths[request->path_id];
     low = request->first_row < request->last_row ? request->first_row
                                                  : request->last_row;
@@ -6178,7 +12261,7 @@ static void traffic_pool_assign_request(int owner, unsigned int request_index) {
          * pre-TRAFFIC-MIX behaviour */
         traffic_pool_place(owner, request_index, 0, NULL, request->path_id,
                            low, high, (float)(high - low) + 1.0f, 0,
-                           request->direction != 0);
+                           request->first_row > request->last_row);
         return;
     }
     for (row = low; ; section++) {
@@ -6205,7 +12288,8 @@ static void traffic_pool_assign_request(int owner, unsigned int request_index) {
                                            section * 64 + index, road,
                                            request->path_id, row, end,
                                            spacing, index,
-                                           request->direction != 0);
+                                           request->first_row
+                                           > request->last_row);
                 }
             }
         }
@@ -6214,36 +12298,185 @@ static void traffic_pool_assign_request(int owner, unsigned int request_index) {
     }
 }
 
+/* FUN_001A33B0 @0x001A33B0 -- retail does NOT search the window table every
+ * frame.  It keeps one byte per racer at manager+0x363A7+i and STEPS IT BY ONE
+ * when the progress leaves the current window:
+ *
+ *     if (w == count-1 && progress == 0)                  w = 0;
+ *     else if (w == 0 && progress == windows[count-1].last) w = count-1;
+ *     else if (progress > windows[w].last)                w = w + 1;
+ *     else if (progress < windows[w].first)               w = w - 1;
+ *     else                                                no change;
+ *
+ * and returns whether it moved.  That is inherently sticky -- a progress that
+ * falls in a gap steps the byte by one, it never leaves the racer without a
+ * window -- and it is also what tells FUN_001A3110 which way the racer is
+ * travelling, which is the +0x363BC flag the request dispatch reads.  This
+ * replaces the previous linear search, which was an approximation of the same
+ * thing with a different failure mode. */
+static int traffic_pool_window_step(unsigned int* window, unsigned int progress,
+                                    int* out_forward)
+{
+    /* Retail's four arms are a +-1 step plus two EXACT-MATCH wrap tests
+     * (@0x001A33DD `progress == 0` and @0x001A3401 `progress ==
+     * windows[count-1].last`), which work because its racer progress is a
+     * monotone counter that visits every anchor.  This harness's progress is
+     * the anchor of the NEAREST NODE, so it can skip values -- at the
+     * start/finish line it goes 1012 -> 9 in one frame and neither exact test
+     * matches.  The old code then took the `progress < first` arm and walked
+     * the index BACKWARD through all 34 windows, one per frame, which is what
+     * the confirmation run caught as `win=32 prog=9`.
+     *
+     * The window table tiles the whole anchor space with no gaps (34 windows
+     * over 0..1012, each starting one past the last), so the window
+     * CONTAINING a progress is always defined.  Take one step toward it along
+     * the SHORTER way round: for a monotone progress that is bit-identical to
+     * retail's four arms, and it makes the lap boundary a single forward step
+     * instead of a lap-long reversal. */
+    unsigned int count = g_traffic_paths.pool_window_count;
+    unsigned int target = count, fwd, back;
+    if (count == 0) return 0;
+    if (*window >= count) *window = 0;
+    for (unsigned int i = 0; i < count; i++) {
+        const B3TrafficPoolWindow* c = &g_traffic_paths.pool_windows[i];
+        if (c->first_progress <= progress && progress <= c->last_progress) {
+            target = i; break;
+        }
+    }
+    if (target == count) return 0;              /* no window holds it: hold */
+    if (target == *window) return 0;
+    fwd = (target - *window + count) % count;
+    back = (*window - target + count) % count;
+    if (fwd <= back) { *window = (*window + 1) % count; *out_forward = 1; }
+    else             { *window = (*window + count - 1) % count; *out_forward = 0; }
+    return 1;
+}
+
+/* FUN_001A3110 @0x001A313C..0x001A3183: on a window change, +0x363BC becomes
+ * `old < new`, with the two wrap arms forcing 1 when the NEW window is 0 or 1
+ * and 0 otherwise -- i.e. the CIRCULAR direction of the crossing, which the
+ * stepper now hands over directly.
+ *
+ * WHY THIS NEEDS HYSTERESIS THE ORIGINAL DOES NOT.  +0x363BC inverts the whole
+ * request dispatch: with it at 0 the direction-0 requests UNSTAMP, and those
+ * are the ones whose ranges lie ON the road the player is driving (a median of
+ * 1.6 m from it, against 309 m for the retire arm).  So one spurious backward
+ * crossing turns the spawn arm into a retire arm right under the player, and
+ * the flag is only rewritten at the NEXT crossing -- a whole window, ~190 m of
+ * driving.  All nine in-view DESPAWN(unstamp) events of the last confirmation
+ * run are explained by exactly that: not one of them fires with the flag at 1,
+ * and six fire from the player's own window group with it at 0 (the other two
+ * from a trailing AI racer's group, since the sweep is global).
+ *
+ * Retail cannot produce a spurious crossing -- its progress is a monotone
+ * racer counter.  This harness's is the anchor of the nearest node over five
+ * parallel lane rows, so it jitters by an anchor when the car changes lane or
+ * weaves across a window boundary.  Require TWO crossings the same way before
+ * believing a reversal: a genuine reverse-driving racer keeps going and still
+ * flips the flag, a boundary oscillation never does. */
+static void traffic_pool_forward_update(int forward)
+{
+    static int pending = -1;
+    if (forward == g_traffic_pool_forward) { pending = -1; return; }
+    if (pending != forward) { pending = forward; return; }   /* first crossing */
+    g_traffic_pool_forward = forward;
+    pending = -1;
+}
+
+/* THE POOL IS DRIVEN BY THE LOCAL PLAYERS, NOT BY THE FIELD.
+ *
+ * FUN_001A28B0 walks `DAT_0073A1C0` racers from `DAT_0073A1D0` (stride 0x27E0,
+ * @0x001A297E and @0x001A2AD2), and this harness read that as "every car in
+ * the race".  It is the LOCAL PLAYER count.  Four independent things in the
+ * image say so, and the first is decisive:
+ *
+ *   FUN_001A3EA0 @0x001A3ED3  LEA EDX,[EAX+0x363A7]
+ *                 @0x001A3ED9  MOV ESI,2              <-- TWO
+ *                 @0x001A3EE0  MOV [EDX+2],CL / MOV [EDX],CL / INC EDX
+ *                 @0x001A3EE6  DEC ESI / JNZ
+ *     the manager owns exactly TWO per-racer window bytes (+0x363A7,+0x363A8)
+ *     and two request countdowns (+0x363A9,+0x363AA).  A third racer's window
+ *     byte would land on the first racer's countdown.
+ *   FUN_001A3470 @0x001A3511  SHL CL,1 / ADD CL,AL / MOV AL,1 / SHL AL,CL
+ *     the occupancy map is TWO BITS PER ROW indexed by the racer, in a BYTE:
+ *     a racer index of 2 or more shifts the stamp clean out of the byte.
+ *   FUN_001AA100 @0x001AA3AE / @0x001AA3F5  CMP DAT_0073A1C0,2
+ *     the split-screen second camera, i.e. the value is 1 or 2.
+ *   FUN_0018D0E0 @0x0018D172  the 160 m view-gate record is indexed by the
+ *     racer's LOCAL PLAYER index at +0x18A0.
+ *
+ * Running the pool for all eight cars is what was left.  An AI scattered
+ * elsewhere on the circuit stamps its own three windows, and its RETIRE ranges
+ * -- correctly a median 309 m from ITS road -- land on the player's.  That is
+ * the whole of the residue: of the four surviving in-view unstamps, p3 r95 and
+ * p1 r409 are retired by a request in window 0, which fires for a racer whose
+ * window is in {0,1,2} while the player was at 31, and p20 r193 by one in
+ * window 5, firing for {5,6,7} while the player was at 3.  Every one is an AI
+ * three to five windows away, and all four carried fwd=1 -- the flag was fine,
+ * the owner set was not.  The player's own window groups (31 and 3) keep their
+ * nearest stamped retire row 272 m and 319 m away.
+ *
+ * Retail's two-bit guard @0x001A3745 does NOT explain them: it spares a row
+ * the OTHER LOCAL PLAYER claims, and in single player there is no other bit.
+ * Retail simply never reaches this state, because it never runs the pool for
+ * an AI car. */
+#define B3_TRAFFIC_LOCAL_VIEWS 1   /* this harness renders one; retail holds 2 */
+
 static void traffic_pool_refresh(void) {
     if (!traffic_paths_active() || g_traffic_paths.pool_window_count == 0
         || g_traffic_paths.pool_request_count == 0)
         return;
     for (int slot = 0; slot < g_traffic_n; slot++)
         g_traffic[slot].pool_seen = 0;
-    for (int owner = 0; owner < g_num_vehicles; owner++) {
+    for (int owner = 0;
+         owner < g_num_vehicles && owner < B3_TRAFFIC_LOCAL_VIEWS; owner++) {
         const Vehicle* vehicle = &g_vehicles[owner];
-        unsigned int progress;
-        unsigned int current = g_traffic_paths.pool_window_count;
-        if (!vehicle->active) continue;
-        if (!traffic_pool_progress(vehicle, &progress)) {
-            g_pool_trace_nowindow++; continue;
+        unsigned int progress = 0;
+        unsigned int count = g_traffic_paths.pool_window_count;
+        unsigned int current = count;
+        /* ONE BYTE PER RACER, FUN_001A28B0 @0x001A29E8 / manager+0x363A7+i,
+         * advanced by FUN_001A33B0's +-1 stepper.  Retail's search writes the
+         * byte only on a hit, so a racer never contributes nothing; the
+         * stepper has the same property structurally, which is why it
+         * replaced the linear search.  Note that route.bin's window table
+         * TILES the anchor range with no gaps (34 windows over anchors
+         * 0..1012, each range starting one past the last), so with a progress
+         * that really is the car's there is no "miss" case to handle at
+         * all. */
+        /* manager+0x363A7, two bytes (FUN_001A3EA0 @0x001A3ED9) */
+        static unsigned char sticky[2];
+        static unsigned char seeded[2];
+        int have = owner >= 0 && owner < 2;
+        if (!vehicle->active || !have) continue;
+        if (!seeded[owner]) {
+            /* FUN_001A3EA0 @0x001A3F0B zeroes every racer's window byte. */
+            sticky[owner] = 0;
+            seeded[owner] = 1;
         }
-        for (unsigned int window = 0;
-             window < g_traffic_paths.pool_window_count; window++) {
-            const B3TrafficPoolWindow* candidate =
-                &g_traffic_paths.pool_windows[window];
-            if (candidate->first_progress <= progress
-                && progress <= candidate->last_progress) {
-                current = window;
-                break;
+        current = sticky[owner];
+        if (current >= count) current = 0;
+        if (traffic_pool_progress(vehicle, &progress)) {
+            int stepped_forward = 1;
+            /* FUN_001A28B0 calls the stepper once per pass; a change is what
+             * drives FUN_001A3110 and the +0x363BC travel sense. */
+            if (traffic_pool_window_step(&current, progress, &stepped_forward)) {
+                /* +0x363BC is one manager-wide byte and retail lets ANY racer
+                 * write it, so an AI car crossing backwards would invert the
+                 * whole dispatch.  Tie it to the local view. */
+                if (owner == 0) traffic_pool_forward_update(stepped_forward);
             }
+        } else {
+            /* retail's progress query is a virtual call that cannot fail; the
+             * harness's nav lookup can, so hold the byte where it was. */
+            g_pool_trace_nowindow++;
         }
-        if (current == g_traffic_paths.pool_window_count) {
-            g_pool_trace_nowindow++; continue;
+        sticky[owner] = (unsigned char)current;
+        if (owner == 0) {
+            g_pool_dbg_window = current;
+            g_pool_dbg_progress = progress;
         }
         for (unsigned int offset = 0; offset < 3; offset++) {
-            unsigned int window = (current + g_traffic_paths.pool_window_count
-                                   - offset) % g_traffic_paths.pool_window_count;
+            unsigned int window = (current + count - offset) % count;
             const B3TrafficPoolWindow* candidate =
                 &g_traffic_paths.pool_windows[window];
             for (unsigned int index = candidate->request_count; index > 0; index--)
@@ -6251,6 +12484,7 @@ static void traffic_pool_refresh(void) {
                     candidate->request_base + index - 1);
         }
     }
+    traffic_request_unstamp_flush();
     {   /* B3_POOL_TRACE=1: why traffic vanishes.  Counts the owners that
          * contributed no window this pass (either the nav progress query
          * failed or the progress sat in a gap between windows) beside the
@@ -6263,7 +12497,33 @@ static void traffic_pool_refresh(void) {
         for (int slot = 0; slot < g_traffic_n; slot++) {
             TrafficCar* traffic = &g_traffic[slot];
             if (traffic->active && traffic->pool_request >= 0
-                && !traffic->pool_seen) {
+                && !traffic->pool_seen
+                && traffic_view_gate_reject(traffic) == 0
+                && !traffic_on_camera(traffic)) {
+                /* GLUE BACKSTOP, and no longer retail's retire.
+                 *
+                 * Residency in retail is the UNSTAMP arm above -- a request
+                 * whose range is swept clears it -- and nothing else.  This
+                 * sweep is kept only because a car that escapes every unstamp
+                 * range would otherwise hold a slot for the rest of the race
+                 * (retail's own free list is 254 bodies, FUN_001A3EA0
+                 * @0x001A3F2B and @0x001A3F60, `while (i < 0xFE)`).
+                 *
+                 * THE 160 m TEST WAS NEVER A VISIBILITY TEST.  It is retail's
+                 * SPAWN gate, and this sweep was confined to bodies outside it
+                 * "so it can never be the thing the player sees" -- but
+                 * traffic_render() draws every active agent with no distance
+                 * cull under a 10 000 m far plane, so 160.1 m dead ahead is in
+                 * plain sight.  Measured before this line existed: 13 of 147
+                 * releases in the forward cone, 5 inside 200 m, the nearest at
+                 * 160.9 m.  The ON-CAMERA test is what "cannot be the thing
+                 * the player sees" actually means; a body still on screen is
+                 * simply left alone until the player has driven past it, which
+                 * costs nothing (measured pool high-water 60-67 of 254, and
+                 * retail's own answer to a full pool is to refuse the spawn --
+                 * FUN_001A2B20 @0x001A2B4E -> FUN_001A6070 @0x001A6423 -- not
+                 * to evict anything). */
+                g_pool_release_why = "backstop";
                 traffic_pool_release_slot(slot);
                 released++;
             }
@@ -6290,6 +12550,14 @@ static void traffic_init(void) {
         printf("[Burnout3] traffic disabled (B3_TRAFFIC=0)\n");
         return;
     }
+    /* PER-TRACK DATA.  The car set, oncoming line, spawn seeds and lane
+     * cross-section all come from build/tracks/<B3_TRACK>/traffic.bin now;
+     * they used to be the compiled-in US_C3_V1 tables, so on every other
+     * track the traffic manager was driving another world's data. */
+    if (!b3_traffic_data_load()) {
+        printf("[Burnout3] traffic disabled (no per-track traffic.bin)\n");
+        return;
+    }
     traffic_paths_load();
     // One display list per traffic car type; real .btv meshes + paint
     // (extract_traffic.py), box fallback where absent.
@@ -6302,6 +12570,11 @@ static void traffic_init(void) {
         if (trackmesh_load(&m, path) != 0) continue;
         g_traffic_ymin[c] = m.min[1];
         g_traffic_len[c] = m.max[2] - m.min[2];
+        /* The bounds are all this copy was ever read for once the geometry
+         * moved into a VBO (car_list_from_obj re-reads the file).  It used to
+         * be leaked -- the display-list build was its last user and nothing
+         * freed it. */
+        trackmesh_free(&m);
         // Wheels sidecar (extract_traffic.py; format = the racer .wheels):
         // attach positions get the loader Z-flip like every mesh.
         {
@@ -6342,41 +12615,16 @@ static void traffic_init(void) {
         snprintf(path, sizeof(path), "build/cars/%s_%s_p0.png",
                  B3_TRAFFIC_CARS[c].cls, B3_TRAFFIC_CARS[c].car);
         GLuint tex = load_gl_texture(path, NULL);
-        GLuint list = glGenLists(1);
-        glNewList(list, GL_COMPILE);
-        if (tex) {
-            glEnable(GL_TEXTURE_2D);
-            glBindTexture(GL_TEXTURE_2D, tex);
-        } else {
-            glDisable(GL_TEXTURE_2D);
-        }
-        glBegin(GL_TRIANGLES);
-        for (int t = 0; t < m.triangle_count; t++) {
-            const unsigned* idx = m.indices + (size_t)t * 3;
-            const float* p0 = m.positions + (size_t)idx[0] * 3;
-            const float* p1 = m.positions + (size_t)idx[1] * 3;
-            const float* p2 = m.positions + (size_t)idx[2] * 3;
-            float ux = p1[0]-p0[0], uy = p1[1]-p0[1], uz = p1[2]-p0[2];
-            float vx = p2[0]-p0[0], vy = p2[1]-p0[1], vz = p2[2]-p0[2];
-            float nx = uy*vz - uz*vy, ny = uz*vx - ux*vz, nz = ux*vy - uy*vx;
-            float len = sqrtf(nx*nx + ny*ny + nz*nz);
-            float shade = 0.75f;
-            if (len > 1e-9f)
-                shade = 0.60f + 0.40f * fabsf(
-                        (nx*0.30f + ny*0.85f + nz*0.42f) / len);
-            glColor3f(shade, shade, shade);
-            for (int k = 0; k < 3; k++) {
-                unsigned vi = idx[k];
-                if (tex && m.uvs)
-                    glTexCoord2f(m.uvs[(size_t)vi * 2],
-                                 m.uvs[(size_t)vi * 2 + 1]);
-                glVertex3fv(m.positions + (size_t)vi * 3);
-            }
-        }
-        glEnd();
-        glDisable(GL_TEXTURE_2D);
-        glEndList();
-        g_traffic_lists[c] = list;
+        /* The body mesh, retained: the same one builder the racer cars use.
+         * It was a display list with one baked texture bind; a traffic body
+         * has no `usemtl` records, so it comes out as a single span with the
+         * same bind and the same flat per-face shade.
+         * NOTE the path is re-derived: `path` above is the PAINT PNG, and the
+         * display list this replaces was built from the `m` loaded at the top
+         * of the loop rather than from a filename. */
+        snprintf(path, sizeof(path), "build/cars/%s_%s.obj",
+                 B3_TRAFFIC_CARS[c].cls, B3_TRAFFIC_CARS[c].car);
+        g_traffic_lists[c] = car_list_from_obj(path, tex, 1, NULL);
         // Wheel mesh list + the racer origin convention: with wheel data
         // the model origin is the hub plane, so the rest offset is the
         // wheel radius, not the body skirt (this was the "sinking").
@@ -6417,8 +12665,8 @@ static void traffic_init(void) {
     // "pulled by a sedan".  Trailers are pulled out of the pool here and
     // handed to the event's slot-4 tractor instead.  Specials keep their
     // old exclusion (their routing is their own system [?]).
-    int pool_idx[B3_TRAFFIC_CAR_COUNT];
-    int trailer_idx[B3_TRAFFIC_CAR_COUNT];
+    int pool_idx[B3_TRAFFIC_CAR_MAX];
+    int trailer_idx[B3_TRAFFIC_CAR_MAX];
     int pool = 0, ntrailer = 0;
     for (int c = 0; c < B3_TRAFFIC_CAR_COUNT; c++) {
         int cat = B3_TRAFFIC_CARS[c].cat;
@@ -6450,6 +12698,7 @@ static void traffic_init(void) {
         t->pool_agent = -1;
         t->pool_seen = 0;
         if (g_traffic_paths.pool_window_count == 0) {
+            g_tpl_seed_why = "init";   /* traffic pop log (agent) */
             if (!traffic_path_seed(t, i % B3_TRAFFIC_SPAWN_COUNT))
                 traffic_place(t, i, &g_player.pos,
                               30.0f + (float)i * 34.0f, +1);
@@ -6534,54 +12783,131 @@ static float traffic_nearest_ahead(const Vec3* pos, float yaw, float maxd) {
  * otherwise the side risk minus the chosen side's must clear "Risk
  * threshold" (@0x0016AD00 -> FUN_0016ADF0).                           [C]
  *
- * WHAT IS GLUE HERE.  Retail indexes the histogram off the .bgd nav graph
- * (road SECTION at racecar+0x18C4, node +0x18C8, the DAT_0073A174 edge-point
- * pool) which this harness does not load -- the same wall as RE_AI section
- * 12.  The lateral frame below is therefore built on the harness route
- * polyline, the road no-go comes from barrier rays on the REAL collision
- * mesh instead of FUN_0016F6C0's node offsets, and the obstacle sweep uses
- * the harness's own traffic/racer arrays.  Everything from the histogram
- * onward -- the 0.2 m pitch, the 4.0 s threat gate, the 0.2 s band slack,
- * the midpoint pick, the (8 - time) risk means, the 10/20/30 -> 26.2/40/60
- * speed map, the 0.9/0.95 risk speeds, the max(5, 2d/5.1) aim distance and
- * every arbitrator threshold -- is the recovered law with the real
- * registered parameter values.
+ * WHAT WAS GLUE HERE -- AND WHAT REPLACED IT (2026-08-20).
+ *
+ * The note that stood here said the harness "does not load" retail's .bgd
+ * nav graph, so the lateral frame was built on the harness route polyline
+ * `g_track.points` and the road no-go came from barrier rays.  Both halves
+ * were wrong, and three separate in-game defect signatures came out of it:
+ *
+ *  1. THE FRAME.  The harness DOES load retail's road network -- nav_load()
+ *     reads build/tracks/<B3_TRACK>/route.bin, whose nav section is exactly
+ *     retail's structure: per-node (point_a, point_b) u16 pairs indexed into
+ *     a shared point pool, i.e. racecar+0x18C4 / +0x18C8 and the
+ *     DAT_0073A174 edge-point pool.  `point_a` is the RIGHT edge and
+ *     `point_b` the LEFT (verified over all 6013 US_C3_V1 pairs).
+ *     `g_track.points`, by contrast, is a SYNTHESISED line: for US_C3_V1
+ *     the wall strands were the drive line +-7.2 m (the synthesised pair the
+ *     purged src/burnout3_track_paths.h carried), so
+ *     its centre is not the road centre.  Measured in game, the stage's own
+ *     lateral and the route lateral disagreed by 16-23 m -- enough to bin
+ *     every occupier into the wrong strips.  The frame now comes from the
+ *     nav pair, per track, with no per-track constants.
+ *
+ *  2. THE BAND.  Retail's [lo,hi] is NOT a road band.  FUN_00170100 sets
+ *     avoid+0x441 / +0x442 to the strips the CAR ITSELF covers
+ *     (128 +- 5*half_extent, ~24 strips = 4.8 m) and EVERY aggregate --
+ *     the 4.0 s threat gate, dmin, the type-2..4 risk fraction and the mean
+ *     window -- is taken over THAT.  The old raycast band spanned the whole
+ *     road, so `dmin` counted occupiers that had reduced no strip the car
+ *     would ever touch: the reported "dmin 6.9 m with here/lo/hi all 0.00"
+ *     is exactly that disagreement.
+ *
+ *  3. THE TYPES.  Measured from the four stampers: 1/2 = soft no-go,
+ *     3 = a vehicle from the global physics list, 4 = the proximity list,
+ *     5 = a WRECKED racecar, 6 = a LIVE racecar, 7 = hard no-go.  The old
+ *     port used 6 for the road no-go, which inverts the one type filter in
+ *     the stage: `avoid+0x48C >= 50 -> drop type 6 from dmin` drops
+ *     RACECARS at speed, not the road.  docs/RE_AI.md 15.1/15.7 had this
+ *     the wrong way round and is corrected by this pass.
+ *
+ *  4. THE TRAFFIC GATE.  FUN_0016EC70 walks the GLOBAL physics-vehicle list
+ *     (DAT_00731E90 / DAT_00731F9C) and has NO distance discard -- its only
+ *     cuts are |dy| <= "Vert dist to discard" (5 m), `along >= -halfext`,
+ *     and eta in [0, 8 s].  The old feed dropped everything past
+ *     B3_AV_DISCARD_D (100 m), which is the 100 m "Distance to discard
+ *     fatally colliding RACECAR" -- a parameter that belongs to
+ *     FUN_0016E5E0's racecar leg, not to traffic.  At 45 m/s closing, 8 s
+ *     is 360 m; the truck in the t=70.98 wreck was simply never seen.
+ *
+ * The stage itself now lives in src/burnout3_ai_avoid.c and every one of
+ * its functions is diffed against the retail instructions EXECUTED under
+ * Unicorn by tools/validate_ai_avoid.py (1342 checks / 61 cases green):
+ * FUN_00170260 the frame, FUN_00170100 the band, FUN_0016F400 the
+ * world->strip map and the stamp, FUN_0016FCD0 the risk query,
+ * FUN_0016F000 the clear-path aim strip and FUN_0016C4B0 the chooser.
+ * What remains in this file is only the WORLD FEED: which occupiers exist
+ * and where they are.
+ *
+ * STILL GLUE, and named as such:
+ *  - FUN_0016F6C0's road no-go walks 10 route sections ahead and stamps a
+ *    full cross-section wherever a node's `flags & 7` is 5 (soft) or 4
+ *    (hard).  Those PER-NODE flags are not in the port's extracted
+ *    route.bin (B3RtNavSection carries a per-SECTION flag word only), so
+ *    the stamper cannot be ported 1:1 yet.  B3_AI_AVOID_NOGO=1 enables an
+ *    in-kind substitute -- the strips outside the measured carriageway are
+ *    stamped type 7 with the registered Hard No Go offsets -- which uses
+ *    the same data retail uses but is NOT retail's rule.  Default OFF.  [S]
+ *  - the per-car lateral extents racecar+0x2444 / +0x2448 and the occupier
+ *    half-widths are harness constants.                                 [S]
+ *  - FUN_0016EC70's exact closing-rate algebra at 0x0016EDE6 is rendered
+ *    unusably by the decompiler; the structure (range >= 12 -> time-based,
+ *    else eta 0; eta -= sweep_dt/2; drop eta > 8) is retail's.          [S]
  */
-#define B3_AV_N      256
-#define B3_AV_MID    128
-#define B3_AV_PITCH  0.2f     /* 1/DAT_005A96EC (= DAT_003B1694 = 5.0)  [C] */
-#define B3_AV_TMAX   8.0f     /* u8 0xFF * 8/255                        [C] */
-#define B3_AV_DMAX   500.0f   /* s16 32767 * 1000/65536                 [C] */
-#define B3_AV_THREAT 4.0f     /* DAT_003B1690                           [C] */
-#define B3_AV_SLACK  0.2f     /* DAT_003A69B4                           [C] */
-/* AI/Avoidance, group defaults -> Data/vdb.xml tune (RE_AI section 1) [C] */
-#define B3_AV_LOOKAHEAD  20.0f   /* AVOID: LookAhead dist racecars           */
-#define B3_AV_DISCARD_V   5.0f   /* Vert dist to discard traffic and racecars*/
-#define B3_AV_DISCARD_D 100.0f   /* Distance to discard fatally colliding .. */
-#define B3_AV_STEERF      5.1f   /* Steering factor big=>extreme             */
-#define B3_AV_SPD_10     26.2f   /* Speed when car is <10m away              */
-#define B3_AV_SPD_20     40.0f   /* Speed when car is <20m away              */
-#define B3_AV_SPD_30     60.0f   /* Speed when car is <30m away              */
-#define B3_AV_SPD_R95    16.0f   /* Speed when risk is >0.95                 */
-#define B3_AV_SPD_R90    30.0f   /* Speed when risk is >0.9                  */
-/* AI/Arbitrator thresholds (0x0047A164..0x0047A178)                    [C] */
-#define B3_AV_RISK        1.0f
-#define B3_AV_RISK_TOT    2.0f
-#define B3_AV_RISK_CUR    5.0f
-#define B3_AV_CRISK       0.5f
-#define B3_AV_CRISK_TOT   1.0f
-#define B3_AV_CRISK_CUR   4.0f
+#include "burnout3_ai_avoid.h"
+
+/* The car's own lateral extents, retail racecar+0x2444 / +0x2448.  The
+ * harness has no per-model extent table wired here yet.                [S] */
+#define B3_AV_CAR_LEN   4.5f
+#define B3_AV_CAR_WID   2.0f
+#define B3_AV_SELF_EXT  2.4f    /* retail's `along >= -(nav+0x2448)`    [S] */
+#define B3_AV_HALF_CAR  2.6f
+#define B3_AV_HALF_RIG  3.4f
+#define B3_AV_MIN_RANGE 12.0f   /* @0x0016EDE6                          [C] */
 
 typedef struct {
-    float time[B3_AV_N];
-    float dist[B3_AV_N];
-    unsigned char type[B3_AV_N];
-    int   lo, hi, win;
-    int   phase;               /* avoid+0x4AF: rebuild 1 frame in 3    [C] */
-    int   ready;
+    B3AiAvoid    a;
+    int          phase;         /* avoid+0x4AF: rebuild 1 frame in 3    [C] */
+    int          ready;
+    float        road_fwd[3];
+    float        road_right[3];
     B3AiAvoidOut out;
 } B3AiAvoidState;
 static B3AiAvoidState g_ai_avoid[8];
+
+/* ------------------------------------------------------------------------
+ * B3_AI_WORLD_DUMP=<frame> -- INSTRUMENTATION ONLY.
+ *
+ * On the requested frame, write out EVERYTHING the AI believes about the
+ * world for every driven car, all of it expressed in the ONE common frame:
+ * the harness's GL space, which is the space collision.bin and track.obj are
+ * in (burnout3_collision.c's loader negates the game z once, on load, and
+ * nothing downstream flips it again).  That is what makes the dump
+ * cross-checkable offline against the collision world -- a layer that
+ * carries a different convention shows up as a systematic offset, mirror or
+ * scale against the soup, not as an opinion.
+ *
+ * Nothing in this block is on the decision path: the only behavioural effect
+ * is that the 1-in-3 profile rebuild is forced to run on the dumped frame so
+ * that the strip profile written out is the one belonging to that frame.
+ * ---------------------------------------------------------------------- */
+static int ai_wd_want(void) {
+    static int f = -2;
+    if (f == -2) {
+        const char* e = getenv("B3_AI_WORLD_DUMP");
+        f = e ? atoi(e) : -1;
+    }
+    return f;
+}
+static int ai_wd_armed(void) {
+    int f = ai_wd_want();
+    return f >= 0 && (int)g_frame_count == f;
+}
+static struct { float p[3], v[3], half, eta, rng; int kind, lo, hi; }
+    g_ai_wd_occ[128];
+static int g_ai_wd_nocc = 0;
+static int g_ai_wd_frame_sec = -1;      /* the section the frame ended up on */
+static FILE* g_ai_wd_f = NULL;
 
 static int ai_avoid_on(void) {
     static int v = -1;
@@ -6592,368 +12918,628 @@ static int ai_avoid_on(void) {
     return v;
 }
 
-/* Stamp one moving occupier into the histogram.  This is FUN_0016E3D0's
- * loop: over the lateral strips the obstacle sweeps between now and its
- * arrival, keep the EARLIEST time and the SHORTEST range.               [C] */
-static void ai_avoid_stamp(B3AiAvoidState* s, float lat_a, float lat_b,
-                           float half, float eta, float range, int kind) {
-    if (eta < 0.0f) eta = 0.0f;
-    if (eta > B3_AV_TMAX) return;
-    float l0 = (lat_a < lat_b ? lat_a : lat_b) - half;
-    float l1 = (lat_a > lat_b ? lat_a : lat_b) + half;
-    int i0 = B3_AV_MID + (int)floorf(l0 / B3_AV_PITCH);
-    int i1 = B3_AV_MID + (int)ceilf(l1 / B3_AV_PITCH);
-    if (i1 < 0 || i0 >= B3_AV_N) return;
-    if (i0 < 0) i0 = 0;
-    if (i1 >= B3_AV_N) i1 = B3_AV_N - 1;
-    for (int i = i0; i <= i1; i++) {
-        if (eta < s->time[i]) { s->time[i] = eta; s->type[i] = (unsigned char)kind; }
-        /* range < 0 = "occupies the strip but is not something we close on"
-         * (a car alongside).  It must still block the lateral pick, but it
-         * is not a braking cue -- retail's range word is fed from the swept
-         * ARRIVAL, not from a static separation. */
-        if (range >= 0.0f && range < s->dist[i]) s->dist[i] = range;
+static int ai_avoid_nogo_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("B3_AI_AVOID_NOGO");
+        v = (e && atoi(e) != 0) ? 1 : 0;    /* default OFF -- GLUE, see above */
+    }
+    return v;
+}
+
+/* ------------------------------------------------------------------------
+ * FUN_00170260's frame, fed from the REAL route: the (right, left) edge
+ * pair at the car's nav node, interpolated toward the next node by the
+ * ribbon-centreline projection (retail's racecar+0x18CC).             [C]
+ * ---------------------------------------------------------------------- */
+// v is NOT const: the ribbon pick below calls vehicle_track_progress(), which
+// writes the car's own sticky track_idx_hint. The one caller holds a mutable
+// Vehicle*, so say so rather than cast the qualifier away.
+static int ai_avoid_frame_from_nav(Vehicle* v, B3AiAvoid* a,
+                                   float road_fwd[3], float road_right[3]) {
+    if (!g_nav.loaded || !v->nav_ready) return 0;
+    unsigned int sec = (unsigned int)v->nav_section;
+    unsigned int node = (unsigned int)v->nav_node;
+    if (!nav_state_valid(sec, node)) return 0;
+    const B3RtNavSection* row = &g_nav.sections[sec];
+    if (node + 1 >= row->node_count) return 0;
+    const B3RtNavPair* p0 = &g_nav.pairs[row->pair_base + node];
+    const B3RtNavPair* p1 = &g_nav.pairs[row->pair_base + node + 1];
+    /* NAMING, and it is load-bearing: `L`/`R` here are retail's avoid+0x00
+     * and avoid+0x10, NOT left/right of travel.  FUN_00170260 fills +0x00
+     * from the node pair's SLOT-0 vertex and +0x10 from slot 1 (0x001702EA
+     * reads [eax], 0x0017037E reads [eax+2], 0x001703DB interpolates the
+     * slot-0 pair into avoid+0x00), and point_a IS slot 0 -- cx_paths.c
+     * copies the pair words "exactly as they sit in the file".  So L comes
+     * from point_a.  It used to come from point_b, which mirrored the whole
+     * strip axis about the car.  The AIM reconstruction is invariant under
+     * that mirror (both `axis` and `target_strip - 128` change sign), but
+     * FUN_0016C4B0's two walks and its five-term side select are NOT --
+     * measured on the real chooser over 20000 randomised profiles with the
+     * road no-go stamped, the mirror changed the avoidance aim in 74.3% of
+     * them (mean 2.47 m, max 22.8 m) and sent the car to the OPPOSITE side
+     * in 14.3%.
+     * In the shipped data slot 0 is the edge on the RIGHT of travel in the
+     * harness's GL space (measured over all 36 variants: median
+     * dot(point_b - point_a, road_right) = -0.997, 100% sign-consistent).
+     * That is not a contradiction with retail: collision.bin, route.bin and
+     * the whole GL space are the z-mirror of retail's game space, and a
+     * reflection maps left-of-travel to right-of-travel.  Binning by the
+     * same SLOT is what puts strip k over the same physical band on both
+     * sides, which is the thing that has to match.                     [C] */
+    Vec3 r0 = nav_point(p0->point_b), l0 = nav_point(p0->point_a);
+    Vec3 r1 = nav_point(p1->point_b), l1 = nav_point(p1->point_a);
+    Vec3 c0 = { (r0.x + l0.x) * 0.5f, (r0.y + l0.y) * 0.5f,
+                (r0.z + l0.z) * 0.5f };
+    Vec3 c1 = { (r1.x + l1.x) * 0.5f, (r1.y + l1.y) * 0.5f,
+                (r1.z + l1.z) * 0.5f };
+    float dx = c1.x - c0.x, dz = c1.z - c0.z;
+    float d2 = dx * dx + dz * dz;
+    float u = 0.0f;
+    if (d2 > 1e-6f)
+        u = fmaxf(0.0f, fminf(1.0f, ((v->pos.x - c0.x) * dx
+                                     + (v->pos.z - c0.z) * dz) / d2));
+    float L[3], R[3], C[3];
+    L[0] = l0.x + (l1.x - l0.x) * u;
+    L[1] = l0.y + (l1.y - l0.y) * u;
+    L[2] = l0.z + (l1.z - l0.z) * u;
+    R[0] = r0.x + (r1.x - r0.x) * u;
+    R[1] = r0.y + (r1.y - r0.y) * u;
+    R[2] = r0.z + (r1.z - r0.z) * u;
+    C[0] = v->pos.x; C[1] = v->pos.y; C[2] = v->pos.z;
+
+    /* CURSOR-CAPTURE GUARD.  US_C3's graph is five PARALLEL 1013-node
+     * ribbons (widths 50/3/6/3/50) and nav_nearest() re-snaps a lost cursor
+     * to the geometrically nearest one -- including the ONCOMING route
+     * ribbon, whose node order runs the REVERSE direction.  Framing the
+     * avoidance on that ribbon put road_fwd BACKWARD along the race
+     * direction, so a committed avoidance aim (pos + fwd*lead + axis*off)
+     * landed behind the car and the driver hauled it into the right wall --
+     * measured: field median rlat +8.7 -> +13.1 after the frame landed, and
+     * retail wall crashes 4 -> 14 per 120 s, with the captured sec owning
+     * half the trace.  So: test the ribbon's direction against the track
+     * tangent, and remap a wrong-way cursor to a same-family (equal
+     * node_count) FORWARD ribbon that contains the car, preferring the one
+     * whose centre is nearest; refuse the frame entirely rather than steer
+     * on a reverse one.  Width is capped at 20 m so the 50 m off-road
+     * bounds ribbons can never be picked. */
+    float tfx, tfz;
+    {
+        int tn = g_track.num_points;
+        int ti = (int)(vehicle_track_progress(v) * tn) % tn;
+        if (ti < 0) ti += tn;
+        Vec3 ta = g_track.points[route_wrap(ti - 2, tn)];
+        Vec3 tb = g_track.points[route_wrap(ti + 2, tn)];
+        tfx = tb.x - ta.x; tfz = tb.z - ta.z;
+        float tl = sqrtf(tfx * tfx + tfz * tfz);
+        if (tl < 1e-4f) return 0;
+        tfx /= tl; tfz /= tl;
+    }
+    {
+        Vec3 f0 = nav_forward(sec, node);
+        int wrong_way = (f0.x * tfx + f0.z * tfz) < 0.0f;
+        int too_wide = 0;
+        {   float w0 = sqrtf((L[0]-R[0])*(L[0]-R[0]) + (L[2]-R[2])*(L[2]-R[2]));
+            too_wide = (w0 > 20.0f);
+        }
+        if (wrong_way || too_wide) {
+            const B3RtNavSection* fam = &g_nav.sections[sec];
+            int best = -1; float best_d2 = 1e30f;
+            float bl[3], br[3];
+            for (unsigned int s2 = 0; s2 < g_nav.section_count; s2++) {
+                if (s2 == sec) continue;
+                const B3RtNavSection* r2 = &g_nav.sections[s2];
+                if (r2->node_count != fam->node_count) continue;
+                if (node + 1 >= r2->node_count) continue;
+                Vec3 f2 = nav_forward(s2, node);
+                if (f2.x * tfx + f2.z * tfz <= 0.0f) continue;   /* reverse */
+                const B3RtNavPair* q0 = &g_nav.pairs[r2->pair_base + node];
+                const B3RtNavPair* q1 = &g_nav.pairs[r2->pair_base + node + 1];
+                /* same slot order as the primary path above: ll* is
+                 * avoid+0x00 (slot 0 = point_a), rr* is avoid+0x10 */
+                Vec3 rr0 = nav_point(q0->point_b), ll0 = nav_point(q0->point_a);
+                Vec3 rr1 = nav_point(q1->point_b), ll1 = nav_point(q1->point_a);
+                float w2 = sqrtf((ll0.x-rr0.x)*(ll0.x-rr0.x)
+                               + (ll0.z-rr0.z)*(ll0.z-rr0.z));
+                if (w2 > 20.0f || w2 < 0.5f) continue;           /* bounds  */
+                float cx = (rr0.x + ll0.x + rr1.x + ll1.x) * 0.25f;
+                float cz = (rr0.z + ll0.z + rr1.z + ll1.z) * 0.25f;
+                float d2c = (v->pos.x - cx) * (v->pos.x - cx)
+                          + (v->pos.z - cz) * (v->pos.z - cz);
+                if (d2c < best_d2) {
+                    best = (int)s2; best_d2 = d2c;
+                    bl[0] = ll0.x + (ll1.x - ll0.x) * u;
+                    bl[1] = ll0.y + (ll1.y - ll0.y) * u;
+                    bl[2] = ll0.z + (ll1.z - ll0.z) * u;
+                    br[0] = rr0.x + (rr1.x - rr0.x) * u;
+                    br[1] = rr0.y + (rr1.y - rr0.y) * u;
+                    br[2] = rr0.z + (rr1.z - rr0.z) * u;
+                }
+            }
+            if (best < 0) return 0;      /* no forward ribbon: no frame */
+            sec = (unsigned int)best;
+            for (int k = 0; k < 3; k++) { L[k] = bl[k]; R[k] = br[k]; }
+        }
+    }
+
+    b3_avoid_frame(a, L, R, C);
+    if (!(a->width > 0.1f)) return 0;
+    {   /* racecar+0x1AF0, the road forward unit vector */
+        Vec3 f = nav_forward(sec, node);
+        float fl = sqrtf(f.x * f.x + f.z * f.z);
+        if (fl < 1e-4f) return 0;
+        road_fwd[0] = f.x / fl; road_fwd[1] = 0.0f; road_fwd[2] = f.z / fl;
+        /* belt + braces: never hand back a reverse frame */
+        if (road_fwd[0] * tfx + road_fwd[2] * tfz < 0.0f) return 0;
+    }
+    road_right[0] = -road_fwd[2];
+    road_right[1] = 0.0f;
+    road_right[2] = road_fwd[0];
+    g_ai_wd_frame_sec = (int)sec;       /* instrumentation, see ai_wd_emit */
+    return 1;
+}
+
+/* ------------------------------------------------------------------------
+ * One occupier, FUN_0016EC70's shape (@0x0016ECA0..0x0016EFDC) followed by
+ * FUN_0016D420's swept stamp: the obstacle's position NOW and at the
+ * forecast time bound a strip span, and that span takes (eta, range).
+ * ---------------------------------------------------------------------- */
+static void ai_avoid_stamp_obj(B3AiAvoid* a, const B3AiAvoidParams* P,
+                               const float road_fwd[3], const Vec3* self,
+                               const float self_vel[3], const float opos[3],
+                               const float ovel[3], float half, int kind) {
+    float d[3], rel[3], range, closing, eta, p0[3], p1[3];
+    int i, s0, s1, hw, lo, hi;
+    d[0] = opos[0] - self->x;
+    d[1] = opos[1] - self->y;
+    d[2] = opos[2] - self->z;
+    if (fabsf(d[1]) > P->discard_v) return;              /* @0x0016ED9E  [C] */
+    if (d[0] * road_fwd[0] + d[2] * road_fwd[2] < -B3_AV_SELF_EXT)
+        return;                                          /* @0x0016EDC4  [C] */
+    range = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (range >= B3_AV_MIN_RANGE) {                      /* @0x0016EDE6  [C] */
+        float rl;
+        for (i = 0; i < 3; i++) rel[i] = self_vel[i] - ovel[i];
+        rl = sqrtf(rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]);
+        if (rl < 0.01f) return;
+        closing = (d[0] * rel[0] + d[1] * rel[1] + d[2] * rel[2]) / range;
+        if (closing < 0.01f) return;
+        eta = range / closing;
+        if (eta < 0.0f) return;
+        eta -= P->sweep_dt * 0.5f;                       /* @0x0016EE1E  [C] */
+        if (eta < 0.0f) eta = 0.0f;
+        else if (eta > B3_AV_TMAX) return;               /* @0x0016EE0C  [C] */
+    } else {
+        eta = 0.0f;                                      /* @0x0016EDF9  [C] */
+    }
+    for (i = 0; i < 3; i++) {
+        p0[i] = opos[i] + ovel[i] * eta;
+        p1[i] = p0[i] + ovel[i] * (eta + P->sweep_dt);
+    }
+    s0 = b3_avoid_strip(a, p0);
+    s1 = b3_avoid_strip(a, p1);
+    hw = (int)(half * B3_AV_STRIPS_PER_M);
+    lo = (s0 < s1 ? s0 : s1) - hw;
+    hi = (s0 > s1 ? s0 : s1) + hw;
+    b3_avoid_paint_span(a, lo, hi, kind, eta, range);
+    if (ai_wd_armed() && g_ai_wd_nocc < 128) {          /* instrumentation */
+        int k = g_ai_wd_nocc++;
+        memcpy(g_ai_wd_occ[k].p, opos, 3 * sizeof(float));
+        memcpy(g_ai_wd_occ[k].v, ovel, 3 * sizeof(float));
+        g_ai_wd_occ[k].half = half;
+        g_ai_wd_occ[k].kind = kind;
+        g_ai_wd_occ[k].eta = eta;
+        g_ai_wd_occ[k].rng = range;
+        g_ai_wd_occ[k].lo = lo;
+        g_ai_wd_occ[k].hi = hi;
     }
 }
 
 static void ai_avoid_build(Vehicle* v, int slot, B3AiAvoidState* s) {
-    int n = g_track.num_points;
-    if (n < 8) { s->ready = 0; return; }
-    int idx = (int)(find_track_progress(v->pos) * n) % n;
-    if (idx < 0) idx += n;
-    Vec3 c  = g_track.points[idx];
-    Vec3 fa = g_track.points[(idx + n - 2) % n];
-    Vec3 fb = g_track.points[(idx + 2) % n];
-    float fx = fb.x - fa.x, fz = fb.z - fa.z;
-    float fl = sqrtf(fx * fx + fz * fz);
-    if (fl < 1e-4f) { s->ready = 0; return; }
-    fx /= fl; fz /= fl;
-    float rx = -fz, rz = fx;                  /* harness right of forward   */
-    float s0 = (v->pos.x - c.x) * rx + (v->pos.z - c.z) * rz;
+    B3AiAvoid* a = &s->a;
+    if (ai_wd_armed()) g_ai_wd_nocc = 0;                /* instrumentation */
+    const B3AiAvoidParams* P = &B3_AI_AVOID_VDB;
+    float car_fwd[3] = { sinf(v->rot.y), 0.0f, -cosf(v->rot.y) };
+    float self_vel[3] = { v->vel.x, v->vel.y, v->vel.z };
+    int i;
 
-    for (int i = 0; i < B3_AV_N; i++) {
-        s->time[i] = B3_AV_TMAX;
-        s->dist[i] = B3_AV_DMAX;
-        s->type[i] = 0;
+    /* FUN_00170100: the car's OWN footprint band -> avoid+0x440/1/2.
+     * ARGUMENT ORDER: (racecar+0x2444, racecar+0x2448) = (WIDTH, LENGTH) --
+     * retail multiplies the |road_fwd . car_fwd| term by +0x2444, executed
+     * and disassembled, see the note over b3_avoid_band.  This used to read
+     * (B3_AV_CAR_LEN, B3_AV_CAR_WID), i.e. a 4.8 m footprint for a 2 m car. */
+    b3_avoid_band(a, s->road_fwd, s->road_right, car_fwd,
+                  B3_AV_CAR_WID, B3_AV_CAR_LEN);
+    b3_avoid_clear(a);
+    /* avoid+0x48C -- the 50.0 gate that drops type-6 (RACECAR) strips out
+     * of dmin.  Retail feeds it a speed; the harness uses the car's.   [S] */
+    a->spd_gate = v->sim.speed;
+
+    /* --- the road no-go, FUN_0016F6C0.  GLUE substitute, see the note
+     * above: off-carriageway strips take the registered HARD No Go
+     * offsets.  Opt-in because the extracted route.bin has no per-node
+     * flags and some US_C3_V1 sections are 50 m right-of-way envelopes
+     * rather than carriageways.                                        [S] */
+    if (ai_avoid_nogo_on()) {
+        int e_lo = (int)((0.0f - a->lat_right) * B3_AV_STRIPS_PER_M)
+                 + B3_AV_MID;
+        int e_hi = (int)((a->width - a->lat_right) * B3_AV_STRIPS_PER_M)
+                 + B3_AV_MID;
+        b3_avoid_paint_span(a, 0, e_lo - 1, B3_AVT_HARD,
+                            P->hard_nogo_t, P->hard_nogo_d);
+        b3_avoid_paint_span(a, e_hi + 1, B3_AV_N - 1, B3_AVT_HARD,
+                            P->hard_nogo_t, P->hard_nogo_d);
     }
 
-    /* --- road no-go (FUN_0016F6C0's job).  GLUE routing on the game's own
-     * barrier geometry: a strip whose look-ahead ray is blocked is type 6
-     * with zero time -- retail's HARD no-go.  Coarse (1 m) because
-     * aim_blocked is a grid walk; the rebuild is 1-in-3 frames anyway. */
-    int b_lo = 0, b_hi = B3_AV_N - 1;
-    {
-        int have = 0, run_lo = 0, run_hi = 0;
-        int c_lo = 0, c_hi = -1, in = 0;
-        int s0i = B3_AV_MID + (int)(s0 / B3_AV_PITCH);
-        for (int m = -20; m <= 20; m++) {
-            float sl = (float)m;
-            float tx = c.x + rx * sl + fx * B3_AV_LOOKAHEAD;
-            float tz = c.z + rz * sl + fz * B3_AV_LOOKAHEAD;
-            int blocked = aim_blocked(v->pos.x, v->pos.z, tx, tz,
-                                      v->pos.y + 0.5f);
-            int bi = B3_AV_MID + (int)(sl / B3_AV_PITCH);
-            if (blocked) {
-                int j0 = bi - 2, j1 = bi + 2;
-                if (j0 < 0) j0 = 0;
-                if (j1 >= B3_AV_N) j1 = B3_AV_N - 1;
-                for (int j = j0; j <= j1; j++) {
-                    s->time[j] = 0.0f;
-                    s->type[j] = 6;
-                }
-                if (in) {
-                    if (!have || (c_lo <= s0i && s0i <= c_hi)
-                        || (c_hi - c_lo > run_hi - run_lo)) {
-                        run_lo = c_lo; run_hi = c_hi; have = 1;
-                    }
-                    in = 0;
-                }
-            } else {
-                if (!in) { c_lo = bi; in = 1; }
-                c_hi = bi;
-            }
-        }
-        if (in && (!have || (c_lo <= s0i && s0i <= c_hi)
-                   || (c_hi - c_lo > run_hi - run_lo))) {
-            run_lo = c_lo; run_hi = c_hi; have = 1;
-        }
-        if (have && run_hi - run_lo >= 10) { b_lo = run_lo; b_hi = run_hi; }
-    }
-    s->lo = b_lo;
-    s->hi = b_hi;
-    s->win = (b_hi - b_lo) / 8;
-    if (s->win < 4) s->win = 4;
-
-    /* --- the other RACECARS (FUN_0016EA40) --------------------------- */
-    for (int i = 0; i < g_num_vehicles; i++) {
+    /* --- the other RACECARS, FUN_0016EA40.  Retail skips wrecked cars
+     * into type 5 rather than 6, and skips its own aggression target and
+     * anything in a takedown cinematic (racecar+0x18FA / +0x1BB8 /
+     * +0x27D8).                                                        [C] */
+    for (i = 0; i < g_num_vehicles; i++) {
         const Vehicle* o = &g_vehicles[i];
+        float opos[3], ovel[3];
+        int wrecked;
         if (o == v || !o->active) continue;
-        float dy = o->pos.y - v->pos.y;
-        if (dy < -B3_AV_DISCARD_V || dy > B3_AV_DISCARD_V) continue;
-        float dx = o->pos.x - v->pos.x, dz = o->pos.z - v->pos.z;
-        float along = dx * fx + dz * fz;
-        if (along < -4.0f || along > B3_AV_DISCARD_D) continue;
-        float lat = dx * rx + dz * rz;
-        float ovf = o->vel.x * fx + o->vel.z * fz;
-        float ovr = o->vel.x * rx + o->vel.z * rz;
-        float close = v->sim.speed - ovf;
-        float half = 2.6f;
-        int over = (along < 2.0f && fabsf(lat) < half);
-        float eta = over ? 0.0f
-                  : ((close > 0.5f && along > 0.0f) ? along / close
-                                                    : B3_AV_TMAX);
-        float rng = sqrtf(along * along + lat * lat);
-        ai_avoid_stamp(s, lat, lat + ovr * eta, half, eta,
-                       along > 2.0f ? rng : -1.0f, 2);
+        wrecked = (o->crashed_until > g_race_time);
+        opos[0] = o->pos.x; opos[1] = o->pos.y; opos[2] = o->pos.z;
+        ovel[0] = o->vel.x; ovel[1] = o->vel.y; ovel[2] = o->vel.z;
+        ai_avoid_stamp_obj(a, P, s->road_fwd, &v->pos, self_vel, opos, ovel,
+                           B3_AV_HALF_CAR,
+                           wrecked ? B3_AVT_WRECK : B3_AVT_RACER);
     }
 
-    /* --- TRAFFIC (FUN_0016EB60 / FUN_0016EC70) ----------------------- */
-    for (int i = 0; i < g_traffic_n; i++) {
+    /* --- TRAFFIC, FUN_0016EC70's global physics-vehicle walk.  No
+     * distance discard: the only cuts are the vertical one, the behind
+     * one and eta > 8 s.                                               [C] */
+    for (i = 0; i < g_traffic_n; i++) {
         const TrafficCar* t = &g_traffic[i];
+        float opos[3], ovel[3], half;
         if (!t->active) continue;
-        float dy = t->pos.y - v->pos.y;
-        if (dy < -B3_AV_DISCARD_V || dy > B3_AV_DISCARD_V) continue;
-        float dx = t->pos.x - v->pos.x, dz = t->pos.z - v->pos.z;
-        float along = dx * fx + dz * fz;
-        if (along < -4.0f || along > B3_AV_DISCARD_D) continue;
-        float lat = dx * rx + dz * rz;
-        float tvx = sinf(t->yaw) * t->speed, tvz = -cosf(t->yaw) * t->speed;
-        if (t->crashed_until > g_race_time) { tvx = 0.0f; tvz = 0.0f; }
-        float ovf = tvx * fx + tvz * fz;
-        float ovr = tvx * rx + tvz * rz;
-        float close = v->sim.speed - ovf;      /* oncoming: closes fast */
-        /* a rig is as wide as its trailer and much longer */
-        float half = (t->trailer >= 0) ? 3.4f : 2.6f;
-        int over = (along < 2.0f && fabsf(lat) < half);
-        float eta = over ? 0.0f
-                  : ((close > 0.5f && along > 0.0f) ? along / close
-                                                    : B3_AV_TMAX);
-        float rng = sqrtf(along * along + lat * lat);
-        ai_avoid_stamp(s, lat, lat + ovr * eta, half, eta,
-                       along > 2.0f ? rng : -1.0f, 3);
-        if (t->trailer >= 0) {
-            float tdx = t->tr_pos.x - v->pos.x, tdz = t->tr_pos.z - v->pos.z;
-            float ta = tdx * fx + tdz * fz;
-            if (ta > -4.0f && ta < B3_AV_DISCARD_D) {
-                float tl = tdx * rx + tdz * rz;
-                int to2 = (ta < 2.0f && fabsf(tl) < half);
-                float te = to2 ? 0.0f
-                         : ((close > 0.5f && ta > 0.0f) ? ta / close
-                                                        : B3_AV_TMAX);
-                float trg = sqrtf(ta * ta + tl * tl);
-                ai_avoid_stamp(s, tl, tl + ovr * te, half, te,
-                               ta > 2.0f ? trg : -1.0f, 3);
-            }
+        opos[0] = t->pos.x; opos[1] = t->pos.y; opos[2] = t->pos.z;
+        ovel[0] = sinf(t->yaw) * t->speed;
+        ovel[1] = 0.0f;
+        ovel[2] = -cosf(t->yaw) * t->speed;
+        if (t->crashed_until > g_race_time) {
+            ovel[0] = 0.0f; ovel[2] = 0.0f;
         }
-    }
-
-    /* --- PROPS (the fourth stamper's job).  One nearest-prop probe on the
-     * look-ahead point: the recovered verdict is that shipped props are
-     * NON-CRASHABLE (props.h b3_props_object_class), so this only shapes the
-     * line, it never has to save the car.  GLUE. */
-    if (b3_props_ready()) {
-        float pp[3] = { c.x + rx * s0 + fx * 15.0f, v->pos.y,
-                        c.z + rz * s0 + fz * 15.0f };
-        float pd = 1e9f;
-        if (b3_props_nearest(pp, &pd) >= 0 && pd < 3.0f) {
-            float eta = 15.0f / (v->sim.speed > 1.0f ? v->sim.speed : 1.0f);
-            ai_avoid_stamp(s, s0, s0, 1.5f, eta, 15.0f, 4);
+        half = (t->trailer >= 0) ? B3_AV_HALF_RIG : B3_AV_HALF_CAR;
+        ai_avoid_stamp_obj(a, P, s->road_fwd, &v->pos, self_vel, opos, ovel,
+                           half, B3_AVT_VEHICLE);
+        if (t->trailer >= 0) {
+            opos[0] = t->tr_pos.x; opos[1] = t->tr_pos.y;
+            opos[2] = t->tr_pos.z;
+            ai_avoid_stamp_obj(a, P, s->road_fwd, &v->pos, self_vel, opos,
+                               ovel, half, B3_AVT_VEHICLE);
         }
     }
     s->ready = 1;
     (void)slot;
 }
 
-static void ai_avoid_choose(Vehicle* v, B3AiAvoidState* s, int corner,
-                            float fx, float fz, float rx, float rz, float s0)
-{
-    B3AiAvoidOut* o = &s->out;
-    memset(o, 0, sizeof *o);
-    o->valid = 1;
-    o->speed = 1e9f;
-    o->dmin = B3_AV_DMAX;
-    int lo = s->lo, hi = s->hi;
-
-    float tmin = B3_AV_TMAX;
-    for (int i = lo; i <= hi; i++) if (s->time[i] < tmin) tmin = s->time[i];
-
-    int s0i = B3_AV_MID + (int)(s0 / B3_AV_PITCH);
-    if (s0i < 0) s0i = 0;
-    if (s0i >= B3_AV_N) s0i = B3_AV_N - 1;
-    o->risk_here = B3_AV_TMAX - s->time[s0i];
-
-    /* dmin over the middle half of the band, skipping the road no-go
-     * strips -- FUN_0016C4B0 @0x0016CC79 (q = (hi-lo)/4). */
-    {
-        int q = (hi - lo) / 4;
-        for (int i = lo + q; i < hi - q; i++)
-            if (s->type[i] != 6 && s->dist[i] < o->dmin) o->dmin = s->dist[i];
+/* ------------------------------------------------------------------------
+ * The B3_AI_WORLD_DUMP writer.  One record per line, whitespace separated,
+ * every position in GL space:
+ *
+ *   HDR   track frame race_time route_n route_from_nav nav_sections
+ *   CAR   slot x y z yaw vx vy vz speed nav_sec nav_node frame_sec
+ *   FRAME slot Lx Ly Lz Rx Ry Rz axisx axisy axisz width lat_l lat_r
+ *         fwdx fwdy fwdz rgtx rgty rgtz lo hi win state dmin
+ *   AIM   slot x y z              the avoidance aim (out->aim)
+ *   TGT   slot x y z              the racing target as handed in
+ *   ROUTE slot k x y z            g_cl station k (route/aim line)
+ *   WALLA slot k x y z            g_wa station k (road-edge strand)
+ *   WALLB slot k x y z            g_wb station k
+ *   NAVR  slot k x y z            frame ribbon's point_a (right) at node k
+ *   NAVL  slot k x y z            frame ribbon's point_b (left)  at node k
+ *   PLAN  slot sec node x y z speed
+ *   OCC   slot i x y z vx vy vz half kind eta range strip_lo strip_hi
+ *   STRIP slot i type time_s dist_m
+ * ---------------------------------------------------------------------- */
+static FILE* ai_wd_file(void) {
+    if (!g_ai_wd_f) {
+        const char* p = getenv("B3_AI_WORLD_DUMP_OUT");
+        char buf[256];
+        if (!p) {
+            snprintf(buf, sizeof buf, "build/ai_world_%d.txt", ai_wd_want());
+            p = buf;
+        }
+        g_ai_wd_f = fopen(p, "w");
+        if (g_ai_wd_f) {
+            const char* t = getenv("B3_TRACK");
+            fprintf(g_ai_wd_f, "HDR %s %d %.4f %d %d %u\n",
+                    t ? t : "US_C3_V1", (int)g_frame_count, g_race_time,
+                    g_route_n, g_route_from_nav, g_nav.section_count);
+        }
     }
+    return g_ai_wd_f;
+}
 
-    if (tmin >= B3_AV_THREAT) {          /* @0x0016C5F8: nothing to dodge */
-        o->state = 0x10;
-        o->override = 0;
-    } else {
-        /* widest band whose time stays within 0.2 s of its best -- the
-         * midpoint of that run is the target strip (@0x0016C6C4). */
-        int best = s0i < lo ? lo : (s0i > hi ? hi : s0i);
-        for (int i = lo; i <= hi; i++) {
-            if (s->time[i] > s->time[best]
-                || (s->time[i] == s->time[best]
-                    && abs(i - s0i) < abs(best - s0i)))
-                best = i;
+static void ai_wd_emit(Vehicle* v, int slot, const B3AiAvoidState* s,
+                       const B3AiAvoidOut* out, const Vec3* target) {
+    const B3AiAvoid* a = &s->a;
+    FILE* f = ai_wd_file();
+    int i;
+    if (!f) return;
+    fprintf(f, "CAR %d %.4f %.4f %.4f %.5f %.4f %.4f %.4f %.4f %d %d %d\n",
+            slot, v->pos.x, v->pos.y, v->pos.z, v->rot.y,
+            v->vel.x, v->vel.y, v->vel.z, v->sim.speed,
+            (int)v->nav_section, (int)v->nav_node, g_ai_wd_frame_sec);
+    fprintf(f, "FRAME %d %.4f %.4f %.4f %.4f %.4f %.4f %.5f %.5f %.5f "
+               "%.4f %.4f %.4f %.5f %.5f %.5f %.5f %.5f %.5f %d %d %d %d "
+               "%.4f\n",
+            slot, a->left[0], a->left[1], a->left[2],
+            a->right[0], a->right[1], a->right[2],
+            a->axis[0], a->axis[1], a->axis[2],
+            a->width, a->lat_left, a->lat_right,
+            s->road_fwd[0], s->road_fwd[1], s->road_fwd[2],
+            s->road_right[0], s->road_right[1], s->road_right[2],
+            (int)a->lo, (int)a->hi, (int)a->win, (int)a->state, a->dmin);
+    fprintf(f, "AIM %d %.4f %.4f %.4f\n", slot, out->aim[0], out->aim[1],
+            out->aim[2]);
+    fprintf(f, "TGT %d %.4f %.4f %.4f\n", slot, target->x, target->y,
+            target->z);
+    /* the route/aim line and its wall strands, from the car's own station */
+    if (g_route_n > 0) {
+        int bi = 0;
+        float bd = 1e30f;
+        for (i = 0; i < g_route_n; i++) {
+            float dx = g_cl[i][0] - v->pos.x, dz = g_cl[i][2] - v->pos.z;
+            float d = dx * dx + dz * dz;
+            if (d < bd) { bd = d; bi = i; }
         }
-        float thr = s->time[best] - B3_AV_SLACK;
-        if (thr < 0.0f) thr = 0.0f;
-        int a = best, b = best;
-        while (a > lo && s->time[a - 1] >= thr) a--;
-        while (b < hi && s->time[b + 1] >= thr) b++;
-        int tgt = (a + b) / 2;
-
-        float rl = 0.0f, rh = 0.0f;
-        for (int k = 1; k <= s->win; k++) {
-            int i = tgt - k; if (i < 0) i = 0;
-            rl += B3_AV_TMAX - s->time[i];
-            i = tgt + k; if (i >= B3_AV_N) i = B3_AV_N - 1;
-            rh += B3_AV_TMAX - s->time[i];
+        for (i = -4; i <= 60; i++) {
+            int k = route_wrap(bi + i, g_route_n);
+            fprintf(f, "ROUTE %d %d %.4f %.4f %.4f\n", slot, k,
+                    g_cl[k][0], g_cl[k][1], g_cl[k][2]);
+            fprintf(f, "WALLA %d %d %.4f %.4f %.4f\n", slot, k,
+                    g_wa[k][0], g_wa[k][1], g_wa[k][2]);
+            fprintf(f, "WALLB %d %d %.4f %.4f %.4f\n", slot, k,
+                    g_wb[k][0], g_wb[k][1], g_wb[k][2]);
         }
-        o->risk_lo = rl / (float)s->win;
-        o->risk_hi = rh / (float)s->win;
-        o->state = (o->risk_lo <= o->risk_hi) ? 1 : 2;
-
-        /* the aim point, FUN_0016C4B0 @0x0016CBED */
-        float lead = 2.0f * o->dmin / B3_AV_STEERF;
-        if (lead < 5.0f) lead = 5.0f;          /* FUN_000198E0(5.0, x)  [C] */
-        if (lead > 40.0f) lead = 40.0f;
-        float off = (float)(tgt - s0i) * B3_AV_PITCH;
-        o->aim[0] = v->pos.x + fx * lead + rx * (s0 + off);
-        o->aim[1] = v->pos.y;
-        o->aim[2] = v->pos.z + fz * lead + rz * (s0 + off);
-        /* the same aim must not cross a barrier (retail's no-go strips
-         * already guarantee this; the harness ray test is the stand-in). */
-        if (aim_blocked(v->pos.x, v->pos.z, o->aim[0], o->aim[2],
-                        v->pos.y + 0.5f)) {
-            o->aim[0] = v->pos.x + fx * lead;
-            o->aim[2] = v->pos.z + fz * lead;
-        }
-
     }
-    (void)corner;
-
-    /* the avoidance speed avoid+0x488 (@0x0016CCEF..0x0016CD48) */
-    if      (o->dmin < 10.0f) o->speed = B3_AV_SPD_10;
-    else if (o->dmin < 20.0f) o->speed = B3_AV_SPD_20;
-    else if (o->dmin < 30.0f) o->speed = B3_AV_SPD_30;
-    else {
-        float frac = 0.0f;
-        int cnt = 0;
-        for (int i = lo; i <= hi; i++)
-            if (s->type[i] >= 2 && s->type[i] <= 4) {
-                frac += B3_AV_TMAX - s->time[i];
-                cnt++;
+    /* the ribbon the avoidance FRAME was actually built on */
+    if (g_nav.loaded && g_ai_wd_frame_sec >= 0
+        && (unsigned)g_ai_wd_frame_sec < g_nav.section_count) {
+        unsigned int sc = (unsigned)g_ai_wd_frame_sec;
+        const B3RtNavSection* row = &g_nav.sections[sc];
+        for (i = 0; i <= 60; i++) {
+            int nd = (int)v->nav_node + i;
+            if (nd >= (int)row->node_count) {
+                if (!(row->flags & 0xff)) break;
+                nd -= (int)row->node_count;
             }
-        frac = (hi > lo) ? frac / ((float)(hi - lo + 1) * B3_AV_TMAX) : 0.0f;
-        (void)cnt;
-        if      (frac > 0.95f) o->speed = B3_AV_SPD_R95;
-        else if (frac > 0.9f)  o->speed = B3_AV_SPD_R90;
+            const B3RtNavPair* pr = &g_nav.pairs[row->pair_base + nd];
+            Vec3 r = nav_point(pr->point_a), l = nav_point(pr->point_b);
+            fprintf(f, "NAVR %d %d %.4f %.4f %.4f\n", slot, nd, r.x, r.y, r.z);
+            fprintf(f, "NAVL %d %d %.4f %.4f %.4f\n", slot, nd, l.x, l.y, l.z);
+        }
+        for (unsigned int q = 0; q < g_nav.plan_count; q++) {
+            const B3RtNavPlan* pl = &g_nav.plans[q];
+            if (pl->section != sc) continue;
+            unsigned short nds[3] = { pl->node_a, pl->node_b, pl->node_c };
+            for (int k = 0; k < 3; k++) {
+                if (nds[k] >= row->node_count) continue;
+                Vec3 m = nav_pair_target(sc, nds[k], v->pos);
+                fprintf(f, "PLAN %d %u %u %.4f %.4f %.4f %u\n", slot, sc,
+                        (unsigned)nds[k], m.x, m.y, m.z,
+                        (unsigned)pl->speed);
+            }
+        }
     }
+    for (i = 0; i < g_ai_wd_nocc; i++)
+        fprintf(f, "OCC %d %d %.4f %.4f %.4f %.4f %.4f %.4f %.3f %d %.4f "
+                   "%.4f %d %d\n",
+                slot, i, g_ai_wd_occ[i].p[0], g_ai_wd_occ[i].p[1],
+                g_ai_wd_occ[i].p[2], g_ai_wd_occ[i].v[0], g_ai_wd_occ[i].v[1],
+                g_ai_wd_occ[i].v[2], g_ai_wd_occ[i].half, g_ai_wd_occ[i].kind,
+                g_ai_wd_occ[i].eta, g_ai_wd_occ[i].rng, g_ai_wd_occ[i].lo,
+                g_ai_wd_occ[i].hi);
+    for (i = 0; i < B3_AV_N; i++)
+        fprintf(f, "STRIP %d %d %d %.4f %.4f\n", slot, i, (int)a->type[i],
+                b3_avoid_time(a, i), b3_avoid_dist(a, i));
+    fflush(f);
 }
 
 static void ai_avoid_update(Vehicle* v, int slot, int corner,
-                            Vec3* target, float* ceiling, B3AiAvoidOut* out)
-{
+                            Vec3* target, float* ceiling, B3AiAvoidOut* out) {
     memset(out, 0, sizeof *out);
     if (slot < 0 || slot >= 8) return;
     B3AiAvoidState* s = &g_ai_avoid[slot];
+    B3AiAvoid* a = &s->a;
+    float road_fwd[3], road_right[3];
+    Vec3 tgt_in = *target;              /* instrumentation: pre-override aim */
 
-    int n = g_track.num_points;
-    if (n < 8) return;
-    int idx = (int)(find_track_progress(v->pos) * n) % n;
-    if (idx < 0) idx += n;
-    Vec3 c  = g_track.points[idx];
-    Vec3 fa = g_track.points[(idx + n - 2) % n];
-    Vec3 fb = g_track.points[(idx + 2) % n];
-    float fx = fb.x - fa.x, fz = fb.z - fa.z;
-    float fl = sqrtf(fx * fx + fz * fz);
-    if (fl < 1e-4f) return;
-    fx /= fl; fz /= fl;
-    float rx = -fz, rz = fx;
-    float s0 = (v->pos.x - c.x) * rx + (v->pos.z - c.z) * rz;
+    if (slot >= 0 && slot < 8) g_ttest[slot].av_frames++;
+    if (!ai_avoid_frame_from_nav(v, a, road_fwd, road_right)) {
+        s->ready = 0;
+        if (slot >= 0 && slot < 8) g_ttest[slot].av_dead++;
+        if (ai_wd_armed() && ai_wd_file())
+            fprintf(g_ai_wd_f, "NOFRAME %d %.4f %.4f %.4f %d %d\n", slot,
+                    v->pos.x, v->pos.y, v->pos.z, (int)v->nav_section,
+                    (int)v->nav_node);
+        return;
+    }
+    memcpy(s->road_fwd, road_fwd, sizeof road_fwd);
+    memcpy(s->road_right, road_right, sizeof road_right);
 
-    /* avoid+0x4AF: the whole stage runs one frame in three [C @0x0016C453] */
+    /* instrumentation: force the 1-in-3 rebuild on the dumped frame so the
+     * profile written out belongs to that frame */
+    if (ai_wd_armed()) s->phase = 2;
+
+    /* avoid+0x4AF: the profile rebuild runs one frame in three; the
+     * arbitrator's risk tests below run EVERY frame.  [C @0x0016C453]
+     *
+     * A NOTE FOR WHOEVER PICKS THIS UP.  Retail also builds the strip FRAME
+     * inside that 1-in-3 rebuild -- FUN_00170260's single caller is
+     * FUN_0016D2F0 @0x0016D37F, and FUN_0016D2F0's single caller is
+     * FUN_0016C450's third-frame branch @0x0016C487 -- so retail's frame,
+     * footprint band (FUN_00170100 @0x0016D40C) and profile are always the
+     * same frame's, while this port re-frames every tick against a profile up
+     * to two ticks old.  Moving the call inside the rebuild WAS built and
+     * measured (11 tracks x 180 s): avoidance-into-traffic wrecks 20 -> 9 and
+     * the armed-override-with-a-live-ceiling subclass 7 -> 4, but wall wrecks
+     * 31 -> 42 and rival wall crashes in validate_ai_quality 14 -> 21 per
+     * 90 s, for a flat total -- so it is NOT applied here.  The reason it
+     * trades rather than wins is upstream: the harness's nav cursor hops
+     * between the parallel ribbons of a section family, which retail's cannot,
+     * and re-framing every tick is what has been hiding that.  Land this
+     * together with the corridor anchor (docs/RE_AI.md 15.6), not before. */
     if (++s->phase >= 3) {
         s->phase = 0;
         ai_avoid_build(v, slot, s);
-        if (s->ready) ai_avoid_choose(v, s, corner, fx, fz, rx, rz, s0);
+        if (s->ready)
+            /* the last argument is retail's racecar+0x1BF4 race-mode
+             * value, read at 0x0016C4C0 and used only by the
+             * five-term side select's `mode == 4` / `mode != 2`
+             * terms.  The harness has no equivalent, so 0 (the
+             * value retail itself uses whenever racecar+0x1BFC is
+             * non-zero or +0x1BF8 is not 1/2).                 [S] */
+            b3_avoid_choose(a, &B3_AI_AVOID_VDB, *ceiling, 0);
     }
-    if (!s->ready || !s->out.valid) goto trace;
-    *out = s->out;
+    if (!s->ready) return;
 
-    /* THE ARBITRATOR'S TWO RISK TESTS -- FUN_0016AAC0.  These run EVERY
-     * frame (only FUN_0016C450's profile rebuild is 1-in-3), and the second
-     * one is evaluated at the TRACKED AIM POINT (`FUN_0016FB50(AI+0x200)`
-     * @0x0016AC81), not at the car:
-     *     r_here > Current(corner) risk threshold        -> @0x0016AC4F
-     *     r_aim - side_risk > (corner) Risk threshold    -> FUN_0016ADF0
-     * both commit the avoidance direction AI+0x720.                    [C] */
-    if (out->state != 0x10) {
-        float tl = (target->x - c.x) * rx + (target->z - c.z) * rz;
-        int ai = B3_AV_MID + (int)(tl / B3_AV_PITCH);
-        if (ai < 0) ai = 0;
-        if (ai >= B3_AV_N) ai = B3_AV_N - 1;
-        float r_aim = B3_AV_TMAX - s->time[ai];
-        float cur  = corner ? B3_AV_CRISK_CUR : B3_AV_RISK_CUR;
-        float side = corner ? B3_AV_CRISK     : B3_AV_RISK;
-        float chosen = (out->state == 1) ? out->risk_lo : out->risk_hi;
-        out->override = (out->risk_here > cur)
-                     || ((r_aim - chosen) > side);
+    out->valid = 1;
+    out->state = a->state;
+    out->speed = a->speed;
+    out->dmin = a->dmin;
+    out->risk_lo = a->risk_mean_r;
+    out->risk_hi = a->risk_mean_l;
+
+    /* THE ARBITRATOR, FUN_0016AAC0.  The first risk test is at the car's
+     * OWN strip (128 by construction), the second at the TRACKED AIM
+     * (FUN_0016FB50(AI+0x200) @0x0016AC81), with the chosen side's own
+     * risk subtracted (AI+0x740/0x744 and AI+0x748/0x74C).            [C] */
+    {
+        float mean, total, maxr;
+        b3_avoid_query(a, B3_AV_MID, &mean, &total, &maxr);
+        out->risk_here = mean;
+        if (mean > (corner ? B3_AV_CRISK_CUR : B3_AV_RISK_CUR)) {
+            out->override = 1;                       /* @0x0016AC4F   [C] */
+        } else {
+            float tp[3] = { target->x, target->y, target->z };
+            int ts = b3_avoid_strip(a, tp);
+            float m2, t2, x2;
+            if (ts < 0) ts = 0;
+            if (ts > B3_AV_N - 1) ts = B3_AV_N - 1;
+            b3_avoid_query(a, ts, &m2, &t2, &x2);
+            if (a->state == 1) { m2 -= a->risk_mean_r; t2 -= a->risk_tot_r; }
+            else if (a->state == 2) { m2 -= a->risk_mean_l;
+                                      t2 -= a->risk_tot_l; }
+            else {
+                /* THE THIRD ARM, FUN_0016AAC0 @0x0016AD70.  With no side
+                 * chosen (state 0x10) retail does NOT skip the test: it
+                 * runs FUN_0016FCD0 at `AI+0x75E` -- the strip the chooser
+                 * parked at @0x0016D025, which on the clear branch is
+                 * FUN_0016F000's aim strip -- and subtracts THAT from the
+                 * risk at the tracked aim before applying the same two
+                 * thresholds (@0x0016AD9B / @0x0016ADCE).
+                 *
+                 * The port used to gate the whole test on `state != 0x10`,
+                 * so on the clear branch -- which is most of a race, since
+                 * tmin >= 4 s means only that nothing sits inside the car's
+                 * OWN FOOTPRINT, not that the road is empty -- nothing
+                 * could ever commit the avoidance aim.  A rival ALONGSIDE
+                 * produced no steering response at all, and the pack only
+                 * reacted once someone was dead ahead, by which point the
+                 * ladder's brake is the only move left.  That is the
+                 * "rivals don't handle each other" defect.               */
+                float m3, t3, x3;
+                b3_avoid_query(a, a->aim_strip_cached, &m3, &t3, &x3);
+                m2 -= m3; t2 -= t3;                  /* @0x0016AD93   [C] */
+            }
+            if (m2 > (corner ? B3_AV_CRISK : B3_AV_RISK))
+                out->override = 1;                   /* @0x0016AD09   [C] */
+            else if (t2 > (corner ? B3_AV_CRISK_TOT : B3_AV_RISK_TOT))
+                out->override = 1;                   /* @0x0016ADDB   [C] */
+        }
     }
-    /* B3_AI_AVOID=0 keeps the profile (so the telemetry stays comparable)
-     * but restores the pre-port feed: no ceiling cap, no aim override, no
-     * band clamp.  That switch is how the "before" column of the crash
-     * table in the integration note was measured. */
+
+    /* The avoidance aim point, FUN_0016C4B0 @0x0016CBED.
+     *
+     * ONE correction: the AVOID branch divides the minimum distance over
+     * the WHOLE footprint band -- the entry loop's second minimum -- and
+     * not the middle-half `dmin` that the speed ladder uses.  Now `dband`.
+     *
+     * NOT taken, deliberately: retail's clear-branch aim is
+     *     pos + fwd * speed * (corner ? 1 : 4)   (@0x0016CE30)
+     * with the lateral term dropped entirely when the edge scan finds that
+     * side occupied (@0x0016CF0B).  Both were ported, MEASURED and backed
+     * out.  Retail consumes that aim through the real nav graph, while the
+     * harness projects it along a SINGLE nav-node tangent (`road_fwd`), so
+     * a 160-320 m projection leaves the road on anything but a locally
+     * straight section.  Measured over 90 s validate_ai_quality runs on the
+     * six worst tracks: unpatched 4/6, retail's long lead 2/6 (EU_M1_V2's
+     * worst-car progress span collapsing 0.228 -> 0.009), the short lead
+     * with the lateral cancel 5/6 but 180 s wall wrecks rising 15 -> 26
+     * across US_C3_V1/EU_C1_V1/AS_C2_V1, and NO aim change at all -- this
+     * -- 5/6 with wall wrecks 15 -> 3.  The aim GEOMETRY cannot be made
+     * retail-faithful until the target follower's graph walk lands
+     * (docs/RE_AI.md section 15.6 row 3); the arbitrator wiring below can,
+     * and is where the whole win comes from.                          [S] */
+    {
+        int tgt = (a->state == 0x10) ? a->aim_strip_cached : a->target_strip;
+        float off = (float)(tgt - B3_AV_MID) * B3_AV_PITCH;
+        float lead = 2.0f * ((a->state == 0x10) ? a->dmin : a->dband)
+                   / B3_AI_AVOID_VDB.steer_f;
+        /* THE COMPANION ARM, @0x0016CDEC -- see nav_avoid_lead_x4.  Retail
+         * multiplies this forward offset by 4 whenever the plan latch is NOT
+         * tracking a corner's apex or exit.  Applied to the port's own lead
+         * rather than to retail's `speed`, because the port projects the aim
+         * along a single nav-node tangent and retail walks the graph: the
+         * FACTOR is retail's, the base length stays the port's.        [S] */
+        if (nav_aim2_enabled() && nav_avoid_lead_x4(v))
+            lead *= B3_NAV_AVOID_LEAD_X4;
+        if (lead < 5.0f) lead = 5.0f;      /* FUN_000198E0(5.0, x)     [C] */
+        if (lead > 40.0f) lead = 40.0f;    /* upper clamp not recovered [?] */
+        out->aim[0] = v->pos.x + road_fwd[0] * lead + a->axis[0] * off;
+        out->aim[1] = v->pos.y;
+        out->aim[2] = v->pos.z + road_fwd[2] * lead + a->axis[2] * off;
+    }
+
     if (!ai_avoid_on()) goto trace;
 
     /* AI+0x780 = min(corner brake, avoidance)  [C @0x0016AB16] */
     if (out->speed < *ceiling) *ceiling = out->speed;
 
-    /* commit the avoidance direction (FUN_0016ADF0) */
+    /* Commit the avoidance direction, FUN_0016ADF0 -- but only to a point
+     * the car can actually reach.
+     *
+     * Retail needs no such test: FUN_0016F6C0 stamps the road no-go into the
+     * strip profile before the chooser runs, so the aim strip FUN_0016F000
+     * returns and the run midpoints FUN_0016C4B0 walks to are inside the
+     * carriageway by construction, and the forward lead is consumed through
+     * the nav graph.  This port projects the same strip offset along a SINGLE
+     * nav-node tangent and cannot stamp the no-go (route.bin carries no
+     * per-node flags), so the reconstructed point can leave the road on a
+     * curve -- the geometry risk recorded above.  When it leaves it far
+     * enough to cross a hole, the commit is REFUSED and the racing-line aim
+     * stands: that aim has already been through the barrier and floor tests
+     * above, so refusing is the conservative half of the trade, never the
+     * lossy one.                                                        [S] */
     if (out->override) {
-        target->x = out->aim[0];
-        target->z = out->aim[2];
-    } else {
-        /* Otherwise keep the racing/aggression aim, but hold it inside the
-         * band -- retail's HARD no-go does this structurally (a strip off
-         * the road simply never wins the midpoint pick).  Without it the
-         * harness's own barrier-fallback offsets (+-4..16 m) and the
-         * wall-grind escape (+-8 m) push a rival clean across the road into
-         * the ONCOMING lanes, which is the reported behaviour. */
-        float tl = (target->x - c.x) * rx + (target->z - c.z) * rz;
-        float blo = (float)(s->lo - B3_AV_MID) * B3_AV_PITCH;
-        float bhi = (float)(s->hi - B3_AV_MID) * B3_AV_PITCH;
-        float cl = tl;
-        if (cl < blo) cl = blo;
-        if (cl > bhi) cl = bhi;
-        if (cl != tl) {
-            target->x += rx * (cl - tl);
-            target->z += rz * (cl - tl);
+        if (aim_gap_on() >= 2
+            && aim_over_gap(v->pos.x, v->pos.y, v->pos.z,
+                            out->aim[0], out->aim[2])) {
+            out->override = 2;                  /* refused; trace shows it */
+        } else {
+            target->x = out->aim[0];
+            target->z = out->aim[2];
         }
     }
 trace:
+    if (ai_wd_armed()) ai_wd_emit(v, slot, s, out, &tgt_in);
     if (getenv("B3_AI_AVOID_TRACE")) {
-        /* rlat = the SAME signed lateral coordinate the traffic lane table
-         * is expressed in (route_project's s = tx*(z-cz) - tz*(x-cx)), so a
-         * rival's rlat can be read straight against B3_TRAFFIC_LANES: on
-         * US_C3_V1 the with-race lanes are +2.66 / +9.07 and the ONCOMING
-         * lanes +14.56 / +20.83, so rlat > ~11.8 means the rival has
-         * crossed into the oncoming half. */
+        float lat = (v->pos.x - a->right[0]) * a->axis[0]
+                  + (v->pos.z - a->right[2]) * a->axis[2];
         int rs = 0; float rt = 0.0f, rlat = 0.0f;
         route_project(v->pos.x, v->pos.z, 0, -1, &rs, &rt, &rlat);
-        printf("[avoid] t=%6.2f car%d st%d ovr%d band[%d,%d] lat%+6.2f "
-               "rlat%+7.2f here%.2f lo%.2f hi%.2f dmin%6.1f spd%6.1f\n",
-               g_race_time, slot, out->state, out->override, s->lo, s->hi,
-               s0, rlat, out->risk_here, out->risk_lo, out->risk_hi,
-               out->dmin, out->speed);
+        printf("[avoid] t=%6.2f car%d sec%d/%d st%d ovr%d w%5.1f lat%+6.2f "
+               "rlat%+7.2f band[%d,%d] here%.2f lo%.2f hi%.2f dmin%6.1f "
+               "spd%6.1f\n",
+               g_race_time, slot, v->nav_section, v->nav_node, out->state,
+               out->override, a->width, lat, rlat, a->lo, a->hi,
+               out->risk_here, out->risk_lo, out->risk_hi, out->dmin,
+               out->speed);
     }
 }
 
@@ -7104,22 +13690,53 @@ static void traffic_update(float dt) {
                         -t->rb.frame[3][2]};
         int raw_path = traffic_paths_active();
         if (t->crashed_until > 0.0f) {
-            if (g_race_time < t->crashed_until) {
+            /* THE WRECK DOES NOT VANISH WHILE YOU ARE LOOKING AT IT.
+             *
+             * Retail's answer to a wrecked traffic car is PROMOTION, not
+             * deletion: FUN_00114910 stamps the collision object's type to 4
+             * (@0x0011491D `MOV byte [EDI],4`), takes a free 0x2430-byte
+             * articulated-vehicle record out of the pool at manager+0x33780
+             * (@0x0011497A), rebinds the object to it (@0x00114999) and seeds
+             * it from the traffic record through FUN_00120BA0 (@0x001149AB) --
+             * and only THEN frees the traffic agent, @0x00114CE0 `CALL
+             * FUN_001A75A0` on body+0x110, whose teardown ends in the pure
+             * free-list push FUN_001A41A0 (no distance, no view, just
+             * head/tail relink and `DEC byte [EAX+0x363AC]`).  The BODY
+             * survives that as a normal vehicle; retail never deletes a wreck
+             * on a timer.                                                 [C]
+             *
+             * This harness has no promoted-vehicle record for traffic -- the
+             * wreck IS the TrafficCar slot -- so releasing the slot when the
+             * 5 s park expires deletes the wreck wherever it stands.
+             * Measured before this arm existed: 2-3 releases per 175 s race
+             * inside retail's own 160 m gate, the nearest 4.0 m and 7.0 m from
+             * the player, one of them dead ahead.  That is the user's
+             * "cars disappear in front of me", exactly.
+             *
+             * Keep the wreck parked while it is on the player's screen.  The
+             * slot returns to the pool the moment the player has driven past,
+             * so the pool cost is a few extra body-seconds against a 254-deep
+             * free list that measures a 60-67 high-water. */
+            if (g_race_time < t->crashed_until
+                || (t->pool_request >= 0 && traffic_on_camera(t))) {
                 traffic_trailer_update(t);
                 continue;                                   // parked wreck
             }
             if (raw_path) {
                 if (t->pool_request >= 0) {
-                    /* retail retires the body (FUN_001A41A0) and lets the next
-                     * FUN_001A28B0 pass re-fill the request with a freshly
-                     * drawn class/model/paint -- it never re-seeds in place */
+                    /* off camera now: FUN_001A75A0 -> FUN_001A41A0 returns the
+                     * agent to the free list and the next FUN_001A28B0 pass
+                     * re-fills the request with a freshly drawn
+                     * class/model/paint -- it never re-seeds in place */
                     g_pool_release_why = "raw-path-reseed";
                     traffic_pool_release_slot(i);
                     continue;
                 }
+                g_tpl_seed_why = "crash-recover";  /* traffic pop log (agent) */
                 if (!traffic_path_seed(t, t->spawn + 1 + i))
                     traffic_place(t, t->lane + 1, &g_player.pos, 320.0f, +1);
             } else {
+                g_tpl_seed_why = "crash-recover";  /* traffic pop log (agent) */
                 traffic_place(t, t->lane + 1, &g_player.pos, 320.0f, +1);
             }
         }
@@ -7297,14 +13914,51 @@ static void traffic_update(float dt) {
 
         Vec3 lp, tangent;
         if (raw_path) {
+            /* FUN_001A8EE0 runs BEFORE the mover's end test: pick a
+             * successor while there is still descriptor left, then commit as
+             * soon as the cursor reaches the source switch row. Retiring at
+             * the end is FUN_0019F1C0's arm for an agent that had none. */
+            traffic_branch_select(t);
+            if (traffic_branch_commit(t, i)) {
+                traffic_path_sample(t->path_id, t->path_cursor, t->path_lateral,
+                                    &lp, &tangent);
+                t->pos = (Vec3){lp.x, lp.y + 0.5f, lp.z};
+                t->yaw = atan2f(tangent.x, -tangent.z);
+                continue;
+            }
             if (traffic_path_advance(t, t->speed * dt)) {
-                if (t->pool_request >= 0) {
-                    /* FUN_0019F1C0 retires an agent at the descriptor end */
+                /* THE TERMINUS, FUN_001A6B40 @0x001A6DA8..0x001A6DC9:
+                 *
+                 *     if (rows - 1 <= (int)agent+0x30 && body+0x118 == 0)
+                 *         FUN_001A75A0();            <- destroy, no distance
+                 *
+                 * so retail does destroy a traffic car at the end of its
+                 * descriptor, wherever it is -- but ONLY when body+0x118, the
+                 * SELECTED SUCCESSOR, is null.  When a successor exists it
+                 * falls through to FUN_001A8EE0, whose commit arm
+                 * (@0x001A8EFE: `COMISS [agent+0x30],[body+0x160]`, then
+                 * FUN_001A9040 @0x001A8F12) hands the agent over instead.  At
+                 * the terminus that compare is satisfied by definition -- the
+                 * cursor has passed every switch row on the path -- so a
+                 * pending selection always commits and never dies here.
+                 *
+                 * Give the selector its last look before deciding, then
+                 * commit if it found anything: that is the `body+0x118 == 0`
+                 * test, and it is the difference between a car handing over
+                 * to the next road and vanishing 16 m in front of you. */
+                traffic_branch_select_terminus(t);
+                if (traffic_branch_commit(t, i)) {
+                    /* reached the end exactly on the switch row */
+                } else if (t->pool_request >= 0) {
+                    /* body+0x118 == 0: FUN_001A6B40 @0x001A6DC4 destroys it */
                     g_pool_release_why = "path-end";
                     traffic_pool_release_slot(i);
                     continue;
+                } else
+                {
+                    g_tpl_seed_why = "path-end-seed"; /* traffic pop log (agent) */
+                    if (traffic_path_seed(t, t->spawn + 1 + i)) continue;
                 }
-                if (traffic_path_seed(t, t->spawn + 1 + i)) continue;
                 raw_path = 0;
             }
             if (raw_path) {
@@ -7312,7 +13966,6 @@ static void traffic_update(float dt) {
                                     t->path_lateral, &lp, &tangent);
                 t->pos = (Vec3){lp.x, lp.y + 0.5f, lp.z};
                 t->yaw = atan2f(tangent.x, -tangent.z);
-                if (t->path_dir < 0) t->yaw += 3.14159265f;
                 traffic_reservations_rebuild();
             }
         }
@@ -7333,22 +13986,49 @@ static void traffic_update(float dt) {
             traffic_tow_sleep_refresh(t);
             body_ready = !t->asleep;
         }
-        if (body_ready) {
-            traffic_tow_constraint(t, dt);
-            B3RigidBody pose;
+        /* THE COLLIDER FOLLOWS THE MESH, ALWAYS.
+         *
+         * This synthesis is not physics -- it is the ROAD AGENT's kinematic
+         * placement, the same t->pos the renderer draws from, expressed as a
+         * rigid-body frame so the car-contact pass has something to hand the
+         * solver.  Retail separates the two the same way: FUN_00120F30's
+         * residency early-out @0x00120F5B skips the ARTICULATED-VEHICLE BODY
+         * update (and its tail-call to FUN_00123000), while the road agent
+         * that places a live traffic handle runs regardless -- which is why
+         * out-of-unit traffic keeps moving in retail instead of freezing.
+         *
+         * The port had the frame sync inside the residency gate, so an
+         * out-of-unit car's collider stayed where it was while its mesh drove
+         * on.  Even after fixing the residency PREDICATE that is the wrong
+         * shape: a stale collider is a phantom.  Only the parts that really
+         * are the body update -- the tow constraint, the drive servo and the
+         * trailer -- stay behind the gate.  The tow constraint keeps its
+         * place BEFORE the sync so a streamed rig sees byte-identical
+         * ordering to before this patch. */
+        if (body_ready) traffic_tow_constraint(t, dt);
+        {
+            B3_RIGID_BODY_LOCAL(pose);
             Vec3 vel = {t->rb.vel[0], t->rb.vel[1], -t->rb.vel[2]};
             carcol_synth_rb(&pose, t->pos,
                             t->pos.y - 0.5f - g_traffic_ymin[t->car],
                             t->yaw, vel);
-            memcpy(t->rb.frame, pose.frame, sizeof(t->rb.frame));
+            memcpy(t->rb.frame, pose.frame, 16 * sizeof(float));
             memcpy(t->rb.inv_frame, pose.inv_frame, sizeof(t->rb.inv_frame));
             memcpy(t->rb.inv_inertia_body, pose.inv_inertia_body,
                    sizeof(t->rb.inv_inertia_body));
             memcpy(t->rb.inv_inertia_world, pose.inv_inertia_world,
                    sizeof(t->rb.inv_inertia_world));
+            /* A traffic body is kinematic in BOTH residency states -- it is
+             * carried by the road agent, not by gravity -- so the
+             * gravity-cancel travels with the placement, not with the body
+             * update.  Without it an out-of-unit car that is now integrated
+             * (so the solver's impulses get consumed instead of piling up)
+             * would accumulate a downward velocity it never uses. */
+            t->rb.force_acc[1] += 20.0f * t->mass_kg;
+        }
+        if (body_ready) {
             t->rb.force_acc[0] += (sinf(t->yaw) * t->speed - t->rb.vel[0])
                                   * t->mass_kg / dt;
-            t->rb.force_acc[1] += 20.0f * t->mass_kg;
             t->rb.force_acc[2] += (cosf(t->yaw) * t->speed - t->rb.vel[2])
                                   * t->mass_kg / dt;
             traffic_trailer_update(t);
@@ -7368,7 +14048,17 @@ static void traffic_update(float dt) {
         } else {
             t->off_time = 0.0f;
         }
-        if (t->crashed_until <= g_race_time && t->speed < 1.0f) {
+        /* GLUE stall recycle, for the LEGACY lane fallback only -- the same
+         * correction c6275b3 made to the 420 m range cull next to it, which
+         * this one was left out of.  Retail has exactly two ways to retire a
+         * pool body: its request stops being stamped (FUN_001A3470
+         * @0x001A38BA, i.e. the window set moved on -- structurally always far
+         * behind the player) and the descriptor end (FUN_0019F1C0).  "Slower
+         * than 1 m/s for 8 s" is neither, and it fires wherever the car
+         * happens to be: a queue behind a wreck, or a jam at a junction,
+         * deletes cars in plain view.  In the legacy lane path it is still
+         * the only thing that unwedges a car. */
+        if (!raw_path && t->crashed_until <= g_race_time && t->speed < 1.0f) {
             t->stall_time += dt;
             if (t->stall_time > 8.0f) recycle = 1;      // wedged
         } else {
@@ -7409,10 +14099,12 @@ static void traffic_update(float dt) {
                     traffic_pool_release_slot(i);
                     continue;
                 }
+                g_tpl_seed_why = "watchdog";   /* traffic pop log (agent) */
                 if (!traffic_path_seed(t, t->spawn + 1 + i))
                     traffic_place(t, t->lane + 1 + (i & 1), &g_player.pos,
                                   260.0f + (float)(i % 5) * 26.0f, -1);
             } else {
+                g_tpl_seed_why = "watchdog";   /* traffic pop log (agent) */
                 traffic_place(t, t->lane + 1 + (i & 1), &g_player.pos,
                               260.0f + (float)(i % 5) * 26.0f, -1);
             }
@@ -7450,12 +14142,22 @@ static void traffic_update(float dt) {
                 if (t->stall_time > 4.0f) { nstall++; ever_stall++; }
                 float px = t->pos.x - g_player.pos.x;
                 float pz = t->pos.z - g_player.pos.z;
-                printf("[tfc] t=%6.1f c%02d act%d %-9s cat%d paint%d "
+                /* RENDER/COLLISION PARITY, in the census.  `act` is what
+                 * traffic_render() gates on and `col` is what carcol_pass()
+                 * admits on -- the same traffic_carcol_admits() the pass
+                 * itself calls, so the two can never drift.  `str`/`hull`
+                 * are its inputs, printed so a failure says WHY.  Without
+                 * these tools/validate_traffic_align.py --run had nothing to
+                 * assert `drawn => collidable` from. */
+                printf("[tfc] t=%6.1f c%02d act%d col%d str%d hull%d %-9s "
+                       "cat%d paint%d "
                        "cruise%5.1f lane%d(%+6.2f%s) "
                        "dir%+d path%u@%6.1f "
                        "lat%+7.2f err%+7.2f spd%5.1f stall%4.1f off%4.1f "
+                       "yaw%+7.3f "
                        "dplayer%6.0f pos %7.1f %6.1f %7.1f %s%s\n",
-                       g_race_time, i, t->active,
+                       g_race_time, i, t->active, traffic_carcol_admits(t),
+                       t->streamed, g_traffic_hull_ok[t->car] ? 1 : 0,
                        B3_TRAFFIC_CARS[t->car].id,
                        B3_TRAFFIC_CARS[t->car].cat, t->paint,
                        t->cruise_ms > 1.0f ? t->cruise_ms
@@ -7463,16 +14165,18 @@ static void traffic_update(float dt) {
                        t->lane, t->lane_lat,
                        t->lane_dir > 0 ? "+" : "-", (int)t->path_dir, t->path_id,
                        t->path_cursor, lat, le, t->speed,
-                       t->stall_time, t->off_time, sqrtf(px * px + pz * pz),
+                       t->stall_time, t->off_time, t->yaw,
+                       sqrtf(px * px + pz * pz),
                        t->pos.x, t->pos.y, t->pos.z,
                        t->crashed_until > g_race_time ? "CRASHED " : "",
                        t->trailer >= 0 ? B3_TRAFFIC_CARS[t->trailer].id : "");
             }
             printf("[tfc] t=%6.1f SUMMARY active=%d idle=%d off_now=%d "
                    "stall_now=%d worst_lane_err=%.2f off_samples=%d "
-                   "stall_samples=%d\n",
+                   "stall_samples=%d player %7.1f %7.1f pyaw%+7.3f\n",
                    g_race_time, nactive, nidle, noff, nstall, worst_lat,
-                   ever_off, ever_stall);
+                   ever_off, ever_stall,
+                   g_player.pos.x, g_player.pos.z, g_player.rot.y);
         }
     }
 }
@@ -7583,16 +14287,111 @@ static void traffic_interact(void) {
 // flat pose sank the uphill half into inclines). origin = hub-plane point
 // (probed ground + wheel radius via -ymin), R9 = row-major object->world
 // (carfx convention). Flat ground reduces exactly to the old yaw path.
+/* RENDER/COLLISION PARITY.  The traffic body the player can hit is
+ * synthesised every frame at ground = t->pos.y - 0.5 - ymin (the
+ * carcol_synth_rb() call in the traffic update, which does NO ground probe),
+ * and carcol_pass() hands exactly that rigid body to the solver.  The probe
+ * below is a PRESENTATION conform -- it exists so a car on an incline leans
+ * onto the surface plane -- so it may refine that plane but must never move
+ * the drawn mesh off the body.  Unclamped it casts DOWN from pos.y + 1 and
+ * takes the first surface it finds, which on a multi-level track is the deck
+ * BELOW: the mesh is drawn one level down (or underground) while the body
+ * stays on the path.  That is a truck the player collides with and never
+ * sees.  Clamp the snap to a vehicle-scale margin and keep the mesh on its
+ * body; B3_TRAFFIC_POSE_LOG=1 reports every rejection.
+ *
+ * THE MARGIN IS MEASURED, and it stays at 2.0 m.  Replaying this exact probe
+ * offline over every cross-section of every traffic path on all 36 shipped
+ * tracks -- 1,271,318 samples, tools/validate_traffic_align.py --deck-audit
+ * -- gives one shape:
+ *
+ *     0.0-0.6 m  98.370%   the constant 0.5 m `base = pos.y - 0.5` puts
+ *                          between a path height and the road it was
+ *                          authored on: the conform is a no-op there
+ *     0.6-2.0 m   0.971%   real camber, crests and kerb cuts
+ *     2.0-4.0 m   0.059%   the band a genuine mis-pose would live in
+ *     4.0-5.0 m   0.001%   THE TROUGH -- 16 samples in 1.27 M
+ *     5.0-23  m   0.599%   a road ONE DECK away
+ *
+ * Nothing legitimate needs a wider margin, and widening it would be actively
+ * wrong: admitting the 5-23 m population would drop every car on an elevated
+ * expressway 20 m onto the street below while its collision body stayed up
+ * top -- the exact defect this clamp was added to stop.
+ *
+ * SO THE AS_C1_V1 PILE IS NOT A BUG IN THIS CLAMP.  That track's traffic
+ * paths 59 and 60 (the two the pool requests 35 times between them) run the
+ * city's elevated expressway: dead flat at y = 31.70 for 1.5 km, with
+ * track.obj carrying the deck at exactly that height all along it and the
+ * collision soup carrying NO up-facing surface above y = 11.7 anywhere under
+ * them.  That is not an extraction defect either -- AS_C1_V1's own race route
+ * spans y = 3.9..22.8 and never reaches the expressway, so retail never
+ * needed collision up there; the deck is scenery the player cannot reach and
+ * traffic drives it kinematically off its path, exactly as retail's road
+ * agents do.  The clamp correctly refuses, every frame, for every car on
+ * those two paths -- which is where all 1,104 rejections in a 20 s run came
+ * from.  What WAS wrong is that a correct refusal was reported in the same
+ * words, and with the same per-frame repetition, as a real mis-pose, so
+ * `tools/validate_traffic_align.py --run` failed the track for it.  The two
+ * are separated below.  */
+#define B3_TRAFFIC_POSE_SNAP_M 2.0f
+/* Above this the probe did not find the agent's own road at all -- it found
+ * another deck.  Set at the trough of the measured distribution above: the
+ * 4.0-5.0 m band holds 16 of 1,271,318 samples, and the multi-level
+ * population resumes at 5.0 m and runs to 23.0 m. */
+#define B3_TRAFFIC_POSE_DECK_M 5.0f
+
+/* One rejection, classified and rate-limited.  A "deck" rejection is the
+ * expected outcome on a multi-level road and is reported ONCE PER PATH at
+ * B3_TRAFFIC_POSE_LOG=1 (every occurrence at =2); a rejection inside the
+ * SNAP..DECK band is a real mis-pose and is still reported every time. */
+static void traffic_pose_reject(const TrafficCar* t, float signed_delta)
+{
+    static int pose_log = -1;
+    static long n_deck = 0, n_pose = 0;
+    static unsigned char deck_seen[256];
+    float mag = signed_delta < 0.0f ? -signed_delta : signed_delta;
+    if (pose_log < 0) {
+        const char* e = getenv("B3_TRAFFIC_POSE_LOG");
+        pose_log = e ? (atoi(e) > 0 ? atoi(e) : 1) : 0;
+    }
+    if (!pose_log) return;
+    if (mag > B3_TRAFFIC_POSE_DECK_M) {
+        unsigned slot = (unsigned)t->path_id & 0xffu;
+        n_deck++;
+        if (pose_log < 2 && deck_seen[slot]) return;
+        deck_seen[slot] = 1;
+        fprintf(stderr, "[tfc-deck] t=%.2f car %s path %u: nearest surface "
+                "%+.2f m from the body plane -- another deck, mesh kept on "
+                "its body (%ld so far)\n",
+                g_race_time, B3_TRAFFIC_CARS[t->car].id,
+                (unsigned)t->path_id, signed_delta, n_deck);
+        return;
+    }
+    n_pose++;
+    fprintf(stderr, "[tfc-pose] t=%.2f car %s path %u: probe %+.2f m from "
+            "body plane, snap rejected (drawn on its body)\n",
+            g_race_time, B3_TRAFFIC_CARS[t->car].id, (unsigned)t->path_id,
+            signed_delta);
+}
+
 static void traffic_pose(const TrafficCar* t, float origin[3], float R9[9])
 {
-    float gy = t->pos.y - 0.5f - g_traffic_ymin[t->car];
+    float base = t->pos.y - 0.5f - g_traffic_ymin[t->car];
+    float gy = base;
     float up[3] = { 0.0f, 1.0f, 0.0f };
     float gh, gn[3];
     if (b3_collision_ready()
         && b3_ground_probe(t->pos.x, t->pos.y + 1.0f, t->pos.z,
                            &gh, gn) >= 0) {
-        gy = gh - g_traffic_ymin[t->car];
-        if (gn[1] > 0.5f) { up[0] = gn[0]; up[1] = gn[1]; up[2] = gn[2]; }
+        float snapped = gh - g_traffic_ymin[t->car];
+        float signed_delta = snapped - base;
+        float delta = signed_delta < 0.0f ? -signed_delta : signed_delta;
+        if (delta <= B3_TRAFFIC_POSE_SNAP_M) {
+            gy = snapped;
+            if (gn[1] > 0.5f) { up[0] = gn[0]; up[1] = gn[1]; up[2] = gn[2]; }
+        } else {
+            traffic_pose_reject(t, signed_delta);
+        }
     }
     origin[0] = t->pos.x; origin[1] = gy; origin[2] = t->pos.z;
     float at[3] = { sinf(t->yaw), 0.0f, -cosf(t->yaw) };
@@ -7613,31 +14412,62 @@ static void traffic_pose(const TrafficCar* t, float origin[3], float R9[9])
 // towed trailer; the tractor keeps the main loop's path unchanged).
 static void traffic_draw_at(int car, const float org[3], const float R9[9],
                             float spin_deg) {
-    if (!g_traffic_lists[car]) return;
-    glPushMatrix();
+    b3r_push();
+    if (!g_traffic_lists[car]) {
+        /* No display list for this body.  carcol_pass() adds a towed trailer
+         * on g_traffic_hull_ok[] alone, so returning silently here made the
+         * trailer COLLIDABLE AND INVISIBLE -- the tractor's own draw has had
+         * a box fallback all along, the trailer's did not.  Anything the
+         * solver can hit gets drawn. */
+        b3r_translate(org[0], org[1], org[2]);
+        B3R_BATCH_PUSH();
+        {   /* the state this site INHERITS, measured at the site with a
+             * glGet probe under B3_FORCE_BOX: texture off, no blend, no
+             * alpha test, depth test + write on with the world's LEQUAL,
+             * cull on (GL_BACK / GL_CCW).  The object transform stays on
+             * the matrix stack -- the batcher transforms with ftransform(),
+             * so a pushed matrix still applies and nothing is rewritten. */
+            B3RState st = B3R_BATCH_WORLD_OPAQUE;
+            b3r_batch_state(&st);
+            b3r2d_color(0.75f, 0.75f, 0.78f, 1.0f);
+            b3r2d_prim(B3R2D_QUADS);
+            b3r2d_vertex3(-1.2f, 0.0f, 6.0f);
+            b3r2d_vertex3(1.2f, 0.0f, 6.0f);
+            b3r2d_vertex3(1.2f, 0.0f, -6.0f);
+            b3r2d_vertex3(-1.2f, 0.0f, -6.0f);
+            b3r2d_vertex3(-1.2f, 3.4f, 6.0f);
+            b3r2d_vertex3(1.2f, 3.4f, 6.0f);
+            b3r2d_vertex3(1.2f, 3.4f, -6.0f);
+            b3r2d_vertex3(-1.2f, 3.4f, -6.0f);
+            b3r2d_prim_end();
+        }
+        B3R_BATCH_POP();
+        b3r_pop();
+        return;
+    }
     float M[16] = {
         R9[0], R9[3], R9[6], 0,
         R9[1], R9[4], R9[7], 0,
         R9[2], R9[5], R9[8], 0,
         org[0], org[1], org[2], 1,
     };
-    glMultMatrixf(M);
-    glCallList(g_traffic_lists[car]);
+    b3r_mult(M);
+    car_mesh_draw(g_traffic_lists[car]);
     if (g_traffic_wheel_lists[car]) {
         for (int w = 0; w < g_traffic_wheel_count[car]; w++) {
-            glPushMatrix();
-            glTranslatef(g_traffic_wheel_pos[car][w][0],
+            b3r_push();
+            b3r_translate(g_traffic_wheel_pos[car][w][0],
                          g_traffic_wheel_pos[car][w][1],
                          g_traffic_wheel_pos[car][w][2]);
             if (g_traffic_wheel_mirror[car][w] < 0)
-                glRotatef(180.0f, 0, 1, 0);
-            glRotatef(spin_deg * (g_traffic_wheel_mirror[car][w] < 0
+                b3r_rotate(180.0f, 0, 1, 0);
+            b3r_rotate(spin_deg * (g_traffic_wheel_mirror[car][w] < 0
                                   ? 1.0f : -1.0f), 1, 0, 0);
-            glCallList(g_traffic_wheel_lists[car]);
-            glPopMatrix();
+            car_mesh_draw(g_traffic_wheel_lists[car]);
+            b3r_pop();
         }
     }
-    glPopMatrix();
+    b3r_pop();
 }
 
 // Towed trailers: their own pose, drawn after the tractors.
@@ -7660,7 +14490,7 @@ static void traffic_render(void) {
     for (int i = 0; i < g_traffic_n; i++) {
         const TrafficCar* t = &g_traffic[i];
         if (!t->active) continue;
-        glPushMatrix();
+        b3r_push();
         if (g_traffic_lists[t->car]) {
             float org[3], R9[9];
             traffic_pose(t, org, R9);
@@ -7672,8 +14502,8 @@ static void traffic_render(void) {
                 R9[2], R9[5], R9[8], 0,
                 org[0], org[1], org[2], 1,
             };
-            glMultMatrixf(M);
-            glCallList(g_traffic_lists[t->car]);
+            b3r_mult(M);
+            car_mesh_draw(g_traffic_lists[t->car]);
             if (g_traffic_wheel_lists[t->car]) {
                 // Spin from actual travelled distance (parked/crashed cars
                 // do not move, so their wheels hold still for free).
@@ -7686,37 +14516,42 @@ static void traffic_render(void) {
                     g_traffic_spin[i] -= 6.2831853f;
                 float spin_deg = g_traffic_spin[i] * RAD_TO_DEG;
                 for (int w = 0; w < g_traffic_wheel_count[t->car]; w++) {
-                    glPushMatrix();
-                    glTranslatef(g_traffic_wheel_pos[t->car][w][0],
+                    b3r_push();
+                    b3r_translate(g_traffic_wheel_pos[t->car][w][0],
                                  g_traffic_wheel_pos[t->car][w][1],
                                  g_traffic_wheel_pos[t->car][w][2]);
                     if (g_traffic_wheel_mirror[t->car][w] < 0)
-                        glRotatef(180.0f, 0, 1, 0);
-                    glRotatef(spin_deg
+                        b3r_rotate(180.0f, 0, 1, 0);
+                    b3r_rotate(spin_deg
                               * (g_traffic_wheel_mirror[t->car][w] < 0
                                  ? 1.0f : -1.0f), 1, 0, 0);
-                    glCallList(g_traffic_wheel_lists[t->car]);
-                    glPopMatrix();
+                    car_mesh_draw(g_traffic_wheel_lists[t->car]);
+                    b3r_pop();
                 }
             }
             g_traffic_prev[i] = t->pos;
         } else {
-            glTranslatef(t->pos.x, t->pos.y, t->pos.z);
-            glRotatef(t->yaw * RAD_TO_DEG, 0, 1, 0);
-            glDisable(GL_TEXTURE_2D);
-            glColor3f(0.75f, 0.75f, 0.78f);   // box fallback
-            glBegin(GL_QUADS);
-            glVertex3f(-0.9f, 0.0f, 1.8f);
-            glVertex3f(0.9f, 0.0f, 1.8f);
-            glVertex3f(0.9f, 0.0f, -1.8f);
-            glVertex3f(-0.9f, 0.0f, -1.8f);
-            glVertex3f(-0.7f, 0.8f, 0.9f);
-            glVertex3f(0.7f, 0.8f, 0.9f);
-            glVertex3f(0.7f, 0.8f, -0.9f);
-            glVertex3f(-0.7f, 0.8f, -0.9f);
-            glEnd();
+            b3r_translate(t->pos.x, t->pos.y, t->pos.z);
+            b3r_rotate(t->yaw * RAD_TO_DEG, 0, 1, 0);
+            B3R_BATCH_PUSH();
+            {   /* same inherited world state as the trailer box above */
+                B3RState st = B3R_BATCH_WORLD_OPAQUE;
+                b3r_batch_state(&st);
+                b3r2d_color(0.75f, 0.75f, 0.78f, 1.0f);
+                b3r2d_prim(B3R2D_QUADS);
+                b3r2d_vertex3(-0.9f, 0.0f, 1.8f);
+                b3r2d_vertex3(0.9f, 0.0f, 1.8f);
+                b3r2d_vertex3(0.9f, 0.0f, -1.8f);
+                b3r2d_vertex3(-0.9f, 0.0f, -1.8f);
+                b3r2d_vertex3(-0.7f, 0.8f, 0.9f);
+                b3r2d_vertex3(0.7f, 0.8f, 0.9f);
+                b3r2d_vertex3(0.7f, 0.8f, -0.9f);
+                b3r2d_vertex3(-0.7f, 0.8f, -0.9f);
+                b3r2d_prim_end();
+            }
+            B3R_BATCH_POP();
         }
-        glPopMatrix();
+        b3r_pop();
     }
 
     // CARFX: traffic light coronas. Head and tail are on permanently, the
@@ -7738,7 +14573,7 @@ static void traffic_render(void) {
     b3_carfx_corona_pass_end();
 }
 
-// Find the per-car VDB override entry (burnout3_car_physics.h, extracted from
+// Find the per-car VDB override entry (build/cars/car_physics.bin, from
 // the retail Data/vdb.xml by tools/extract_car_vdb.py) for a roster vehicle.
 static const B3CarPhysics* car_vdb_lookup(const VehicleInfo* info) {
     if (!info) return NULL;
@@ -7829,7 +14664,7 @@ static void init_vehicles(void) {
     }
 
     printf("[Burnout3] Grid of %d cars from a roster of %d real vehicles\n"
-           "           (per-car physics from Data/vdb.xml via burnout3_car_physics.h):\n",
+           "           (per-car physics from Data/vdb.xml via build/cars/car_physics.bin):\n",
            g_num_vehicles, VEHICLE_COUNT);
     for (int i = 0; i < g_num_vehicles; i++) {
         const Vehicle* v = &g_vehicles[i];
@@ -7850,16 +14685,15 @@ static void init_vehicles(void) {
 // ============================================================
 
 // Real audio extracted from the game (tools/extract_awd.py / extract_rws.py):
-// rpm-labelled engine loops from the player's car's own AWD bank, and the
-// front-end music stream. Only the mixing below is harness code.
+// rpm-labelled engine loops from the player's car's own AWD bank. Only the
+// mixing below is harness code. (The front-end music stream moved to
+// src/burnout3_music.c; this file's own g_music* mixer state went with it.)
+#include <dirent.h>     /* load_engine_bank() reads the car's own bank */
+
 typedef struct { Sint16* pcm; Uint32 frames; int rate; float rpm; } EngineLoop;
 static EngineLoop g_eng[8];
 static int g_eng_n = 0;
 static double g_eng_phase = 0.0;
-static Sint16* g_music = NULL;
-static Uint32 g_music_frames = 0;
-static double g_music_pos = 0.0;
-static int g_music_rate = 44100, g_music_ch = 2;
 
 static int load_wav_s16(const char* path, Sint16** pcm, Uint32* frames,
                         int* rate, int* channels) {
@@ -7878,35 +14712,221 @@ static int load_wav_s16(const char* path, Sint16** pcm, Uint32* frames,
     return 0;
 }
 
-static void load_real_audio(void) {
-    const VehicleInfo* info = g_player.info;
-    if (info) {
-        char base[32], path[160];
-        snprintf(base, sizeof(base), "%s", info->file);
-        char* dot = strrchr(base, '.');
-        if (dot) *dot = '\0';
-        // The rpm labels the loops ship with (see docs/AUDIO_NOTES.md).
-        static const int rpms[] = {2873, 4317, 5279, 6234};
-        for (int i = 0; i < 4 && g_eng_n < 8; i++) {
-            snprintf(path, sizeof(path),
-                     "build/audio/awd_pveh_%s_%s_high/eng_%d.wav",
-                     info->class_code, base, rpms[i]);
-            EngineLoop* L = &g_eng[g_eng_n];
-            int ch;
+/* THE RPM LABELS ARE THE CAR'S OWN, and they are READ OFF THE BANK.
+ *
+ * They used to be four compiled-in integers -- {2873, 4317, 5279, 6234} --
+ * lifted from the ONE example docs/AUDIO_NOTES.md §2 spells out,
+ * `awd_pveh_COMP_Car1_high/eng_2873.wav`.  The doc states a PATTERN there,
+ * `eng_<rpm>` / `ex_<rpm>` (exhaust) / `gear______11`, and the rpm in the name
+ * is retail's own: both extractors copy the wave's `name` field out of the AWD
+ * record verbatim (tools/cextract/cx_audio_awd.c:149, the archived
+ * tools/py_extract_archive/extract_awd.py:146).  Nothing about the four
+ * numbers generalises.
+ *
+ * MEASURED over the 67 shipped `_high` banks: only NINE carry that rpm set.
+ * There are 79 distinct labels across the fleet -- COMP_Car2 is
+ * {2489, 4487, 5483, 6475}, HEVY_Car1 is {1473, 2453, 3437, 4421} -- so
+ * picking any other car scored four misses and ran on the synthesized note.
+ *
+ * So the bank is SCANNED.  Two passes, and the split is the doc's own
+ * vocabulary rather than a guess:
+ *
+ *   1. `eng_<digits>`, with a bank-local prefix allowed -- the documented
+ *      engine-loop name.  COMP_Car4 and COMP_Car9 label theirs `c9_eng_<rpm>`,
+ *      which is the same stem behind a prefix.  65 of the 67 banks: 60 carry
+ *      four loops, 5 carry three.
+ *   2. Only if pass 1 found NOTHING: any other `<letters><digits>` wave that
+ *      is not one of the documented non-rpm families (gear/dump/turbine/
+ *      reverse) and whose letters do not end in `x`.  This is the last two
+ *      banks, MSCL_Car1 and MSCL_Car6, which name their set `mtr<rpm>` /
+ *      `m6r<rpm>` against exhausts `mtx<rpm>` / `m6x<rpm>` -- `x` for the
+ *      `ex_` the doc names as the exhaust.  [?] The r/x reading is INFERENCE
+ *      from those two banks, not a recovered table; it is fenced behind
+ *      "pass 1 found nothing" so it can never touch the other 65.
+ *
+ * The DIRECTORY is resolved before it is opened.  opendir() is not one of the
+ * four entry points src/burnout3_isoshim.h takes over, so the scan asks
+ * b3_iso_resolve() for the bank itself: in iso mode that materialises the awd
+ * stage (which b3_sfx's own banks already trigger, so it is not a new cost)
+ * and hands back the cache's copy; in build mode it hands back the argument.
+ * MAIN THREAD ONLY, which this is -- load_real_audio() runs from audio_init()
+ * during the loading screen, before the device is opened. */
+static int eng_stem_rpm(const char* stem, int* alpha_len) {
+    size_t n = strlen(stem), d = n;
+    while (d > 0 && stem[d - 1] >= '0' && stem[d - 1] <= '9') d--;
+    if (d == n || d == 0 || n - d > 6) return -1;   /* no digits, or all of them */
+    *alpha_len = (int)d;
+    return atoi(stem + d);
+}
+
+static int eng_wave_wanted(const char* stem, int pass, int alpha_len) {
+    static const char* const NOT_RPM[] = { "gear", "dump", "turbine",
+                                           "reverse", NULL };
+    int i;
+    if (pass == 1) {
+        /* "eng_" immediately before the digits, at the stem's head or behind
+         * a bank-local prefix. */
+        return alpha_len >= 4 && memcmp(stem + alpha_len - 4, "eng_", 4) == 0;
+    }
+    for (i = 0; NOT_RPM[i]; i++)
+        if (strncmp(stem, NOT_RPM[i], strlen(NOT_RPM[i])) == 0) return 0;
+    if (alpha_len >= 3 && memcmp(stem + alpha_len - 3, "ex_", 3) == 0) return 0;
+    return stem[alpha_len - 1] != 'x';
+}
+
+static void load_engine_bank(const char* rel_dir) {
+    const char* dir = b3_iso_resolve(rel_dir);   /* materialises, then names it */
+    char real[320];
+    int pass;
+
+    snprintf(real, sizeof real, "%s", dir);      /* resolve's ring is short-lived */
+    for (pass = 1; pass <= 2 && g_eng_n == 0; pass++) {
+        DIR* d = opendir(real);
+        struct dirent* e;
+        if (!d) return;
+        while ((e = readdir(d)) != NULL && g_eng_n < 8) {
+            char stem[128], path[512];
+            EngineLoop* L;
+            int alpha_len = 0, rpm, ch;
+            size_t n = strlen(e->d_name);
+            if (n < 5 || n - 4 >= sizeof stem
+                || strcmp(e->d_name + n - 4, ".wav") != 0) continue;
+            memcpy(stem, e->d_name, n - 4);
+            stem[n - 4] = '\0';
+            rpm = eng_stem_rpm(stem, &alpha_len);
+            if (rpm <= 0 || !eng_wave_wanted(stem, pass, alpha_len)) continue;
+            snprintf(path, sizeof path, "%s/%s", real, e->d_name);
+            L = &g_eng[g_eng_n];
+            /* Already a real path: load_wav_s16's SDL_LoadWAV would resolve it
+             * again, which is a no-op on anything that is not "build/...". */
             if (load_wav_s16(path, &L->pcm, &L->frames, &L->rate, &ch) == 0
                 && ch == 1 && L->frames > 0) {
-                L->rpm = (float)rpms[i];
+                L->rpm = (float)rpm;
                 g_eng_n++;
             }
         }
+        closedir(d);
+    }
+    /* readdir order is the filesystem's; the mixer picks the nearest loop in
+     * log-rpm and does not care, but the boot line reads as a ladder. */
+    for (int i = 1; i < g_eng_n; i++)
+        for (int j = i; j > 0 && g_eng[j - 1].rpm > g_eng[j].rpm; j--) {
+            EngineLoop t = g_eng[j - 1];
+            g_eng[j - 1] = g_eng[j];
+            g_eng[j] = t;
+        }
+}
+
+static void load_real_audio(void) {
+    const VehicleInfo* info = g_player.info;
+    char dir[192];
+
+    dir[0] = '\0';
+    if (info) {
+        char base[32];
+        snprintf(base, sizeof(base), "%s", info->file);
+        char* dot = strrchr(base, '.');
+        if (dot) *dot = '\0';
+        snprintf(dir, sizeof(dir), "build/audio/awd_pveh_%s_%s_high",
+                 info->class_code, base);
+        load_engine_bank(dir);
     }
     int mus = b3_music_init();          /* MUSIC: scans build/music */
     printf("[Burnout3] REAL audio: %d engine loops, EA TRAX %d/44 tracks\n",
            g_eng_n, mus);
+    /* WHICH labels, out of WHICH bank.  "0 engine loops" survived for as long
+     * as it did because the line above never said what it had looked for. */
+    if (dir[0]) {
+        printf("           engine bank %s:", dir + sizeof "build/audio/" - 1);
+        if (!g_eng_n) printf(" NO rpm-labelled loops found");
+        for (int i = 0; i < g_eng_n; i++)
+            printf(" %.0f rpm @ %d Hz", g_eng[i].rpm, g_eng[i].rate);
+        printf("\n");
+    }
     /* Mix balance (GLUE, user-tuned): the SFX master default of 0.9 over
      * music's 0.30 drowned the soundtrack. */
     mixer_load();               /* build/mixer.cfg overrides defaults */
     mixer_apply();
+}
+
+/* ---- FRONTEND sounds: the retail awd_fe bank + the rws__femain menu
+ * stream.  Loaded on menu entry, mixed as plain voices in the master
+ * callback; every wave is converted to the device format (44.1k mono s16)
+ * through SDL_AudioCVT at load. ---- */
+enum { FE_CUE_VERTICAL, FE_CUE_GTURN, FE_CUE_ZOOM, FE_CUE_ZOOMOUT,
+       FE_CUE_SELECT, FE_CUE_BACK, FE_CUE_COUNT };
+static const char* FE_CUE_WAV[FE_CUE_COUNT] = {
+    "Vertical.wav", "GTurn.wav", "Zoom.wav", "Zoomout.wav",
+    "Select.wav", "Back.wav" };
+static struct { Sint16* pcm; Uint32 frames; } g_fe_wav[FE_CUE_COUNT];
+static struct { Sint16* pcm; Uint32 frames; } g_fe_music;
+static struct { int cue; Uint32 pos; int active; } g_fe_voice[4];
+static volatile int g_fe_music_on = 0;
+static Uint32 g_fe_music_pos = 0;
+static int g_fe_loaded = 0;
+
+static int fe_load_wav(const char* name, Sint16** out_pcm,
+                       Uint32* out_frames) {
+    char path[256];
+    snprintf(path, sizeof path, "build/audio/awd_fe/%s", name);
+    SDL_AudioSpec spec; Uint8* buf; Uint32 len;
+    if (!SDL_LoadWAV(path, &spec, &buf, &len)) {
+        snprintf(path, sizeof path, "build/audio/rws__femain/%s", name);
+        if (!SDL_LoadWAV(path, &spec, &buf, &len)) return 0;
+    }
+    SDL_AudioCVT cvt;
+    if (SDL_BuildAudioCVT(&cvt, spec.format, spec.channels, spec.freq,
+                          AUDIO_S16SYS, 1, 44100) < 0) {
+        SDL_FreeWAV(buf); return 0;
+    }
+    cvt.len = (int)len;
+    cvt.buf = malloc((size_t)cvt.len * cvt.len_mult);
+    if (!cvt.buf) { SDL_FreeWAV(buf); return 0; }
+    memcpy(cvt.buf, buf, len);
+    SDL_FreeWAV(buf);
+    if (cvt.needed && SDL_ConvertAudio(&cvt) < 0) { free(cvt.buf); return 0; }
+    *out_pcm = (Sint16*)cvt.buf;
+    *out_frames = (Uint32)(cvt.len_cvt / 2);
+    return 1;
+}
+
+static void fe_audio_load(void) {
+    if (g_fe_loaded) return;
+    g_fe_loaded = 1;
+    for (int i = 0; i < FE_CUE_COUNT; i++)
+        fe_load_wav(FE_CUE_WAV[i], &g_fe_wav[i].pcm, &g_fe_wav[i].frames);
+    fe_load_wav("zzfirst.wav", &g_fe_music.pcm, &g_fe_music.frames);
+}
+
+static void fe_play(int cue) {
+    if (cue < 0 || cue >= FE_CUE_COUNT || !g_fe_wav[cue].frames) return;
+    if (g_audio_dev) SDL_LockAudioDevice(g_audio_dev);
+    for (int v = 0; v < 4; v++)
+        if (!g_fe_voice[v].active) {
+            g_fe_voice[v].cue = cue;
+            g_fe_voice[v].pos = 0;
+            g_fe_voice[v].active = 1;
+            break;
+        }
+    if (g_audio_dev) SDL_UnlockAudioDevice(g_audio_dev);
+}
+
+static float fe_next_sample(void) {
+    float out = 0.0f;
+    for (int v = 0; v < 4; v++) {
+        if (!g_fe_voice[v].active) continue;
+        const int c = g_fe_voice[v].cue;
+        if (g_fe_voice[v].pos >= g_fe_wav[c].frames) {
+            g_fe_voice[v].active = 0;
+            continue;
+        }
+        out += g_fe_wav[c].pcm[g_fe_voice[v].pos++] * 0.8f;
+    }
+    if (g_fe_music_on && g_fe_music.frames) {
+        out += g_fe_music.pcm[g_fe_music_pos++] * 0.45f;
+        if (g_fe_music_pos >= g_fe_music.frames) g_fe_music_pos = 0;
+    }
+    return out;
 }
 
 static void audio_callback(void* userdata, Uint8* stream, int len) {
@@ -7922,6 +14942,12 @@ static void audio_callback(void* userdata, Uint8* stream, int len) {
     float rpm = b3_sfx_engine_rpm(g_player.sim.rpm);
     if (rpm < 900.0f) rpm = 900.0f;
 
+    /* SFX SLOW MOTION: the engine is an ordinary 3-D voice in retail, so it
+     * takes the same DAT_004A1EF0 playback-rate scale as every other
+     * non-exempt voice (FUN_001CAD10 @0x001CADC6).  Read once per callback
+     * from the same authority the event pool uses.                   [C] */
+    const double eng_ts = (double)b3_sfx_time_scale();
+
     // Nearest loop in log-rpm, pitch-shifted to the live engine speed.
     int best = -1;
     float bd = 1e9f;
@@ -7934,7 +14960,8 @@ static void audio_callback(void* userdata, Uint8* stream, int len) {
         float out = 0.0f;
         if (best >= 0) {
             EngineLoop* L = &g_eng[best];
-            g_eng_phase += (double)L->rate / 44100.0 * (rpm / L->rpm);
+            g_eng_phase += (double)L->rate / 44100.0 * (rpm / L->rpm)
+                         * eng_ts;
             while (g_eng_phase >= L->frames) g_eng_phase -= L->frames;
             Uint32 i0 = (Uint32)g_eng_phase;
             Uint32 i1 = (i0 + 1 < L->frames) ? i0 + 1 : 0;
@@ -7947,15 +14974,18 @@ static void audio_callback(void* userdata, Uint8* stream, int len) {
         }
         out += b3_music_next_sample(); /* MUSIC: the EA TRAX stream */
         out += b3_sfx_next_sample();   /* SFX: event voices */
+        out += fe_next_sample();       /* FRONTEND: menu cues + femain */
         if (out > 32767.0f) out = 32767.0f;
         if (out < -32768.0f) out = -32768.0f;
         s[i] = (Sint16)out;
     }
 }
 
-static void audio_init(void) {
-    load_real_audio();
-    b3_sfx_init();                 /* SFX: crash/slam/boost event waves */
+/* Device-open alone, idempotent: the menu needs a live device before the
+ * per-car engine loops or the sfx banks exist, and the callback tolerates
+ * all-empty state (every source returns 0). */
+static void audio_device_open(void) {
+    if (g_audio_dev) return;
     SDL_AudioSpec spec;
     SDL_zero(spec);   // was uninitialised; SDL reads padding/userdata from it
     spec.freq = 44100;
@@ -7963,12 +14993,18 @@ static void audio_init(void) {
     spec.channels = 1;
     spec.samples = 1024;
     spec.callback = audio_callback;
-    
+
     g_audio_dev = SDL_OpenAudioDevice(NULL, 0, &spec, NULL, 0);
     if (g_audio_dev) {
         SDL_PauseAudioDevice(g_audio_dev, 0);
         printf("[Burnout3] Audio initialized\n");
     }
+}
+
+static void audio_init(void) {
+    load_real_audio();
+    b3_sfx_init();                 /* SFX: crash/slam/boost event waves */
+    audio_device_open();
 }
 
 // ============================================================
@@ -7982,44 +15018,19 @@ static void render_init(int w, int h) {
     glDepthFunc(GL_LEQUAL);
     // Fixed-function lighting stays off: the track uses the game's textures
     // (lighting there is baked into them), and nothing here submits normals.
-    glDisable(GL_LIGHTING);
 }
 
-// Axis-aligned HUD rectangle in NDC; caller wraps in glBegin(GL_QUADS).
-static void hud_rect(float x, float y, float w, float h) {
-    glVertex2f(x, y);
-    glVertex2f(x + w, y);
-    glVertex2f(x + w, y + h);
-    glVertex2f(x, y + h);
-}
-
-// Seven-segment digit at (x,y), segment length s. Segments A..G bit 6..0.
-static void hud_digit(float x, float y, float s, int d) {
-    static const unsigned char seg[10] = {
-        0x7E, 0x30, 0x6D, 0x79, 0x33, 0x5B, 0x5F, 0x70, 0x7F, 0x7B };
-    float t = s * 0.28f;   // segment thickness
-    unsigned char m = seg[d % 10];
-    glBegin(GL_QUADS);
-    if (m & 0x40) hud_rect(x, y + 2*s, s, t);              // A top
-    if (m & 0x20) hud_rect(x + s - t, y + s, t, s);        // B top-right
-    if (m & 0x10) hud_rect(x + s - t, y, t, s);            // C bottom-right
-    if (m & 0x08) hud_rect(x, y, s, t);                    // D bottom
-    if (m & 0x04) hud_rect(x, y, t, s);                    // E bottom-left
-    if (m & 0x02) hud_rect(x, y + s, t, s);                // F top-left
-    if (m & 0x01) hud_rect(x, y + s, s, t);                // G middle
-    glEnd();
-}
-
-// Right-aligned n-digit number; leading zeros blanked (except last digit).
-static void hud_number(float x, float y, float s, int value, int digits) {
-    float adv = s * 1.35f;
-    for (int i = digits - 1; i >= 0; i--) {
-        int div = 1;
-        for (int k = 0; k < i; k++) div *= 10;
-        int d = (value / div) % 10;
-        if (value >= div || i == 0)
-            hud_digit(x + (digits - 1 - i) * adv, y, s, d);
-    }
+/* RETAINED: hand the retained path the same camera the fixed-function stack
+ * just took, INCLUDING the display mirror.  glScalef(-1,1,1) post-multiplies
+ * the projection, i.e. it negates its first COLUMN (indices 0..3 of the
+ * column-major float[16] glLoadMatrixf consumes), so the retained MVP is
+ * proj * mirror * view and no glGetFloatv(GL_MODELVIEW_MATRIX) readback is
+ * needed anywhere downstream. */
+static void b3_retained_camera(const Mat4* proj, const Mat4* view) {
+    float p[16];
+    memcpy(p, proj->m, sizeof p);
+    for (int k = 0; k < 4; k++) p[k] = -p[k];
+    b3r_set_camera(p, (const float*)view->m);
 }
 
 static void render_frame(void) {
@@ -8030,8 +15041,35 @@ static void render_frame(void) {
     // the viewport was the only fixed piece).
     glViewport(0, 0, w, h);
 
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    
+    // AFTEREFFECTS hook 1 of 3 (src/burnout3_aftereffects.c): put the scene in
+    // a texture-backed FBO so the effects chain has something to read without
+    // ever copying the canvas. Returns 0 when the chain is unavailable, in
+    // which case the frame goes straight to the back buffer and the older
+    // b3_postfx_blur / b3_postfx_gamma path runs instead -- so this is a pure
+    // addition, and every hook below is guarded on the same flag.
+    g_afx_on = b3_afx_frame_begin(w, h);
+    {   /* One line, once: which post path this build actually took. Worth
+         * keeping -- the chain degrades to the old path silently when it
+         * cannot build, and a platform quietly losing all its effects is
+         * exactly the failure this line exists to make visible. */
+        static int said = 0;
+        if (!said) {
+            said = 1;
+            /* On stdout and unconditional. A user who says "I see no blur"
+             * has already produced the answer by running the game in a
+             * terminal: this line names the path AND, when the chain
+             * declined, the exact stage that declined it. */
+            const char* why = b3_afx_status();
+            printf("[Burnout3] postfx path: %s (%dx%d)%s%s\n",
+                   g_afx_on ? "aftereffects chain" : "legacy postfx", w, h,
+                   (g_afx_on || !why) ? "" : " -- aftereffects unavailable: ",
+                   (g_afx_on || !why) ? "" : why);
+            fflush(stdout);
+        }
+    }
+    if (!g_afx_on)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
     // Chase camera: sits behind the car along its heading, smoothed so wall
     // impacts and drift snaps do not jerk the view.
     float hy = g_player.rot.y;
@@ -8156,11 +15194,12 @@ static void render_frame(void) {
         cam_target = vec3_add(look, (Vec3){0, 0.6f, 0});
         Mat4 view_a = mat4_lookat(cam_pos, cam_target, (Vec3){0, 1, 0});
         Mat4 proj_a = mat4_perspective(60.0f * DEG_TO_RAD,
-                                       (float)w / (float)h, 0.1f, 5000.0f);
-        glMatrixMode(GL_PROJECTION);
-        glLoadMatrixf((float*)proj_a.m);
-        glMatrixMode(GL_MODELVIEW);
-        glLoadMatrixf((float*)view_a.m);
+                                       (float)w / (float)h,
+                                       b3_view_near(), b3_view_far());
+        b3r_matrix_mode(B3R_MAT_PROJECTION);
+        b3r_load((float*)proj_a.m);
+        b3r_matrix_mode(B3R_MAT_MODELVIEW);
+        b3r_load((float*)view_a.m);
     }
 
     // Debug: B3_CAMSIDE=1 parks the camera broadside of the player car
@@ -8174,13 +15213,14 @@ static void render_frame(void) {
         cam_target = vec3_add(g_player.pos, (Vec3){0, 0.6f, 0});
         Mat4 view_s = mat4_lookat(cam_pos, cam_target, (Vec3){0, 1, 0});
         Mat4 proj_s = mat4_perspective(45.0f * DEG_TO_RAD, (float)w / (float)h,
-                                       0.1f, 5000.0f);
-        glMatrixMode(GL_PROJECTION);
-        glLoadMatrixf((float*)proj_s.m);
-        glScalef(-1.0f, 1.0f, 1.0f);   // display mirror (see main path)
+                                       b3_view_near(), b3_view_far());
+        b3r_matrix_mode(B3R_MAT_PROJECTION);
+        b3r_load((float*)proj_s.m);
+        b3r_scale(-1.0f, 1.0f, 1.0f);   // display mirror (see main path)
         glFrontFace(GL_CCW);
-        glMatrixMode(GL_MODELVIEW);
-        glLoadMatrixf((float*)view_s.m);
+        b3r_matrix_mode(B3R_MAT_MODELVIEW);
+        b3r_load((float*)view_s.m);
+        b3_retained_camera(&proj_s, &view_s);
         goto cam_done;
     }
     // Debug: B3_CAM="ex,ey,ez,tx,ty,tz" pins the camera for verification shots.
@@ -8195,8 +15235,26 @@ static void render_frame(void) {
     }
     {
         Mat4 view = mat4_lookat(cam_pos, cam_target, (Vec3){0, 1, 0});
-        Mat4 proj = mat4_perspective(g_cam_fov_deg * DEG_TO_RAD, (float)w / (float)h, 0.1f, 5000.0f);
+        Mat4 proj = mat4_perspective(g_cam_fov_deg * DEG_TO_RAD,
+                                     (float)w / (float)h,
+                                     b3_view_near(), b3_view_far());
         g_cam_view = view;   // saved for HUD-space projections (opponent tags)
+        /* THE ON-CAMERA HALF of vehicle+0x1550.  FUN_00105BD0 only counts a
+         * player whose stored view volume contains the car: FUN_001AD4A0
+         * walks the viewport ring and FUN_0019D7F0 tests the point against
+         * FOUR planes using x and z ONLY (`a*x + c*z - d >= 0`), returning
+         * -1 -> vehicle+0x216 = 0xFF -> FUN_00105FC0 returns with the
+         * in-range byte untouched.  The harness has one camera, so the AI
+         * stage gets its eye and horizontal half-angle and runs the same 2-D
+         * test.  The RADII this gates are [C]; this substitute for retail's
+         * stored plane set is [S].  Consumer: rubberband_world_build. */
+        g_oncam_eye = cam_pos;
+        {
+            float ha = atanf(tanf(0.5f * g_cam_fov_deg * DEG_TO_RAD)
+                             * ((float)w / (float)h));
+            g_oncam_cos = cosf(ha);
+        }
+        g_oncam_ready = 1;
         /* CRASH-CINEMA: the aftertouch direction basis.  Retail takes
          * rows 0/2 of the camera orientation (veh+0x1410, unpacked at
          * 0x00118A24) and flattens y; the harness derives the same two
@@ -8214,46 +15272,55 @@ static void render_frame(void) {
             }
         }
         g_cam_proj = proj;
-        glMatrixMode(GL_PROJECTION);
-        glLoadMatrixf((float*)proj.m);
+        b3r_matrix_mode(B3R_MAT_PROJECTION);
+        b3r_load((float*)proj.m);
         // HANDEDNESS: the GL world is the Z-mirror of the game world
         // (RE_NOTES 12), so the raw render is the horizontal MIRROR of
         // retail (proven against the xemu references: signage reads
         // backwards, building layout swapped). Flip the final image in the
         // projection; winding flips with it, so the scene renders CCW-front
         // (restored to CW before the HUD, whose quads are CW-wound).
-        glScalef(-1.0f, 1.0f, 1.0f);
+        b3r_scale(-1.0f, 1.0f, 1.0f);
         glFrontFace(GL_CCW);
-        glMatrixMode(GL_MODELVIEW);
-        glLoadMatrixf((float*)view.m);
+        b3r_matrix_mode(B3R_MAT_MODELVIEW);
+        b3r_load((float*)view.m);
+        b3_retained_camera(&proj, &view);
     }
 cam_done:;
     /* POSTFX: the sky dome draws first, before any world geometry, with
      * depth writes off (FUN_00032580 / FUN_000323D0 [C]); centred on the
      * camera, scaled by far_clip - 1000. progress picks the gradient-LUT
      * column ([S] identity; track progress is the harness stand-in). */
+    B3_ZONE(B3_ZONE_SKY);
     {
         float eye[3] = { cam_pos.x, cam_pos.y, cam_pos.z };
-        b3_postfx_sky_draw(eye, 5000.0f, g_player.track_progress);
+        b3_postfx_sky_draw(eye, b3_view_far(), g_player.track_progress);
     }
+    B3_ZONE(B3_ZONE_NONE);
     
     // Draw ground plane (only when the real track is absent; the real mesh has
     // its own ground and a river below road level).
     if (!g_have_real_track) {
-        glColor3f(0.2f, 0.5f, 0.2f);
-        glBegin(GL_TRIANGLES);
-        for (int i = 0; i < g_ground_mesh.num_faces; i++) {
-            for (int j = 0; j < 3; j++) {
-                Vec3 v = g_ground_mesh.verts[g_ground_mesh.indices[i * 3 + j]];
-                glVertex3f(v.x, v.y, v.z);
+        B3R_BATCH_PUSH();
+        {   /* world space, so no model matrix; same inherited opaque state */
+            B3RState st = B3R_BATCH_WORLD_OPAQUE;
+            b3r_batch_state(&st);
+            b3r2d_color(0.2f, 0.5f, 0.2f, 1.0f);
+            b3r2d_prim(B3R2D_TRIANGLES);
+            for (int i = 0; i < g_ground_mesh.num_faces; i++) {
+                for (int j = 0; j < 3; j++) {
+                    Vec3 v =
+                        g_ground_mesh.verts[g_ground_mesh.indices[i * 3 + j]];
+                    b3r2d_vertex3(v.x, v.y, v.z);
+                }
             }
+            b3r2d_prim_end();
         }
-        glEnd();
+        B3R_BATCH_POP();
     }
     
-    // Draw the real extracted track geometry when available (baked once into a
-    // display list by load_track_textures).
-    if (g_have_real_track && g_track_list) {
+    // The world, out of the retained renderer's static buffers.
+    if (g_have_real_track) {
         // STATIC-WORLD-2: the world fog. FUN_00038D10 enables D3DRS_FOGENABLE
         // before every world pass and the teardown FUN_00039140 disables it
         // again (@0x000391C5), so retail fogs the WORLD ONLY. The animated
@@ -8261,20 +15328,39 @@ cam_done:;
         // DAT_0060EA20, the same clock the vehicle step reads, so it is the
         // DILATED sim delta and the boards slow down with a takedown replay.
         trackmesh_tick(&g_real_track, g_delta_time);
-        trackmesh_fog_begin(&g_real_track);
-        glCallList(g_track_list);
-        trackmesh_draw_scroll(&g_real_track);
+        float shine_eye[3] = { cam_pos.x, cam_pos.y, cam_pos.z };
+        B3_ZONE(B3_ZONE_TRACK);
+        b3r_begin();
+        /* The fog the world setup programs as D3DRS_FOG* -- and the
+         * `min(|z_eye|, fog_far)` coordinate clamp that no fixed-function fog
+         * table can express -- are two uniforms on the world program.  Nothing
+         * is pushed, popped or enabled per pass any more. */
+        if (getenv("B3_TRACK_NOFOG")) b3r_fog(NULL, 0, 0);
+        else b3r_fog(&g_real_track.scene, 0, !getenv("B3_TRACK_NOFOGFLOOR"));
+        b3r_track_draw(&g_real_track);
+        b3r_track_draw_scroll(&g_real_track);
+        B3_ZONE(B3_ZONE_PROPS);
         /* PROPS: the cones/barrier boards/marker posts are world geometry
          * (static.dat +0x3C model table, +0x48 instance transforms), so they
          * are drawn inside the world pass -- retail fogs the world only. */
         b3_props_draw();
-        trackmesh_fog_end();
+        B3_ZONE(B3_ZONE_SCENERY);
+        /* SCENERY: the palms/hero trees/lamp posts/signage/benches/boats/
+         * parked vehicles out of static.dat's FIRST 0x70-record table
+         * (hdr +0x34 count / +0x38 table), which no extractor read until now.
+         * The world mesh was drawing WF_Palm_shadow decals with no palm above
+         * them -- user capture build/debug_dump_082.bmp.  World geometry, so
+         * it is fogged with the world exactly as the props pass is.
+         * tools/cextract/cx_scenery.c bakes build/tracks/<ID>/scenery.bin. */
+        b3_scenery_draw(shine_eye);
+        B3_ZONE(B3_ZONE_TRACK);
         // TRACK-BLEND: the class-1/7/10 additive term of the world shader,
-        // tex.a * gate * pow(max(R.V,0), power) * light * strength. It is view
-        // dependent, so it cannot be baked into the display list. See
-        // trackmesh_draw_shine() for the recovered equation and its citations.
-        float shine_eye[3] = { cam_pos.x, cam_pos.y, cam_pos.z };
-        trackmesh_draw_shine(&g_real_track, shine_eye, NULL);
+        // tex.a * gate * pow(max(R.V,0), power) * light * strength.  It is view
+        // dependent, so its colour half is the one buffer this renderer
+        // rewrites per frame; see b3r_track_draw_shine().
+        b3r_track_draw_shine(&g_real_track, shine_eye, NULL);
+        b3r_end();
+        B3_ZONE(B3_ZONE_CARS);   /* everything up to the particle pass */
     }
 
     // B3_DEBUGWALLS=1: draw the collision polylines over the world so wall
@@ -8282,44 +15368,67 @@ cam_done:;
     static int dbgwalls = -1;
     if (dbgwalls < 0) dbgwalls = getenv("B3_DEBUGWALLS") != NULL;
     if (dbgwalls) {
-        glDisable(GL_TEXTURE_2D);
+        /* The three collision polylines, through the batcher's LINE_LOOP kind
+         * -- which exists for exactly this: leaving one glBegin in the tree
+         * for a diagnostic is how a "there is one renderer" claim stops being
+         * true.  glLineWidth is core GL, not compatibility, so it stays. */
+        static const float dw[3][3] = {
+            { 1.00f, 0.15f, 0.15f },   /* wall A */
+            { 0.15f, 0.40f, 1.00f },   /* wall B */
+            { 0.20f, 1.00f, 0.30f },   /* centre line */
+        };
+        const float (*const src[3])[3] = { g_wa, g_wb, g_cl };
         glLineWidth(3.0f);
-        glColor3f(1.0f, 0.15f, 0.15f);
-        glBegin(GL_LINE_LOOP);
-        for (int i = 0; i < B3_WALL_A_COUNT; i++)
-            glVertex3f(g_wa[i][0], g_wa[i][1] + 0.4f, g_wa[i][2]);
-        glEnd();
-        glColor3f(0.15f, 0.4f, 1.0f);
-        glBegin(GL_LINE_LOOP);
-        for (int i = 0; i < B3_WALL_B_COUNT; i++)
-            glVertex3f(g_wb[i][0], g_wb[i][1] + 0.4f, g_wb[i][2]);
-        glEnd();
-        glColor3f(0.2f, 1.0f, 0.3f);
-        glBegin(GL_LINE_LOOP);
-        for (int i = 0; i < B3_WALL_A_COUNT; i++)
-            glVertex3f(g_cl[i][0], g_cl[i][1] + 0.4f, g_cl[i][2]);
-        glEnd();
+        b3r2d_begin();
+        {   B3RState st;
+            st.tex = 0; st.mode = B3R_TEX_NONE;
+            st.blend = B3R_BLEND_NONE;
+            st.alpha_ref = -1.0f;
+            st.depth_mask = 1; st.depth_test = 1;
+            st.depth_func = GL_LEQUAL; st.cull = 0;
+            b3r_batch_state(&st);
+        }
+        for (int k = 0; k < 3; k++) {
+            b3r2d_color(dw[k][0], dw[k][1], dw[k][2], 1.0f);
+            b3r2d_prim(B3R2D_LINE_LOOP);
+            for (int i = 0; i < g_route_n; i++)
+                b3r2d_vertex3(src[k][i][0], src[k][i][1] + 0.4f,
+                              src[k][i][2]);
+            b3r2d_prim_end();
+        }
+        b3r2d_end();
         glLineWidth(1.0f);
     }
 
     // Draw placeholder road (only when no real geometry is loaded)
-    glColor3f(0.3f, 0.3f, 0.3f);
-    if (!g_have_real_track)
-    glBegin(GL_TRIANGLES);
-    for (int i = 0; i < (g_have_real_track ? 0 : g_road_mesh.num_faces); i++) {
-        for (int j = 0; j < 3; j++) {
-            Vec3 v = g_road_mesh.verts[g_road_mesh.indices[i * 3 + j]];
-            glVertex3f(v.x, v.y, v.z);
+    /* the glColor3f stays UNCONDITIONAL, exactly as it was: it is the current
+     * fixed-function colour the passes after this one inherit, and on the real
+     * track (where the loop below ran zero times) it is all this block ever
+     * did. */
+    if (!g_have_real_track) {
+        B3R_BATCH_PUSH();
+        {
+            B3RState st = B3R_BATCH_WORLD_OPAQUE;
+            b3r_batch_state(&st);
+            b3r2d_color(0.3f, 0.3f, 0.3f, 1.0f);
+            b3r2d_prim(B3R2D_TRIANGLES);
+            for (int i = 0; i < g_road_mesh.num_faces; i++) {
+                for (int j = 0; j < 3; j++) {
+                    Vec3 v = g_road_mesh.verts[g_road_mesh.indices[i * 3 + j]];
+                    b3r2d_vertex3(v.x, v.y, v.z);
+                }
+            }
+            b3r2d_prim_end();
         }
+        B3R_BATCH_POP();
     }
-    if (!g_have_real_track) glEnd();
     
     // Draw vehicles: real .bgv meshes where extracted, boxes otherwise.
     for (int i = 0; i < g_num_vehicles; i++) {
         Vehicle* v = &g_vehicles[i];
         if (!v->active) continue;
 
-        glPushMatrix();
+        b3r_push();
         if (g_car_lists[i]) {
             if (v->crashed_until > 0.0f && g_wrecks[i].active) {
                 // CRASH-EVENT (GLUE): the tumbling wreck draws with the
@@ -8333,7 +15442,7 @@ cam_done:;
                     -wk->frame[2][0], -wk->frame[2][1], -wk->frame[2][2], 0,
                     wk->frame[3][0],  wk->frame[3][1],  wk->frame[3][2], 1,
                 };
-                glMultMatrixf(M);
+                b3r_mult(M);
             } else if (v->fsim_ready) {
             // FULL POSE: the recovered pipeline's rigid body carries pitch
             // and roll (suspension over per-wheel ground rays); rendering
@@ -8348,12 +15457,12 @@ cam_done:;
                    -f[2][0], -f[2][1],  f[2][2], 0,
                     v->pos.x, v->pos.y - 0.5f - g_car_ymin[i], v->pos.z, 1,
                 };
-                glMultMatrixf(M);
+                b3r_mult(M);
             } else {
             // Rest the wheels on the road (pos.y sits 0.5 above the surface;
             // with wheel data, g_car_ymin = -wheel radius, hub at y = 0).
-            glTranslatef(v->pos.x, v->pos.y - 0.5f - g_car_ymin[i], v->pos.z);
-            glRotatef(-v->rot.y * RAD_TO_DEG, 0, 1, 0); // mesh nose = -Z after the
+            b3r_translate(v->pos.x, v->pos.y - 0.5f - g_car_ymin[i], v->pos.z);
+            b3r_rotate(-v->rot.y * RAD_TO_DEG, 0, 1, 0); // mesh nose = -Z after the
             // loader Z-flip (windshield/driver-position verified). The
             // yaw is NEGATED: heading fwd=(sin h,-cos h) vs glRotatef's
             // CCW-about-+Y mapping of -Z to (-sin h,-cos h) -- rendering
@@ -8417,19 +15526,19 @@ cam_done:;
                  * pivot translation is the whole transform.  z is negated
                  * because the mesh loader Z-flips every car mesh
                  * (RE_NOTES 12). */
-                glCallList(g_car_shell_lists[i]);
+                car_mesh_draw(g_car_shell_lists[i]);
                 for (int pk = 0; pk < g_car_panel_count[i]; pk++) {
                     if (!g_car_panel_lists[i][pk]) continue;
                     if (!b3_panel_attached(&g_panels[i], pk)) continue;
-                    glPushMatrix();
-                    glTranslatef(g_car_panel_pos[i][pk][0],
+                    b3r_push();
+                    b3r_translate(g_car_panel_pos[i][pk][0],
                                  g_car_panel_pos[i][pk][1],
                                  -g_car_panel_pos[i][pk][2]);
-                    glCallList(g_car_panel_lists[i][pk]);
-                    glPopMatrix();
+                    car_mesh_draw(g_car_panel_lists[i][pk]);
+                    b3r_pop();
                 }
             } else
-                glCallList(g_car_intact_lists[i] ? g_car_intact_lists[i]
+                car_mesh_draw(g_car_intact_lists[i] ? g_car_intact_lists[i]
                                                  : g_car_lists[i]);
             b3_carfx_body_end();
 
@@ -8437,17 +15546,60 @@ cam_done:;
             // Wrecked tint 0.6 is the execution-verified FUN_000300A0
             // shattered value; the intact pale-blue alpha is harness styling
             // (the game's glass shader isn't recovered).
-            if (g_car_glass_lists[i]) {
-                glEnable(GL_BLEND);
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                glDepthMask(GL_FALSE);
-                if (wrecked) glColor4f(0.35f, 0.40f, 0.45f, 0.60f);
-                else         glColor4f(0.55f, 0.65f, 0.75f, 0.38f);
-                b3_carfx_glass_begin(&fxp, wrecked ? 0.60f : 0.38f);
-                glCallList(g_car_glass_lists[i]);
-                b3_carfx_glass_end();
-                glDepthMask(GL_TRUE);
-                glDisable(GL_BLEND);
+            //
+            // CRASH-UV: and the PAGE moves with the tint.  FUN_000300A0 writes
+            // the damage tier into the record's own texture slot byte and its
+            // tint together -- 3 + 0.5 cracked (0x00030107 / 0x00030116), 4 +
+            // 0.6 shattered (0x000300E0 / 0x000300EF), 2 + the shipped tint on
+            // restore (0x000300B6 / 0x000300CB).  The harness already carried
+            // the 0.6; carrying only half the stamp left the recovered glass
+            // shader sampling the CAR PAINT page (or, before the texcoords
+            // were emitted, one frozen texel of it) where SmashedGlass should
+            // be.  That is the tier this harness models: intact or shattered.
+            {
+                int gslot = wrecked ? B3_BGV_TEX_GLASS_SMASHED
+                                    : B3_BGV_TEX_GLASS;
+                GLuint gpage = car_global_texture(gslot);
+                int any_glass = (g_car_glass_lists[i] != 0);
+                if (wrecked && !any_glass)
+                    for (int pk = 0; pk < g_car_panel_count[i]; pk++)
+                        if (g_car_panel_glass_lists[i][pk]) { any_glass = 1; break; }
+                if (any_glass) {
+                    glEnable(GL_BLEND);
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                    glDepthMask(GL_FALSE);
+                    if (gpage) {
+                        glBindTexture(GL_TEXTURE_2D, gpage);
+                    } else {
+                    }
+                    /* the glass TINT is the shader's, not the vertex colour's:
+                     * b3_carfx_glass_begin() takes the alpha and the two
+                     * recovered defs supply the rest (pass 1 ps c13 =
+                     * (0,0,0,tint)).  The glColor4f pair that used to stand
+                     * here was verified dead by experiment, not by reading:
+                     * restoring it reproduces the pinned frame BYTE FOR BYTE
+                     * (40812 px moved either way at frame 900). */
+                    b3_carfx_glass_begin(&fxp, wrecked ? 0.60f : 0.38f);
+                    if (g_car_glass_lists[i])
+                        car_mesh_draw(g_car_glass_lists[i]);
+                    /* CRASH-UV: the still-attached panels' own glass records,
+                     * under the same car matrix and the same pivot translation
+                     * their body half uses above. */
+                    if (wrecked)
+                        for (int pk = 0; pk < g_car_panel_count[i]; pk++) {
+                            if (!g_car_panel_glass_lists[i][pk]) continue;
+                            if (!b3_panel_attached(&g_panels[i], pk)) continue;
+                            b3r_push();
+                            b3r_translate(g_car_panel_pos[i][pk][0],
+                                         g_car_panel_pos[i][pk][1],
+                                         -g_car_panel_pos[i][pk][2]);
+                            car_mesh_draw(g_car_panel_glass_lists[i][pk]);
+                            b3r_pop();
+                        }
+                    b3_carfx_glass_end();
+                    glDepthMask(GL_TRUE);
+                    glDisable(GL_BLEND);
+                }
             }
 
             // Wheels: separate origin-centred .bgv meshes at the real attach
@@ -8475,46 +15627,53 @@ cam_done:;
                                   * v->steer;
                 float spin_deg = g_car_wheel_spin[i] * RAD_TO_DEG;
                 for (int w = 0; w < g_car_wheel_count[i]; w++) {
-                    glPushMatrix();
-                    glTranslatef(g_car_wheel_pos[i][w][0],
+                    b3r_push();
+                    b3r_translate(g_car_wheel_pos[i][w][0],
                                  g_car_wheel_pos[i][w][1],
                                  g_car_wheel_pos[i][w][2]);
                     if (g_car_wheel_front[i][w])
-                        glRotatef(-steer_deg, 0, 1, 0);
+                        b3r_rotate(-steer_deg, 0, 1, 0);
                     if (g_car_wheel_mirror[i][w] < 0)
-                        glRotatef(180.0f, 0, 1, 0);
-                    glRotatef(spin_deg * (g_car_wheel_mirror[i][w] < 0
+                        b3r_rotate(180.0f, 0, 1, 0);
+                    b3r_rotate(spin_deg * (g_car_wheel_mirror[i][w] < 0
                                           ? 1.0f : -1.0f), 1, 0, 0);
                     {   // blur variant by |spin rate| (25/50 rad/s [C])
                         float aw = fabsf(g_car_wheel_omega[i]);
-                        GLuint wl = g_car_wheel_lists[i];
+                        const B3CarMesh* wl = g_car_wheel_lists[i];
                         if (aw >= 50.0f && g_car_wheel_blur9[i])
                             wl = g_car_wheel_blur9[i];
                         else if (aw >= 25.0f && g_car_wheel_blur8[i])
                             wl = g_car_wheel_blur8[i];
-                        glCallList(wl);
+                        car_mesh_draw(wl);
                     }
-                    glPopMatrix();
+                    b3r_pop();
                 }
             }
         } else {
-            glTranslatef(v->pos.x, v->pos.y, v->pos.z);
-            glRotatef(v->rot.y * RAD_TO_DEG, 0, 1, 0);
+            b3r_translate(v->pos.x, v->pos.y, v->pos.z);
+            b3r_rotate(v->rot.y * RAD_TO_DEG, 0, 1, 0);
             Color c = v == &g_player ? (Color){1, 0.2f, 0.2f, 1}
                                      : (Color){0.2f, 0.2f, 1, 1};
-            glColor3f(c.r, c.g, c.b);
-            glBegin(GL_QUADS);
-            glVertex3f(-1.0f, 0.0f, 1.5f);
-            glVertex3f(1.0f, 0.0f, 1.5f);
-            glVertex3f(1.0f, 0.0f, -1.5f);
-            glVertex3f(-1.0f, 0.0f, -1.5f);
-            glVertex3f(-0.7f, 0.6f, 0.5f);
-            glVertex3f(0.7f, 0.6f, 0.5f);
-            glVertex3f(0.7f, 0.6f, -0.5f);
-            glVertex3f(-0.7f, 0.6f, -0.5f);
-            glEnd();
+            B3R_BATCH_PUSH();
+            {   /* the car's own translate/rotate is on the stack and stays
+                 * there; same inherited world state as the traffic boxes */
+                B3RState st = B3R_BATCH_WORLD_OPAQUE;
+                b3r_batch_state(&st);
+                b3r2d_color(c.r, c.g, c.b, 1.0f);
+                b3r2d_prim(B3R2D_QUADS);
+                b3r2d_vertex3(-1.0f, 0.0f, 1.5f);
+                b3r2d_vertex3(1.0f, 0.0f, 1.5f);
+                b3r2d_vertex3(1.0f, 0.0f, -1.5f);
+                b3r2d_vertex3(-1.0f, 0.0f, -1.5f);
+                b3r2d_vertex3(-0.7f, 0.6f, 0.5f);
+                b3r2d_vertex3(0.7f, 0.6f, 0.5f);
+                b3r2d_vertex3(0.7f, 0.6f, -0.5f);
+                b3r2d_vertex3(-0.7f, 0.6f, -0.5f);
+                b3r2d_prim_end();
+            }
+            B3R_BATCH_POP();
         }
-        glPopMatrix();
+        b3r_pop();
     }
 
     /* PANELS: the detached panels, in flight.  Each piece carries its own
@@ -8527,7 +15686,9 @@ cam_done:;
         const B3PanelSet* ps = &g_panels[i];
         for (int pk = 0; pk < ps->n; pk++) {
             const B3PanelPiece* pp = &ps->piece[pk];
-            if (!pp->active || !g_car_panel_lists[i][pk]) continue;
+            if (!pp->active) continue;
+            if (!g_car_panel_lists[i][pk] && !g_car_panel_glass_lists[i][pk])
+                continue;
             const float (*f)[4] = (const float (*)[4])pp->frame;
             float M[16] = {
                  f[0][0],  f[0][1],  f[0][2], 0,
@@ -8544,17 +15705,52 @@ cam_done:;
             pfx.rot3[6] =  f[0][2]; pfx.rot3[7] =  f[1][2];
             pfx.rot3[8] = -f[2][2];
             pfx.slot = i;
-            pfx.pos[0] = f[3][0];
-            pfx.pos[1] = f[3][1];
-            pfx.pos[2] = f[3][2];
+            /* THE PROBE, and why this is the CAR's position and not the
+             * panel's.  b3_carfx_body_begin() casts the light probe from
+             * ::pos and caches the nine it gets in slot ::slot -- so a
+             * detached door in flight was re-sampling the probe volume at
+             * its own airborne position and OVERWRITING its parent car's
+             * cached nine, thrashing the wreck's body lighting frame to
+             * frame and, once the panel fell below the world (y = -92 in
+             * the B3_CARFX_PROBETRACE capture), missing the cast entirely.
+             * Retail never does this: FUN_001AB136's probe loop walks the
+             * RACECAR list only (carObj+0x40 position -> carObj+0x6C nine,
+             * unit index carObj+0x6A), and the flying-part pool has no
+             * racecar entry -- the parts are drawn with their parent model
+             * instance's constants.  So the panel takes the parent car's
+             * probe, which is what sampling at the CAR's position gives. */
+            pfx.pos[0] = g_vehicles[i].pos.x;
+            pfx.pos[1] = g_vehicles[i].pos.y;
+            pfx.pos[2] = g_vehicles[i].pos.z;
             pfx.paint_index = i % 8;
             pfx.has_normals = 1;
-            glPushMatrix();
-            glMultMatrixf(M);
-            b3_carfx_body_begin(&pfx);
-            glCallList(g_car_panel_lists[i][pk]);
-            b3_carfx_body_end();
-            glPopMatrix();
+            b3r_push();
+            b3r_mult(M);
+            if (g_car_panel_lists[i][pk]) {
+                b3_carfx_body_begin(&pfx);
+                car_mesh_draw(g_car_panel_lists[i][pk]);
+                b3_carfx_body_end();
+            }
+            /* CRASH-UV: a flying door still has its window.  Same blended
+             * glass pass as the car's, on the SHATTERED tier -- a detached
+             * panel only exists on a wrecked car (FUN_000300A0's tier 2:
+             * slot 4 + tint 0.6, @0x000300E0 / 0x000300EF). */
+            if (g_car_panel_glass_lists[i][pk]) {
+                GLuint gpage = car_global_texture(B3_BGV_TEX_GLASS_SMASHED);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glDepthMask(GL_FALSE);
+                if (gpage) {
+                    glBindTexture(GL_TEXTURE_2D, gpage);
+                } else {
+                }
+                b3_carfx_glass_begin(&pfx, 0.60f);
+                car_mesh_draw(g_car_panel_glass_lists[i][pk]);
+                b3_carfx_glass_end();
+                glDepthMask(GL_TRUE);
+                glDisable(GL_BLEND);
+            }
+            b3r_pop();
         }
     }
 
@@ -8648,7 +15844,9 @@ cam_done:;
     /* CRASH-SHOW H8: the particle layer draws after the opaque world and
      * the boost flames, before the traffic pass and the HUD. */
     b3_pfx_update(g_tdfx_real_dt);
+    B3_ZONE(B3_ZONE_FX);
     b3_pfx_draw();
+    B3_ZONE(B3_ZONE_NONE);
 
     /* CRASH-SHOW H6: the per-wheel particle FX -- tyre smoke on
      * slip, plus the SURFACE-keyed dust/gravel/snow emitter from the
@@ -8706,14 +15904,39 @@ cam_done:;
     }
 
     // Traffic vehicles (real .btv meshes on the oncoming line; own section).
+    B3_ZONE(B3_ZONE_TRAFFIC);
     traffic_render();
+    /* The car and traffic meshes draw from VBOs, and a bound ARRAY_BUFFER
+     * turns any later glVertexPointer given a CLIENT pointer into an offset
+     * into that buffer.  Hand the arrays back before the postfx passes, which
+     * still draw the sky dome and the screen quads from client memory. */
+    b3r_arrays_none();
+    B3_ZONE(B3_ZONE_NONE);
 
-    /* POSTFX: radial speed blur over the finished world, before the HUD
-     * (the HUD must stay sharp). Shape is the recovered per-screen radial
-     * zoom; the strength ramp is GLUE (see burnout3_postfx.h). boost_ramp
-     * = racecar+0x11AC; harness has none yet -> 0. */
-    b3_postfx_blur(w, h, g_player.sim.speed * 2.2374146f, 0.0f,
-                   g_tdfx_real_dt);
+    /* POSTFX: the effects chain over the finished world, before the HUD (the
+     * HUD must stay sharp -- retail draws its HUD after FUN_0003DA90 too).
+     *
+     * AFTEREFFECTS hook 2 of 3: downsample -> radial blur -> bloom ->
+     * composite, leaving the UI target bound so the HUD lands in it. The
+     * older grab-based path is the fallback when the chain is unavailable.
+     *
+     * boost_ramp is no longer a hard 0. It is racecar+0x11AC, the quantity
+     * the recovered FOV 90->110 law consumes (RE_TAKEDOWN_FX 9.2), and the
+     * chase camera above already maintains it as s_boost_ramp -- so the
+     * blur's boost coupling, which has been dead since it was written,
+     * finally has its input. */
+    B3_ZONE(B3_ZONE_POST);
+    if (g_afx_on) {
+        B3AfxInputs afx;
+        afx.speed_mph  = g_player.sim.speed * 2.2374146f;
+        afx.boost_ramp = s_boost_ramp;
+        afx.divisor    = b3_tdfx_divisor();
+        b3_afx_scene_done(w, h, &afx);
+    } else {
+        b3_postfx_blur(w, h, g_player.sim.speed * 2.2374146f, s_boost_ramp,
+                       g_tdfx_real_dt);
+    }
+    B3_ZONE(B3_ZONE_HUD);
 
     // HUD: the real game HUD (XBE-embedded fonts, Global.txd art,
     // Globalus.bin labels -- src/burnout3_hud.c, docs/RE_FRONTEND.md),
@@ -8721,10 +15944,10 @@ cam_done:;
     // harness overlay is gone; everything drawn is the game's own art.
     glFrontFace(GL_CW);   // leave the mirrored-scene winding (HUD is CW)
     glDisable(GL_DEPTH_TEST);
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
+    b3r_matrix_mode(B3R_MAT_PROJECTION);
+    b3r_identity();
+    b3r_matrix_mode(B3R_MAT_MODELVIEW);
+    b3r_identity();
 
     // Speed in mph, using the game's own (slightly off) conversion constant.
     int mph = (int)(g_player.sim.speed * 2.2374146f + 0.5f);
@@ -8749,6 +15972,7 @@ cam_done:;
         hs.total_laps  = g_lap_count;
         hs.position    = pos;
         hs.n_cars      = g_num_vehicles;
+        b3_raceflow_hud_adjust(&hs.lap, &hs.position);       /* race flow (agent) */
         hs.boost.tier      = g_player.bar.tier;
         hs.boost.bar_size  = g_player.bar.size;
         hs.boost.meter     = g_player.bar.meter;
@@ -8764,9 +15988,9 @@ cam_done:;
         {
             const B3ScoreEvents* se = &g_player.sev;
             const struct { const B3CatRecord* r; int open; int row; } tk[] = {
-                { &se->onc,   se->onc_active,   B3_HUD_TICK_ONCOMING },
-                { &se->drift, se->drift_active, B3_HUD_TICK_DRIFT    },
-                { &se->nm,    se->nm_active,    B3_HUD_TICK_NEARMISS }
+                { &se->onc,   se->onc.active,   B3_HUD_TICK_ONCOMING },
+                { &se->drift, se->drift.active, B3_HUD_TICK_DRIFT    },
+                { &se->nm,    se->nm.active,    B3_HUD_TICK_NEARMISS }
             };
             for (unsigned t = 0; t < sizeof(tk) / sizeof(tk[0]); t++) {
                 B3HudTickIn* d = &hs.ticker[tk[t].row];
@@ -8805,6 +16029,15 @@ cam_done:;
                              + B3_TDFX_ANIM1_OUT;
             hs.callout.id    = ts.callout_msg;
         }
+        /* FINAL LAP: retail's own callout (Globalus 2033) [C].  It only
+         * claims the slot when the takedown FX is not already using it. */
+        if (hs.callout.t < 0.0f) {                          /* race flow (agent) */
+            float ca, cl;                                   /* race flow (agent) */
+            const char *cs = b3_raceflow_callout(&ca, &cl); /* race flow (agent) */
+            if (cs) { hs.callout.label = cs; hs.callout.art = 0;
+                      hs.callout.t = ca; hs.callout.life = cl;
+                      hs.callout.id = 0; }                  /* race flow (agent) */
+        }                                                   /* race flow (agent) */
         // HUD animation runs at presentation rate: real dt, not the
         // dilated sim dt (the callout timeline is wall-clock in retail).
         /* CRASH-SHOW H3: the crash presentation feed.  All-zero is
@@ -8915,7 +16148,19 @@ cam_done:;
                         g_mix[2] / g_mix_max[2] };
         b3_hud_pause_mixer(fr);
     }
-    b3_gamma_in_gl = b3_postfx_gamma(w, h);
+    b3_raceflow_results_draw();                             /* race flow (agent) */
+    B3_ZONE(B3_ZONE_POST);
+    /* AFTEREFFECTS hook 3 of 3: resolve the UI target to the default
+     * framebuffer through the retail gamma ramp. This is also what removes
+     * the SECOND full-canvas copy the old chain made -- b3_postfx_gamma()
+     * re-grabbed the whole canvas every frame purely to read it back. */
+    b3_gamma_in_gl = g_afx_on ? b3_afx_frame_end(w, h)
+                              : b3_postfx_gamma(w, h);
+    B3_ZONE(B3_ZONE_NONE);
+    /* B3_RENDER_STATS=<n>: the renderer's own per-pass DRAW count, which is
+     * what the web port's WebGL call count is a small multiple of and is the
+     * cheapest regression tripwire for the batch merge. */
+    b3r_stats_frame();
 }
 
 // ============================================================
@@ -9036,6 +16281,12 @@ static void process_input(void) {
                 race_restart();
                 printf("[Burnout3] Restarting race\n");
             }
+            /* results screen: A / ENTER / SPACE closes it */
+            if (b3_raceflow_results_active()                /* race flow (agent) */
+                && (e.key.keysym.scancode == SDL_SCANCODE_RETURN
+                    || e.key.keysym.scancode == SDL_SCANCODE_SPACE
+                    || e.key.keysym.scancode == SDL_SCANCODE_A))
+                b3_raceflow_results_dismiss();              /* race flow (agent) */
         }
         
         if (e.type == SDL_KEYUP) {
@@ -9053,6 +16304,7 @@ static void process_input(void) {
 static void race_restart(void) {
     b3_tdfx_event_reset();  // FUN_00025AB0: new event, new credit
     b3_props_reset();       // PROPS: every prop back to its authored pose
+    b3_raceflow_reset();                                    /* race flow (agent) */
     g_state = RACING;
     g_current_lap = 0;
     g_race_time = 0;
@@ -9091,6 +16343,7 @@ static void race_restart(void) {
 typedef struct {
     B3CarBody   body;
     B3RigidBody rb;          // used only for synthesised bodies
+    float rb_frame_store[4][4];   /* the 4x4 is not inline any more */
     Vehicle*    veh;         // racer source, or NULL
     int         traffic;     // traffic index, or -1
     int         synth;       // 1 = write the result back by hand
@@ -9114,9 +16367,787 @@ static const char* carcol_dump_id(const Vehicle* v) {
 }
 static B3CarcolDbg g_carcol_dbg[8];
 
+/* --- ai wreck log (agent) ------------------------------------------------
+ * B3_AI_WRECK_LOG=1 -- WRECK POST-MORTEM CAPTURE.  Instrumentation only.
+ *
+ * WHY IT EXISTS.  The rivals still wreck themselves too often, and the
+ * [aicrash] line says only "car3 world spd 49.5" -- what the car was TRYING
+ * to do when it died is gone by the time anyone reads it.  This keeps a
+ * 5 s / 10 Hz ring of the DECIDING state per AI car and dumps that car's
+ * whole ring, plus the impact geometry and a mechanical classification
+ * guess, the instant a wreck begins.  One wreck = one block.
+ *
+ * NOTHING HERE IS ON THE DECISION PATH.  Every field is READ back out of
+ * state the AI has already computed this tick; the accessor behind each one
+ * is named in the PROVENANCE legend written into the head of every log.  The
+ * six entry points below all return on their first branch when the env is
+ * unset, so a run without it is byte-for-byte the run before this block
+ * existed -- no getenv per tick, no float work, no ring fill.
+ *
+ * THE fopen SEAM.  `(fopen)(...)` is parenthesised on purpose: a
+ * function-like macro is not expanded when its name is not followed by `(`,
+ * so this reaches the real libc fopen and NOT burnout3_isoshim.h's
+ * b3_iso_fopen.  Same reason the save block uses raw open()/mkdir(): the log
+ * has to land in the REAL build/debug/ that the user can find, not be
+ * resolved into build/.isocache and lost to the next cache wipe.
+ *
+ * ORDER WITHIN A TICK (all inside vehicle_update's AI arm):
+ *   awl_avoid()  <- the arbitrator's verdict, at the ai_avoid_update site
+ *   awl_queue()  <- the 8.0 m / cos 0.90 close-range brake, at its trigger
+ *   awl_sample() <- once per tick, after b3_ai_dispatch has run; folds the
+ *                   two accumulators above into the 10 Hz ring entry
+ * and on a wreck, from wreck_begin_for():
+ *   awl_kind()   <- ai_crash_note's own takedown/traffic/world verdict
+ *   awl_wreck()  <- the record
+ * ------------------------------------------------------------------------ */
+#include <time.h>
+
+#define B3_AWL_RING    50          /* 5.0 s of history at 10 Hz            */
+#define B3_AWL_PERIOD  0.1f        /* sample period, on the race clock     */
+#define B3_AWL_SLOTS   8           /* g_vehicles is [8]                    */
+#define B3_AWL_CLASSES 14
+
+/* One 10 Hz ring entry: the deciding state of one AI car for one sample. */
+typedef struct {
+    float t;                      /* g_race_time at the sample             */
+    /* speed law */
+    float spd, dem, ceilv, cbrake, bdist, corner_ai, cap;
+    float thr, brk, str;
+    int   gear;
+    /* the close-range queue brake, ACCUMULATED over the ticks since the
+     * previous sample so a fire between samples is never lost */
+    int   q_hits, q_ticks, q_who;
+    float q_d;
+    /* aim + plan latch */
+    float aim[2], aim_dist, radius, curve;
+    int   aim_lost, tmode, m1fc, latch, alt;
+    /* avoidance: hits are accumulated like the queue brake, the rest is the
+     * instantaneous picture at the sample tick */
+    int   ovr_hits, ovr_ref, av_valid, av_state, av_ovr, av_strip;
+    float av_speed, av_dmin, av_dband, av_here, av_lo, av_hi;
+    /* rubber band */
+    float rb_cap, rb_bonus, rb_win;
+    int   rb_exp;
+    /* pace / aggression */
+    float agg;
+    int   agg_state, agg_tgt, aggspd_mode, ooc_mode, ooc_win;
+    /* ribbon + route */
+    int   nav_sec, nav_node, nav_ok, station;
+    float lat, ribw, off, rlat, prog, st_t;
+    /* pose */
+    float pos[3], yaw, slip;
+    /* the two nearest bodies, racer or traffic */
+    int   n_kind[2], n_id[2];
+    float n_d[2], n_ang[2];
+} B3AwlTick;
+
+/* per-slot ring + the between-sample accumulators */
+static struct {
+    B3AwlTick ring[B3_AWL_RING];
+    int       head;                /* next write index                     */
+    int       n;                   /* entries held, <= B3_AWL_RING         */
+    float     next_t;              /* next race clock to sample at         */
+    int       started;
+    /* accumulators, reset at every sample */
+    int       q_hits, q_ticks, q_who, ovr_hits, ovr_ref;
+    float     q_d;
+    /* last avoidance verdict seen this tick */
+    int       av_valid, av_state, av_ovr;
+    float     av_speed, av_dmin, av_here, av_lo, av_hi;
+    /* ai_crash_note's own kind for the wreck being recorded */
+    int       last_kind;
+} g_awl[B3_AWL_SLOTS];
+
+static const char* const g_awl_class_name[B3_AWL_CLASSES] = {
+    "takedown-victim",        /*  0 */
+    "rear-ended-rival",       /*  1 */
+    "side-swiped-rival",      /*  2 */
+    "head-on-rival",          /*  3 */
+    "avoidance-into-traffic", /*  4 */
+    "clipped-traffic",        /*  5 */
+    "left-road-open-edge",    /*  6 */
+    "wall-into-corner",       /*  7 */
+    "avoidance-into-wall",    /*  8 */
+    "spun",                   /*  9 */
+    "wall-grind",             /* 10 */
+    "wall-hit",               /* 11 */
+    "hit-by-wreck",           /* 12 */
+    "unclassified"            /* 13 */
+};
+
+static int   g_awl_wreck_n;
+static int   g_awl_per_car[B3_AWL_SLOTS];
+static int   g_awl_per_class[B3_AWL_CLASSES];
+static int   g_awl_per_third[3];
+static int   g_awl_class_by_car[B3_AWL_SLOTS][B3_AWL_CLASSES];
+static FILE* g_awl_f;
+static int   g_awl_state;          /* 0 unknown, 1 open, -1 disabled       */
+static char  g_awl_path[512];
+
+/* The switch.  getenv ONCE; every entry point below leads with this. */
+static int awl_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("B3_AI_WRECK_LOG");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return v;
+}
+
+/* Signed bearing of (dx,dz) off the car's nose, degrees.  Same convention
+ * the driver's own steering error uses: err = angle_diff(want, rot.y) with
+ * want = atan2f(dx, -dz)  (vehicle_update, the `want`/`err` pair). */
+static float awl_bearing_deg(float dx, float dz, float yaw) {
+    return angle_diff(atan2f(dx, -dz), yaw) * RAD_TO_DEG;
+}
+
+static FILE* awl_file(void) {
+    if (g_awl_state < 0) return NULL;
+    if (g_awl_state > 0) return g_awl_f;
+    {
+        const char* track = raceflow_track_id();
+        (void)mkdir("build", 0777);
+        (void)mkdir("build/debug", 0777);
+        snprintf(g_awl_path, sizeof g_awl_path,
+                 "build/debug/ai_wrecks_%.64s_%ld.log", track,
+                 (long)time(NULL));
+        /* parenthesised: the real fopen, not the isoshim macro -- see the
+         * block header */
+        g_awl_f = (fopen)(g_awl_path, "w");
+        if (!g_awl_f) {
+            printf("[Burnout3] ai wreck log: cannot open %s\n", g_awl_path);
+            g_awl_state = -1;
+            return NULL;
+        }
+        /* line buffered + an explicit flush after every record, so the file
+         * is complete even if the user closes the window mid-race */
+        setvbuf(g_awl_f, NULL, _IOLBF, 1 << 14);
+        g_awl_state = 1;
+        printf("[Burnout3] ai wreck log -> %s\n", g_awl_path);
+        fprintf(g_awl_f,
+"# Burnout3 AI WRECK LOG   track=%s  ring=%d samples @ %g Hz (%.1f s)\n"
+"#\n"
+"# One block per wreck.  `impact` is what was hit; `ring` is that car's\n"
+"# deciding state for the 5 s before it, oldest first, rt = seconds BEFORE\n"
+"# the wreck.  `guess` is mechanical and HEURISTIC -- it is derived from the\n"
+"# impact + ring by awl_classify(), it is not something the game decided.\n"
+"#\n"
+"# FIELD PROVENANCE -- which AI internal each ring field reads:\n"
+"#   spd      Vehicle.sim.speed (m/s)          the legacy mirror the AI reads\n"
+"#   dem      ai.target_speed   AI+0x9C4       the DEMANDED speed\n"
+"#   ceil     `ceiling`         AI+0x780       min(corner brake, avoidance)\n"
+"#   cbrake   nav_corner_speed  FUN_00176150   the planner's corner value\n"
+"#   bd       nav_brake_dist                   arclen left to that corner\n"
+"#   cspd     ai.corner_speed   AI+0x9D0\n"
+"#   cap      ai.speed_cap      AI+0xA08       the rubber band's hard cap\n"
+"#   thr/brk/str  fsim.throttle_1400 / brake_1404 / steer_1408\n"
+"#   q        the CLOSE-RANGE QUEUE BRAKE, B3_QUEUE_RANGE_M 8.0 m /\n"
+"#            B3_QUEUE_COS 0.90 / B3_QUEUE_SLOW_MS 6.0.  `q=-` never fired;\n"
+"#            `q=car2@6.1(4/6)` = fired on slot 2 at 6.1 m, on 4 of the 6\n"
+"#            ticks covered by this sample.  Live = it capped the ceiling to\n"
+"#            B3_AI_RESCUE_SPEED_MS.\n"
+"#   aim      the target point AFTER every override (route line -> plan ->\n"
+"#            anti-cut -> barrier/gap ladder -> aggression -> avoidance)\n"
+"#   amode    nav_target_mode/nav_mode_1fc = AI+0x1F8 / AI+0x1FC\n"
+"#   latch    nav_latch.latch  AI+0x1F8 progression: 0 entry 1 apex 2 exit\n"
+"#            4 done;  rad = nav_latch.radius AI+0x298\n"
+"#   lost     aim_lost -- nothing reachable, ceiling forced to rescue speed\n"
+"#   alt      aiw.route_alt  AI+0x1F0 square wave\n"
+"#   av       g_ai_avoid[slot]: st = avoid+0x4AC (0x10 none, 1/2 side),\n"
+"#            ovr = the arbitrator FUN_0016AAC0 verdict -- 0 not committed,\n"
+"#            1 committed, 2 REFUSED by the aim_over_gap world-model test;\n"
+"#            (n/m) = armed on n of the m ticks in this sample.\n"
+"#            strip = target_strip, dmin/dband = avoid+0x488 band minima,\n"
+"#            risk = here/lo/hi = own-strip / right / left risk means\n"
+"#   rb       speed_cap AI+0xA08 / catchup_bonus AI+0x9DC / catchup_window\n"
+"#            AI+0x9E8 (pace rec[0x93]) / catchup_expired AI+0xA31\n"
+"#   agg      g_aggro_cars[slot].aggression = pace rec[0x90] (racecar+0x23E0)\n"
+"#            aggst = aggro.state, aggtgt = aggro.target,\n"
+"#            aspd = aggspd.mode, ooc = ac.ooc_mode (rec[0x95]) / ooc_window\n"
+"#   nav      Vehicle.nav_section/nav_node/nav_ready\n"
+"#   lat/w/off  the AVOIDANCE FRAME (FUN_00170260 via ai_avoid_frame_from_nav):\n"
+"#            lat = offset from the frame's `right` edge along `axis`, w =\n"
+"#            ribbon width, off = lat - w/2 = signed offset from the ribbon\n"
+"#            CENTRE.  |off| > w/2 means the car is off the carriageway.\n"
+"#   stn      route_project() station/t and its signed lateral `rlat`\n"
+"#            (this is the ONCOMING polyline -- the same number the existing\n"
+"#            [avoid] trace prints as rlat, kept for cross-reference)\n"
+"#   slip     angle between velocity and heading, deg (spin detector)\n"
+"#   near1/2  the two nearest bodies: cN = racer slot, tN = g_traffic index;\n"
+"#            @d = metres, b = signed bearing off the nose, deg\n"
+"#\n"
+"#\n"
+"# TWO CAVEATS, both real port state and not artefacts of this log:\n"
+"#   * RIBBON WIDTH.  `w` flips between ~3 m and ~15 m from one nav section\n"
+"#     to the next on the same track, so `off` can read \"off the\n"
+"#     carriageway\" for a car sitting in its own lane.  The classifier\n"
+"#     therefore does NOT decide on `off`; it reports it.\n"
+"#   * dem > ceil is NOT a bug in the log.  FUN_001734C0's catch-up bonus is\n"
+"#     added after the ceiling and nothing re-clamps it, so an armed rival\n"
+"#     legitimately carries a demand far above its own corner brake.\n"
+"#\n"
+"# A block whose ring is empty is a car under HUMAN control -- the ring is\n"
+"# filled from the AI arm of vehicle_update only.\n"
+"#\n",
+                track, B3_AWL_RING, (double)(1.0f / B3_AWL_PERIOD),
+                (double)(B3_AWL_RING * B3_AWL_PERIOD));
+    }
+    return g_awl_f;
+}
+
+/* ---- the three per-tick collectors ---------------------------------- */
+
+/* The 8.0 m / cos 0.90 close-range queue brake fired this tick, on `who`. */
+static void awl_queue(const Vehicle* v, int who, float d) {
+    int slot;
+    if (!awl_on()) return;
+    slot = (int)(v - g_vehicles);
+    if (slot < 0 || slot >= B3_AWL_SLOTS) return;
+    g_awl[slot].q_hits++;
+    g_awl[slot].q_who = who;
+    g_awl[slot].q_d   = d;
+}
+
+/* The arbitrator's verdict for this tick.  `out->override` is 0 / 1 / 2 and
+ * 2 is the aim_over_gap REFUSAL -- the world-model veto. */
+static void awl_avoid(int slot, const B3AiAvoidOut* out) {
+    if (!awl_on()) return;
+    if (slot < 0 || slot >= B3_AWL_SLOTS) return;
+    g_awl[slot].av_valid = out->valid;
+    g_awl[slot].av_state = out->state;
+    g_awl[slot].av_ovr   = out->override;
+    g_awl[slot].av_speed = out->speed;
+    g_awl[slot].av_dmin  = out->dmin;
+    g_awl[slot].av_here  = out->risk_here;
+    g_awl[slot].av_lo    = out->risk_lo;
+    g_awl[slot].av_hi    = out->risk_hi;
+    if (out->override == 1) g_awl[slot].ovr_hits++;
+    if (out->override == 2) g_awl[slot].ovr_ref++;
+}
+
+/* The two nearest bodies (racers first, then traffic) inside `maxd`. */
+static void awl_nearest(const Vehicle* v, B3AwlTick* s, float maxd) {
+    float bd[2] = { 1e30f, 1e30f };
+    int   i;
+    s->n_kind[0] = s->n_kind[1] = 0;
+    s->n_id[0] = s->n_id[1] = -1;
+    s->n_d[0] = s->n_d[1] = 0.0f;
+    s->n_ang[0] = s->n_ang[1] = 0.0f;
+    for (i = 0; i < g_num_vehicles + g_traffic_n; i++) {
+        int   racer = (i < g_num_vehicles);
+        int   id    = racer ? i : (i - g_num_vehicles);
+        float ox, oz, dx, dz, d;
+        if (racer) {
+            if (&g_vehicles[id] == v || !g_vehicles[id].active) continue;
+            ox = g_vehicles[id].pos.x; oz = g_vehicles[id].pos.z;
+        } else {
+            if (!g_traffic[id].active) continue;
+            ox = g_traffic[id].pos.x; oz = g_traffic[id].pos.z;
+        }
+        dx = ox - v->pos.x; dz = oz - v->pos.z;
+        d  = sqrtf(dx * dx + dz * dz);
+        if (d > maxd) continue;
+        if (d < bd[0]) {
+            bd[1] = bd[0]; s->n_kind[1] = s->n_kind[0];
+            s->n_id[1] = s->n_id[0]; s->n_d[1] = s->n_d[0];
+            s->n_ang[1] = s->n_ang[0];
+            bd[0] = d; s->n_kind[0] = racer ? 1 : 2; s->n_id[0] = id;
+            s->n_d[0] = d; s->n_ang[0] = awl_bearing_deg(dx, dz, v->rot.y);
+        } else if (d < bd[1]) {
+            bd[1] = d; s->n_kind[1] = racer ? 1 : 2; s->n_id[1] = id;
+            s->n_d[1] = d; s->n_ang[1] = awl_bearing_deg(dx, dz, v->rot.y);
+        }
+    }
+}
+
+/* One ring entry.  Called once per tick per AI car, from the tail of the AI
+ * arm -- after b3_ai_dispatch, so throttle/brake/steer are this tick's. */
+static void awl_sample(Vehicle* v, int slot, float ceiling,
+                       float nav_corner_speed, float nav_brake_dist,
+                       int nav_target_mode, int nav_mode_1fc, int aim_lost,
+                       const Vec3* target, float curve) {
+    B3AwlTick* s;
+    if (!awl_on()) return;
+    if (slot < 0 || slot >= B3_AWL_SLOTS) return;
+    g_awl[slot].q_ticks++;
+    if (!g_awl[slot].started) {
+        g_awl[slot].started = 1;
+        g_awl[slot].next_t  = g_race_time;
+        (void)awl_file();          /* echo the path once, at race start */
+    }
+    if (g_race_time < g_awl[slot].next_t) return;
+    g_awl[slot].next_t = g_race_time + B3_AWL_PERIOD;
+
+    s = &g_awl[slot].ring[g_awl[slot].head];
+    memset(s, 0, sizeof *s);
+    s->t = g_race_time;
+
+    s->spd       = v->sim.speed;
+    s->dem       = v->ai.target_speed;
+    s->ceilv     = ceiling;
+    s->cbrake    = nav_corner_speed;
+    s->bdist     = nav_brake_dist;
+    s->corner_ai = v->ai.corner_speed;
+    s->cap       = v->ai.speed_cap;
+    s->thr       = v->fsim.throttle_1400;
+    s->brk       = v->fsim.brake_1404;
+    s->str       = v->fsim.steer_1408;
+    s->gear      = v->fsim.trans.gear;
+
+    s->q_hits  = g_awl[slot].q_hits;
+    s->q_ticks = g_awl[slot].q_ticks;
+    s->q_who   = g_awl[slot].q_hits ? g_awl[slot].q_who : -1;
+    s->q_d     = g_awl[slot].q_d;
+
+    s->aim[0]   = target->x;
+    s->aim[1]   = target->z;
+    s->aim_dist = sqrtf((target->x - v->pos.x) * (target->x - v->pos.x)
+                      + (target->z - v->pos.z) * (target->z - v->pos.z));
+    s->aim_lost = aim_lost;
+    s->tmode    = nav_target_mode;
+    s->m1fc     = nav_mode_1fc;
+    s->latch    = v->nav_latch.latch;
+    s->radius   = v->nav_latch.radius;
+    s->alt      = v->aiw.route_alt;
+    s->curve    = curve;
+
+    s->ovr_hits = g_awl[slot].ovr_hits;
+    s->ovr_ref  = g_awl[slot].ovr_ref;
+    s->av_valid = g_awl[slot].av_valid;
+    s->av_state = g_awl[slot].av_state;
+    s->av_ovr   = g_awl[slot].av_ovr;
+    s->av_speed = g_awl[slot].av_speed;
+    s->av_dmin  = g_awl[slot].av_dmin;
+    s->av_here  = g_awl[slot].av_here;
+    s->av_lo    = g_awl[slot].av_lo;
+    s->av_hi    = g_awl[slot].av_hi;
+    {   /* the persistent side of the avoidance state, g_ai_avoid[slot].a */
+        const B3AiAvoid* a = &g_ai_avoid[slot].a;
+        s->av_strip = a->target_strip;
+        s->av_dband = a->dband;
+        s->ribw     = a->width;
+        /* the avoid frame's own lateral, exactly as the [avoid] trace takes
+         * it: offset from the frame `right` edge along `axis` */
+        s->lat = (v->pos.x - a->right[0]) * a->axis[0]
+               + (v->pos.z - a->right[2]) * a->axis[2];
+        s->off = (a->width > 0.1f) ? s->lat - a->width * 0.5f : 0.0f;
+    }
+
+    s->rb_cap   = v->ai.speed_cap;
+    s->rb_bonus = v->ai.catchup_bonus;
+    s->rb_win   = v->ai.catchup_window;
+    s->rb_exp   = v->ai.catchup_expired;
+
+    s->agg         = (slot < g_aggro_world.ncars)
+                   ? g_aggro_cars[slot].aggression : 0.0f;
+    s->agg_state   = v->aggro.state;
+    s->agg_tgt     = v->aggro.target;
+    s->aggspd_mode = v->aggspd.mode;
+    s->ooc_mode    = v->emu_ai_car_valid ? v->emu_ai_car.ooc_mode : -1;
+    s->ooc_win     = v->emu_ai_car_valid ? v->emu_ai_car.ooc_window : -1;
+
+    s->nav_sec  = (int)v->nav_section;
+    s->nav_node = (int)v->nav_node;
+    s->nav_ok   = v->nav_ready;
+    s->prog     = v->track_progress;
+    {   int rs = 0; float rt = 0.0f, rl = 0.0f;
+        float d2 = route_project(v->pos.x, v->pos.z, 0, -1, &rs, &rt, &rl);
+        s->station = (d2 < 1e29f) ? rs : -1;
+        s->st_t    = rt;
+        s->rlat    = rl;
+    }
+
+    s->pos[0] = v->pos.x; s->pos[1] = v->pos.y; s->pos[2] = v->pos.z;
+    s->yaw    = v->rot.y;
+    {   float sp = sqrtf(v->vel.x * v->vel.x + v->vel.z * v->vel.z);
+        s->slip = (sp > 1.0f)
+                ? awl_bearing_deg(v->vel.x, v->vel.z, v->rot.y) : 0.0f;
+    }
+    awl_nearest(v, s, 60.0f);
+
+    g_awl[slot].head = (g_awl[slot].head + 1) % B3_AWL_RING;
+    if (g_awl[slot].n < B3_AWL_RING) g_awl[slot].n++;
+    g_awl[slot].q_hits = g_awl[slot].q_ticks = 0;
+    g_awl[slot].ovr_hits = g_awl[slot].ovr_ref = 0;
+}
+
+/* ai_crash_note's own verdict for the wreck about to be recorded. */
+static void awl_kind(int slot, int kind) {
+    if (!awl_on()) return;
+    if (slot < 0 || slot >= B3_AWL_SLOTS) return;
+    g_awl[slot].last_kind = kind;
+}
+
+/* ---- the record ------------------------------------------------------ */
+
+/* Oldest-first index i (0 .. n-1) of a slot's ring. */
+static const B3AwlTick* awl_at(int slot, int i) {
+    int n = g_awl[slot].n;
+    int base = (g_awl[slot].head - n + 2 * B3_AWL_RING) % B3_AWL_RING;
+    return &g_awl[slot].ring[(base + i) % B3_AWL_RING];
+}
+
+/* THE HEURISTIC.  Mechanical, from the impact + the ring, nothing else.
+ * Returns a g_awl_class_name index and fills `why` with the terms it used. */
+static int awl_classify(int slot, int entry, int akind, int other_traffic,
+                        int other_wrecked, float ang_deg, float lon,
+                        float spd_at, float y_at, char* why, size_t whyn) {
+    int   n = g_awl[slot].n, i;
+    float ovr_frac = 0.0f, over_ceil = 0.0f, dem_over = 0.0f, off_worst = 0.0f;
+    float slip_max = 0.0f, corner_min = -1.0f, curve_max = 0.0f;
+    float y_top = y_at, y_drop;
+    int   ovr_ticks = 0, ovr_n = 0, q_fired = 0, lost = 0, corner, cls;
+    const B3AwlTick* last = n ? awl_at(slot, n - 1) : NULL;
+    float t_end = last ? last->t : 0.0f;
+
+    for (i = 0; i < n; i++) {
+        const B3AwlTick* s = awl_at(slot, i);
+        float age = t_end - s->t;
+        if (age <= 1.5f) {
+            float o = s->spd - s->ceilv;
+            float d = s->dem - s->ceilv;
+            ovr_n += s->ovr_hits;
+            ovr_ticks += (s->q_ticks > 0 ? s->q_ticks : 1);
+            if (o > over_ceil) over_ceil = o;
+            if (d > dem_over) dem_over = d;
+            if (s->cbrake > 0.0f
+                && (corner_min < 0.0f || s->cbrake < corner_min))
+                corner_min = s->cbrake;
+            if (s->curve > curve_max) curve_max = s->curve;
+            if (s->q_hits > 0) q_fired = 1;
+            if (s->aim_lost) lost = 1;
+        }
+        if (age <= 1.0f) {
+            if (s->ribw > 0.1f) {
+                float e = fabsf(s->off) - s->ribw * 0.5f;
+                if (e > off_worst) off_worst = e;
+            }
+            if (s->pos[1] > y_top) y_top = s->pos[1];
+        }
+        if (age <= 0.7f && fabsf(s->slip) > slip_max) slip_max = fabsf(s->slip);
+    }
+    if (ovr_ticks > 0) ovr_frac = (float)ovr_n / (float)ovr_ticks;
+    y_drop = y_top - y_at;
+    /* "a corner is in front of this car": either the planner published one
+     * (nav_corner_speed > 0), or the curvature scan measured one past the
+     * SAME 0.25 rad the AI itself calls a corner when it hands `corner` to
+     * ai_avoid_update (`curve > 0.25f` at the ai_avoid_update call site). */
+    corner = (corner_min > 0.0f) || (curve_max > 0.25f);
+
+    /* THE LADDER, first match wins.  Car entries are decided by geometry,
+     * wall entries by which AI term was misbehaving in the run-up. */
+    if (akind == 0)                      cls = 0;   /* takedown-victim     */
+    else if (other_wrecked)              cls = 12;  /* hit-by-wreck        */
+    else if (entry == 1 && other_traffic)
+        cls = (ovr_frac > 0.15f) ? 4 : 5;           /* avoidance-into-tfc  */
+    else if (entry == 1 && fabsf(ang_deg) > 140.0f) cls = 3;
+    else if (entry == 1 && fabsf(ang_deg) <= 45.0f && lon >= 0.0f) cls = 1;
+    else if (entry == 1)                 cls = 2;   /* side-swiped         */
+    else if (slip_max > 45.0f)           cls = 9;   /* spun                */
+    /* OPEN EDGE.  aim_lost is the unambiguous one -- it is set only when
+     * every candidate the aim ladder offers is over a hole (aim_gap_scan),
+     * which is the US_P1 dead-end-deck state; a >2 m fall in the last
+     * second is the same event seen from the geometry.  `off_ribbon` alone
+     * is NOT enough to call it: the nav ribbon width flips between ~3 m and
+     * ~15 m across sections on the same track, so a narrow-ribbon sample
+     * reads "off the carriageway" for a car sitting in its own lane.  It
+     * stays in the evidence line, out of the decision.               [S] */
+    else if (lost || y_drop > 2.0f)      cls = 6;   /* left-road-open-edge */
+    /* CORNER OVERSPEED.  `dem_over` is the one that catches the rubber
+     * band: FUN_001734C0's catch-up bonus is added AFTER the ceiling and
+     * nothing re-clamps it, so a car can carry demand 88 into a corner
+     * whose ceiling is 56 without `spd` itself ever exceeding the ceiling.
+     * Either overshoot counts. */
+    else if (corner && (dem_over > 5.0f || over_ceil > 5.0f)) cls = 7;
+    else if (ovr_frac > 0.15f)           cls = 8;   /* avoidance-into-wall */
+    else if (spd_at < 12.0f)             cls = 10;  /* wall-grind          */
+    else if (entry == 0)                 cls = 11;  /* wall-hit            */
+    else                                 cls = 13;
+
+    snprintf(why, whyn,
+             "ring=%d ovr_frac=%.2f dem_over_ceiling=%.1f "
+             "spd_over_ceiling=%.1f corner=%d curve_max=%.2f corner_min=%s "
+             "y_drop=%.2f aim_lost=%d slip_max=%.0f queue=%d "
+             "off_ribbon=%.2f(see the ribbon-width note) "
+             "impact_deg=%+.0f lon=%+.1f spd=%.1f",
+             n, (double)ovr_frac, (double)dem_over, (double)over_ceil,
+             corner, (double)curve_max,
+             corner_min > 0.0f ? "set" : "none",
+             (double)y_drop, lost, (double)slip_max, q_fired,
+             (double)off_worst,
+             (double)ang_deg, (double)lon, (double)spd_at);
+    return cls;
+}
+
+static void awl_body_name(int is_traffic, int id, char* buf, size_t n) {
+    if (id < 0) { snprintf(buf, n, "unknown"); return; }
+    if (!is_traffic) {
+        snprintf(buf, n, "car%d%s", id,
+                 (id == 0) ? "(player)" : "");
+        return;
+    }
+    if (id < g_traffic_n && g_traffic[id].car >= 0
+        && g_traffic[id].car < B3_TRAFFIC_CAR_COUNT)
+        snprintf(buf, n, "traffic%d(%.40s)", id,
+                 B3_TRAFFIC_CARS[g_traffic[id].car].id);
+    else
+        snprintf(buf, n, "traffic%d", id);
+}
+
+/* THE RECORD.  Called from wreck_begin_for, immediately after
+ * ai_crash_note, with that site's own contact geometry. */
+static void awl_wreck(Vehicle* v, int slot, Vec3 cp, Vec3 cn, Vec3 rv,
+                      int entry) {
+    FILE* f;
+    int   akind, i, n, cls, third;
+    int   other_id = -1, other_traffic = 0, other_wrecked = 0, fresh = 0;
+    float closing = 0.0f, ang = 0.0f, lon = 0.0f, other_mph = 0.0f;
+    float normal_deg = 0.0f, body_closing = 0.0f;
+    float gate_vn = 0.0f, fx, fz, spd_at, t_end;
+    float lat = 0.0f, ribw = 0.0f, off = 0.0f, rlat = 0.0f, st_t = 0.0f;
+    int   station = -1, have_normal, rel_zero, have_body = 0;
+    char  oname[128], why[640];
+    const B3AwlTick* last;
+
+    if (!awl_on()) return;
+    if (slot < 0 || slot >= B3_AWL_SLOTS) return;
+    f = awl_file();
+    if (!f) return;
+
+    akind = g_awl[slot].last_kind;
+    fx = sinf(v->rot.y); fz = -cosf(v->rot.y);
+
+    /* WHAT WAS HIT.  g_carcol_dbg is the one place the car/traffic contact
+     * is already captured in a uniform shape (carcol_pass writes it for
+     * every racer contact, rival or traffic); the wall path leaves it stale,
+     * which the 0.25 s freshness test below is what distinguishes. */
+    if (g_race_time - g_carcol_dbg[slot].t <= 0.25f) {
+        fresh         = 1;
+        other_traffic = g_carcol_dbg[slot].is_traffic;
+        other_id      = g_carcol_dbg[slot].other;
+        gate_vn       = g_carcol_dbg[slot].vn;          /* mph, crash gate */
+        other_mph     = g_carcol_dbg[slot].other_mph;
+    }
+    if (v->slam_by >= 0 && g_race_time - v->slam_time < 1.5f) {
+        other_traffic = 0;
+        other_id      = v->slam_by;                     /* racecar+0x16BC  */
+    }
+    if (!other_traffic && other_id >= 0 && other_id < B3_AWL_SLOTS)
+        other_wrecked = (g_vehicles[other_id].crashed_until > 0.0f);
+
+    /* THE IMPACT GEOMETRY, from wreck_begin_for's own arguments: contact_n
+     * points from the obstacle INTO the victim, rel_vel is the victim's
+     * velocity relative to the obstacle. */
+    have_normal = (cn.x * cn.x + cn.y * cn.y + cn.z * cn.z) > 1e-6f;
+    rel_zero    = (rv.x * rv.x + rv.y * rv.y + rv.z * rv.z) < 1e-6f;
+    if (have_normal) {
+        closing = -(rv.x * cn.x + rv.y * cn.y + rv.z * cn.z);
+        /* bearing of the obstacle direction (-n) off the car's nose.  The
+         * wreck_begin_for contract says contact_n points from the obstacle
+         * INTO the victim, but the six sites do not all honour it (measured:
+         * a traffic car 2.6 m DEAD AHEAD reports -n at 171 deg), so this is
+         * reported and NOT used to classify whenever the two bodies'
+         * positions can answer the same question.                      [S] */
+        normal_deg = awl_bearing_deg(-cn.x, -cn.z, v->rot.y);
+        ang = normal_deg;
+    }
+    if (other_id >= 0) {
+        float ox, oz, ovx = 0.0f, ovz = 0.0f, dx, dz, d;
+        if (other_traffic && other_id < g_traffic_n) {
+            ox = g_traffic[other_id].pos.x; oz = g_traffic[other_id].pos.z;
+            ovx = sinf(g_traffic[other_id].yaw) * g_traffic[other_id].speed;
+            ovz = -cosf(g_traffic[other_id].yaw) * g_traffic[other_id].speed;
+            have_body = 1;
+        } else if (!other_traffic && other_id < B3_AWL_SLOTS) {
+            ox = g_vehicles[other_id].pos.x; oz = g_vehicles[other_id].pos.z;
+            ovx = g_vehicles[other_id].vel.x; ovz = g_vehicles[other_id].vel.z;
+            have_body = 1;
+        } else { ox = v->pos.x; oz = v->pos.z; }
+        dx = ox - v->pos.x; dz = oz - v->pos.z;
+        d  = sqrtf(dx * dx + dz * dz);
+        lon = dx * fx + dz * fz;
+        if (have_body) {
+            /* the unambiguous one: closing rate along the line of centres,
+             * from the two bodies' own velocities.  Site C hands
+             * wreck_begin_for a ZERO rel_vel, so `closing` above is 0 there
+             * and this is the number to read. */
+            if (d > 1e-3f)
+                body_closing = ((v->vel.x - ovx) * dx
+                              + (v->vel.z - ovz) * dz) / d;
+            ang = awl_bearing_deg(dx, dz, v->rot.y);
+        }
+    }
+    {   /* the ribbon picture, taken FRESH here rather than from the last ring
+         * sample (which can be 100 ms and one nav section stale) */
+        const B3AiAvoid* a = &g_ai_avoid[slot].a;
+        float d2;
+        ribw = a->width;
+        lat  = (v->pos.x - a->right[0]) * a->axis[0]
+             + (v->pos.z - a->right[2]) * a->axis[2];
+        off  = (ribw > 0.1f) ? lat - ribw * 0.5f : 0.0f;
+        d2 = route_project(v->pos.x, v->pos.z, 0, -1, &station, &st_t, &rlat);
+        if (d2 >= 1e29f) station = -1;
+    }
+
+    n      = g_awl[slot].n;
+    last   = n ? awl_at(slot, n - 1) : NULL;
+    t_end  = last ? last->t : g_race_time;
+    spd_at = v->sim.speed;
+    cls    = awl_classify(slot, entry, akind, other_traffic, other_wrecked,
+                          ang, lon, spd_at, v->pos.y, why, sizeof why);
+    third  = (int)(v->track_progress * 3.0f);
+    if (third < 0) third = 0;
+    if (third > 2) third = 2;
+    awl_body_name(other_traffic, other_id, oname, sizeof oname);
+
+    g_awl_wreck_n++;
+    g_awl_per_car[slot]++;
+    g_awl_per_class[cls]++;
+    g_awl_per_third[third]++;
+    g_awl_class_by_car[slot][cls]++;
+
+    fprintf(f,
+"\n"
+"================================================================ WRECK %d\n"
+"wreck    n=%d car=%d t=%.2f frame=%d track=%s third=%d driver=%s\n"
+"impact   entry=%s aicrash_kind=%s what=%s\n"
+"         closing=%.1fm/s (%s)%s\n"
+"         gate_vn=%.1fmph other_spd=%.1fmph\n"
+"         impact_deg=%+.1f (%s, bearing off own nose) normal_deg=%+.1f "
+"lon=%+.1fm\n"
+"         contact_pt=%.1f,%.1f,%.1f contact_n=%.3f,%.3f,%.3f%s\n"
+"         spd=%.1fm/s(%.0fmph) pos=%.1f,%.1f,%.1f yaw_deg=%.1f\n"
+"         nav=%d/%d nav_ok=%d station=%d t=%.2f prog=%.3f\n"
+"         ribbon_lat=%+.2f ribbon_w=%.2f centre_off=%+.2f rlat=%+.2f\n"
+"         (ribbon values are FRESH at the impact, not from the last sample)\n"
+"guess    %s   [HEURISTIC -- derived, not a game decision]\n"
+"evidence %s\n"
+"ring     n=%d hz=%g span=%.1fs  rt = seconds BEFORE the wreck\n",
+        g_awl_wreck_n,
+        g_awl_wreck_n, slot, (double)g_race_time, g_frame_count,
+        raceflow_track_id(), third,
+        (slot == 0 && !getenv("B3_AUTODRIVE")) ? "human" : "ai",
+        entry == 0 ? "WALL" : (entry == 1 ? "CAR" : "ROLLOVER"),
+        akind == 0 ? "takedown" : (akind == 1 ? "traffic" : "world"),
+        fresh || other_id >= 0 ? oname : "world/wall (no car contact record)",
+        (double)(have_body ? body_closing : closing),
+        have_body ? "line of centres, from both bodies' velocities"
+                  : "-dot(rel_vel, contact_n) -- no other body recorded",
+        rel_zero ? "   [this site hands wreck_begin_for a ZERO rel_vel]" : "",
+        (double)gate_vn, (double)other_mph,
+        (double)ang, have_body ? "from the two bodies" : "from contact_n",
+        (double)normal_deg, (double)lon,
+        (double)cp.x, (double)cp.y, (double)cp.z,
+        (double)cn.x, (double)cn.y, (double)cn.z,
+        have_normal ? "" : " (stale/zero -- angle taken from the other body)",
+        (double)spd_at, (double)(spd_at * 2.2369363f),
+        (double)v->pos.x, (double)v->pos.y, (double)v->pos.z,
+        (double)(v->rot.y * RAD_TO_DEG),
+        (int)v->nav_section, (int)v->nav_node, v->nav_ready,
+        station, (double)st_t, (double)v->track_progress,
+        (double)lat, (double)ribw, (double)off, (double)rlat,
+        g_awl_class_name[cls], why,
+        n, (double)(1.0f / B3_AWL_PERIOD),
+        (double)(n * B3_AWL_PERIOD));
+
+    if (n == 0)
+        fprintf(f, "         (empty -- this car was not on the AI arm; the "
+                   "ring is filled from vehicle_update's AI branch only)\n");
+
+    for (i = 0; i < n; i++) {
+        const B3AwlTick* s = awl_at(slot, i);
+        char q[96], nb[2][112];
+        int  k;
+        if (s->q_who >= 0)
+            snprintf(q, sizeof q, "car%d@%.1f(%d/%d)", s->q_who,
+                     (double)s->q_d, s->q_hits, s->q_ticks);
+        else
+            snprintf(q, sizeof q, "-");
+        for (k = 0; k < 2; k++) {
+            if (s->n_kind[k] == 0) snprintf(nb[k], sizeof nb[k], "-");
+            else snprintf(nb[k], sizeof nb[k], "%c%d@%.1f/b%+.0f",
+                          s->n_kind[k] == 1 ? 'c' : 't', s->n_id[k],
+                          (double)s->n_d[k], (double)s->n_ang[k]);
+        }
+        fprintf(f,
+"  rt=%+.2f spd=%.1f dem=%.1f ceil=%.1f cbrake=%.1f bd=%.1f cspd=%.1f "
+"cap=%.1f thr=%.2f brk=%.2f str=%+.2f gear=%d q=%s "
+"aim=%.0f,%.0f d=%.1f lost=%d amode=%d/%d latch=%d rad=%.0f alt=%d curve=%.2f "
+"av=st%d/ovr%d(%d+%dref/%d) strip=%d dmin=%.1f dband=%.1f "
+"risk=%.2f/%.2f/%.2f avspd=%.1f "
+"rb=cap%.1f/bon%.1f/win%.2f/exp%d "
+"agg=%.2f aggst=%d aggtgt=%d aspd=%d ooc=%d/%d "
+"nav=%d/%d/%d stn=%d/%.2f prog=%.3f lat=%+.2f w=%.2f off=%+.2f rlat=%+.2f "
+"pos=%.0f,%.0f,%.0f slip=%+.0f near1=%s near2=%s\n",
+            (double)(s->t - t_end), (double)s->spd, (double)s->dem,
+            (double)s->ceilv, (double)s->cbrake, (double)s->bdist,
+            (double)s->corner_ai, (double)s->cap,
+            (double)s->thr, (double)s->brk, (double)s->str, s->gear, q,
+            (double)s->aim[0], (double)s->aim[1], (double)s->aim_dist,
+            s->aim_lost, s->tmode, s->m1fc, s->latch, (double)s->radius,
+            s->alt, (double)s->curve,
+            s->av_state, s->av_ovr, s->ovr_hits, s->ovr_ref, s->q_ticks,
+            s->av_strip, (double)s->av_dmin, (double)s->av_dband,
+            (double)s->av_here, (double)s->av_lo, (double)s->av_hi,
+            (double)s->av_speed,
+            (double)s->rb_cap, (double)s->rb_bonus, (double)s->rb_win,
+            s->rb_exp,
+            (double)s->agg, s->agg_state, s->agg_tgt, s->aggspd_mode,
+            s->ooc_mode, s->ooc_win,
+            s->nav_sec, s->nav_node, s->nav_ok, s->station, (double)s->st_t,
+            (double)s->prog, (double)s->lat, (double)s->ribw, (double)s->off,
+            (double)s->rlat,
+            (double)s->pos[0], (double)s->pos[1], (double)s->pos[2],
+            (double)s->slip, nb[0], nb[1]);
+    }
+    fflush(f);
+}
+
+/* End of race / exit: the tallies. */
+static void awl_summary(void) {
+    FILE* f;
+    int   i, c;
+    if (!awl_on()) return;
+    if (g_awl_state <= 0) return;         /* never opened -- nothing to say */
+    f = g_awl_f;
+    if (!f) return;
+    fprintf(f, "\n"
+"================================================================ SUMMARY\n"
+"summary  race_t=%.1f track=%s wrecks=%d cars=%d\n",
+            (double)g_race_time, raceflow_track_id(), g_awl_wreck_n,
+            g_num_vehicles);
+    fprintf(f, "per_car ");
+    for (i = 0; i < g_num_vehicles && i < B3_AWL_SLOTS; i++)
+        fprintf(f, " car%d=%d", i, g_awl_per_car[i]);
+    fprintf(f, "\n");
+    fprintf(f, "per_third first=%d second=%d final=%d "
+               "(track_progress at the wreck, thirds of a lap)\n",
+            g_awl_per_third[0], g_awl_per_third[1], g_awl_per_third[2]);
+    for (c = 0; c < B3_AWL_CLASSES; c++) {
+        if (!g_awl_per_class[c]) continue;
+        fprintf(f, "per_class %-24s total=%d  by_car:", g_awl_class_name[c],
+                g_awl_per_class[c]);
+        for (i = 0; i < g_num_vehicles && i < B3_AWL_SLOTS; i++)
+            if (g_awl_class_by_car[i][c])
+                fprintf(f, " car%d=%d", i, g_awl_class_by_car[i][c]);
+        fprintf(f, "\n");
+    }
+    fprintf(f, "# end of log\n");
+    fflush(f);
+    fclose(f);
+    g_awl_f = NULL;
+    g_awl_state = -1;
+    printf("[Burnout3] ai wreck log: %d wreck(s) -> %s\n", g_awl_wreck_n,
+           g_awl_path);
+}
+/* --- end ai wreck log (agent) ------------------------------------------ */
+
 static void carcol_synth_rb(B3RigidBody* rb, Vec3 pos_gl, float y_origin,
                             float yaw, Vec3 vel_gl) {
+    {   /* preserve the caller's frame binding across the zeroing */
+    float (*keep_frame)[4] = rb->frame;
     memset(rb, 0, sizeof(*rb));
+    rb->frame = keep_frame; }
     float cy = cosf(yaw), sy = sinf(yaw);
     rb->frame[0][0] =  cy; rb->frame[0][2] = -sy;   // right
     rb->frame[1][1] =  1.0f;                        // up
@@ -9157,6 +17188,14 @@ static void carcol_fill_racer(CarColEntry* e, Vehicle* v, int slot) {
         b->bbmin[k] = v->fsim.center_off[k];  // +0x1E0 (.bgv +0xE90)
     }
     b->type = B3_COL_TYPE_RACER;
+    /* The type-3 arm (FUN_00112E70) reads these off the CAR and nothing
+     * else: +0xBC the scalar speed it builds its velocity from, +0x1534 the
+     * crash-threshold authority, +0x1353 (bit 1 mutes the pair, bit 4 vetoes
+     * the crash) and +0x152C, the 0.5 s post-spawn object-crash immunity. */
+    b->speed      = v->fsim.rb.vel[3];
+    b->authority  = v->fsim.authority_1534;
+    b->flags_1353 = v->fsim.flags_1353;
+    b->immune     = (unsigned char)(v->fsim.timer_152C >= 0.0f);
     if (v->crashed_until > 0.0f) {
         e->synth = 1;                 // driven by the wreck sim
         b->crashed = 1;               // -> FUN_00113960's path
@@ -9183,7 +17222,10 @@ static void carcol_fill_racer(CarColEntry* e, Vehicle* v, int slot) {
 // to the reverse-direction line (0x1A8540, 926 pts) than to the forward race
 // line".  Everything downstream of this flag is the game's own rule.
 static int score_oncoming_flag(const Vehicle* v) {
-    float d_fwd = loop_closest(g_cl, ROUTE_COUNT, v->pos.x, v->pos.z,
+    /* No per-track oncoming line -> the mirror has nothing to compare and
+     * must not report "wrong side" for every car on the road. */
+    if (!B3_ONCOMING_USABLE) return 0;
+    float d_fwd = loop_closest(g_cl, g_route_n, v->pos.x, v->pos.z,
                                NULL, NULL);
     float d_onc = loop_closest(B3_ONCOMING, B3_ONCOMING_COUNT,
                                v->pos.x, v->pos.z, NULL, NULL);
@@ -9259,6 +17301,31 @@ static void score_contact_pair(Vehicle* a, Vehicle* b, int a_traffic,
     }
 }
 
+/* Retail's drift scorer FUN_00196E10 gates on racecar+0x10C2, a byte with no
+ * locatable writer in the image (RE_SCORE_EVENTS section 6 -- an operand sweep
+ * and a raw displacement search find only its two readers). The port
+ * substitutes the vehicle's own drift state, which is the same signal from the
+ * side we do own.
+ *
+ * The substitution has to test for the DRIFTING states specifically, not
+ * "non-zero". veh+0x1524 is a small enum and only 1 and 2 mean drifting
+ * (RE_NOTES: "drift state (+0x1524 = 1/2)", and FUN_001206D0 routes on
+ * "+0x1524 in {1,2}"). The other two values are sentinels:
+ *
+ *   3  the chassis-vs-world resolve forces it on ANY body contact
+ *      (FUN_0011BE50 @0x0011C0C0, the eax != 0 arm) -- a wall scrape, not a
+ *      drift. This is the one that reached the player: scoring it meant every
+ *      scrape past 90 mph poured distance into the drift category and the
+ *      ticker awarded stars for it.
+ *   4  the AI navigator's "I have the wheel" marker, set by
+ *      b3_ai_vehicle_state_init and cleared by b3_ai_wheel_set. It leaves
+ *      every AI rival permanently "drifting".
+ */
+static int score_drifting_flag(const Vehicle* v) {
+    int st = v->fsim.drift_state_1524;
+    return st == 1 || st == 2;
+}
+
 static void score_events_update(Vehicle* v) {
     B3ScoreFrame f;
     float dx = v->pos.x - v->sev_prev_pos.x;
@@ -9272,8 +17339,19 @@ static void score_events_update(Vehicle* v) {
     f.speed_mph = v->sim.speed * B3_SE_MPH_PER_MS;
     f.airborne  = score_airborne_flag(v);
     f.oncoming  = score_oncoming_flag(v);
-    f.drifting  = v->fsim.drift_state_1524 != 0;
+    f.drifting  = score_drifting_flag(v);
     b3_score_events_frame(&v->sev, &v->bar, &f);
+    /* B3_CAT_DBG=1: one line every 5 s with each scoring category's live
+     * accumulator and tier, and whether its gate is open. This is how the
+     * drift gate was caught -- "drift on" was 1 on every sample while the
+     * car was driving straight. Diagnostic only; off by default. */
+    if (getenv("B3_CAT_DBG") && v == &g_player && g_frame_count % 300 == 0)
+        fprintf(stderr, "[cat] t=%.0f onc=%.0f/t%d drift=%.0f/t%d nm=%.0f/t%d "
+                "(onc on=%d drift on=%d)\n", g_race_time,
+                v->sev.onc.value, (int)v->sev.onc.tier,
+                v->sev.drift.value, (int)v->sev.drift.tier,
+                v->sev.nm.value, (int)v->sev.nm.tier,
+                f.oncoming, f.drifting);
 }
 
 // Fill an OBB exactly as FUN_00195DD0 reads one (GAME space).
@@ -9295,7 +17373,7 @@ static void score_near_miss_update(Vehicle* v) {
                          v->fsim.half_ext, v->fsim.center_off);
     for (i = 0; i < g_traffic_n && n < B3_TRAFFIC_N; i++) {
         TrafficCar* t = &g_traffic[i];
-        B3RigidBody rb;
+        B3_RIGID_BODY_LOCAL(rb);
         float bmax[4], bmin[4], half;
         if (!t->active || t->crashed_until > g_race_time) continue;
         carcol_synth_rb(&rb, t->pos,
@@ -9385,13 +17463,62 @@ static void carcol_fill_traffic(CarColEntry* e, TrafficCar* t, int idx) {
     }
     b->hull = &g_traffic_hull[t->car];
     b->mass = t->mass_kg;
-    float half = 0.5f * (g_traffic_len[t->car] > 2.0f
-                         ? g_traffic_len[t->car] : 4.2f);
-    b->bbmax[0] =  1.0f; b->bbmax[1] =  1.2f; b->bbmax[2] =  half;
-    b->bbmin[0] = -1.0f; b->bbmin[1] = -0.2f; b->bbmin[2] = -half;
+    /* The broadphase box, from the car's OWN hull.  The racer path takes it
+     * from the .bgv body box (v+0x1D0/+0x1E0); traffic had X and Y hardcoded
+     * at +-1.0 and [-0.2, 1.2] with only Z from the mesh length, which is
+     * badly undersized for the big vehicles -- HEVY_Car34's hull reaches
+     * x +-1.30 and y 2.95, HEVY_Car24's y 3.69.  Anything taller or wider
+     * than a small car was dropped in the BROAD phase, so the narrow phase
+     * never saw it and the racer drove through: side-swipes against trucks,
+     * and anything above car height against a trailer.  Deriving it from the
+     * hull vertices cannot be undersized by construction.  Cached per class:
+     * the hull never changes once loaded. */
+    {
+        static float bmax[B3_TRAFFIC_CAR_MAX][3];
+        static float bmin[B3_TRAFFIC_CAR_MAX][3];
+        static unsigned char have[B3_TRAFFIC_CAR_MAX];
+        int c = t->car;
+        if (c >= 0 && c < B3_TRAFFIC_CAR_COUNT && !have[c]) {
+            const B3CarHull* h = &g_traffic_hull[c];
+            int nv = h->nverts;
+            if (nv > 0) {
+                for (int k = 0; k < 3; k++) {
+                    bmax[c][k] = h->verts[0][k];
+                    bmin[c][k] = h->verts[0][k];
+                }
+                for (int vi = 1; vi < nv; vi++)
+                    for (int k = 0; k < 3; k++) {
+                        if (h->verts[vi][k] > bmax[c][k]) bmax[c][k] = h->verts[vi][k];
+                        if (h->verts[vi][k] < bmin[c][k]) bmin[c][k] = h->verts[vi][k];
+                    }
+            } else {
+                /* no hull verts: fall back to the old literals rather than
+                 * collapse the box to a point */
+                float hz = 0.5f * (g_traffic_len[c] > 2.0f
+                                   ? g_traffic_len[c] : 4.2f);
+                bmax[c][0] =  1.0f; bmax[c][1] =  1.2f; bmax[c][2] =  hz;
+                bmin[c][0] = -1.0f; bmin[c][1] = -0.2f; bmin[c][2] = -hz;
+            }
+            have[c] = 1;
+        }
+        for (int k = 0; k < 3; k++) {
+            b->bbmax[k] = bmax[c][k];
+            b->bbmin[k] = bmin[c][k];
+        }
+    }
     b->type    = B3_COL_TYPE_TRAFFIC;
     b->crashed = (unsigned char)(t->crashed_until > g_race_time);
     b->asleep  = t->asleep;
+    /* The type-3 arm builds the object's velocity as frame.at * the traffic
+     * record's own scalar +0xC4 -- there is no rigid body behind a live
+     * traffic car in retail, so there is nothing else to read.  +0x174 bit 3
+     * is the "this one never crashes anything" flag; the harness's traffic
+     * records do not carry it.  FUN_00120BA0 @0x00120E44 always stamps the
+     * promoted car with DAT_0073BB8C, so a promoted traffic car is always
+     * FUN_0010FBC0's class 3. */
+    b->speed      = t->speed;
+    b->no_crash   = 0;
+    b->designated = 1;
 }
 
 static void carcol_writeback(CarColEntry* e, float dt) {
@@ -9554,6 +17681,7 @@ static void carcol_wreck_takedown(Vehicle* a, Vehicle* b,
     } else {
         b3_td_on_crash(&g_tdr, g_race_time, vs, NULL, NULL);
     }
+    g_takedowns_committed++;
     printf("[Burnout3] t=%.2f WRECK TAKEDOWN: wreck %d -> car %d "
            "(impact %.0f, aftertouch=%d, wreck_age %.2f s, "
            "victim_was_its_attacker=%d)\n",
@@ -9731,6 +17859,70 @@ static void debug_dump(void) {
            n, n);
 }
 
+/* B3_RESIZE_SWEEP=WxH,WxH,... -- DRIVE THE WINDOW THROUGH A LIST OF SIZES.
+ *
+ * The effects chain (src/burnout3_aftereffects.c) rebuilds every target it
+ * owns whenever the drawable changes, and that rebuild is the SHARED half of a
+ * defect the web hit: a stale depth attachment left the scene framebuffer
+ * incomplete at any new size.  The desktop never showed it -- GL 3.0 dropped
+ * the same-dimensions rule that GLES2/WebGL 1 still enforce -- but the code is
+ * one path and it deserves one test.
+ *
+ * SDL's `offscreen` video driver honours SDL_SetWindowSize and its drawable
+ * follows (measured: 640x480 -> 1921x1080 on GL 4.6/NVIDIA), so the whole
+ * sweep runs headless, on the real desktop driver, without a window ever
+ * existing.  render_frame() re-reads SDL_GetWindowSize() every frame, so
+ * setting it here is all it takes.
+ *
+ * The web has its own copy of this in web/b3_web.c, because there the canvas
+ * backing store has to move with the window and only b3_web_apply_resolution()
+ * moves both; same env name, same log lines, same gate.  Off unless set. */
+static void resize_sweep_tick(void) {
+#ifndef __EMSCRIPTEN__
+    static const char* list = NULL;
+    static int armed = -1, every = 120, countdown = 0, step = 0;
+    const char* p;
+    int i, w, h;
+
+    if (armed < 0) {
+        const char* e;
+        list  = getenv("B3_RESIZE_SWEEP");
+        armed = (list && *list) ? 1 : 0;
+        if ((e = getenv("B3_RESIZE_SWEEP_EVERY")) && *e) {
+            every = atoi(e);
+            if (every < 1) every = 1;
+        }
+        countdown = every;
+        if (armed)
+            printf("[Burnout3] resize sweep armed -- %s (a step every %d "
+                   "frames)\n", list, every);
+    }
+    if (!armed || !g_window) return;
+    /* Wait for the chain: b3_afx_status() is NULL exactly while it is up, and
+     * a step taken before the first build proves nothing about the rebuild
+     * path.  Same guard, same reason, as the web copy in web/b3_web.c. */
+    if (b3_afx_status() != NULL) return;
+    if (--countdown > 0) return;
+    countdown = every;
+
+    p = list;
+    for (i = 0; i < step && p; i++) { p = strchr(p, ','); if (p) p++; }
+    if (!p || !*p) {
+        if (armed == 1) {
+            armed = 2;
+            printf("[Burnout3] resize sweep complete (%d steps)\n", step);
+            fflush(stdout);
+        }
+        return;
+    }
+    step++;
+    if (sscanf(p, "%dx%d", &w, &h) != 2 || w < 1 || h < 1) return;
+    printf("[Burnout3] resize sweep step %d -> %dx%d\n", step, w, h);
+    fflush(stdout);
+    SDL_SetWindowSize(g_window, w, h);
+#endif
+}
+
 /* B3_DRIVE_LOG: append the whole game state, every frame, to one file.
  * B3_DRIVE_LOG=1 writes build/drive_log.txt; any other value is used as the
  * path.  Same block the T-key dump writes, so a frame-by-frame trace and a
@@ -9772,10 +17964,16 @@ static void b3_write_gamestate(FILE* f, int n) {
             g_frame_count, g_race_time, g_delta_time, g_tdfx_real_dt);
     fprintf(f, "game_state %d  lap %d/%d  cam_fov %.1f\n",
             (int)g_state, g_current_lap + 1, g_lap_count, g_cam_fov_deg);
-    fprintf(f, "tdfx: divisor %d timescale %.3f cinematic=%d t=%.2f "
-            "victim=%d callout msg=0x%X age=%.2f\n",
-            st.divisor, st.timescale, st.active, st.t, st.victim_slot,
-            st.callout_msg, st.callout_age);
+    fprintf(f, "tdfx: divisor %d timescale %.3f audio_rate %.3f "
+            "cinematic=%d t=%.2f victim=%d callout msg=0x%X age=%.2f\n",
+            st.divisor, st.timescale, st.pitch, st.active, st.t,
+            st.victim_slot, st.callout_msg, st.callout_age);
+    /* AFTERTOUCH: the live Impact Time state -- the pad bit veh+0x13FC & 4,
+     * the two axes veh+0x1408/+0x140C, the qualifier veh+0x4AC5, and the
+     * mixer rate the recovered DAT_003EBFD0 latch is driving. */
+    fprintf(f, "aftertouch: held %d h %+.2f v %+.2f used %d sfx_rate %.3f\n",
+            g_at_held, g_at_h, g_at_v, g_wrecks[0].aftertouch_used,
+            b3_sfx_time_scale());
     for (int i = 0; i < g_num_vehicles; i++) {
         Vehicle* v = &g_vehicles[i];
         fprintf(f, "\ncar %d%s: pos (%.1f, %.1f, %.1f) vel (%.1f, %.1f, %.1f)"
@@ -9794,7 +17992,7 @@ static void b3_write_gamestate(FILE* f, int n) {
                 g_tdr.car[i].td_credited, g_tdr.car[i].aggressor);
         fprintf(f, "  ai: tgt_angle %.1f tgt_speed %.1f rev_timer %.2f "
                 "stuck %d/%0.1f  aggro state %d aim_valid %d\n",
-                v->ai.target_angle, v->ai.target_speed, v->ai.reverse_timer,
+                v->ai.target_angle, v->ai.target_speed, v->fsim.reverse_timer_157C,
                 v->stuck_frames, v->stuck_time,
                 v->aggro.state, v->aggro.aim_valid);
         fprintf(f, "  score: bp %d  air %.1f/t%d onc %.1f/t%d drift %.1f/t%d"
@@ -9908,12 +18106,15 @@ static void crash_trace_tick(void) {
     if (g_crash_trace) {
         const B3WreckState* wk = &g_wrecks[0];
         fprintf(g_crash_trace,
-                "f=%d t=%.3f dt=%.5f div=%d ts=%.3f tdfx_t=%.2f cin=%d | "
+                "f=%d t=%.3f dt=%.5f div=%d ts=%.3f arate=%.3f "
+                "held=%d ath=%+.2f atv=%+.2f atused=%d tdfx_t=%.2f cin=%d | "
                 "wr%d pos %.3f %.3f %.3f | vel %.3f %.3f %.3f (%.2f) | "
                 "om %.3f %.3f %.3f | upY %.3f | air=%d at=%.2f "
                 "settle=%.2f asleep=%d rest=%.2f | until %.2f\n",
                 g_frame_count, g_race_time, g_delta_time,
-                st.divisor, st.timescale, st.t, st.active,
+                st.divisor, st.timescale, st.pitch,
+                g_at_held, g_at_h, g_at_v, wk->aftertouch_used,
+                st.t, st.active,
                 wk->active, wk->frame[3][0], wk->frame[3][1], wk->frame[3][2],
                 wk->vel[0], wk->vel[1], wk->vel[2], wk->vel[3],
                 wk->omega[0], wk->omega[1], wk->omega[2],
@@ -10126,6 +18327,8 @@ static void tdr_frame_pass(void) {
                  * +0x16C4 = the unmodelled damage-machine field, keeping
                  * the human arm's 0.3 > health gate open. */
                 b3_tdfx_takedown_credit(at == 0, vi == 0, 0.0f);
+                g_takedowns_committed++;
+                if (at == 0) g_player_takedowns++;
                 printf("[Burnout3] TAKEDOWN COMMIT: car %d took down car %d"
                        " -- message 0x%X, +%d BP%s%s\n",
                        at, vi, ev[k].message, ev[k].bp,
@@ -10161,8 +18364,65 @@ static void tdr_frame_pass(void) {
 
 #define CARCOL_MAX (8 + B3_TRAFFIC_N * 2)
 
+/* --------------------------------------------------------------------------
+ * FUN_00111CD0's TYPE-3 ARM.
+ *
+ * A live traffic car is not a vehicle in retail.  The traffic spawn
+ * FUN_001A2B20 registers it through FUN_00111620 (@0x001A2DB0 / 0x001A2EEA /
+ * 0x001A3088), which writes collision-object type **3** with the frame taken
+ * from the traffic record's own +0x70 matrix and the box from its model at
+ * +0xE80 -- no vehicle record, no rigid body, no accumulators.  FUN_00111CD0
+ * @0x00111D6E routes a pair with exactly one type-3 handle to FUN_00112E70
+ * (ordering it so the CAR is A), NOT to the racer-vs-racer response.
+ *
+ * That is why this harness's live traffic never yielded: FUN_001121F0 splits
+ * the separation by mass and writes half of it into the traffic body, which
+ * traffic_update() then overwrites from the lane cursor -- so the pair never
+ * came apart and re-contacted every frame.  Retail's own answer is that the
+ * CAR takes 100 % of the push-out and the traffic car takes nothing at all;
+ * above `authority * 75` mph of normal closing the car crashes and
+ * FUN_00114910 PROMOTES the traffic object into a real type-4 vehicle whose
+ * lane cursor is destroyed, which is the only way a traffic car ever moves
+ * under a hit.  See docs/RE_CARCOL.md and burnout3_carcol.h.
+ *
+ * The mapping onto this harness: one TrafficCar covers both retail states,
+ * so `traffic && !crashed` is retail's type-3 handle and `traffic &&
+ * crashed` is retail's promoted type-4 vehicle (which keeps the
+ * FUN_00113960 arm it already has).
+ * ------------------------------------------------------------------------ */
+static int carcol_live_traffic(const CarColEntry* e, int owner) {
+    return owner >= 0 && !e->body.crashed;
+}
+
+static int carcol_resolve_pair(CarColEntry* ei, CarColEntry* ej,
+                               int oi, int oj, B3CarContact* ct) {
+    int li = carcol_live_traffic(ei, oi);
+    int lj = carcol_live_traffic(ej, oj);
+    if (li != lj) {
+        CarColEntry* car = li ? ej : ei;
+        CarColEntry* obj = li ? ei : ej;
+        if (car->veh) {                       /* a racer against type 3 */
+            unsigned char keep = obj->body.type;
+            obj->body.type = B3_COL_TYPE_OBJECT;
+            /* FUN_00017310's "crash party" (game mode 6, or sub-mode 3/4/5)
+             * drops the bar from authority*75 to authority*20 mph.  This
+             * harness only runs a normal race. */
+            int r = b3_carcol_resolve_traffic(&car->body, &obj->body, 0, ct);
+            obj->body.type = keep;
+            return r;
+        }
+    }
+    return b3_carcol_resolve(&ei->body, &ej->body, ct);
+}
+
 static void carcol_pass(void) {
     static CarColEntry ent[CARCOL_MAX];
+    static int ent_bound = 0;
+    if (!ent_bound) {
+        for (int i = 0; i < CARCOL_MAX; i++)
+            b3_rigid_body_bind_frame(&ent[i].rb, ent[i].rb_frame_store);
+        ent_bound = 1;
+    }
     B3CarBody* list[CARCOL_MAX];
     // Rig id per entry: the traffic-car slot a body belongs to (-1 = racer).
     // A tractor and the trailer it tows share one, so the solver can be told
@@ -10183,7 +18443,46 @@ static void carcol_pass(void) {
     }
     for (int i = 0; i < g_traffic_n && n < CARCOL_MAX; i++) {
         TrafficCar* t = &g_traffic[i];
-        if (!t->active || !t->streamed || !g_traffic_hull_ok[t->car]) continue;
+        /* THE RESIDENCY VETO IS TYPE-SCOPED, AND A LIVE TRAFFIC CAR IS NOT
+         * IN ITS SCOPE.  [C] FUN_00114610, retail's pair filter, ends with
+         * one clause per side:
+         *
+         *   @0x001146D3..0x001146EA  CMP CL,2 / CL,1 / CL,AL(=4) / CL,6 / CL,7
+         *   @0x001146F2              CMP byte [ECX+0x216], BL      (BL = -1)
+         *   @0x001146FA..0x00114711  the same five for the other side
+         *   @0x00114719              CMP byte [EDX+0x216], BL
+         *
+         * i.e. the pair is rejected when a body's collision-object type is
+         * one of {0,1,2,4,6,7} AND its +0x216 is -1.  TYPE 3 IS NOT IN THAT
+         * SET.  Every live traffic car is a type-3 handle (FUN_00111620 from
+         * the traffic spawn, @0x001A2DB0 / @0x001A2EEA / @0x001A3088), so
+         * retail pairs the player against an out-of-unit LIVE traffic car
+         * quite happily; only a wreck -- promoted to a type-4 vehicle by
+         * FUN_00114910, `traffic && crashed` in this harness -- gets the
+         * veto, along with the racers themselves.
+         *
+         * The port applied the veto to every traffic car, which is where the
+         * user's "I can see them and drive through them" came from: an agent
+         * the renderer draws (it gates on `active` alone) and this loop
+         * refused.  Scoped correctly, a drawn LIVE traffic car is always
+         * collidable, whatever the collision soup does or does not have
+         * under it -- which is the invariant
+         * tools/validate_traffic_align.py --run now asserts. */
+        int promoted = t->crashed_until > g_race_time;   /* retail's type 4 */
+        if (getenv("B3_CARCOL_DBG")) {
+            static int f = 0, na = 0, ns = 0, nh = 0, nv = 0, tot = 0;
+            tot++;
+            if (!t->active) na++;
+            else if (!g_traffic_hull_ok[t->car]) nh++;
+            else if (promoted && !t->streamed) nv++;
+            else if (!t->streamed) ns++;          /* admitted anyway now */
+            if (++f % 20000 == 0)
+                fprintf(stderr, "[carcol] traffic seen=%d  skipped: "
+                        "inactive=%d no-hull=%d promoted-not-streamed=%d "
+                        "| admitted-while-not-streamed=%d  (n=%d)\n",
+                        tot, na, nh, nv, ns, n);
+        }
+        if (!traffic_carcol_admits(t)) continue;
         carcol_fill_traffic(&ent[n], t, i);
         rig[n] = i;
         traffic_owner[n] = i;
@@ -10208,6 +18507,22 @@ static void carcol_pass(void) {
             list[n] = &ent[n].body; n++;
         }
     }
+    /* PASS-THROUGH DETECTOR (B3_PASSTHRU=1).  The direct test of "I can drive
+     * through them": did the PLAYER's swept segment this frame pass through
+     * another car's world box without any contact being resolved against it?
+     * A contact that resolves and pushes is fine; a body the player's centre
+     * transits with no contact at all is the bug.  Records which bodies the
+     * player resolved against, then checks every other one after the loop. */
+    static int pt_dbg = -1;
+    if (pt_dbg < 0) pt_dbg = getenv("B3_PASSTHRU") != NULL;
+    static Vec3 pt_prev; static int pt_have = 0;
+    unsigned char pt_hit[CARCOL_MAX];
+    int pt_player = -1;
+    if (pt_dbg) {
+        memset(pt_hit, 0, sizeof pt_hit);
+        for (int i = 0; i < n; i++)
+            if (ent[i].veh == &g_player) { pt_player = i; break; }
+    }
     if (n >= 2) {
         int pairs[0x100][2];
         int np = b3_carcol_broadphase(list, n, pairs, 0x100);
@@ -10224,6 +18539,27 @@ static void carcol_pass(void) {
              * that instead. */
             if (rig[i] >= 0 && rig[i] == rig[j]) continue;
             if (traffic_owner[i] >= 0 && traffic_owner[i] == traffic_owner[j])
+                continue;
+            /* [C] FUN_00114610, retail's PAIR FILTER, which sits between the
+             * sweep and FUN_00111CD0: it rejects a pair when both bodies are
+             * asleep (+0x20E).  The port ran the AABB sweep but not this, so
+             * a settled pile of wrecks -- every member asleep and mutually
+             * overlapping by construction -- was re-resolved every frame.
+             * With carcol=retail that is a full emulated narrow phase per
+             * pair (~2.3 ms on a contact), and the pile dominated the count:
+             * 3861 of 4000 broadphase pairs were traffic-vs-traffic. */
+            if (list[i]->asleep && list[j]->asleep) continue;
+            /* [C-disasm] FUN_00114610 @0x00114613: the pair filter rejects
+             * TWO TYPE-3 handles outright.  Every live traffic car is a
+             * type-3 handle (FUN_00111620 from the traffic spawn), so retail
+             * never resolves live traffic against live traffic at all -- the
+             * agents' own follow/avoid law is what keeps them apart, and a
+             * traffic car only enters the collision response once it has
+             * been PROMOTED to a vehicle (type 4) by FUN_00114910.  This
+             * harness was resolving every live traffic pair, which is where
+             * the bulk of the broadphase resolve rate came from. */
+            if (carcol_live_traffic(&ent[i], traffic_owner[i])
+                && carcol_live_traffic(&ent[j], traffic_owner[j]))
                 continue;
             B3CarContact ct;
             /* FUN_00113960's recent-slam window: retail clears the wreck
@@ -10246,7 +18582,131 @@ static void carcol_pass(void) {
                        < B3_CARCOL_SLAM_WINDOW_S)
                     ent[j].body.slam_recent = 1;
             }
-            if (!b3_carcol_resolve(list[i], list[j], &ct)) continue;
+            if (getenv("B3_CARCOL_DBG")) {
+                static int nf = 0, ntraf = 0, nres = 0, nplt = 0, npltres = 0;
+                static int nwreck = 0, nplayer = 0, nplayer_wreck = 0;
+                static double dv_alive = 0.0, dv_wreck = 0.0;
+                int is_pt = ((traffic_owner[i] < 0) != (traffic_owner[j] < 0));
+                /* THE DRIVE-THROUGH SPLIT.  "resolved" says a contact was
+                 * found, not that the RACER felt it: a pair with a crashed
+                 * body goes to b3_carcol_resolve_wreck (FUN_00113960), which
+                 * makes the alive car immovable (kind 2 @0x00113B75) and
+                 * hands the wreck 100% of the impulse and separation.  So
+                 * count the wreck pairs separately and measure what the racer
+                 * actually received on each. */
+                int wreck_pair = (list[i]->crashed || list[j]->crashed);
+                int pl = (ent[i].veh == &g_player || ent[j].veh == &g_player);
+                B3CarBody* rb_side = ent[i].veh ? list[i]
+                                   : (ent[j].veh ? list[j] : NULL);
+                float pre[4] = {0,0,0,0}, pred[4] = {0,0,0,0};
+                if (rb_side) {
+                    for (int k = 0; k < 4; k++) pre[k]  = rb_side->rb->imp_force[k];
+                    for (int k = 0; k < 4; k++) pred[k] = rb_side->rb->deflection[k];
+                }
+                ntraf++;                      /* pairs considered */
+                if (is_pt) nplt++;            /* player/racer vs traffic */
+                int r = carcol_resolve_pair(&ent[i], &ent[j],
+                                            traffic_owner[i],
+                                            traffic_owner[j], &ct);
+                if (r) {
+                    nres++;
+                    if (is_pt) npltres++;
+                    if (is_pt && wreck_pair) nwreck++;
+                    if (pt_dbg && pt_player >= 0) {
+                        if (i == pt_player) pt_hit[j] = 1;
+                        if (j == pt_player) pt_hit[i] = 1;
+                    }
+                    if (pl && !is_pt && ent[i].veh && ent[j].veh) {
+                        /* player vs OPPONENT (both racers).  The takedown
+                         * path needs these, so a run with none of them can
+                         * never produce a takedown -- which is exactly what
+                         * an all-zero takedown count means. */
+                        B3CarBody* pb2 = (ent[i].veh == &g_player) ? list[i] : list[j];
+                        float m2 = pb2->mass > 1.0f ? pb2->mass : 1.0f;
+                        fprintf(stderr, "[opp] player-vs-opponent t=%.2f spd=%.1f "
+                                "impact=%.0f slam=%d dv=%.3f\n",
+                                g_race_time, pb2->rb->vel[3], ct.impact,
+                                (int)ct.slam_class,
+                                sqrtf(pb2->rb->imp_force[0]*pb2->rb->imp_force[0]
+                                    + pb2->rb->imp_force[2]*pb2->rb->imp_force[2]) / m2);
+                    }
+                    if (pl && is_pt) {
+                        nplayer++;
+                        if (wreck_pair) nplayer_wreck++;
+                        /* Per-contact, for the player only: what did the
+                         * PLAYER actually receive?  The aggregate above mixes
+                         * the AI racers in, so it cannot answer "why do I
+                         * drive through oncoming traffic". */
+                        B3CarBody* pb = (ent[i].veh == &g_player) ? list[i]
+                                                                  : list[j];
+                        B3CarBody* ob = (ent[i].veh == &g_player) ? list[j]
+                                                                  : list[i];
+                        float pm = pb->mass > 1.0f ? pb->mass : 1.0f;
+                        /* the response has THREE channels now: the alive
+                         * traffic arm (FUN_00112E70's sub-threshold rub)
+                         * delivers the whole push-out as DEFLECTION (+0x130)
+                         * plus a FORCE through FUN_001205E0, with no impulse
+                         * at all -- measuring imp_force alone read the
+                         * retail-faithful response as "delivered nothing". */
+                        float px = pb->rb->imp_force[0] - (pb == rb_side ? pre[0] : 0.0f);
+                        float py = pb->rb->imp_force[1] - (pb == rb_side ? pre[1] : 0.0f);
+                        float pz = pb->rb->imp_force[2] - (pb == rb_side ? pre[2] : 0.0f);
+                        float dfx = pb->rb->deflection[0] - (pb == rb_side ? pred[0] : 0.0f);
+                        float dfz = pb->rb->deflection[2] - (pb == rb_side ? pred[2] : 0.0f);
+                        float fax = pb->rb->force_acc[0], faz = pb->rb->force_acc[2];
+                        float pvx = pb->rb->vel[0], pvz = pb->rb->vel[2];
+                        float ovx = ob->rb->vel[0], ovz = ob->rb->vel[2];
+                        float clos = sqrtf((pvx-ovx)*(pvx-ovx) + (pvz-ovz)*(pvz-ovz));
+                        /* SIGNED approach along the contact normal.  |impact|
+                         * cannot distinguish a car driving INTO another from
+                         * one separating after the hit -- it is built from
+                         * |vn| -- and retail correctly applies nothing to a
+                         * separating pair.  Only an APPROACHING contact is
+                         * required to deliver an impulse. */
+                        float rvx = pvx - ovx, rvz = pvz - ovz;
+                        float nx = ct.normal[0], nz = ct.normal[2];
+                        float vn_signed = rvx * nx + rvz * nz;
+                        if (ent[j].veh == &g_player) vn_signed = -vn_signed;
+                        float ox = ob->rb->imp_force[0], oz = ob->rb->imp_force[2];
+                        float om = ob->mass > 1.0f ? ob->mass : 1.0f;
+                        fprintf(stderr, "[hit] player t=%.2f spd=%.1f closing=%.1f "
+                                "wreck=%d | imp=(%.0f %.0f) dv=%.3f m/s | n=(%.2f %.2f) "
+                                "ny=%.2f impact=%.0f slam=%d dvy=%.3f "
+                                "| OTHER dv=%.3f | vn_signed=%+.2f\n",
+                                g_race_time, pb->rb->vel[3], clos, wreck_pair,
+                                px, pz, sqrtf(px*px + pz*pz) / pm
+                                    + sqrtf(dfx*dfx + dfz*dfz) * 60.0f
+                                    + sqrtf(fax*fax + faz*faz)
+                                        * g_delta_time / pm,
+                                ct.normal[0], ct.normal[2], ct.normal[1],
+                                ct.impact, (int)ct.slam_class,
+                                fabsf(py) / pm,
+                                sqrtf(ox*ox + oz*oz) / om, vn_signed);
+                    }
+                    if (is_pt && rb_side) {
+                        float m = rb_side->mass > 1.0f ? rb_side->mass : 1.0f;
+                        float dx = rb_side->rb->imp_force[0] - pre[0];
+                        float dz = rb_side->rb->imp_force[2] - pre[2];
+                        float sx = rb_side->rb->deflection[0] - pred[0];
+                        float sz = rb_side->rb->deflection[2] - pred[2];
+                        double got = sqrt((double)dx*dx + (double)dz*dz) / m
+                                   + sqrt((double)sx*sx + (double)sz*sz);
+                        if (wreck_pair) dv_wreck += got; else dv_alive += got;
+                    }
+                }
+                if (++nf % 4000 == 0)
+                    fprintf(stderr,
+                            "[carcol] pairs=%d resolved=%d | racer-vs-traffic "
+                            "pairs=%d resolved=%d (of which the traffic car was "
+                            "ALREADY WRECKED: %d) | player-vs-traffic %d "
+                            "(wrecked %d) | racer response sum: alive %.2f, "
+                            "wreck %.2f  <- wreck must not be 0\n",
+                            ntraf, nres, nplt, npltres, nwreck,
+                            nplayer, nplayer_wreck, dv_alive, dv_wreck);
+                if (!r) continue;
+            } else
+            if (!carcol_resolve_pair(&ent[i], &ent[j], traffic_owner[i],
+                                     traffic_owner[j], &ct)) continue;
             /* SCORE-CLASSIFIER: the collision dispatcher at 0x00027500
              * notifies the score object of every car-on-car contact --
              * FUN_00197920 for the near-miss cancel and FUN_001979E0 for the
@@ -10400,6 +18860,19 @@ static void carcol_pass(void) {
                                t->crashed_until > g_race_time);
                     }
                     if (ct.crash_a && ct.crash_b) {
+                        /* FUN_00114910 -> FUN_00120BA0: the promoted vehicle
+                         * inherits the traffic record's frame, its speed
+                         * (veh+0xBC = rec+0xC4 @0x00120DDD) and a LINEAR
+                         * VELOCITY of frame.at * that speed
+                         * (@0x00120E20/0x00120E2E/0x00120E3C), and the
+                         * traffic-manager slot plus its lane cursor are
+                         * destroyed (@0x00114BAC..).  Here the lane cursor
+                         * simply stops being read -- traffic_update() skips
+                         * a crashed car -- so the body only needs seeding. */
+                        t->rb.vel[0] =  sinf(t->yaw) * t->speed;
+                        t->rb.vel[1] =  0.0f;
+                        t->rb.vel[2] =  cosf(t->yaw) * t->speed;
+                        t->rb.vel[3] =  t->speed;
                         t->crashed_until = g_race_time + 5.0f;
                         t->speed = 0.0f;
                         carcol_wreck_racer_from_traffic(v, t, &ct);
@@ -10411,15 +18884,143 @@ static void carcol_pass(void) {
             }
         }
     }
+    if (pt_dbg && pt_player >= 0) {
+        /* Did the player's swept centre transit a body it never resolved
+         * against?  Segment-vs-AABB (slab test) on the body's WORLD box. */
+        Vec3 cur = g_player.pos;
+        if (pt_have) {
+            float p0[3] = { pt_prev.x, pt_prev.y + 0.3f, -pt_prev.z };
+            float p1[3] = { cur.x,     cur.y     + 0.3f, -cur.z };
+            float d[3]  = { p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2] };
+            for (int i = 0; i < n; i++) {
+                if (i == pt_player || pt_hit[i] || !list[i]) continue;
+                /* the body's ORIENTED box, not its world AABB: for a
+                 * rotated 5 m trailer the AABB is far larger than the
+                 * vehicle, so driving ALONGSIDE one clipped the AABB corner
+                 * and read as a pass-through.  Transform the segment into
+                 * the body's local frame and slab-test bbmin/bbmax. */
+                const float (*fm)[4] = list[i]->rb->frame;
+                float r0[3], r1[3], q0[3], q1[3];
+                for (int k = 0; k < 3; k++) {
+                    r0[k] = p0[k] - fm[3][k];
+                    r1[k] = p1[k] - fm[3][k];
+                }
+                for (int k = 0; k < 3; k++) {
+                    q0[k] = r0[0]*fm[k][0] + r0[1]*fm[k][1] + r0[2]*fm[k][2];
+                    q1[k] = r1[0]*fm[k][0] + r1[1]*fm[k][1] + r1[2]*fm[k][2];
+                }
+                const float* lo = list[i]->bbmin;
+                const float* hi = list[i]->bbmax;
+                float t0 = 0.0f, t1 = 1.0f;
+                int miss = 0;
+                for (int k = 0; k < 3 && !miss; k++) {
+                    float dk = q1[k] - q0[k];
+                    if (fabsf(dk) < 1e-6f) {
+                        if (q0[k] < lo[k] || q0[k] > hi[k]) miss = 1;
+                    } else {
+                        float ta = (lo[k]-q0[k]) / dk;
+                        float tb = (hi[k]-q0[k]) / dk;
+                        if (ta > tb) { float t = ta; ta = tb; tb = t; }
+                        if (ta > t0) t0 = ta;
+                        if (tb < t1) t1 = tb;
+                        if (t0 > t1) miss = 1;
+                    }
+                }
+                if (!miss) {
+                    const char* what = (traffic_owner[i] >= 0) ? "TRAFFIC"
+                                     : (ent[i].veh ? "OPPONENT" : "body");
+                    fprintf(stderr, "[passthru] player through %s at t=%.2f "
+                            "spd=%.1f step=%.2f m depth_into_box=%.2f m\n",
+                            what, g_race_time, g_player.fsim.rb.vel[3],
+                            sqrtf(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]),
+                            (t1 - t0) * sqrtf(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]));
+                }
+            }
+        }
+        pt_prev = cur; pt_have = 1;
+    }
     for (int i = 0; i < n; i++) carcol_writeback(&ent[i], g_delta_time);
     for (int i = 0; i < g_traffic_n; i++) {
         TrafficCar* t = &g_traffic[i];
-        if (!t->active || !t->streamed || t->crashed_until > g_race_time) continue;
+        /* SAME ADMISSION AS THE LOOP THAT BUILT `list`, by construction.
+         * The solver writes +0x110/+0x130 into every body it was handed, and
+         * this is what consumes them; a body admitted above but skipped here
+         * would accumulate an impulse until its next residency transition
+         * fired the whole pile at once.  (Retail has that accumulation too
+         * while a body is out of unit -- FUN_00120F30 skips the tail-call to
+         * FUN_00123000 -- and clears it on re-entry at @0x00120F98 via
+         * FUN_001213C0, which traffic_stream_refresh() ports; but retail
+         * never hands an out-of-unit type-{0,1,2,4,6,7} body to the solver
+         * in the first place, so it never accumulates a CONTACT.) */
+        if (!t->active) continue;
+        if (t->crashed_until > g_race_time && !t->streamed) continue;
+        /* A CRASHED TRAFFIC CAR IS STILL A LIVE RIGID BODY.
+         *
+         * THE DRIVE-THROUGH BUG.  b3_carcol_resolve_wreck() is the port of
+         * FUN_00113960, and FUN_00113960 forces the UN-crashed car to kind 2
+         * -- IMMOVABLE -- at 0x00113B75.  So when a racer hits a wreck the
+         * racer receives NOTHING: 100% of the contact impulse (+0x110) and
+         * 100% of the separation (+0x130) are written to the WRECK's body and
+         * the racer's own +0x110/+0x130 stay at zero.  Measured with the real
+         * hulls (COMP/Car1 into a standing, wrecked HEVYCAR11 at 45 m/s):
+         *     racer  imp_force (0,0,0)  deflection (0,0,0)      dv  0.000 m/s
+         *     wreck  imp_force (842,5778,17218)  deflection (0,0.055,0.552)
+         * In retail that is correct, because a crashed car keeps running its
+         * own solver and ITS integrator consumes exactly those two
+         * accumulators: the wreck is shoved aside and the racer's path clears.
+         * Here the parked wreck was skipped by BOTH traffic_update() (the
+         * `continue` in its crashed branch) and by this integrate, so nothing
+         * ever consumed them -- the wreck did not move a millimetre and the
+         * racer was never touched.  The car is still DRAWN, because
+         * traffic_render() gates on t->active alone, which is the user's
+         * report exactly: "I can drive through traffic cars like they are not
+         * there (but I can see them)".  It compounds: a stationary wreck is
+         * rammed by the traffic behind it (FUN_00113960's traffic threshold
+         * is 2500, ~15 mph of closing), and every car that joins the pile is
+         * another drive-through body.
+         *
+         * So the wreck is integrated too.  It gets no drive servo -- that
+         * lives in traffic_update()'s live branch, which a wreck never reaches
+         * -- so the parked-wreck model is applied here instead: gravity is
+         * cancelled and the body height pinned (a wreck must neither sink
+         * through the road nor be levitated by the wreck resolve's un-
+         * flattened Y separation -- FUN_001121F0 zeroes the separation's Y for
+         * an alive pair, FUN_00113960 does not), and the linear/angular
+         * velocity is bled off so a shove moves the wreck without launching it
+         * down the road.  [GLUE: only the decay rate, in the same per-second
+         * form the g_carcol_knock decay just below already uses.  The impulse
+         * and the separation that do the moving are retail's.] */
+        int wrecked = t->crashed_until > g_race_time;
+        float keep_y = t->rb.frame[3][1];
+        float keep_ty = t->trailer_rb.frame[3][1];
+        if (wrecked) {
+            float d = 1.0f - 4.0f * g_delta_time;   /* GLUE decay, ~4 /s */
+            if (d < 0.0f) d = 0.0f;
+            t->rb.force_acc[1] += 20.0f * t->mass_kg;   /* cancel gravity */
+            for (int k = 0; k < 3; k++) t->rb.vel[k] *= d;
+            t->rb.vel[1] = 0.0f;
+            t->rb.vel[3] = sqrtf(t->rb.vel[0] * t->rb.vel[0]
+                               + t->rb.vel[2] * t->rb.vel[2]);
+            for (int k = 0; k < 4; k++) t->rb.angmom[k] *= d;
+            if (t->trailer_ready) {
+                t->trailer_rb.force_acc[1] += 20.0f * t->trailer_mass_kg;
+                for (int k = 0; k < 3; k++) t->trailer_rb.vel[k] *= d;
+                t->trailer_rb.vel[1] = 0.0f;
+                t->trailer_rb.vel[3] =
+                    sqrtf(t->trailer_rb.vel[0] * t->trailer_rb.vel[0]
+                        + t->trailer_rb.vel[2] * t->trailer_rb.vel[2]);
+                for (int k = 0; k < 4; k++) t->trailer_rb.angmom[k] *= d;
+            }
+        }
         b3_rigid_body_integrate(&t->rb, t->mass_kg, 0.0f, 0, 0,
                                 g_delta_time);
         if (t->trailer_ready)
             b3_rigid_body_integrate(&t->trailer_rb, t->trailer_mass_kg,
                                     0.0f, 0, 0, g_delta_time);
+        if (wrecked) {
+            t->rb.frame[3][1] = keep_y;
+            if (t->trailer_ready) t->trailer_rb.frame[3][1] = keep_ty;
+        }
         t->pos = (Vec3){t->rb.frame[3][0],
                         t->rb.frame[3][1] + 0.5f + g_traffic_ymin[t->car],
                        -t->rb.frame[3][2]};
@@ -10450,7 +19051,7 @@ static void panels_pieces_update(float dt) {
                 ground_y[panel] = height;
             } else {
                 Vec3 route;
-                loop_closest(g_cl, ROUTE_COUNT, piece->frame[3][0],
+                loop_closest(g_cl, g_route_n, piece->frame[3][0],
                              piece->frame[3][2], &route, NULL);
                 ground_y[panel] = route.y;
             }
@@ -10459,23 +19060,44 @@ static void panels_pieces_update(float dt) {
     }
 }
 
+// Every vehicle body must point at its frame storage before ANY code reads a
+// row. b3_vehicle_full_init does it, but the grid is touched before the cars
+// are initialised -- when the matrix was inline that read zeros, and now it
+// would read through a NULL pointer. Bind the whole static array once.
+static void b3_bind_vehicle_frames(void)
+{
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    for (int i = 0; i < (int)(sizeof g_vehicles / sizeof g_vehicles[0]); i++)
+        b3_rigid_body_bind_frame(&g_vehicles[i].fsim.rb,
+                                 g_vehicles[i].fsim.rb_frame_store);
+}
+
 static void game_update(void) {
+    b3_bind_vehicle_frames();
     // Update race timer
     if (g_state == RACING) {
         g_race_time += g_delta_time;
         g_real_clock_dbg += g_tdfx_real_dt;
         
+        /* The original pair of end checks.  They stay authoritative on
+         * B3_EXIT_AT / B3_TRACK_TEST runs, which the validators depend
+         * on; in normal play b3_raceflow_owns_end() is 1 and real lap
+         * completion ends the race instead (see the race flow block). */
+        if (!b3_raceflow_owns_end()) {                      /* race flow (agent) */
         // Check lap completion
         if (g_current_lap >= g_lap_count) {
             g_state = FINISHED;
             printf("[Burnout3] Race finished! Time: %.1fs\n", g_race_time);
         }
-        
+
         // Check time limit
         if (g_race_time >= g_time_limit) {
             g_state = FINISHED;
             printf("[Burnout3] Time's up!\n");
         }
+        }                                                   /* race flow (agent) */
     }
     
     // Update vehicles (slot 0 is the player)
@@ -10493,6 +19115,198 @@ static void game_update(void) {
     }
     for (int i = 0; i < g_num_vehicles; i++) {
         vehicle_update(&g_vehicles[i], g_delta_time);
+    }
+
+    /* ------------------------------------------------------------------
+     * B3_SCENARIO=slam[:T[:D]] -- the in-game takedown scenario.
+     *
+     * Autodrive follows the racing line and never touches an opponent (a
+     * 120 s run produced 0 player-vs-opponent contacts), so without this the
+     * takedown path is simply never exercised in game.
+     *
+     * This RETRIES rather than firing once at a fixed instant.  The first
+     * design teleported the player once at t=T with speeds pinned relative
+     * to the target, and every run of it measured a different confound --
+     * emulator ownership, the target's own speed, a start pile-up -- because
+     * the two backends' worlds diverge chaotically within seconds, so no
+     * single fixed moment is comparable across them.  The assertion this
+     * feeds (validate_collision_scenarios.py) is therefore QUALITATIVE and
+     * per-backend: "this backend can commit a takedown and pays BP for it".
+     * Numeric scoring parity is the unit differential's job
+     * (validate_takedown_score.py, every expected value executed retail).
+     *
+     * Every RETRY_S from t=T: if the player is free and some healthy
+     * opponent is doing at least TGT_MIN m/s, place the player scen_d metres
+     * behind it, matched in heading, at 45 m/s with the target pinned to
+     * 20 m/s (closing 25).  Stop after a takedown commits or MAX_TRIES.
+     * Everything after the placement is the real game -- physics, carcol,
+     * td_rules and the scorer all run normally.
+     * ------------------------------------------------------------------ */
+    {
+        enum { MAX_TRIES = 12 };
+        static const float RETRY_S = 6.0f, TGT_MIN = 10.0f;
+        static int scen = -1; static float scen_t = 8.0f, scen_d = 7.0f;
+        static int tries = 0; static float next_try = 0.0f;
+        static int scen_traffic = 0;
+        if (scen < 0) {
+            const char* e = getenv("B3_SCENARIO");
+            scen = (e && strncmp(e, "slam", 4) == 0);
+            scen_traffic = (e && strncmp(e, "traffic", 7) == 0);
+            if (scen_traffic) scen = 1;
+            const char* col = e ? strchr(e, ':') : NULL;
+            if (scen && col) {
+                scen_t = (float)atof(col + 1);
+                const char* c2 = strchr(col + 1, ':');
+                if (c2) scen_d = (float)atof(c2 + 1);
+            }
+            next_try = scen_t;
+        }
+        /* B3_SCENARIO=traffic[:T] -- the deterministic ONCOMING-TRAFFIC hit.
+         * With retail's population law in place (160 m spawn view-gate,
+         * separated retire arm, correct progress), organic hard head-ons
+         * became rare enough that a 90 s autodrive run can produce ZERO
+         * solid approaching samples -- so the suite's delivery check needs
+         * this the same way takedowns needed the slam scenario.  Every
+         * RETRY_S: aim the player at the nearest live streamed traffic car
+         * and close at 40 m/s.  Everything after the placement is the real
+         * game. */
+        if (scen_traffic && tries < MAX_TRIES && g_race_time >= next_try
+            && g_player.crashed_until <= 0.0f) {
+            TrafficCar* tc = NULL; float bd = 500.0f * 500.0f;
+            for (int i = 0; i < g_traffic_n; i++) {
+                TrafficCar* t = &g_traffic[i];
+                if (!t->active || !t->streamed) continue;
+                if (t->crashed_until > g_race_time) continue;
+                float dx = t->pos.x - g_player.pos.x;
+                float dz = t->pos.z - g_player.pos.z;
+                float d2 = dx * dx + dz * dz;
+                if (d2 > 40.0f * 40.0f && d2 < bd) { bd = d2; tc = t; }
+            }
+            next_try = g_race_time + RETRY_S;
+            if (tc) {
+                tries++;
+                B3RigidBody* pr = &g_player.fsim.rb;
+                /* face the traffic car from 35 m out, in GAME space */
+                float gx = tc->pos.x, gz = -tc->pos.z;   /* harness -> game */
+                float dx = gx - pr->frame[3][0], dz = gz - pr->frame[3][2];
+                float dl = sqrtf(dx * dx + dz * dz);
+                if (dl > 1.0f) {
+                    dx /= dl; dz /= dl;
+                    for (int r = 0; r < 3; r++)
+                        for (int c = 0; c < 4; c++) pr->frame[r][c] = 0.0f;
+                    pr->frame[0][0] =  dz; pr->frame[0][2] = -dx;
+                    pr->frame[1][1] = 1.0f;
+                    pr->frame[2][0] =  dx; pr->frame[2][2] =  dz;
+                    pr->frame[3][0] = gx - dx * 35.0f;
+                    pr->frame[3][2] = gz - dz * 35.0f;
+                    pr->frame[3][3] = 1.0f;
+                    for (int c = 0; c < 3; c++) pr->vel[c] = 0.0f;
+                    pr->vel[0] = dx * 40.0f; pr->vel[2] = dz * 40.0f;
+                    pr->vel[3] = 40.0f;
+                    for (int c = 0; c < 4; c++) {
+                        pr->omega[c] = 0.0f; pr->imp_force[c] = 0.0f;
+                        pr->deflection[c] = 0.0f;
+                    }
+                    g_player.pos = (Vec3){ pr->frame[3][0], g_player.pos.y,
+                                           -pr->frame[3][2] };
+                    b3_emu_drop_car(&g_player);
+                    g_traffic_scen_until = g_race_time + 4.0f;
+                    g_traffic_scen_target = (int)(tc - g_traffic);
+                    printf("[Burnout3] [scenario] traffic hit try %d/%d at "
+                           "t=%.2f: 35 m from car %d, closing 40 m/s\n",
+                           tries, (int)MAX_TRIES, g_race_time,
+                           (int)(tc - g_traffic));
+                }
+            }
+        }
+        if (scen && !scen_traffic && tries < MAX_TRIES
+            && g_race_time >= next_try
+            && g_num_vehicles >= 2 && g_player.crashed_until <= 0.0f
+            && !g_player_takedowns) {
+            /* the FASTEST healthy opponent -- the first one in slot order was
+             * once a car tangled in a start pile-up, and the "slam" fired
+             * 0.02 s after the teleport against a stationary heap */
+            Vehicle* tgt = NULL; float best = TGT_MIN;
+            for (int i = 0; i < g_num_vehicles; i++) {
+                Vehicle* c = &g_vehicles[i];
+                if (c == &g_player || !c->active || !c->fsim_ready) continue;
+                if (c->crashed_until > 0.0f) continue;
+                if (c->fsim.rb.vel[3] >= best) { best = c->fsim.rb.vel[3]; tgt = c; }
+            }
+            next_try = g_race_time + RETRY_S;
+            if (tgt) {
+                tries++;
+                B3RigidBody* pr = &g_player.fsim.rb;
+                B3RigidBody* tr = &tgt->fsim.rb;
+                for (int r = 0; r < 3; r++)
+                    for (int c = 0; c < 4; c++) pr->frame[r][c] = tr->frame[r][c];
+                for (int c = 0; c < 3; c++)
+                    pr->frame[3][c] = tr->frame[3][c] - tr->frame[2][c] * scen_d;
+                pr->frame[3][3] = 1.0f;
+                float clos = 45.0f, tspd = 20.0f;
+                { const char* e2 = getenv("B3_SCENARIO_SPEED");
+                  if (e2) clos = (float)atof(e2); }
+                /* Aim the punt at the nearest WALL.  A slam along the road
+                 * registers (kind 5/6, victim out of control) but the victim
+                 * rarely WRECKS inside the claim window -- on the retail
+                 * backend, 0 direct commits in 12 open-road tries.  A
+                 * takedown IS "slam him into something", so point the whole
+                 * exchange at a wall when one is within range; the collision
+                 * world is GL space (z negated). */
+                if (!getenv("B3_SCENARIO_NOWALL")) {
+                    float pc2[3] = { tr->frame[3][0],
+                                     tr->frame[3][1] + 0.3f,
+                                     -tr->frame[3][2] };
+                    float sdw, wn2[3];
+                    if (b3_nearest_wall_signed(pc2, 35.0f, 0.70f, &sdw, wn2)
+                        && sdw > 2.0f) {
+                        /* -normal points INTO the wall; back to GAME space */
+                        float dx2 = -wn2[0], dz2 = wn2[2];
+                        float dl = sqrtf(dx2*dx2 + dz2*dz2);
+                        if (dl > 1e-3f) {
+                            dx2 /= dl; dz2 /= dl;
+                            for (int r = 0; r < 3; r++)
+                                for (int cc = 0; cc < 4; cc++)
+                                    pr->frame[r][cc] = 0.0f;
+                            pr->frame[0][0] =  dz2; pr->frame[0][2] = -dx2;
+                            pr->frame[1][1] = 1.0f;
+                            pr->frame[2][0] =  dx2; pr->frame[2][2] =  dz2;
+                            for (int r = 0; r < 3; r++)
+                                for (int cc = 0; cc < 4; cc++)
+                                    tr->frame[r][cc] = pr->frame[r][cc];
+                            tr->frame[3][3] = pr->frame[3][3] = 1.0f;
+                            for (int cc = 0; cc < 3; cc++)
+                                pr->frame[3][cc] = tr->frame[3][cc]
+                                                 - tr->frame[2][cc] * scen_d;
+                        }
+                    }
+                }
+                for (int c = 0; c < 3; c++) {
+                    pr->vel[c] = tr->frame[2][c] * clos;
+                    tr->vel[c] = tr->frame[2][c] * tspd;
+                }
+                pr->vel[3] = clos; tr->vel[3] = tspd;
+                for (int c = 0; c < 4; c++) {
+                    pr->omega[c] = 0.0f; pr->imp_force[c] = 0.0f;
+                    pr->deflection[c] = 0.0f;
+                    tr->omega[c] = 0.0f; tr->imp_force[c] = 0.0f;
+                    tr->deflection[c] = 0.0f;
+                }
+                g_player.pos = (Vec3){ pr->frame[3][0], g_player.pos.y,
+                                       -pr->frame[3][2] };
+                /* with physics=retail the EMULATOR owns both cars and the
+                 * port side is a mirror, so a teleport that only writes fsim
+                 * is undone by the next handover; dropping releases ownership
+                 * and the emulator re-seeds from the pose just written (the
+                 * route_replace_car arrangement) */
+                b3_emu_drop_car(&g_player);
+                b3_emu_drop_car(tgt);
+                printf("[Burnout3] [scenario] slam try %d/%d at t=%.2f: player "
+                       "%.1f m behind car %d at %.0f m/s, target pinned to "
+                       "%.0f m/s\n", tries, (int)MAX_TRIES, g_race_time,
+                       scen_d, (int)(tgt - g_vehicles), clos, tspd);
+            }
+        }
     }
 
     // Traffic: drive the oncoming line; carcol_pass() resolves its contacts.
@@ -10566,6 +19380,17 @@ static void game_update(void) {
     // listener the 15/50-unit distance roll-off is measured from.
     b3_sfx_tick();
     b3_sfx_set_listener(g_player.pos.x, g_player.pos.y, g_player.pos.z);
+    /* SFX SLOW MOTION: DAT_003EBFD0 -> FUN_001CA530 -> DAT_004A1EF0, the
+     * playback-rate scale every non-exempt voice is multiplied by
+     * (FUN_001CAD10 @0x001CADC6 + five siblings).  b3_tdfx_pitch() is the
+     * latch that mirrors retail's ten paired divisor/rate write sites, so
+     * holding Impact Time through a crash drops the effects to 0.75x and
+     * releasing it restores 1.0x -- while a takedown cinematic, which
+     * dilates time without a paired store, leaves the audio alone.  The
+     * MUSIC stream is deliberately not scaled: retail's streamed path reads
+     * only the volume DAT_004A1EEC (FUN_001CBA60 @0x001CBAA0).  See the
+     * table in burnout3_sfx.h section 3.                              [C] */
+    b3_sfx_set_time_scale(b3_tdfx_pitch());
     /* BOOSTFX: the exhaust-flame level, FUN_0017A480's tail
      * (boostRecord+0x14 = carObj+0x11B0).  Every car, not just the
      * player -- FUN_0017F730 runs the emitter for every car object and
@@ -10623,12 +19448,12 @@ static void game_update(void) {
             din.wheel[wq].contact = ws->contact;
             din.wheel[wq].mode    = -1;   /* wheel+0x78 is not ported */
             din.wheel[wq].pos[0]  = g_player.pos.x
-                                  + din.right[0] * ws->local_x
-                                  + din.fwd[0]   * ws->local_z;
+                                  + din.right[0] * g_player.fsim.wheel_local_x[wq]
+                                  + din.fwd[0]   * g_player.fsim.wheel_local_z[wq];
             din.wheel[wq].pos[1]  = g_player.pos.y;
             din.wheel[wq].pos[2]  = g_player.pos.z
-                                  + din.right[2] * ws->local_x
-                                  + din.fwd[2]   * ws->local_z;
+                                  + din.right[2] * g_player.fsim.wheel_local_x[wq]
+                                  + din.fwd[2]   * g_player.fsim.wheel_local_z[wq];
         }
         din.speed_ms = g_player.sim.speed;
         din.gear     = g_player.fsim.trans.gear;
@@ -10670,13 +19495,2403 @@ static void game_update(void) {
     // two substeps after it).
     carcol_pass();
     tdr_frame_pass();
+    b3_raceflow_update();                                   /* race flow (agent) */
 }
 
 // ============================================================
 // Main entry point (harness; the game's real entry is 0x001D2807)
 // ============================================================
 
+/* ==========================================================================
+ * TRACK SELECT
+ *
+ * Runs before any track-dependent load and publishes its choice through
+ * B3_TRACK, the selector every loader already reads (the standing
+ * data-driven-tracks directive).  Art and layout follow retail's track
+ * select as far as it is recovered: the HD*.png preview plates and
+ * GlobalFont come straight out of Data/Frontend.txd / Global.txd
+ * (docs/RE_FRONTEND.md).
+ *
+ * The table it walks is LOADED AT BOOT, not compiled in: the retail display
+ * strings (the venue and directional names) are the publisher's content and
+ * cannot ship in the source of a user-supplies-assets build.  See
+ * src/burnout3_trackselect_runtime.h -- ids and Globalus indices out of the
+ * user's own default.xbe (as build/burnout3.elf), the text out of the user's
+ * own Data/Globalus.bin, the lap count out of the track's .bgd via pace.bin.
+ * There is no fallback table: with the user's files absent the selector says
+ * so and stands down, and B3_TRACK still decides the track.
+ *
+ * ALL TRACKS UNLOCKED by design (deviation from retail's profile-gated
+ * unlocks, documented in RE_FRONTEND).  Submodes are listed but LOCKED:
+ * pure races only.
+ * ======================================================================== */
+#include "burnout3_trackselect_runtime.h"  /* runtime: retail track table,
+                                        * names from Globalus, tlist menu
+                                        * order, lap counts (RE_FRONTEND) */
+
+/* ---- SELECT REGION: the globe's region highlight, LIFTED FROM THE MAP ----
+ *
+ * The highlight used to be the region's icon art (USA.png &c) stretched over
+ * a lat/long window of World_Map.  It could never register: the icons are
+ * GLOBE RENDERS (orthographic) while World_Map is a Gall-stereographic
+ * cylinder, so a box mapping agrees in the middle and drifts at the corners
+ * -- the satellite coastline slid off the wireframe one underneath (the Gulf,
+ * Florida and the north-east were visibly out).
+ *
+ * So the highlight is not overlaid on the map any more, it is LIFTED OUT OF
+ * IT.  Every highlight texel's ALPHA is World_Map's own land alpha at that
+ * same texel, clipped to the region's lon/lat polygon, and the texture is
+ * World_Map's own texel grid -- drawn by a second pass of the SAME sphere
+ * mesh.  A highlight texel and the map texel under it are therefore the same
+ * texel: the coastline of the lit region IS the coastline of the map, at any
+ * rotation, and it cannot drift.
+ *
+ * Only the COLOUR comes from the icon, and colour carries no edges, so it
+ * only has to be right to a few pixels.  Each icon is an orthographic globe
+ * render, so it is fitted (centre lon/lat, radius, image centre, roll) by
+ * matching its own silhouette to the map's coastlines -- mean mask error
+ * 0.04 (USA), 0.23 (EUROPE), 0.11 (FAR EAST).  Where the icon has nothing to
+ * say -- its region ends before the polygon does, or a piece of its art sits
+ * off its fitted place (FAR EAST's Japan is drawn ~8 px out) -- the colour is
+ * filled from the region's own palette: an 8x8 block field of the colours
+ * that DID land, relaxed into the holes.
+ *
+ * Returns 1 and fills *out (texture + the mask's centroid in map uv, which is
+ * what the globe aims at) or 0 if the art is missing.
+ */
+typedef struct { GLuint tex; float cu, cv; } B3RegionHL;
+
+static int b3_menu_build_region_hl(int r, B3RegionHL* out)
+{
+    /* the region boundaries, lon/lat.  Coastal legs run offshore -- the map's
+     * own land alpha cuts them to the coast -- so only the INLAND legs are
+     * borders: the 49th parallel and the Rio Grande for USA, the icons' own
+     * eastern/northern cuts for EUROPE and FAR EAST. */
+    static const float POLY_US[] = {
+        -125.0f,48.2f, -123.2f,48.4f, -123.0f,49.0f,  -95.2f,49.0f,
+         -95.0f,48.9f,  -89.6f,48.2f,  -88.5f,48.4f,  -84.3f,46.6f,
+         -82.4f,45.0f,  -82.5f,42.3f,  -78.9f,43.3f,  -76.5f,44.1f,
+         -74.7f,45.0f,  -71.5f,45.0f,  -69.2f,47.4f,  -67.8f,47.1f,
+         -67.0f,45.2f,  -66.5f,44.5f,  -65.5f,42.5f,  -69.0f,40.0f,
+         -73.0f,37.5f,  -74.5f,34.0f,  -77.5f,30.5f,  -79.6f,26.5f,
+         -80.0f,24.2f,  -82.0f,23.8f,  -84.0f,24.5f,  -88.0f,26.5f,
+         -93.0f,26.8f,  -96.5f,25.9f,  -97.15f,25.95f,-99.1f,26.4f,
+         -99.5f,27.6f, -101.4f,29.8f, -102.6f,29.8f, -103.1f,29.0f,
+        -104.5f,29.7f, -106.5f,31.8f, -108.2f,31.33f,-111.1f,31.33f,
+        -114.8f,32.5f, -117.15f,32.53f,-118.6f,33.4f,-121.2f,34.2f,
+        -122.5f,36.8f, -124.5f,40.5f, -125.3f,44.0f, -125.6f,47.5f
+    };
+    static const float POLY_EU[] = {
+        -11.0f,51.2f, -11.5f,55.5f,  -9.0f,58.5f,  -3.5f,61.5f,
+          2.0f,62.5f,   4.0f,62.8f,   8.0f,64.5f,  11.5f,67.5f,
+         15.0f,69.5f,  20.0f,71.2f,  26.0f,71.6f,  31.0f,70.6f,
+         36.0f,69.5f,  41.0f,67.5f,  38.0f,64.0f,  33.0f,61.0f,
+         31.0f,57.0f,  28.0f,54.0f,  27.0f,51.0f,  28.0f,48.5f,
+         30.0f,46.5f,  29.5f,44.8f,  28.0f,43.5f,  24.0f,41.0f,
+         21.0f,40.0f,  19.5f,39.0f,  18.5f,39.6f,  17.0f,38.0f,
+         16.0f,36.4f,  15.5f,35.6f,  12.4f,37.2f,   8.0f,38.5f,
+          0.0f,37.5f,  -2.0f,36.6f,  -5.6f,36.0f,  -6.5f,36.0f,
+         -9.5f,36.5f, -10.5f,43.5f,  -6.0f,48.5f,  -8.0f,50.0f
+    };
+    static const float POLY_FE[] = {
+        /* the northern leg follows the icon's own arc across Asia (it stops
+         * around 44 N) with a lobe out to Hokkaido, so the lit region is the
+         * one retail drew rather than a straight rule through Siberia */
+         72.0f,34.0f,  78.0f,38.0f,  85.0f,40.0f,  92.0f,42.0f,
+        100.0f,44.0f, 108.0f,44.0f, 116.0f,43.0f, 124.0f,42.0f,
+        130.0f,44.0f, 136.0f,46.0f, 142.0f,47.0f, 146.0f,45.0f,
+        146.0f,44.0f, 143.0f,38.0f, 143.0f,33.0f, 136.0f,30.0f,
+        130.0f,24.0f, 125.0f,20.0f, 128.0f,12.0f, 130.0f, 5.0f,
+        136.0f, 0.0f, 142.0f,-3.0f, 146.0f,-8.0f, 151.0f,-11.0f,
+        140.0f,-12.0f,128.0f,-11.0f,120.0f,-11.0f,112.0f,-9.0f,
+        104.0f,-8.0f, 100.0f,-7.0f,  95.0f,-6.0f,  93.0f, 2.0f,
+         92.0f,15.0f,  90.0f,20.0f,  88.0f,22.0f,  88.0f,26.0f,
+         85.0f,28.0f,  80.0f,30.0f,  75.0f,32.0f
+    };
+    static const float* const POLY[3] = { POLY_US, POLY_EU, POLY_FE };
+    static const int POLYN[3] = {
+        (int)(sizeof POLY_US / (2 * sizeof(float))),
+        (int)(sizeof POLY_EU / (2 * sizeof(float))),
+        (int)(sizeof POLY_FE / (2 * sizeof(float)))
+    };
+    /* the icon's own globe render, fitted against the map's coastlines:
+     * centre lon, centre lat, sphere radius, image centre x/y, roll -- in the
+     * icon's own pixels at its shipped 256x256, scaled below if it differs */
+    static const float FIT[3][6] = {
+        { -96.563f, 38.191f, 244.136f, 103.202f,  93.781f, -5.949f },
+        {  11.080f, 50.768f, 296.072f, 103.406f, 158.804f,  6.251f },
+        { 104.799f, 30.591f, 167.749f, 104.664f, 117.880f,  0.000f },
+    };
+    const float DEG = 0.01745329252f;
+    const float* poly = POLY[r];
+    int np = POLYN[r], x, y, i, k, it;
+    SDL_Surface *ms = NULL, *is = NULL;
+    unsigned char *core = NULL, *core2 = NULL, *tex = NULL, *known = NULL;
+    float *a = NULL, *col = NULL, *cw = NULL, *gl = NULL, *t1 = NULL,
+          *t2 = NULL, *g = NULL, *gwt = NULL, *icol = NULL;
+    int ok = 0;
+
+    /* --- the two source images, as straight RGBA --- */
+    ms = IMG_Load("build/frontend/World_Map.png");
+    if (ms) {
+        SDL_Surface* c = SDL_ConvertSurfaceFormat(ms, SDL_PIXELFORMAT_ABGR8888,
+                                                  0);
+        SDL_FreeSurface(ms); ms = c;
+    }
+    if (!ms) return 0;
+    {
+        char ip[256];
+        snprintf(ip, sizeof ip, "build/frontend/%s.png",
+                 B3_TRACK_REGIONS[r].art_silhouette);
+        is = IMG_Load(ip);
+        if (is) {
+            SDL_Surface* c = SDL_ConvertSurfaceFormat(is,
+                                                      SDL_PIXELFORMAT_ABGR8888,
+                                                      0);
+            SDL_FreeSurface(is); is = c;
+        }
+    }
+    /* no icon means no palette to paint the region in -- stand down and let
+     * the globe draw bare, as it did when the silhouette was missing */
+    if (!is) { SDL_FreeSurface(ms); return 0; }
+    {
+    const int MW = ms->w, MH = ms->h;
+    /* World_Map is Gall-stereographic (fitted on twelve coastline landmarks
+     * to 2.4 px rms at 1024x512), written here so it scales with the art */
+    const float GX = (float)MW / 360.0f;
+    const float GY0 = 254.9f * (float)MH / 512.0f;
+    const float GK  = 230.4f * (float)MH / 512.0f;
+    float ppx[128], ppy[128], xs[128];
+    float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f;
+    int bx0, by0, bx1, by1, bw, bh, amin = 255;
+    const int SS = 4, BS = 8;
+
+    if (np > 128) np = 128;
+    for (i = 0; i < np; i++) {
+        ppx[i] = (poly[i * 2] + 180.0f) * GX;
+        ppy[i] = GY0 - GK * tanf(poly[i * 2 + 1] * DEG * 0.5f);
+        if (ppx[i] < minx) minx = ppx[i];
+        if (ppx[i] > maxx) maxx = ppx[i];
+        if (ppy[i] < miny) miny = ppy[i];
+        if (ppy[i] > maxy) maxy = ppy[i];
+    }
+    bx0 = (int)minx - 8; by0 = (int)miny - 8;
+    bx1 = (int)maxx + 9; by1 = (int)maxy + 9;
+    if (bx0 < 0) bx0 = 0;
+    if (by0 < 0) by0 = 0;
+    if (bx1 > MW) bx1 = MW;
+    if (by1 > MH) by1 = MH;
+    bw = bx1 - bx0; bh = by1 - by0;
+    if (bw > 1 && bh > 1) {
+    a   = (float*)calloc((size_t)bw * bh, sizeof(float));
+    col = (float*)calloc((size_t)bw * bh * 3, sizeof(float));
+    cw  = (float*)calloc((size_t)bw * bh, sizeof(float));
+    gl  = (float*)calloc((size_t)bw * bh, sizeof(float));
+    t1  = (float*)calloc((size_t)bw * bh, sizeof(float));
+    t2  = (float*)calloc((size_t)bw * bh, sizeof(float));
+    tex = (unsigned char*)calloc((size_t)MW * MH * 4, 1);
+    if (a && col && cw && gl && t1 && t2 && tex) {
+
+    /* --- 1. the mask: the polygon's area coverage times the MAP's own land
+     * alpha.  The map's ocean sits at the alpha floor and its land at 255,
+     * but the ocean carries a soft 15 px halo up to about a sixth of the way
+     * (alpha 188 of 175..255) -- taken as land that put a khaki wedge out
+     * into the Pacific, so the ramp is read from 30% to 80% of the range and
+     * the coast comes out crisp with a pixel of antialiasing. --- */
+    for (y = 0; y < MH; y++) {
+        const unsigned char* p = (const unsigned char*)ms->pixels
+                               + (size_t)y * ms->pitch;
+        for (x = 0; x < MW; x++)
+            if (p[x * 4 + 3] < amin) amin = p[x * 4 + 3];
+    }
+    {
+        const float alo = (float)amin + 0.30f * (255.0f - (float)amin);
+        const float ahi = (float)amin + 0.80f * (255.0f - (float)amin);
+        const float asc = (ahi > alo) ? 1.0f / (ahi - alo) : 1.0f;
+        for (y = 0; y < bh; y++) {
+            int s;
+            for (s = 0; s < SS; s++) {
+                float sy = (float)(by0 + y) + ((float)s + 0.5f) / SS;
+                int nx = 0;
+                for (i = 0; i < np; i++) {
+                    int j = (i + 1 == np) ? 0 : i + 1;
+                    float y0 = ppy[i], y1 = ppy[j];
+                    if ((y0 <= sy) == (y1 <= sy)) continue;
+                    xs[nx++] = ppx[i]
+                             + (sy - y0) * (ppx[j] - ppx[i]) / (y1 - y0);
+                }
+                for (i = 1; i < nx; i++) {
+                    float v = xs[i];
+                    k = i - 1;
+                    while (k >= 0 && xs[k] > v) { xs[k + 1] = xs[k]; k--; }
+                    xs[k + 1] = v;
+                }
+                for (i = 0; i + 1 < nx; i += 2) {
+                    float xa = xs[i] - bx0, xb = xs[i + 1] - bx0;
+                    int ia, ib;
+                    if (xb <= 0.0f || xa >= (float)bw) continue;
+                    if (xa < 0.0f) xa = 0.0f;
+                    if (xb > (float)bw) xb = (float)bw;
+                    ia = (int)xa; ib = (int)xb;
+                    if (ib >= bw) ib = bw - 1;
+                    if (ia >= ib) {
+                        a[y * bw + ia] += (xb - xa) / SS;
+                        continue;
+                    }
+                    a[y * bw + ia] += ((float)(ia + 1) - xa) / SS;
+                    for (k = ia + 1; k < ib; k++) a[y * bw + k] += 1.0f / SS;
+                    a[y * bw + ib] += (xb - (float)ib) / SS;
+                }
+            }
+        }
+        for (y = 0; y < bh; y++) {
+            const unsigned char* p = (const unsigned char*)ms->pixels
+                                   + (size_t)(by0 + y) * ms->pitch + bx0 * 4;
+            for (x = 0; x < bw; x++) {
+                float land = ((float)p[x * 4 + 3] - alo) * asc;
+                float cov = a[y * bw + x];
+                if (land < 0.0f) land = 0.0f;
+                if (land > 1.0f) land = 1.0f;
+                if (cov > 1.0f) cov = 1.0f;
+                a[y * bw + x] = cov * land;
+            }
+        }
+    }
+
+    /* --- 2. the colour, sampled out of the icon's globe render --- */
+    if (is) {
+        const int iw = is->w, ih = is->h;
+        const float sc = (float)iw / 256.0f;
+        const float lon0 = FIT[r][0] * DEG, lat0 = FIT[r][1] * DEG;
+        const float IR = FIT[r][2] * sc;
+        const float icx = FIT[r][3] * sc, icy = FIT[r][4] * ((float)ih / 256.f);
+        const float cr = cosf(FIT[r][5] * DEG), sr = sinf(FIT[r][5] * DEG);
+        const float s0 = sinf(lat0), c0 = cosf(lat0);
+        core  = (unsigned char*)calloc((size_t)iw * ih, 1);
+        core2 = (unsigned char*)calloc((size_t)iw * ih, 1);
+        if (core && core2) {
+            /* the icon's TERRAIN: opaque, and not the cyan halo it is drawn
+             * with (the halo is only ~2 px wide at full alpha, so a 1 px
+             * erode after the colour test keeps every coastal pixel) */
+            for (y = 0; y < ih; y++) {
+                const unsigned char* p = (const unsigned char*)is->pixels
+                                       + (size_t)y * is->pitch;
+                for (x = 0; x < iw; x++) {
+                    const unsigned char* q = p + x * 4;
+                    core[y * iw + x] = (q[3] >= 250
+                                        && !(q[2] >= q[0] + 40 && q[2] >= 200));
+                }
+            }
+            for (y = 0; y < ih; y++)
+                for (x = 0; x < iw; x++) {
+                    int dx, dy, m = 1;
+                    for (dy = -1; dy <= 1 && m; dy++)
+                        for (dx = -1; dx <= 1 && m; dx++) {
+                            int X = x + dx, Y = y + dy;
+                            if (X < 0 || Y < 0 || X >= iw || Y >= ih
+                                || !core[Y * iw + X]) m = 0;
+                        }
+                    core2[y * iw + x] = (unsigned char)m;
+                }
+            /* and GROW those terrain colours 4 px outwards.  The fit is a
+             * pixel or two out in places and the icon's art stops dead on its
+             * own border, so without this the map's coastal and border texels
+             * fall just outside the art and go to the flat palette -- which
+             * showed as a khaki strip along the 49th parallel. */
+            icol = (float*)calloc((size_t)iw * ih * 3, sizeof(float));
+            if (icol) {
+                int pass;
+                for (y = 0; y < ih; y++) {
+                    const unsigned char* p = (const unsigned char*)is->pixels
+                                           + (size_t)y * is->pitch;
+                    for (x = 0; x < iw; x++)
+                        if (core2[y * iw + x]) {
+                            icol[(y * iw + x) * 3 + 0] = p[x * 4 + 0];
+                            icol[(y * iw + x) * 3 + 1] = p[x * 4 + 1];
+                            icol[(y * iw + x) * 3 + 2] = p[x * 4 + 2];
+                        }
+                }
+                for (pass = 0; pass < 4; pass++) {
+                    for (y = 0; y < ih; y++)
+                        for (x = 0; x < iw; x++) {
+                            float s[3] = { 0, 0, 0 };
+                            int dx, dy, n = 0;
+                            if (core2[y * iw + x]) continue;
+                            for (dy = -1; dy <= 1; dy++)
+                                for (dx = -1; dx <= 1; dx++) {
+                                    int X = x + dx, Y = y + dy;
+                                    if (X < 0 || Y < 0 || X >= iw || Y >= ih
+                                        || core2[Y * iw + X] != 1) continue;
+                                    s[0] += icol[(Y * iw + X) * 3 + 0];
+                                    s[1] += icol[(Y * iw + X) * 3 + 1];
+                                    s[2] += icol[(Y * iw + X) * 3 + 2];
+                                    n++;
+                                }
+                            if (!n) continue;
+                            icol[(y * iw + x) * 3 + 0] = s[0] / n;
+                            icol[(y * iw + x) * 3 + 1] = s[1] / n;
+                            icol[(y * iw + x) * 3 + 2] = s[2] / n;
+                            core2[y * iw + x] = 2;
+                        }
+                    for (i = 0; i < iw * ih; i++)
+                        if (core2[i] == 2) core2[i] = 1;
+                }
+            }
+            for (y = 0; y < bh; y++)
+                for (x = 0; x < bw; x++) {
+                    float lon, lat, dl, cl, sl, cd, X, Y, u, v, du, dv, len;
+                    int step;
+                    if (a[y * bw + x] <= 0.0f || !icol) continue;
+                    lon = (((float)(bx0 + x) + 0.5f) / GX - 180.0f) * DEG;
+                    lat = 2.0f * atanf((GY0 - ((float)(by0 + y) + 0.5f)) / GK);
+                    dl = lon - lon0; cl = cosf(lat); sl = sinf(lat);
+                    cd = cosf(dl);
+                    if (s0 * sl + c0 * cl * cd <= 0.0f) continue;
+                    X = cl * sinf(dl);
+                    Y = c0 * sl - s0 * cl * cd;
+                    u = icx + IR * (X * cr - Y * sr);
+                    v = icy - IR * (X * sr + Y * cr);
+                    /* the fit is a compromise -- it is several pixels short at
+                     * the corners of a region (the map's whole west coast fell
+                     * outside the USA art), so a texel that lands off the art
+                     * WALKS IN towards the render's centre until it finds
+                     * terrain.  Capped at 16 px: past that the colour would be
+                     * smeared down a long ray, which fanned visible stripes
+                     * across northern Asia -- beyond the cap the region's own
+                     * palette takes over instead. */
+                    du = icx - u; dv = icy - v;
+                    len = sqrtf(du * du + dv * dv);
+                    if (len < 1e-4f) len = 1e-4f;
+                    du /= len; dv /= len;
+                    for (step = 0; step <= 16; step++) {
+                        float su = u + du * (float)step;
+                        float sv = v + dv * (float)step;
+                        float fu, fv, w2 = 0.0f, c2[3] = { 0, 0, 0 };
+                        int iu, iv, dx, dy;
+                        if (su < 0.0f || sv < 0.0f
+                            || su >= (float)(iw - 1) || sv >= (float)(ih - 1))
+                            continue;
+                        iu = (int)su; iv = (int)sv; fu = su - iu; fv = sv - iv;
+                        for (dy = 0; dy < 2; dy++)
+                            for (dx = 0; dx < 2; dx++) {
+                                float ww = (dx ? fu : 1.0f - fu)
+                                         * (dy ? fv : 1.0f - fv);
+                                int c = (iv + dy) * iw + (iu + dx);
+                                if (!core2[c]) continue;
+                                c2[0] += icol[c * 3 + 0] * ww;
+                                c2[1] += icol[c * 3 + 1] * ww;
+                                c2[2] += icol[c * 3 + 2] * ww;
+                                w2 += ww;
+                            }
+                        if (w2 < 0.5f) continue;
+                        col[(y * bw + x) * 3 + 0] = c2[0];
+                        col[(y * bw + x) * 3 + 1] = c2[1];
+                        col[(y * bw + x) * 3 + 2] = c2[2];
+                        cw[y * bw + x] = w2;
+                        break;
+                    }
+                }
+        }
+    }
+
+    /* --- 3. the region's own palette, an 8x8 block field of the colours
+     * that landed, relaxed into the holes and read back bilinearly --- */
+    {
+        int gw = (bw + BS - 1) / BS, gh = (bh + BS - 1) / BS;
+        g     = (float*)calloc((size_t)gw * gh * 3, sizeof(float));
+        gwt   = (float*)calloc((size_t)gw * gh, sizeof(float));
+        known = (unsigned char*)calloc((size_t)gw * gh, 1);
+        if (g && gwt && known) {
+            unsigned char* was = (unsigned char*)calloc((size_t)gw * gh, 1);
+            float* ng = (float*)calloc((size_t)gw * gh * 3, sizeof(float));
+            if (was && ng) {
+                for (y = 0; y < bh; y++)
+                    for (x = 0; x < bw; x++) {
+                        int c = (y / BS) * gw + (x / BS);
+                        g[c * 3 + 0] += col[(y * bw + x) * 3 + 0];
+                        g[c * 3 + 1] += col[(y * bw + x) * 3 + 1];
+                        g[c * 3 + 2] += col[(y * bw + x) * 3 + 2];
+                        gwt[c] += cw[y * bw + x];
+                    }
+                for (i = 0; i < gw * gh; i++)
+                    if (gwt[i] > 4.0f) {
+                        g[i * 3 + 0] /= gwt[i];
+                        g[i * 3 + 1] /= gwt[i];
+                        g[i * 3 + 2] /= gwt[i];
+                        known[i] = 1;
+                    } else {
+                        g[i * 3] = g[i * 3 + 1] = g[i * 3 + 2] = 0.0f;
+                        was[i] = 1;
+                    }
+                for (it = 0; it < gw + gh + 4; it++) {
+                    int grew = 0;
+                    for (i = 0; i < gw * gh; i++) ng[i * 3] = -1.0f;
+                    for (y = 0; y < gh; y++)
+                        for (x = 0; x < gw; x++) {
+                            float s[3] = { 0, 0, 0 }, sw = 0.0f;
+                            int dx, dy;
+                            if (known[y * gw + x]) continue;
+                            for (dy = -1; dy <= 1; dy++)
+                                for (dx = -1; dx <= 1; dx++) {
+                                    int X = x + dx, Y = y + dy;
+                                    float ww = (dx && dy) ? 1.0f
+                                             : (dx || dy) ? 2.0f : 0.0f;
+                                    if (X < 0 || Y < 0 || X >= gw || Y >= gh
+                                        || !known[Y * gw + X] || ww == 0.0f)
+                                        continue;
+                                    s[0] += g[(Y * gw + X) * 3 + 0] * ww;
+                                    s[1] += g[(Y * gw + X) * 3 + 1] * ww;
+                                    s[2] += g[(Y * gw + X) * 3 + 2] * ww;
+                                    sw += ww;
+                                }
+                            if (sw <= 0.0f) continue;
+                            ng[(y * gw + x) * 3 + 0] = s[0] / sw;
+                            ng[(y * gw + x) * 3 + 1] = s[1] / sw;
+                            ng[(y * gw + x) * 3 + 2] = s[2] / sw;
+                            grew = 1;
+                        }
+                    if (!grew) break;
+                    for (i = 0; i < gw * gh; i++)
+                        if (!known[i] && ng[i * 3] >= 0.0f) {
+                            g[i * 3 + 0] = ng[i * 3 + 0];
+                            g[i * 3 + 1] = ng[i * 3 + 1];
+                            g[i * 3 + 2] = ng[i * 3 + 2];
+                            known[i] = 1;
+                        }
+                }
+                for (it = 0; it < 8; it++) {   /* soften the filled cells */
+                    for (y = 0; y < gh; y++)
+                        for (x = 0; x < gw; x++) {
+                            float s[3] = { 0, 0, 0 }, sw = 0.0f;
+                            int dx, dy;
+                            for (dy = -1; dy <= 1; dy++)
+                                for (dx = -1; dx <= 1; dx++) {
+                                    int X = x + dx, Y = y + dy;
+                                    float ww = (dx && dy) ? 1.0f
+                                             : (dx || dy) ? 2.0f : 4.0f;
+                                    if (X < 0 || Y < 0 || X >= gw || Y >= gh)
+                                        continue;
+                                    s[0] += g[(Y * gw + X) * 3 + 0] * ww;
+                                    s[1] += g[(Y * gw + X) * 3 + 1] * ww;
+                                    s[2] += g[(Y * gw + X) * 3 + 2] * ww;
+                                    sw += ww;
+                                }
+                            ng[(y * gw + x) * 3 + 0] = s[0] / sw;
+                            ng[(y * gw + x) * 3 + 1] = s[1] / sw;
+                            ng[(y * gw + x) * 3 + 2] = s[2] / sw;
+                        }
+                    for (i = 0; i < gw * gh; i++)
+                        if (was[i]) {
+                            g[i * 3 + 0] = ng[i * 3 + 0];
+                            g[i * 3 + 1] = ng[i * 3 + 1];
+                            g[i * 3 + 2] = ng[i * 3 + 2];
+                        }
+                }
+                for (y = 0; y < bh; y++)
+                    for (x = 0; x < bw; x++) {
+                        float w0 = cw[y * bw + x];
+                        float fx, fy, tx, ty;
+                        int gx0, gy0, dx, dy;
+                        if (w0 > 1.0f) w0 = 1.0f;
+                        if (w0 > 0.999f) continue;
+                        fx = ((float)x + 0.5f) / BS - 0.5f;
+                        fy = ((float)y + 0.5f) / BS - 0.5f;
+                        gx0 = (int)floorf(fx); gy0 = (int)floorf(fy);
+                        tx = fx - gx0; ty = fy - gy0;
+                        for (dy = 0; dy < 2; dy++)
+                            for (dx = 0; dx < 2; dx++) {
+                                int X = gx0 + dx, Y = gy0 + dy;
+                                float ww = (dx ? tx : 1.0f - tx)
+                                         * (dy ? ty : 1.0f - ty)
+                                         * (1.0f - w0);
+                                if (X < 0) X = 0;
+                                if (Y < 0) Y = 0;
+                                if (X >= gw) X = gw - 1;
+                                if (Y >= gh) Y = gh - 1;
+                                col[(y * bw + x) * 3 + 0]
+                                    += g[(Y * gw + X) * 3 + 0] * ww;
+                                col[(y * bw + x) * 3 + 1]
+                                    += g[(Y * gw + X) * 3 + 1] * ww;
+                                col[(y * bw + x) * 3 + 2]
+                                    += g[(Y * gw + X) * 3 + 2] * ww;
+                            }
+                    }
+            }
+            free(was); free(ng);
+        }
+    }
+
+    /* --- 4. the halo: the mask's own blur, so it hugs the same coastline
+     * (two 5-tap box passes ~ a 2.2 px gaussian) --- */
+    {
+        float* src = a;
+        for (it = 0; it < 2; it++) {
+            for (y = 0; y < bh; y++)
+                for (x = 0; x < bw; x++) {
+                    float s = 0.0f;
+                    int d;
+                    for (d = -2; d <= 2; d++) {
+                        int X = x + d;
+                        if (X < 0) X = 0;
+                        if (X >= bw) X = bw - 1;
+                        s += src[y * bw + X];
+                    }
+                    t1[y * bw + x] = s * 0.2f;
+                }
+            for (y = 0; y < bh; y++)
+                for (x = 0; x < bw; x++) {
+                    float s = 0.0f;
+                    int d;
+                    for (d = -2; d <= 2; d++) {
+                        int Y = y + d;
+                        if (Y < 0) Y = 0;
+                        if (Y >= bh) Y = bh - 1;
+                        s += t1[Y * bw + x];
+                    }
+                    t2[y * bw + x] = s * 0.2f;
+                }
+            src = t2;
+        }
+        memcpy(gl, t2, (size_t)bw * bh * sizeof(float));
+    }
+
+    /* --- 5. compose, and the centroid the globe aims at --- */
+    {
+        double sx = 0.0, sy = 0.0, sa = 0.0;
+        for (y = 0; y < bh; y++) {
+            unsigned char* p = tex + ((size_t)(by0 + y) * MW + bx0) * 4;
+            for (x = 0; x < bw; x++) {
+                float A = a[y * bw + x];
+                float G = gl[y * bw + x] * 1.35f - A;
+                float T;
+                if (G < 0.0f) G = 0.0f;
+                if (G > 1.0f) G = 1.0f;
+                G *= (1.0f - A);
+                T = A + G;
+                sx += A * (bx0 + x + 0.5); sy += A * (by0 + y + 0.5); sa += A;
+                if (T <= 0.004f) continue;
+                {
+                    float c0v = (col[(y * bw + x) * 3 + 0] * A + 205.0f * G) / T;
+                    float c1v = (col[(y * bw + x) * 3 + 1] * A + 235.0f * G) / T;
+                    float c2v = (col[(y * bw + x) * 3 + 2] * A + 255.0f * G) / T;
+                    p[x * 4 + 0] = (unsigned char)(c0v < 0 ? 0
+                                                   : c0v > 255 ? 255 : c0v);
+                    p[x * 4 + 1] = (unsigned char)(c1v < 0 ? 0
+                                                   : c1v > 255 ? 255 : c1v);
+                    p[x * 4 + 2] = (unsigned char)(c2v < 0 ? 0
+                                                   : c2v > 255 ? 255 : c2v);
+                    p[x * 4 + 3] = (unsigned char)(T > 1.0f ? 255 : T * 255.0f);
+                }
+            }
+        }
+        if (sa > 1.0) {
+            out->cu = (float)(sx / sa / MW);
+            out->cv = (float)(sy / sa / MH);
+            glGenTextures(1, &out->tex);
+            glBindTexture(GL_TEXTURE_2D, out->tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, MW, MH, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, tex);
+            ok = 1;
+        }
+    }
+    }
+    }
+    }
+    free(a); free(col); free(cw); free(gl); free(t1); free(t2);
+    free(g); free(gwt); free(known); free(core); free(core2); free(icol);
+    free(tex);
+    if (is) SDL_FreeSurface(is);
+    SDL_FreeSurface(ms);
+    return ok;
+}
+
+static void track_select_screen(void) {
+    if (!b3_trackselect_load()) {
+        fprintf(stderr, "[Burnout3] track select: no track table -- skipping "
+                "the selector; set B3_TRACK to choose a track\n");
+        return;
+    }
+    /* only tracks whose extracted data is complete are offered */
+    int avail[B3_TRACK_MAX]; int n = 0;
+    for (int i = 0; i < B3_TRACK_COUNT; i++) {
+        /* pace.bin joins the list because the row's LAP COUNT now comes from
+         * it -- a track without one has no lap count to race to. */
+        static const char* need[] = { "route.bin", "collision.bin",
+                                      "traffic.bin", "grid.bin", "pace.bin",
+                                      "track.obj" };
+        int ok = 1;
+        /* In ISO MODE the six artefacts do not exist yet -- opening them here
+         * to test for them is what would extract them, all 36 events' worth,
+         * to draw one menu.  There the disc's own track list is the answer;
+         * -1 means build mode, and then this is the probe it always was. */
+        int disc = b3_iso_track_available(B3_TRACKS[i].id);
+        for (unsigned k = 0; disc < 0 && k < sizeof need / sizeof *need && ok;
+             k++) {
+            char p[256];
+            snprintf(p, sizeof p, "build/tracks/%s/%s",
+                     B3_TRACKS[i].id, need[k]);
+            FILE* f = fopen(p, "rb");
+            if (f) fclose(f); else ok = 0;
+        }
+        if (disc >= 0) ok = disc;
+        if (ok) avail[n++] = i;
+    }
+    if (n == 0) return;
+
+    GLuint logo = b3_hud_load_texture("build/frontend/B3Logo.png");
+    GLuint abtn = b3_hud_load_texture("build/frontend/A_Button.png");
+    GLuint bbtn = b3_hud_load_texture("build/frontend/B_Button.png");
+    GLuint tick_medal = b3_hud_load_texture("build/frontend/Tick_MedalG.png");
+    GLuint circle_icon = b3_hud_load_texture("build/frontend/circle.png");
+    GLuint padlock = b3_hud_load_texture("build/frontend/Padlock.png");
+    /* Retail's satellite zoom chain (docs/RE_FRONTEND.md 7.3):
+     * World_Map -> region silhouette -> satellite continent -> the stitched
+     * SATMAP<R>n_1|_2 pair.  All names from B3_TRACK_REGIONS; the n->venue
+     * binding is [S] (the FE consumes these data-driven, no code xrefs), so
+     * city venue Cn takes map n and everything else falls back to the
+     * regional satellite. */
+    GLuint world_map = b3_hud_load_texture("build/frontend/World_Map.png");
+    GLuint car_arrow = b3_hud_load_texture("build/frontend/CarArrow.png");
+    (void)car_arrow;   /* loaded with the rest of the chain; the moving map
+                        * marker that consumes it is not drawn yet, and the
+                        * load stays so the texture-id sequence does not move */
+    GLuint region_sil[3], region_cont[3], region_lsat[3];
+    GLuint satmap[3][3][2];
+    for (int r = 0; r < 3; r++) {
+        char p[256];
+        /* art_silhouette is the FILE stem (USA/Europe/FarEast); .name is
+         * the display string ("FAR EAST") and only matched a file for USA,
+         * which is why the other two regions never drew. */
+        snprintf(p, sizeof p, "build/frontend/%s.png",
+                 B3_TRACK_REGIONS[r].art_silhouette);
+        region_sil[r] = b3_hud_load_texture(p);
+        snprintf(p, sizeof p, "build/frontend/%s.png",
+                 B3_TRACK_REGIONS[r].art_continent);
+        region_cont[r] = b3_hud_load_texture(p);
+        snprintf(p, sizeof p, "build/frontend/%s.png",
+                 B3_TRACK_REGIONS[r].art_lsat);
+        region_lsat[r] = b3_hud_load_texture(p);
+        for (int m = 1; m <= 3; m++)
+            for (int h = 1; h <= 2; h++) {
+                char nm[64];
+                snprintf(nm, sizeof nm, B3_TRACK_REGIONS[r].art_tile_fmt,
+                         m, h);
+                snprintf(p, sizeof p, "build/frontend/%s.png", nm);
+                satmap[r][m - 1][h - 1] = b3_hud_load_texture(p);
+            }
+    }
+
+    /* Venue folders: group the available tracks by (region, venue) in tlist
+     * order -- retail's own SELECT LOCATION list is per-region venues
+     * (FUN_000DF960, 18 race venues), each holding its route permutations. */
+    typedef struct {
+        const char* venue; int region; char kind; int cnum;
+        int tracks[4]; int ntracks;
+    } MenuVenue;
+    MenuVenue venues[B3_TRACK_MAX];
+    int nvenue = 0;
+    for (int i = 0; i < n; i++) {
+        const B3TrackSelect* t = &B3_TRACKS[avail[i]];
+        int v;
+        for (v = 0; v < nvenue; v++)
+            if (venues[v].region == t->region
+                && strcmp(venues[v].venue, t->venue) == 0) break;
+        if (v == nvenue) {
+            venues[v].venue = t->venue;
+            venues[v].region = t->region;
+            venues[v].kind = t->kind;
+            venues[v].cnum = (t->kind == 'C' && t->id[4] >= '1'
+                              && t->id[4] <= '9') ? t->id[4] - '0' : 0;
+            venues[v].ntracks = 0;
+            nvenue++;
+        }
+        if (venues[v].ntracks < 4)
+            venues[v].tracks[venues[v].ntracks++] = avail[i];
+    }
+    int region_venues[3][B3_TRACK_MAX], region_nv[3] = {0, 0, 0};
+    for (int v = 0; v < nvenue; v++) {
+        int r = venues[v].region % 3;
+        region_venues[r][region_nv[r]++] = v;
+    }
+
+    /* cursor state: level 0 = SELECT REGION, 1 = SELECT LOCATION,
+     * 2 = SELECT TRACK (retail flow A's three screens) */
+    int level = 0, rsel = 0, vsel[3] = {0, 0, 0}, tsel = 0;
+    int chosen = -1;
+    for (int i = 0; i < n; i++)
+        if (strcmp(B3_TRACKS[avail[i]].id, "US_C3_V1") == 0) chosen = avail[i];
+    if (chosen < 0) chosen = avail[0];
+
+    /* the four LOCKED submode labels -- retail's own game-mode name list,
+     * Globalus 250/252/249/254 out of the run at 247..254, resolved at boot
+     * rather than typed in here.  "SUBMODES LOCKED" below is the PORT's own
+     * caption (no Globalus entry): retail has no such state. */
+    const char* SUBMODES[4] = { B3_UI(B3_UI_MODE_ROADRAGE),
+                                B3_UI(B3_UI_MODE_ELIMINATOR),
+                                B3_UI(B3_UI_MODE_BURNINGLAP),
+                                B3_UI(B3_UI_MODE_CRASH) };
+    int running = 1;
+    const char* autosel = getenv("B3_MENU_AUTOSELECT");
+    int auto_frames = 0;
+    Uint32 last = SDL_GetTicks();
+    /* retail's frontend audio: the awd_fe cue bank + the femain stream
+     * looping under the whole selector */
+    audio_device_open();
+    fe_audio_load();
+    g_fe_music_pos = 0;
+    g_fe_music_on = 1;
+    float mt = 0.0f;          /* menu clock, drives every animation */
+    int level_fade = 12;      /* frames left of the level-change fade */
+    /* the three-level cursor moves share one edge/repeat model:
+     *   dir -1/+1 = up/down in the level's list, enter descends,
+     *   back ascends (level 0 back = quit, as retail's B does) */
+    while (running && g_running) {
+        int want_pixels = (autosel && auto_frames == 20);
+        if (autosel) {
+            /* walk the real levels to the target so the frame-20 pixel
+             * check exercises the deepest screen, not just the world map */
+            ++auto_frames;
+            int ti = -1;
+            for (int i = 0; i < n; i++)
+                if (strcmp(B3_TRACKS[avail[i]].id, autosel) == 0)
+                    ti = avail[i];
+            const char* sl = getenv("B3_MENU_SHOT_LEVEL");
+            int max_level = sl ? atoi(sl) : 2;
+            if (ti >= 0) {
+                const B3TrackSelect* t = &B3_TRACKS[ti];
+                if (auto_frames == 8) {
+                    rsel = t->region % 3;   /* cursor even for a L0 shot */
+                    if (max_level >= 1) level = 1;
+                }
+                if (auto_frames == 12 && max_level >= 2) {
+                    int rr = t->region % 3;
+                    for (int i = 0; i < region_nv[rr]; i++)
+                        if (strcmp(venues[region_venues[rr][i]].venue,
+                                   t->venue) == 0) vsel[rr] = i;
+                    level = 2;
+                }
+                if (auto_frames == 16) {
+                    int rr = t->region % 3;
+                    const MenuVenue* vv =
+                        &venues[region_venues[rr][vsel[rr]
+                                                  % region_nv[rr]]];
+                    for (int i = 0; i < vv->ntracks; i++)
+                        if (vv->tracks[i] == ti) tsel = i;
+                }
+            }
+            if (auto_frames > 30) {
+                if (ti >= 0) chosen = ti;
+                running = 0;
+            }
+        }
+        int mv_dir = 0, mv_enter = 0, mv_back = 0;
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT) { g_running = 0; return; }
+            if (e.type != SDL_KEYDOWN) continue;
+            switch (e.key.keysym.scancode) {
+            case SDL_SCANCODE_UP:
+            case SDL_SCANCODE_W:
+            case SDL_SCANCODE_LEFT:
+            case SDL_SCANCODE_A:      mv_dir = -1; break;
+            case SDL_SCANCODE_DOWN:
+            case SDL_SCANCODE_S:
+            case SDL_SCANCODE_RIGHT:
+            case SDL_SCANCODE_D:      mv_dir = 1; break;
+            case SDL_SCANCODE_RETURN:
+            case SDL_SCANCODE_SPACE:  mv_enter = 1; break;
+            case SDL_SCANCODE_BACKSPACE: mv_back = 1; break;
+            case SDL_SCANCODE_ESCAPE:
+                g_fe_music_on = 0; g_running = 0; return;
+            default: break;
+            }
+        }
+        if (g_pad) {
+            SDL_GameControllerUpdate();
+            static Uint32 pad_next = 0;
+            Uint32 now0 = SDL_GetTicks();
+            if (now0 >= pad_next) {
+                float ay = pad_axis(SDL_CONTROLLER_AXIS_LEFTY, 0.4f);
+                float ax = pad_axis(SDL_CONTROLLER_AXIS_LEFTX, 0.4f);
+                if (ay < 0.0f || ax < 0.0f
+                    || pad_btn(SDL_CONTROLLER_BUTTON_DPAD_UP)
+                    || pad_btn(SDL_CONTROLLER_BUTTON_DPAD_LEFT))
+                    { mv_dir = -1; pad_next = now0 + 160; }
+                else if (ay > 0.0f || ax > 0.0f
+                         || pad_btn(SDL_CONTROLLER_BUTTON_DPAD_DOWN)
+                         || pad_btn(SDL_CONTROLLER_BUTTON_DPAD_RIGHT))
+                    { mv_dir = 1; pad_next = now0 + 160; }
+            }
+            static int a_was = 0, b_was = 0;
+            int a_now = pad_btn(SDL_CONTROLLER_BUTTON_A);
+            int b_now = pad_btn(SDL_CONTROLLER_BUTTON_B);
+            if (a_now && !a_was) mv_enter = 1;
+            if (b_now && !b_was) mv_back = 1;
+            a_was = a_now; b_was = b_now;
+        }
+
+        int r = rsel % 3;
+        int nv = region_nv[r];
+        const MenuVenue* cv = nv ? &venues[region_venues[r][vsel[r] % nv]]
+                                 : NULL;
+        if (mv_dir) {
+            if (level == 0) {
+                rsel = (rsel + 3 + mv_dir) % 3;
+                fe_play(FE_CUE_GTURN);       /* the globe turn */
+            } else if (level == 1 && nv) {
+                vsel[r] = (vsel[r] + nv + mv_dir) % nv;
+                fe_play(FE_CUE_VERTICAL);
+            } else if (level == 2 && cv && cv->ntracks) {
+                tsel = (tsel + cv->ntracks + mv_dir) % cv->ntracks;
+                fe_play(FE_CUE_VERTICAL);
+            }
+        }
+        if (mv_enter) {
+            if (level == 0 && region_nv[rsel % 3]) {
+                level = 1; level_fade = 12;
+                fe_play(FE_CUE_ZOOM);        /* the satellite zoom-in */
+            } else if (level == 1 && cv) {
+                tsel = 0; level = 2; level_fade = 12;
+                fe_play(FE_CUE_ZOOM);
+            } else if (level == 2 && cv && cv->ntracks) {
+                chosen = cv->tracks[tsel % cv->ntracks];
+                fe_play(FE_CUE_SELECT);
+                running = 0;
+            }
+        } else if (mv_back) {
+            if (level == 0) {
+                fe_play(FE_CUE_BACK);
+                g_fe_music_on = 0;
+                g_running = 0; return;
+            }
+            level--; level_fade = 12;
+            fe_play(FE_CUE_ZOOMOUT);
+        }
+        r = rsel % 3;
+        nv = region_nv[r];
+        cv = nv ? &venues[region_venues[r][vsel[r] % nv]] : NULL;
+
+        int W, H;
+        SDL_GL_GetDrawableSize(g_window, &W, &H);
+        glViewport(0, 0, W, H);
+        glClearColor(0.02f, 0.03f, 0.06f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        /* everything below draws through the HUD helpers, which manage
+         * their own matrices/state; the canvas is the HUD's 640x480
+         * virtual space, y down.  The first version laid out a 1280x720
+         * screen through its own glOrtho and the whole menu rendered as
+         * one corner pixel -- verified by glReadPixels, which stays in
+         * the autoselect path as the standing regression check. */
+
+        /* ---- retail chrome (matched to the xemu reference captures):
+         * dark grid ground, steel-blue italic header top-right over a
+         * cyan rule, the game logo top-left, a status marquee above the
+         * footer, and the B/diamond/A footer bar. ---- */
+        const float RULE_R = 0.30f, RULE_G = 0.58f, RULE_B = 0.82f;
+        const float HDR_R = 0.62f, HDR_G = 0.78f, HDR_B = 0.92f;
+        /* header + marquee: retail's own Globalus text, resolved at boot out
+         * of the user's Data/Globalus.bin (burnout3_trackselect_runtime.h).
+         * These were English literals typed into this file, and three of them
+         * were PARAPHRASES of the retail line -- so the screen reads closer to
+         * retail now, not just cleaner: level 0's status line is Globalus 228,
+         * level 1's is 234/235/236 (which continue "... PLEASE SELECT A
+         * LOCATION"), level 2's is 2559 with its full stop back. */
+        const char* header = level == 0 ? B3_UI(B3_UI_HDR_REGION)
+                           : level == 1 ? B3_UI(B3_UI_HDR_LOCATION)
+                                        : B3_UI(B3_UI_HDR_TRACK);
+        const char* marquee =
+            level == 0 ? B3_UI(B3_UI_MARQUEE_REGION) :
+            level == 1 ? (r == 0 ? B3_UI(B3_UI_MARQUEE_LOC_USA)
+                          : r == 1 ? B3_UI(B3_UI_MARQUEE_LOC_EUROPE)
+                          : B3_UI(B3_UI_MARQUEE_LOC_FAREAST))
+                       : B3_UI(B3_UI_MARQUEE_TRACK);
+
+        mt += 0.0167f;
+        /* every level is FULL-BLEED, like retail: no dead black.  The
+         * backdrop drifts slowly (retail's globe turns / maps breathe),
+         * and the selection prongs pulse like retail's cursor. */
+        float drift = 0.012f * sinf(mt * 0.35f);
+        float pp = 2.5f + 2.5f * sinf(mt * 5.0f);
+        if (level == 1) {
+            /* SELECT LOCATION: full-bleed satellite with a slow breathe */
+            if (region_cont[r])
+                b3_hud_draw_quad_uv_px(region_cont[r], 0, 0, 640, 452,
+                                       0.02f + drift, 0.02f,
+                                       0.98f + drift, 0.98f, 1.f);
+            b3_hud_draw_rect_px(0, 0, 640, 66, 0.02f, 0.03f, 0.06f, 0.55f);
+        } else if (level == 0) {
+            /* retail's 3D GLOBE: the world map on a sphere, spun AND
+             * pitched so the selected region faces the camera, with the
+             * region lit in place by a second pass of the same sphere.
+             *
+             * The sphere below carries World_Map with texcoord u = theta/2pi
+             * and v = phi/pi, so a texture point (u,v) is dead-centre of the
+             * visible disc when the yaw is (0.75 - u) * 360 (u = 0.75 is the
+             * meridian facing -Z, which is the camera) and the pitch is
+             * 90 - 180 * v (v = 0.5 is the equator, which needs none).
+             * REGION_U/REGION_V are the centre of the region's own LIT MASK
+             * on the map (b3_menu_build_region_hl hands back the centroid it
+             * masked), so the thing that comes to rest facing the camera is
+             * the continent itself.  The table below is only the standby for
+             * a build that failed on missing art. */
+            static float gy = -1e9f, gp = 0.0f;
+            static float REGION_U[3] = { 0.2246f, 0.5501f, 0.7981f };
+            static float REGION_V[3] = { 0.3418f, 0.2631f, 0.4340f };
+            /* the region highlights, lifted out of World_Map itself: built
+             * once per visit to the selector (world_map's id is fresh on
+             * every entry, which is what tells us the old ones are stale) */
+            static B3RegionHL hl[3];
+            static GLuint hl_of = 0;
+            if (hl_of != world_map) {
+                int q;
+                for (q = 0; q < 3; q++) {
+                    if (hl[q].tex) glDeleteTextures(1, &hl[q].tex);
+                    hl[q].tex = 0;
+                    if (b3_menu_build_region_hl(q, &hl[q])) {
+                        REGION_U[q] = hl[q].cu;
+                        REGION_V[q] = hl[q].cv;
+                    }
+                }
+                hl_of = world_map;
+            }
+            float target  = (0.75f - REGION_U[r]) * 360.0f;
+            float targetp = 90.0f - 180.0f * REGION_V[r];
+            if (gy < -1e8f) { gy = target + 140.0f; gp = targetp; }
+            float d = fmodf(target - gy + 540.0f, 360.0f) - 180.0f;
+            /* the turn has to SETTLE, not creep.  At 0.18/frame a region
+             * change was still 10 degrees short a dozen frames later, so
+             * every B3_MENU_SHOT caught the globe mid-spin; ease harder and
+             * snap the last degree so the region really does come to rest
+             * facing the camera. */
+            gy += d * 0.32f;
+            if (fabsf(d) < 1.0f) gy = target;
+            float dp = targetp - gp;
+            gp += dp * 0.32f;
+            if (fabsf(dp) < 0.5f) gp = targetp;
+            b3r_matrix_mode(B3R_MAT_PROJECTION);
+            b3r_identity();
+            {
+                /* the HUD stretches its 640x480 virtual canvas over the
+                 * WHOLE viewport (burnout3_hud.c vtx()), so the globe has to
+                 * project through that same virtual aspect -- with the
+                 * window's own aspect the sphere and the 2D chrome drift
+                 * apart on every non-4:3 window. */
+                float nh = 0.30f, nw = nh * (640.0f / 480.0f);
+                b3r_frustum(-nw, nw, -nh, nh, 1.0f, 40.0f);
+            }
+            b3r_matrix_mode(B3R_MAT_MODELVIEW);
+            b3r_identity();
+            /* Framing, in the HUD's virtual pixels.  What has to land well
+             * is the REGION, not the sphere's centre: the globe is off-axis,
+             * so the face pointing -Z projects ~20 px left of the disc's
+             * middle.  Aiming that face at (200,206) puts the region on the
+             * middle of the left two thirds and leaves the 131 px disc at
+             * x 89..350, y 81..342 -- clear of the header rule (y 62), of
+             * the progress strip (y 356), and of the region list (x 440).
+             * The old -5.6 gave a 307 px radius: the globe bled off the top
+             * and bottom and its right limb ran under the list. */
+            b3r_translate(-1.66f, 0.47f, -13.2f);
+            b3r_rotate(gp, 1, 0, 0);
+            b3r_rotate(gy, 0, 1, 0);
+            glEnable(GL_DEPTH_TEST);
+            glClear(GL_DEPTH_BUFFER_BIT);
+            const int ST = 20, SL = 36; const float R = 2.15f;
+            /* pass 0 is the map, pass 1 is the region highlight -- the SAME
+             * mesh, the same texcoords, so a highlight texel lands on the map
+             * texel it was lifted from, exactly, at every rotation.  (The old
+             * highlight was a separate lat/long patch floating 1.2% above the
+             * surface: even with a perfect texture that reprojects, and the
+             * texture was icon art in another projection on top of that.) */
+            for (int pass = 0; pass < 2; pass++) {
+                B3RState bst;
+                float ca = 1.0f;
+                bst.alpha_ref = -1.0f;
+                bst.depth_test = 1;
+                /* the depth FUNC is the one the raw calls below leave set --
+                 * LESS for pass 0, LEQUAL for pass 1 -- so the batch leaves it
+                 * alone (0) rather than re-asserting it */
+                bst.depth_func = 0;
+                bst.cull = 0;               /* this screen never culls */
+                if (pass == 0) {
+                    if (world_map) {
+                        glBindTexture(GL_TEXTURE_2D, world_map);
+                    } else {
+                    }
+                    bst.tex  = world_map;
+                    bst.mode = world_map ? B3R_TEX_MODULATE : B3R_TEX_NONE;
+                    /* PASS 0 INHERITS ITS BLEND, and it is not constant: pass
+                     * 1 below enables blending and NOTHING disables it, so the
+                     * first frame of the globe draws this pass unblended and
+                     * every frame after it draws it SRC_ALPHA/ONE_MINUS_SRC_
+                     * ALPHA.  Both were measured at the site; reading the live
+                     * enable is what keeps that quirk exactly as it was
+                     * instead of quietly picking one of the two. */
+                    bst.blend = glIsEnabled(GL_BLEND) ? B3R_BLEND_ALPHA
+                                                      : B3R_BLEND_NONE;
+                    bst.depth_mask = 1;
+                } else {
+                    if (!hl[r].tex) continue;
+                    ca = 0.82f + 0.18f * sinf(mt * 3.0f);
+                    glBindTexture(GL_TEXTURE_2D, hl[r].tex);
+                    glEnable(GL_BLEND);
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                    glDepthFunc(GL_LEQUAL);   /* same depth as pass 0 */
+                    glDepthMask(GL_FALSE);
+                    bst.tex  = hl[r].tex;
+                    bst.mode = B3R_TEX_MODULATE;
+                    bst.blend = B3R_BLEND_ALPHA;
+                    bst.depth_mask = 0;
+                }
+                /* the push comes AFTER the state calls above, so the pop puts
+                 * back what this pass ran under -- including pass 1's blend,
+                 * which the next frame's pass 0 reads */
+                B3R_BATCH_PUSH();
+                b3r_batch_state(&bst);
+                if (pass == 0) b3r2d_color(0.80f, 0.90f, 1.0f, 1.0f);
+                else           b3r2d_color(1.f, 1.f, 1.f, ca);
+                for (int st = 0; st < ST; st++) {
+                    float p0 = (float)st / ST * 3.14159265f;
+                    float p1 = (float)(st + 1) / ST * 3.14159265f;
+                    b3r2d_prim(B3R2D_QUAD_STRIP);
+                    for (int sl = 0; sl <= SL; sl++) {
+                        float th = (float)sl / SL * 6.2831853f;
+                        for (int e = 0; e < 2; e++) {
+                            float ph = e ? p1 : p0;
+                            b3r2d_uv((float)sl / SL, ph / 3.14159265f);
+                            b3r2d_vertex3(R * sinf(ph) * cosf(th), R * cosf(ph),
+                                          -R * sinf(ph) * sinf(th));
+                        }
+                    }
+                    b3r2d_prim_end();
+                }
+                B3R_BATCH_POP();
+            }
+            glDepthFunc(GL_LESS);
+            glDepthMask(GL_TRUE);
+            glDisable(GL_DEPTH_TEST);
+        }
+        if (level != 1) {
+            /* the fine background grid the panel screens sit on */
+            for (int gx = 0; gx <= 640; gx += 32)
+                b3_hud_draw_rect_px((float)gx, 0, 1, 452,
+                                    0.35f, 0.55f, 0.8f, 0.06f);
+            for (int gy = 66; gy <= 452; gy += 32)
+                b3_hud_draw_rect_px(0, (float)gy, 640, 1,
+                                    0.35f, 0.55f, 0.8f, 0.06f);
+        }
+
+        if (level == 0) {
+            /* --- SELECT REGION: one full-bleed world map (drawn above as
+             * the backdrop), the selected region's silhouette as a large
+             * FOCUS CARD left -- it is icon art with its own padding, so it
+             * is presented as a card, never overlaid "onto" map geography
+             * (the overlay only ever lined up for USA, by luck) --- */
+
+            for (int i = 0; i < 3; i++) {
+                int hot = (i == r);
+                float bright = hot ? 1.0f : 0.42f;
+                float sc = hot ? 0.95f : 0.72f;
+                float x = 440, y = 130 + i * 52;
+                b3_hud_draw_text(B3_TRACK_REGIONS[i].name, x, y, sc,
+                                 bright, bright, bright, 1.f);
+                if (hot) {
+                    float tw = b3_hud_text_width(B3_TRACK_REGIONS[i].name,
+                                                 sc);
+                    float yc = y + 11;
+                    b3_hud_draw_rect_px(x - 26 - pp, yc, 16, 3,
+                                        1.f, 1.f, 1.f, 0.9f);
+                    b3_hud_draw_rect_px(x - 12 - pp, yc - 4, 3, 11,
+                                        1.f, 1.f, 1.f, 0.9f);
+                    b3_hud_draw_rect_px(x + tw + 10 + pp, yc, 16, 3,
+                                        1.f, 1.f, 1.f, 0.9f);
+                    b3_hud_draw_rect_px(x + tw + 10 + pp, yc - 4, 3, 11,
+                                        1.f, 1.f, 1.f, 0.9f);
+                }
+            }
+            /* the progress strip, retail's icon + count + medal groups --
+             * one group per region, the selected one lit */
+            b3_hud_draw_rect_px(40, 394, 560, 1, RULE_R, RULE_G, RULE_B,
+                                0.5f);
+            for (int i = 0; i < 3; i++) {
+                float gx = 56 + i * 196;
+                float al = (i == r) ? 1.0f : 0.45f;
+                int tr_count = 0;
+                for (int k = 0; k < region_nv[i]; k++)
+                    tr_count += venues[region_venues[i][k]].ntracks;
+                if (region_sil[i])
+                    b3_hud_draw_quad_px(region_sil[i], gx, 356, 46, 36,
+                                        al);
+                char st[24];
+                snprintf(st, sizeof st, "%d", tr_count);
+                float stw = b3_hud_draw_text(st, gx + 56, 362, 0.7f,
+                                             0.75f * al + 0.2f,
+                                             0.85f * al + 0.1f,
+                                             0.95f * al, 1.f);
+                b3_hud_draw_text("TRACKS", gx + 60 + stw, 372, 0.42f,
+                                 0.6f * al, 0.7f * al, 0.8f * al, 1.f);
+                if (tick_medal)
+                    b3_hud_draw_quad_px(tick_medal, gx + 124, 362, 22, 22,
+                                        al);
+            }
+        } else if (level == 1) {
+            /* --- SELECT LOCATION: the blue-bordered venue info box over
+             * the map (retail's DOWNTOWN / NEW RACE EVENT panel) --- */
+            float bx = 330, by = 236, bw = 224, bh = 56;
+            b3_hud_draw_rect_px(bx - 2, by - 2, bw + 4, bh + 4,
+                                0.35f, 0.65f, 0.9f, 0.9f);
+            b3_hud_draw_rect_px(bx, by, bw, bh, 0.02f, 0.05f, 0.10f, 0.88f);
+            if (cv) {
+                b3_hud_draw_text(cv->venue, bx + 10, by + 8, 0.62f,
+                                 1.f, 1.f, 1.f, 1.f);
+                char sub[40];
+                snprintf(sub, sizeof sub, "%d RACE ROUTE%s", cv->ntracks,
+                         cv->ntracks == 1 ? "" : "S");
+                b3_hud_draw_text(sub, bx + 10, by + 32, 0.48f,
+                                 0.65f, 0.8f, 0.95f, 1.f);
+            }
+            /* medal chip beside the box, as retail draws its 0/3 */
+            b3_hud_draw_rect_px(bx + bw + 4, by - 2, 58, bh + 4,
+                                0.35f, 0.65f, 0.9f, 0.9f);
+            b3_hud_draw_rect_px(bx + bw + 6, by, 54, bh,
+                                0.02f, 0.05f, 0.10f, 0.88f);
+            if (tick_medal)
+                b3_hud_draw_quad_px(tick_medal, bx + bw + 20, by + 6,
+                                    26, 26, 1.f);
+            if (cv) {
+                char cnt[16];
+                snprintf(cnt, sizeof cnt, "%d/%d",
+                         (vsel[r] % (nv ? nv : 1)) + 1, nv);
+                float tw = b3_hud_text_width(cnt, 0.5f);
+                b3_hud_draw_text(cnt, bx + bw + 33 - tw * 0.5f, by + 34,
+                                 0.5f, 0.9f, 0.95f, 1.f, 1.f);
+            }
+            /* the venue carousel: prev/next along the bottom of the map */
+            if (nv) {
+                float cy = 412;
+                const MenuVenue* pv =
+                    &venues[region_venues[r][(vsel[r] + nv - 1) % nv]];
+                const MenuVenue* nx =
+                    &venues[region_venues[r][(vsel[r] + 1) % nv]];
+                b3_hud_draw_rect_px(0, cy - 6, 640, 30,
+                                    0.02f, 0.03f, 0.06f, 0.55f);
+                b3_hud_draw_text(pv->venue, 24, cy, 0.45f,
+                                 0.5f, 0.6f, 0.7f, 1.f);
+                if (cv) {
+                    float tw = b3_hud_text_width(cv->venue, 0.62f);
+                    float x = 320 - tw * 0.5f, yc = cy + 8;
+                    b3_hud_draw_text(cv->venue, x, cy - 2, 0.62f,
+                                     1.f, 1.f, 1.f, 1.f);
+                    b3_hud_draw_rect_px(x - 26 - pp, yc, 16, 3,
+                                        1.f, 1.f, 1.f, 0.9f);
+                    b3_hud_draw_rect_px(x - 12 - pp, yc - 4, 3, 11,
+                                        1.f, 1.f, 1.f, 0.9f);
+                    b3_hud_draw_rect_px(x + tw + 10 + pp, yc, 16, 3,
+                                        1.f, 1.f, 1.f, 0.9f);
+                    b3_hud_draw_rect_px(x + tw + 10 + pp, yc - 4, 3, 11,
+                                        1.f, 1.f, 1.f, 0.9f);
+                }
+                float nw = b3_hud_text_width(nx->venue, 0.45f);
+                b3_hud_draw_text(nx->venue, 616 - nw, cy, 0.45f,
+                                 0.5f, 0.6f, 0.7f, 1.f);
+            }
+        } else {
+            /* --- SELECT TRACK: retail's split -- close-in satellite map
+             * left of a cyan divider, the route list panel right --- */
+            b3_hud_draw_rect_px(396, 66, 2, 386, RULE_R, RULE_G, RULE_B,
+                                0.8f);
+            /* the map fills the whole left pane, retail-style: the stitched
+             * 512x256 pair is CROPPED to the pane's aspect (the centre
+             * square: right half of _1 + left half of _2) rather than
+             * letterboxed -- and it BLEEDS dimmed under the right panel so
+             * nothing on screen is dead black */
+            int m = (cv && cv->cnum >= 1 && cv->cnum <= 3) ? cv->cnum : 0;
+            float dz = 0.02f * sinf(mt * 0.3f);
+            if (m && satmap[r][m - 1][0] && satmap[r][m - 1][1]) {
+                b3_hud_draw_quad_uv_px(satmap[r][m - 1][1], 396, 66, 244,
+                                       386, 0.4f, 0.f, 0.9f, 1.f, 0.28f);
+                b3_hud_draw_quad_uv_px(satmap[r][m - 1][0], 0, 68, 198, 384,
+                                       0.5f + dz, 0.f, 1.f + dz, 1.f, 1.f);
+                b3_hud_draw_quad_uv_px(satmap[r][m - 1][1], 198, 68, 198,
+                                       384, 0.f + dz, 0.f, 0.5f + dz, 1.f,
+                                       1.f);
+            } else if (region_lsat[r]) {
+                b3_hud_draw_quad_px(region_lsat[r], 396, 66, 244, 386,
+                                    0.28f);
+                b3_hud_draw_quad_px(region_lsat[r], 0, 68, 396, 384, 1.f);
+            }
+            /* the venue label box, bottom-left of the map (MUSCLE SERIES
+             * style) */
+            if (cv) {
+                float tw = b3_hud_text_width(cv->venue, 0.55f);
+                float bx = 20, by = 402, bw = tw + 24, bh = 26;
+                b3_hud_draw_rect_px(bx - 2, by - 2, bw + 4, bh + 4,
+                                    0.35f, 0.65f, 0.9f, 0.9f);
+                b3_hud_draw_rect_px(bx, by, bw, bh,
+                                    0.02f, 0.05f, 0.10f, 0.9f);
+                b3_hud_draw_text(cv->venue, bx + 12, by + 5, 0.55f,
+                                 1.f, 1.f, 1.f, 1.f);
+            }
+            /* right panel: venue name in its underline frame, then the
+             * route rows with circle icons and the prong-flanked pick */
+            b3_hud_draw_rect_px(400, 66, 240, 386, 0.03f, 0.05f, 0.09f,
+                                0.82f);
+            /* the blue checker the retail panel carries */
+            for (int cy = 66; cy < 452; cy += 16)
+                for (int cx = 400; cx < 640; cx += 16)
+                    if (((cx / 16) + (cy / 16)) & 1)
+                        b3_hud_draw_rect_px((float)cx, (float)cy, 16,
+                                            cy + 16 > 452 ? 452 - cy : 16,
+                                            0.35f, 0.55f, 0.85f, 0.055f);
+            if (cv) {
+                float tw = b3_hud_text_width(cv->venue, 0.6f);
+                float hx = 520 - tw * 0.5f;
+                b3_hud_draw_text(cv->venue, hx, 84, 0.6f,
+                                 0.9f, 0.95f, 1.f, 1.f);
+                b3_hud_draw_rect_px(414, 106, 212, 2,
+                                    RULE_R, RULE_G, RULE_B, 0.8f);
+                b3_hud_draw_rect_px(414, 82, 2, 26,
+                                    RULE_R, RULE_G, RULE_B, 0.8f);
+            }
+            float y = 140;
+            if (cv) for (int i = 0; i < cv->ntracks; i++) {
+                const B3TrackSelect* t = &B3_TRACKS[cv->tracks[i]];
+                int hot = (i == tsel % cv->ntracks);
+                float bright = hot ? 1.0f : 0.5f;
+                /* The event's medal replaces the bullet once the pair
+                 * (track, game type) has been won.  Retail marks event
+                 * rows with the Tick_Medal{B,S,G} chips from the
+                 * frontend manifest at 0x0038A360 [C]; an unraced row
+                 * keeps the port's existing circle bullet. */
+                int rf_medal = b3_raceflow_medal_for(t->id, B3_GT_RACE);
+                GLuint rf_chip = b3_raceflow_medal_chip(rf_medal);
+                if (rf_chip)                                /* race flow (agent) */
+                    b3_hud_draw_quad_px(rf_chip, 418, y - 2, 24, 24,
+                                        hot ? 1.f : 0.62f);
+                else if (circle_icon)
+                    b3_hud_draw_quad_px(circle_icon, 418, y - 2, 24, 24,
+                                        hot ? 1.f : 0.55f);
+                /* the variant word alone -- the venue is the panel header */
+                const char* vn = t->name;
+                if (strncmp(vn, cv->venue, strlen(cv->venue)) == 0) {
+                    vn += strlen(cv->venue);
+                    while (*vn == ' ') vn++;
+                    if (!*vn) vn = t->name;
+                }
+                b3_hud_draw_text(vn, 452, y, 0.55f,
+                                 bright, bright, bright, 1.f);
+                char meta[32];
+                snprintf(meta, sizeof meta, "%d LAP%s", t->laps,
+                         t->laps == 1 ? "" : "S");
+                b3_hud_draw_text(meta, 452, y + 15, 0.4f,
+                                 0.55f, 0.62f, 0.7f, 1.f);
+                if (hot) {
+                    /* retail flanks the whole row: prongs both sides */
+                    float yc = y + 8;
+                    float twv = b3_hud_text_width(vn, 0.55f);
+                    b3_hud_draw_rect_px(400 - pp, yc, 14, 3,
+                                        1.f, 1.f, 1.f, 0.9f);
+                    b3_hud_draw_rect_px(412 - pp, yc - 4, 3, 11,
+                                        1.f, 1.f, 1.f, 0.9f);
+                    b3_hud_draw_rect_px(452 + twv + 10 + pp, yc, 14, 3,
+                                        1.f, 1.f, 1.f, 0.9f);
+                    b3_hud_draw_rect_px(452 + twv + 10 + pp, yc - 4, 3, 11,
+                                        1.f, 1.f, 1.f, 0.9f);
+                }
+                y += 48;
+            }
+            /* submodes: visible, locked -- pure races only */
+            float sy = 396;
+            b3_hud_draw_text("RACE", 418, sy, 0.5f, 1.f, 0.75f, 0.2f, 1.f);
+            float sx = 418 + b3_hud_text_width("RACE", 0.5f) + 10;
+            for (unsigned mm = 0; mm < 2; mm++) {
+                b3_hud_draw_text(SUBMODES[mm], sx, sy, 0.38f,
+                                 0.35f, 0.35f, 0.4f, 1.f);
+                sx += b3_hud_text_width(SUBMODES[mm], 0.38f) + 8;
+            }
+            if (padlock)
+                b3_hud_draw_quad_px(padlock, sx + 2, sy - 1, 14, 16, 0.8f);
+            b3_hud_draw_text("SUBMODES LOCKED", 418, sy + 18, 0.36f,
+                             0.5f, 0.42f, 0.42f, 1.f);
+        }
+
+        /* header chrome over everything */
+        if (logo) b3_hud_draw_quad_px(logo, 14, 8, 120, 52, 1.f);
+        {
+            float hw = b3_hud_text_width(header, 1.05f);
+            b3_hud_draw_text(header, 624 - hw, 24, 1.05f,
+                             HDR_R, HDR_G, HDR_B, 1.f);
+            b3_hud_draw_rect_px(150, 62, 490, 2, RULE_R, RULE_G, RULE_B,
+                                0.7f);
+        }
+        /* status marquee: retail's is a right-to-left SCROLLER on its
+         * translucent band (the reference captures show it mid-scroll,
+         * cut at the screen edge) */
+        {
+            float msc = 0.5f;
+            float mw = b3_hud_text_width(marquee, msc);
+            b3_hud_draw_rect_px(0, 429, 640, 23,
+                                0.015f, 0.025f, 0.045f, 0.6f);
+            float span = mw + 720.0f;
+            float mx = 640.0f - fmodf(mt * 70.0f, span);
+            b3_hud_draw_text(marquee, mx, 433, msc,
+                             HDR_R, HDR_G, HDR_B, 0.9f);
+        }
+        b3_hud_draw_rect_px(0, 452, 640, 2, RULE_R, RULE_G, RULE_B, 0.6f);
+        b3_hud_draw_rect_px(0, 454, 640, 26, 0.015f, 0.025f, 0.045f, 0.95f);
+        if (bbtn) b3_hud_draw_quad_px(bbtn, 18, 458, 18, 18, 1.f);
+        b3_hud_draw_text(level == 0 ? "QUIT" : "BACK", 42, 460, 0.45f,
+                         0.8f, 0.85f, 0.9f, 1.f);
+        b3_hud_draw_text("CHANGE", 300, 460, 0.45f, 0.8f, 0.85f, 0.9f, 1.f);
+        {
+            float sw = b3_hud_text_width("SELECT", 0.45f);
+            b3_hud_draw_text("SELECT", 596 - sw, 460, 0.45f,
+                             0.8f, 0.85f, 0.9f, 1.f);
+            if (abtn) b3_hud_draw_quad_px(abtn, 602, 458, 18, 18, 1.f);
+        }
+        /* level-change crossfade (retail cuts through black on zoom);
+         * suppressed under autoselect so the regression shots stay lit */
+        if (level_fade > 0 && !autosel) {
+            b3_hud_draw_rect_px(0, 0, 640, 480, 0.f, 0.f, 0.f,
+                                (float)level_fade / 12.0f);
+            level_fade--;
+        }
+
+        if (want_pixels) {
+            int W2, H2;
+            SDL_GL_GetDrawableSize(g_window, &W2, &H2);
+            unsigned char* px = (unsigned char*)malloc((size_t)W2 * H2 * 3);
+            if (px) {
+                glReadPixels(0, 0, W2, H2, GL_RGB, GL_UNSIGNED_BYTE, px);
+                long lit = 0; long n3 = (long)W2 * H2;
+                int minx = W2, maxx = 0, miny = H2, maxy = 0;
+                for (long i = 0; i < n3; i++) {
+                    unsigned char r = px[i*3], g = px[i*3+1], b = px[i*3+2];
+                    if (r > 40 || g > 40 || b > 60) {
+                        int x2 = (int)(i % W2), y2 = (int)(i / W2);
+                        lit++;
+                        if (x2 < minx) minx = x2;
+                        if (x2 > maxx) maxx = x2;
+                        if (y2 < miny) miny = y2;
+                        if (y2 > maxy) maxy = y2;
+                    }
+                }
+                {   /* B3_MENU_SHOT=<path.ppm>: save the frame for eyes */
+                    const char* shot = getenv("B3_MENU_SHOT");
+                    if (shot) {
+                        FILE* fp = fopen(shot, "wb");
+                        if (fp) {
+                            fprintf(fp, "P6\n%d %d\n255\n", W2, H2);
+                            for (int yy = H2 - 1; yy >= 0; yy--)
+                                fwrite(px + (size_t)yy * W2 * 3, 3, W2, fp);
+                            fclose(fp);
+                            printf("[Burnout3] menu screenshot -> %s\n", shot);
+                        }
+                    }
+                }
+                printf("[Burnout3] [menu-pixels] lit=%ld/%ld (%.1f%%) "
+                       "bbox=(%d,%d)-(%d,%d) of %dx%d\n",
+                       lit, n3, 100.0 * lit / (double)n3,
+                       minx, miny, maxx, maxy, W2, H2);
+                free(px);
+            }
+        }
+        SDL_GL_SwapWindow(g_window);
+        Uint32 now = SDL_GetTicks();
+        if (now - last < 16) SDL_Delay(16 - (now - last));
+        last = now;
+    }
+
+    /* music keeps rolling into the car-select screen; that screen (or the
+     * headless skip) stops it before the race */
+    {
+        const B3TrackSelect* r = &B3_TRACKS[chosen];
+        setenv("B3_TRACK", r->id, 1);
+        g_lap_count = (r->laps > 0) ? r->laps : 3;   /* retail's own count */
+        printf("[Burnout3] track select: %s / %s / %s -> B3_TRACK=%s, "
+               "%d laps\n", B3_TRACK_REGIONS[r->region % 3].name, r->venue,
+               r->name, r->id, g_lap_count);
+    }
+}
+
+/* CAR-SELECT PREVIEW: one showroom car, assembled from the same pieces the
+ * race draw site assembles (~ the g_car_*_lists block).  The menu cannot use
+ * those tables -- load_car_meshes() has not run yet when this screen is up,
+ * and its slots are the RACE roster, not the picker's cursor -- so the three
+ * cached preview slots carry their own copies.  Pieces:
+ *
+ *   body   the whole-car OBJ minus its glass records (NO_GLASS).  Every
+ *          record class the extractor emits is in here: mask bits 0/1 the
+ *          shell and apertures, bits 2..7 (extract_bgv.py LIGHT_BITS 0x0FC)
+ *          the LAMP LENSES -- headlight, tail, brake, reverse, indicator --
+ *          and the mask-0x10002 underside on its own shared page.
+ *   glass  the same OBJ's slot-2..4 records (GLASS_ONLY | DEFER_BIND), drawn
+ *          blended over the body with the UnbrokenGlass page bound by the
+ *          caller, exactly as the race path does (CRASH-UV).  Drawing them
+ *          inside the body list -- which is what this screen used to do --
+ *          made every window an opaque near-black plate.
+ *   wheel  the origin-centred wheel OBJ, replayed once per .bgv attach
+ *          matrix; the race site's per-wheel transform minus race state
+ *          (no steer angle, no spin, no blur variant).
+ *   lift   body/wheel copies built with use_color=0, so an additive re-draw
+ *          can be SCALED by glColor.  The shaded lists bake glColor3f per
+ *          face, which overrides anything the caller sets -- the old
+ *          "alpha 0.32" exposure pass was really adding at alpha 1.0.
+ *
+ * Menu lighting: the RACE shaders, not a stand-in.  b3_carfx_body_begin /
+ * b3_carfx_glass_begin need nothing from race state except an object->world
+ * 3x3 and a paint index -- the nine SH coefficients are .rdata literals the
+ * module installs at init, the sun RGB and the reflection sheet come from
+ * the track the player just picked (b3_carfx_set_track, driven off B3_TRACK
+ * inside b3_carfx_init), and the per-car probe lookup is opt-in through
+ * ::slot, which this screen leaves at -1 because a showroom car has no world
+ * position.  So the menu hero car runs the same program, the same uniforms
+ * and the same gloss mask (paint alpha) as a car on the track.  The only
+ * menu-only pieces left are the floor reflection and the exposure lift.  */
+typedef struct {
+    B3CarMesh *body, *lift, *glass, *wheel, *wheel_lift;
+    GLuint tex;             /* the paint page, for B3CarFxBodyParams.has_texture */
+    int nw;                 /* .bgv attach matrices, file+0xB80 */
+    float radius;           /* .bgv+0x18 */
+    float wpos[6][3];       /* loader-Z-flipped, i.e. GL space */
+    int wmir[6];            /* attach matrix's negated Right/At rows */
+    float ymin;             /* contact line: the floor/reflection plane */
+    int key;                /* (roster slot, paint) this was built for */
+} B3MenuCar;
+
+/* The .wheels sidecar, parsed standalone.  load_car_wheels() writes the
+ * per-RACE-SLOT globals, which this screen must not disturb. */
+static void car_select_load(const char* base, GLuint tex, B3MenuCar* c) {
+    char path[256];
+    c->tex = tex;
+    snprintf(path, sizeof path, "build/cars/%s.obj", base);
+    c->body = car_list_from_obj_ex(path, tex, 1, &c->ymin,
+                                   B3CAR_LIST_NO_GLASS);
+    c->lift = car_list_from_obj_ex(path, tex, 0, NULL, B3CAR_LIST_NO_GLASS);
+    c->glass = car_list_from_obj_ex(path, 0, 0, NULL,
+                                    B3CAR_LIST_GLASS_ONLY
+                                    | B3CAR_LIST_DEFER_BIND);
+    snprintf(path, sizeof path, "build/cars/%s_wheel.obj", base);
+    c->wheel = car_list_from_obj(path, tex, 1, NULL);
+    c->wheel_lift = car_list_from_obj_ex(path, tex, 0, NULL, B3CAR_LIST_ALL);
+
+    snprintf(path, sizeof path, "build/cars/%s.wheels", base);
+    FILE* f = fopen(path, "r");
+    if (f) {
+        char line[160];
+        while (fgets(line, sizeof line, f)) {
+            float x, y, z; int mir;
+            if (line[0] == '#') continue;
+            if (sscanf(line, "radius %f", &x) == 1) {
+                c->radius = x;
+            } else if (sscanf(line, "wheel %f %f %f %d", &x, &y, &z, &mir)
+                       == 4 && c->nw < 6) {
+                c->wpos[c->nw][0] = x;
+                c->wpos[c->nw][1] = y;
+                c->wpos[c->nw][2] = -z;      /* loader Z-flip (RE_NOTES 12) */
+                c->wmir[c->nw] = mir;
+                c->nw++;
+            }
+        }
+        fclose(f);
+    }
+    /* Ground the preview through the wheels, like load_car_meshes(): the
+     * attach matrices put the hub at y = 0, so the contact line is -radius.
+     * The OBJ's own min-y includes pivot-local panel vertices and sank the
+     * body into the floor plate. */
+    if (c->nw > 0 && c->radius > 0.0f) c->ymin = -c->radius;
+}
+
+static void car_select_free(B3MenuCar* c) {
+    if (c->body) car_mesh_free(&c->body);
+    if (c->lift) car_mesh_free(&c->lift);
+    if (c->glass) car_mesh_free(&c->glass);
+    if (c->wheel) car_mesh_free(&c->wheel);
+    if (c->wheel_lift) car_mesh_free(&c->wheel_lift);
+    memset(c, 0, sizeof *c);
+    c->key = -1;
+}
+
+/* One wheel per attach matrix.  Race site parity: translate to the attach
+ * position (already GL space), and mirror the right-hand side by a 180 deg
+ * turn about Y -- a ROTATION, so the winding parity the caller set up for
+ * the scene's x-mirror is unchanged.  No steer, no spin: menu car. */
+static void car_select_wheels(const B3MenuCar* c,
+                              const B3CarMesh* list) {
+    if (!list) return;
+    for (int w = 0; w < c->nw; w++) {
+        b3r_push();
+        b3r_translate(c->wpos[w][0], c->wpos[w][1], c->wpos[w][2]);
+        if (c->wmir[w] < 0) b3r_rotate(180.0f, 0, 1, 0);
+        car_mesh_draw(list);
+        b3r_pop();
+    }
+}
+
+/* full=0: the floor reflection -- the UNSHADED copies, so the caller's
+ * glColor4f actually reaches the fragment.  The shaded lists bake glColor3f,
+ * which forces alpha to 1: the reflection was drawn with a translucent
+ * colour that the list overwrote, so it came out a solid black car under the
+ * real one.
+ * full=1: opaque body+wheels, the additive exposure lift, then the blended
+ * glass -- the race path's own order (body pass, then the translucent glass
+ * pass over it).
+ *
+ * `fx` non-NULL runs the RECOVERED body/glass shaders over the body and the
+ * glass, exactly as render_frame() wraps the race draw: b3_carfx_body_begin
+ * around the body records, b3_carfx_glass_begin around the slot-2 records.
+ * The wheels stay OFF the program because the race path draws them outside
+ * it too (they are replayed under their own attach matrix, so the one uN2W
+ * the program carries would be wrong for the mirrored side).  NULL keeps the
+ * old flat path, which is what the small rail thumbnails use. */
+static void car_select_draw(const B3MenuCar* c, float exposure, float wexp,
+                            int full, const B3CarFxBodyParams* fx) {
+    if (!c->body) return;
+    if (!full) {
+        if (c->lift) car_mesh_draw(c->lift);
+        car_select_wheels(c, c->wheel_lift);
+        return;
+    }
+    if (fx) {
+        B3CarFxBodyParams p = *fx;
+        p.has_texture = c->tex ? 1 : 0;
+        b3_carfx_body_begin(&p);
+        car_mesh_draw(c->body);
+        b3_carfx_body_end();
+    } else {
+        car_mesh_draw(c->body);
+    }
+    car_select_wheels(c, c->wheel);
+
+    /* The exposure lift, in TWO amounts.  It is one additive re-draw of the
+     * unshaded copies (glColor scales the texel), but the body and the wheels
+     * no longer need the same amount once the shader is on: the body is lit
+     * by the recovered irradiance and only wants a small ambient floor, while
+     * the wheels never touch the program and still need the whole lift or
+     * they go black against the garage floor. */
+    if (exposure > 0.0f || wexp > 0.0f) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE);       /* add exposure * texel */
+        glDepthFunc(GL_LEQUAL);
+        glDepthMask(GL_FALSE);
+        if (exposure > 0.0f && c->lift) {
+            car_mesh_draw(c->lift);
+        }
+        if (wexp > 0.0f) {
+            car_select_wheels(c, c->wheel_lift);
+        }
+        glDepthMask(GL_TRUE);
+        glDepthFunc(GL_LESS);
+        glDisable(GL_BLEND);
+    }
+
+    if (c->glass) {
+        /* CRASH-UV: the caller owns the bind because the tier moves; in the
+         * menu the car is never damaged, so it is always slot 2. */
+        GLuint gpage = car_global_texture(B3_BGV_TEX_GLASS);
+        /* RESTORE, do not force: this screen runs with culling OFF (the car
+         * lists do not enable it, contrary to the note at the end of the 3D
+         * block), and leaving it enabled here dropped faces out of the
+         * thumbnail rail drawn after the hero car. */
+        GLboolean cull = glIsEnabled(GL_CULL_FACE);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_CULL_FACE);   /* both panes, no carfx to fake depth */
+        if (gpage) {
+            glBindTexture(GL_TEXTURE_2D, gpage);
+        } else {
+        }
+        if (fx) {
+            /* the race site's own intact tint (0.38): the recovered glass
+             * pair composited into one blended draw, so the windows pick up
+             * the same sky the body does instead of a flat plate. */
+            B3CarFxBodyParams p = *fx;
+            p.has_texture = gpage ? 1 : 0;
+            b3_carfx_glass_begin(&p, 0.38f);
+            car_mesh_draw(c->glass);
+            b3_carfx_glass_end();
+        } else {
+            car_mesh_draw(c->glass);
+        }
+        if (cull) glEnable(GL_CULL_FACE);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+    }
+}
+
+/* THE PRESENT COMPOSITE'S x2, for a screen that has no present composite.
+ *
+ * b3_postfx_blur() step 3 draws a full-screen quad with DST_COLOR/ONE over
+ * the finished race frame -- dst + dst -- which is FUN_0003DA90's final
+ * combiner SHIFTLEFTBY1 (burnout3_postfx.c, "the present composite").  Every
+ * race pass, the car shader above included, is authored for it.  This is the
+ * same quad, and nothing else: no blur taps (there is no speed here), no
+ * gamma ramp (the ^0.95 table is a 6% midtone lift the 2D chrome below was
+ * never authored through, and the chrome is drawn after this point).      */
+static void car_select_present_x2(void) {
+    b3r_matrix_mode(B3R_MAT_PROJECTION); b3r_push(); b3r_identity();
+    b3r_ortho(0.0, 1.0, 0.0, 1.0, -1.0, 1.0);
+    b3r_matrix_mode(B3R_MAT_MODELVIEW); b3r_push(); b3r_identity();
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_DST_COLOR, GL_ONE);
+    /* THE DOUBLING BLEND.  dst = dst*src + dst = 2*dst for a white source --
+     * retail's step 3 present composite, which is what brings this screen's
+     * half-range (B3_MENU_RT) 3D block back up.  It reached the batcher when
+     * B3R_BLEND_DST_ONE was added for it; before that it was the one site in
+     * the file that could not move, because a preset applied at flush time
+     * would have silently overwritten the doubling. */
+    b3r2d_begin();
+    {   B3RState st;
+        st.tex = 0; st.mode = B3R_TEX_NONE;
+        st.blend = B3R_BLEND_DST_ONE;
+        st.alpha_ref = -1.0f;
+        st.depth_mask = 0; st.depth_test = 0; st.depth_func = 0; st.cull = 0;
+        b3r_batch_state(&st);
+    }
+    b3r2d_color(1.0f, 1.0f, 1.0f, 1.0f);
+    b3r2d_prim(B3R2D_QUADS);
+    b3r2d_vertex(0.f, 0.f); b3r2d_vertex(1.f, 0.f);
+    b3r2d_vertex(1.f, 1.f); b3r2d_vertex(0.f, 1.f);
+    b3r2d_prim_end();
+    b3r2d_end();
+    glDisable(GL_BLEND);
+    glDepthMask(GL_TRUE);
+    b3r_matrix_mode(B3R_MAT_PROJECTION); b3r_pop();
+    b3r_matrix_mode(B3R_MAT_MODELVIEW); b3r_pop();
+}
+
+/* THE MENU'S RENDER-TARGET SPACE.  The race scene is not presented as it is
+ * drawn: FUN_0003DA90's final combiner SHIFTLEFTBY1 doubles the whole frame
+ * (b3_postfx_blur step 3), so every race pass is authored to live in the
+ * BOTTOM HALF of the range and the present composite expands it -- which is
+ * exactly why the car shader carries B3FX_T_ENV_RT = 0.5 on the reflection
+ * layer ("cancels the x2") and why its paint term is 2*albedo*E.
+ *
+ * This screen ran the same car program but NEVER ran that composite, so the
+ * hero car was presented at half the radiance it is authored for, with the
+ * sky sheen and the sun glint -- the two terms that carry the 0.5 -- landing
+ * at a quarter of the paint's slope.  That is the "not shiny in the menu"
+ * report: nothing in the shader was dead, the PRESENT was.
+ *
+ * So the 3D block ends with retail's own step 3 (car_select_present_x2), and
+ * everything drawn into the scene before it is authored in the same half
+ * space the race authors in -- hence B3_MENU_RT on the backdrop, the floor
+ * and the reflection.  The 2D chrome is drawn AFTER the doubling and is
+ * untouched, exactly as the HUD is in a race frame. */
+#define B3_MENU_RT  0.5f
+
+/* THUMBNAIL RAIL geometry: 0..1 fractions of the drawable, y from the BOTTOM
+ * (GL).  ONE definition for all three consumers -- the backdrop's backing
+ * plates, the 3D thumbnail viewports and the arrow glyphs -- so the plate and
+ * the car in it cannot drift apart when either is nudged.
+ *
+ * Retail stacks the rail as a column down the left edge: up arrow, the cars
+ * either side of the hero, down arrow.  It used to be a COMPACT 200 px block
+ * (two 145x74 plates between y = 92 and y = 292) floating in a 386 px column,
+ * which is the "not using all available vertical space" report.  The rail now
+ * fills the whole usable band -- from the header rule (y = 64) to the footer
+ * rule (y = 452) -- as FOUR plates, sel-2 / sel-1 / sel+1 / sel+2 top to
+ * bottom, with the arrows at the two extremes.
+ *
+ * FOUR and not two, and this is a size argument rather than a taste one: the
+ * car in a plate is WIDTH-limited, not height-limited (a 3/4-view car is
+ * about 2:1 and the frustum follows the viewport's own aspect), so two tall
+ * plates would draw exactly the same size of car as four short ones, in a box
+ * with 40% of its height empty above and below.  Four gives the same car at
+ * the same size, twice the roster visible, and no dead air.  The extra width
+ * (145 -> 166 px, out to x = 180, still clear of the hero's silhouette at
+ * x = 187) is where the readability gain actually comes from.
+ *
+ * Rows top-down: 86..168, 174..256, 262..344, 350..432; arrows at 68..79 and
+ * 436..450.  B3_RAIL_YT is the row pitch, so the four rows are one constant
+ * apart and cannot drift.                                                  */
+#define B3_RAIL_N   4          /* rows: sel-2, sel-1, sel+1, sel+2          */
+#define B3_RAIL_X   0.021875f  /* plate left,  14 px at 640                 */
+#define B3_RAIL_W   0.259375f  /* plate width, 166 px at 640                */
+#define B3_RAIL_H   0.170833f  /* plate height, 82 px at 480                */
+#define B3_RAIL_YT  0.183333f  /* row pitch, 88 px at 480 (82 + 6 of air)   */
+#define B3_RAIL_Y0  0.650000f  /* TOP row's GL bottom edge: 480-86-82 = 312 */
+/* the offset into the roster each row shows, hero-relative */
+static const int B3_RAIL_OFF[B3_RAIL_N] = { -2, -1, 1, 2 };
+/* row r's GL bottom edge */
+#define B3_RAIL_Y(r) (B3_RAIL_Y0 - (float)(r) * B3_RAIL_YT)
+/* the preview cache holds sel-2 .. sel+2; index 2 is the hero, and rail row
+ * r lives at B3_RAIL_OFF[r] + B3_MENU_HERO. */
+#define B3_MENU_HERO   2
+#define B3_MENU_PREV_N 5
+
+/* CAR SELECT -- retail's "SELECT A <CLASS> CAR" screen (reference: the
+ * Crash Nav car picker): the chosen car rendered large in 3D over a dark
+ * garage floor with a reflection, a thumbnail rail on the left with
+ * up/down arrows, the name plate ("MUSCLE TYPE 3") lower right with the
+ * TOP SPEED / WEIGHT segment bars, and the B/X/diamond/A footer.  Runs
+ * after track select, before the race.  Returns 1 when the player backs
+ * out (caller loops to track select), 0 on confirm/skip. */
+static int car_select_screen(void) {
+    /* B3_VEHICLE_MAX, not VEHICLE_COUNT: the roster is loaded at run time now
+     * (burnout3_vehicle_data_runtime.h), so VEHICLE_COUNT is a call and only
+     * the format cap is a constant. */
+    int ros[B3_VEHICLE_MAX]; int n = 0;
+    for (int i = 0; i < VEHICLE_COUNT; i++)
+        if (VEHICLES[i].kind == VEH_PLAYER) ros[n++] = i;
+    if (n == 0) return 0;
+
+    const char* drv = SDL_GetCurrentVideoDriver();
+    int headless = drv && strcmp(drv, "offscreen") == 0;
+    const char* autosel = getenv("B3_MENU_AUTOSELECT_CAR");
+    if ((headless || getenv("B3_AUTODRIVE") || getenv("B3_PLAYER_CAR"))
+        && !getenv("B3_MENU") && !autosel) {
+        g_fe_music_on = 0;   /* track select may have left it rolling */
+        return 0;
+    }
+
+    audio_device_open();
+    fe_audio_load();
+    g_fe_music_on = 1;   /* keep the frontend stream rolling from track sel */
+
+    static GLuint s_logo = 0, s_abtn = 0, s_bbtn = 0;
+    static int s_art = 0;
+    if (!s_art) {
+        s_art = 1;
+        s_logo = b3_hud_load_texture("build/frontend/B3Logo.png");
+        s_abtn = b3_hud_load_texture("build/frontend/A_Button.png");
+        s_bbtn = b3_hud_load_texture("build/frontend/B_Button.png");
+    }
+
+    /* CARFX, the hero car's gloss.  main() brings the module up AFTER the
+     * frontend (it has to: b3_carfx_init fills the tables load_car_meshes
+     * then reads), so at menu time it is still down.  Bring it up here and
+     * hand it straight back at the exit -- b3_carfx_init's own B3_TRACK-first
+     * chain loads the track the player just picked, so the reflection sheet
+     * and the sun RGB are that track's, and b3_carfx_shutdown leaves main's
+     * later init to start from a clean slate (no double program, no double
+     * 3 MB probe volume).  Backing out re-enters through track select, so
+     * releasing here also lets a NEW track's sheet be picked up. */
+    int fx_own = 0;
+    if (!b3_carfx_ready()) {
+        b3_carfx_init();
+        fx_own = 1;
+    }
+
+    int sel = 0, paint = 0;
+    /* preview cache: sel-2 .. sel+2, keyed by (roster, paint).  Index 2 is
+     * the HERO; the other four are the rail rows, in B3_RAIL_OFF order. */
+    B3MenuCar prev[B3_MENU_PREV_N];
+    memset(prev, 0, sizeof prev);
+    for (int t = 0; t < B3_MENU_PREV_N; t++) prev[t].key = -1;
+    /* which rail rows show a car this frame.  A roster shorter than five
+     * would otherwise repeat the same vehicle down the column (offsets -2
+     * and +2 are the same car at n = 4, and every row is the hero at n = 1),
+     * so a row is drawn only when its car is distinct from the hero's and
+     * from every row above it -- plate, viewport and arrow together. */
+    int rail_show[B3_RAIL_N];
+    float mt = 0.0f;
+    int running = 1, backed = 0, auto_frames = 0;
+    Uint32 last = SDL_GetTicks();
+    /* input grace: the confirm that opened this screen is often still held
+     * (key repeat / pad A) -- retail also ignores carried-over input */
+    Uint32 armed_at = SDL_GetTicks() + 450;
+
+    /* stat ranges over the whole roster, for the relative bars.  WEIGHT is
+     * Physics/Vehicle/Mass (0x0B8); the SPEED bar is the harness's relative
+     * proxy change-up-rpm / final-gear (0x108 / 0x100) -- real per-car data,
+     * presentation-only [S]. */
+    float mmin = 1e9f, mmax = -1e9f, smin = 1e9f, smax = -1e9f;
+    float mval[B3_VEHICLE_MAX], sval[B3_VEHICLE_MAX];
+    for (int k = 0; k < n; k++) {
+        const VehicleInfo* vi = &VEHICLES[ros[k]];
+        const B3CarPhysics* ph = car_vdb_lookup(vi);
+        float mass = 1200.0f, fg = 3.2f, rpm = 6000.0f;
+        if (ph)
+            for (int p = 0; p < ph->n_params; p++) {
+                if (ph->params[p].offset == 0x0B8u) mass = ph->params[p].value;
+                if (ph->params[p].offset == 0x100u) fg = ph->params[p].value;
+                if (ph->params[p].offset == 0x108u) rpm = ph->params[p].value;
+            }
+        mval[k] = mass; sval[k] = fg > 0.01f ? rpm / fg : rpm;
+        if (mass < mmin) mmin = mass;
+        if (mass > mmax) mmax = mass;
+        if (sval[k] < smin) smin = sval[k];
+        if (sval[k] > smax) smax = sval[k];
+    }
+
+    while (running && g_running) {
+        int want_pixels = (autosel && auto_frames == 20);
+        if (autosel) {
+            ++auto_frames;
+            if (auto_frames == 8) {
+                for (int k = 0; k < n; k++) {
+                    char full[64];
+                    snprintf(full, sizeof full, "%s_%s",
+                             VEHICLES[ros[k]].class_code,
+                             VEHICLES[ros[k]].file);
+                    char* dot = strrchr(full, '.'); if (dot) *dot = '\0';
+                    if (strcmp(full, autosel) == 0) sel = k;
+                }
+            }
+            if (auto_frames > 30) running = 0;
+        }
+        int mv = 0, mv_enter = 0, mv_back = 0, mv_color = 0;
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT) { g_running = 0; return 0; }
+            if (e.type != SDL_KEYDOWN || e.key.repeat) continue;
+            switch (e.key.keysym.scancode) {
+            case SDL_SCANCODE_UP: case SDL_SCANCODE_W:    mv = -1; break;
+            case SDL_SCANCODE_DOWN: case SDL_SCANCODE_S:  mv = 1; break;
+            case SDL_SCANCODE_LEFT: case SDL_SCANCODE_A:  mv = -1; break;
+            case SDL_SCANCODE_RIGHT: case SDL_SCANCODE_D: mv = 1; break;
+            case SDL_SCANCODE_C: case SDL_SCANCODE_X:     mv_color = 1; break;
+            case SDL_SCANCODE_RETURN:
+            case SDL_SCANCODE_SPACE:
+                if (SDL_GetTicks() >= armed_at) mv_enter = 1;
+                break;
+            case SDL_SCANCODE_BACKSPACE: mv_back = 1; break;
+            case SDL_SCANCODE_ESCAPE:
+                g_fe_music_on = 0; g_running = 0; return 0;
+            default: break;
+            }
+        }
+        if (g_pad) {
+            SDL_GameControllerUpdate();
+            static Uint32 pn = 0; Uint32 now0 = SDL_GetTicks();
+            if (now0 >= pn) {
+                float ay = pad_axis(SDL_CONTROLLER_AXIS_LEFTY, 0.4f);
+                if (ay < 0.0f || pad_btn(SDL_CONTROLLER_BUTTON_DPAD_UP))
+                    { mv = -1; pn = now0 + 160; }
+                else if (ay > 0.0f
+                         || pad_btn(SDL_CONTROLLER_BUTTON_DPAD_DOWN))
+                    { mv = 1; pn = now0 + 160; }
+            }
+            static int aw = 0, bw = 0, xw = 0;
+            int an = pad_btn(SDL_CONTROLLER_BUTTON_A);
+            int bn = pad_btn(SDL_CONTROLLER_BUTTON_B);
+            int xn = pad_btn(SDL_CONTROLLER_BUTTON_X);
+            if (an && !aw && SDL_GetTicks() >= armed_at) mv_enter = 1;
+            if (bn && !bw && SDL_GetTicks() >= armed_at) mv_back = 1;
+            if (xn && !xw) mv_color = 1;
+            aw = an; bw = bn; xw = xn;
+        }
+        if (mv) {
+            sel = (sel + n + mv) % n; paint = 0;
+            fe_play(FE_CUE_VERTICAL);
+            /* SLIDE the preview window, do not rebuild it.  The cache is a
+             * sliding window over the roster, so a one-step move leaves four
+             * of its five entries holding exactly the car the next frame
+             * wants -- only the end that just came into view is new.  Without
+             * this every slot's key would change on every press and the
+             * screen would re-load and re-list FIVE cars per keystroke (the
+             * two-plate rail already re-loaded three); with it a keystroke
+             * costs one.  The key check below still has the last word, so a
+             * slot that slid into the hero position with a non-zero paint --
+             * or a roster too short for five distinct cars -- reloads. */
+            if (mv > 0) {
+                car_select_free(&prev[0]);
+                memmove(&prev[0], &prev[1],
+                        sizeof prev[0] * (B3_MENU_PREV_N - 1));
+                memset(&prev[B3_MENU_PREV_N - 1], 0, sizeof prev[0]);
+                prev[B3_MENU_PREV_N - 1].key = -1;
+            } else {
+                car_select_free(&prev[B3_MENU_PREV_N - 1]);
+                memmove(&prev[1], &prev[0],
+                        sizeof prev[0] * (B3_MENU_PREV_N - 1));
+                memset(&prev[0], 0, sizeof prev[0]);
+                prev[0].key = -1;
+            }
+        }
+        if (mv_color) { paint = (paint + 1) % 8; fe_play(FE_CUE_GTURN); }
+        if (mv_enter) { fe_play(FE_CUE_SELECT); running = 0; }
+        else if (mv_back) { fe_play(FE_CUE_ZOOMOUT); backed = 1; running = 0; }
+
+        /* WHICH ROWS HAVE A CAR.  Offsets that alias onto the hero, or onto
+         * a row already taken, are dropped rather than drawn twice. */
+        for (int r = 0; r < B3_RAIL_N; r++) {
+            int k = ((sel + B3_RAIL_OFF[r]) % n + n) % n;
+            rail_show[r] = (k != sel);
+            for (int q = 0; q < r && rail_show[r]; q++)
+                if (rail_show[q]
+                    && ((sel + B3_RAIL_OFF[q]) % n + n) % n == k)
+                    rail_show[r] = 0;
+        }
+
+        /* (re)build the five previews on demand */
+        for (int t = 0; t < B3_MENU_PREV_N; t++) {
+            int k = ((sel + t - B3_MENU_HERO) % n + n) % n;
+            int hero = (t == B3_MENU_HERO);
+            int key = ros[k] * 16 + (hero ? paint : 0);
+            if (prev[t].key == key) continue;
+            car_select_free(&prev[t]);
+            const VehicleInfo* vi = &VEHICLES[ros[k]];
+            char base[64], path[256];
+            snprintf(base, sizeof base, "%s_%s", vi->class_code, vi->file);
+            char* dot = strrchr(base, '.'); if (dot) *dot = '\0';
+            GLuint tex = 0;
+            for (int p = (hero ? paint : 0); p >= 0 && !tex; p--) {
+                snprintf(path, sizeof path, "build/cars/%s_p%d.png", base, p);
+                tex = load_gl_texture(path, NULL);
+            }
+            car_select_load(base, tex, &prev[t]);
+            prev[t].key = key;
+        }
+
+        int W, H;
+        SDL_GL_GetDrawableSize(g_window, &W, &H);
+        glViewport(0, 0, W, H);
+        /* every colour from here to car_select_present_x2() is authored in
+         * the RENDER-TARGET half space the race authors in (B3_MENU_RT), so
+         * the doubling at the end of the 3D block lands it exactly where it
+         * was authored -- and lands the CAR where a race frame puts it. */
+        glClearColor(0.055f * B3_MENU_RT, 0.065f * B3_MENU_RT,
+                     0.095f * B3_MENU_RT, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        /* showroom backdrop: a lit band behind the car so a black livery
+         * still has an edge against the wall.  A flat near-black clear left
+         * the dark cars and the background at the same value. */
+        {
+            const float rt = B3_MENU_RT;
+            b3r_matrix_mode(B3R_MAT_PROJECTION); b3r_push(); b3r_identity();
+            b3r_ortho(0.0, 1.0, 0.0, 1.0, -1.0, 1.0);
+            b3r_matrix_mode(B3R_MAT_MODELVIEW); b3r_push(); b3r_identity();
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_BLEND);
+            glDisable(GL_CULL_FACE);
+            B3R_BATCH_PUSH();
+            {   /* measured at the site: untextured, no blend, no alpha test,
+                 * depth test OFF (so the ambient write mask cannot matter),
+                 * no culling.  The gradient is per-vertex colour inside one
+                 * primitive, which the batcher carries per corner. */
+                B3RState bst = { .tex = 0, .mode = B3R_TEX_NONE,
+                                 .blend = B3R_BLEND_NONE, .alpha_ref = -1.0f,
+                                 .depth_mask = 1, .depth_test = 0,
+                                 .depth_func = 0, .cull = 0 };
+                b3r_batch_state(&bst);
+            }
+            b3r2d_prim(B3R2D_QUADS);
+            /* top -> horizon */
+            b3r2d_color(0.035f * rt, 0.045f * rt, 0.075f * rt, 1.0f);
+            b3r2d_vertex(0.f, 1.f); b3r2d_vertex(1.f, 1.f);
+            b3r2d_color(0.20f * rt, 0.24f * rt, 0.32f * rt, 1.0f);
+            b3r2d_vertex(1.f, 0.42f); b3r2d_vertex(0.f, 0.42f);
+            /* horizon -> floor */
+            b3r2d_color(0.20f * rt, 0.24f * rt, 0.32f * rt, 1.0f);
+            b3r2d_vertex(0.f, 0.42f); b3r2d_vertex(1.f, 0.42f);
+            b3r2d_color(0.045f * rt, 0.055f * rt, 0.075f * rt, 1.0f);
+            b3r2d_vertex(1.f, 0.f); b3r2d_vertex(0.f, 0.f);
+            /* backing plates behind the thumbnail viewports (the rects the
+             * 3D pass below uses), so a BLACK livery still shows a
+             * silhouette -- in the user's screenshot they were lost in the
+             * backdrop entirely. */
+            for (int r = 0; r < B3_RAIL_N; r++) {
+                float y0 = B3_RAIL_Y(r);
+                if (!rail_show[r]) continue;
+                b3r2d_color(0.130f * rt, 0.155f * rt, 0.210f * rt, 1.0f);
+                b3r2d_vertex(B3_RAIL_X, y0 + B3_RAIL_H);
+                b3r2d_vertex(B3_RAIL_X + B3_RAIL_W, y0 + B3_RAIL_H);
+                b3r2d_color(0.052f * rt, 0.064f * rt, 0.092f * rt, 1.0f);
+                b3r2d_vertex(B3_RAIL_X + B3_RAIL_W, y0);
+                b3r2d_vertex(B3_RAIL_X, y0);
+            }
+            b3r2d_prim_end();
+            B3R_BATCH_POP();
+            b3r_matrix_mode(B3R_MAT_PROJECTION); b3r_pop();
+            b3r_matrix_mode(B3R_MAT_MODELVIEW); b3r_pop();
+        }
+        mt += 0.0167f;
+        if (getenv("B3_CARSEL_DBG")) {
+            GLint prog = 0; glGetIntegerv(0x8B8D /*GL_CURRENT_PROGRAM*/,
+                                          &prog);
+            fprintf(stderr, "[carsel] frame=%d prog=%d err=0x%x\n",
+                    auto_frames, (int)prog, glGetError());
+            b3_hud_draw_rect_px(20, 200, 120, 80, 0.f, 1.f, 0.f, 1.f);
+            {
+                unsigned char pix[4] = {9, 9, 9, 9};
+                int sx = (int)(80.0f * W / 640.0f);
+                int sy = (int)((480.0f - 240.0f) * H / 480.0f);
+                glReadPixels(sx, sy, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, pix);
+                fprintf(stderr, "[carsel] probe(%d,%d)=%d,%d,%d err=0x%x "
+                        "scissor=%d\n", sx, sy, pix[0], pix[1], pix[2],
+                        glGetError(), glIsEnabled(GL_SCISSOR_TEST));
+            }
+        }
+
+        /* ---- the 3D garage view: selected car on a dark reflective
+         * floor, slow turntable ---- */
+        if (!getenv("B3_CARSEL_NO3D")) {
+        b3r_matrix_mode(B3R_MAT_PROJECTION);
+        b3r_identity();
+        {
+            float aspect = H > 0 ? (float)W / (float)H : 4.0f / 3.0f;
+            float nh = 0.35f, nw = nh * aspect;   /* ~53 deg vertical */
+            b3r_frustum(-nw, nw, -nh, nh, 1.0f, 60.0f);
+        }
+        b3r_matrix_mode(B3R_MAT_MODELVIEW);
+        b3r_identity();
+        b3r_rotate(12.0f, 1, 0, 0);
+        /* FRAME THE CAR BY ITS OWN SIZE.  VehicleInfo.dim_a is the .bgv
+         * header's +0x14 float -- 2.2..3.1 across the cars, up to 6.6 for the
+         * Heavy rigs -- so a FIXED camera distance cannot suit both: 6.0 m
+         * framed a compact and put a truck's cab through the header text and
+         * out of frame on every side.  Holding the distance at a fixed
+         * MULTIPLE of that dimension gives every vehicle the same apparent
+         * size.  The multiple (and the two offsets, kept as fractions of it,
+         * so the composition rides along) is one constant for this screen,
+         * not a per-car number: 2.18 reproduces today's 6.0 m at the roster's
+         * median dim_a. */
+        float cdim = VEHICLES[ros[sel]].dim_a;
+        if (!(cdim > 0.5f)) cdim = 2.75f;   /* a roster row with no dimension */
+        float cdist = cdim * 2.18f;
+        b3r_translate(0.0917f * cdist, -0.175f * cdist, -cdist);
+        float turn = -(mt * 10.0f) + 210.0f;
+        b3r_rotate(turn, 0, 1, 0);
+        /* the exported meshes carry the game->GL z-flip; in-race the car
+         * frame's own handedness cancels it.  A plain menu transform does
+         * not, so the car reads chirally mirrored (decals backwards)
+         * without this x-mirror + winding flip. */
+        b3r_scale(-1.0f, 1.0f, 1.0f);
+        /* CARFX: the hero car's object->world 3x3 for the recovered body /
+         * glass program -- exactly the two calls above, glRotatef(turn,Y)
+         * then glScalef(-1,1,1), ROW-major as B3CarFxBodyParams wants
+         * (r0,r1,r2 rows).  Everything AFTER this in the modelview is the
+         * camera, and the shader takes the eye position from
+         * gl_ModelViewMatrixInverse, so it needs no separate view input.
+         * The x-mirror is a reflection, i.e. its own inverse-transpose, so
+         * this one matrix is correct for the NORMAL as well as for the eye
+         * vector -- no second matrix, no sign fix. */
+        B3CarFxBodyParams fxp;
+        B3CarFxBodyParams* fxh = NULL;
+        if (b3_carfx_ready()) {
+            float ca = cosf(turn * DEG_TO_RAD), sa = sinf(turn * DEG_TO_RAD);
+            b3_carfx_body_defaults(&fxp);
+            fxp.rot3[0] = -ca; fxp.rot3[1] = 0.0f; fxp.rot3[2] = sa;
+            fxp.rot3[3] = 0.0f; fxp.rot3[4] = 1.0f; fxp.rot3[5] = 0.0f;
+            fxp.rot3[6] = sa;  fxp.rot3[7] = 0.0f; fxp.rot3[8] = ca;
+            /* slot -1 = no probe lookup.  A showroom car has no world
+             * position, so it keeps the nine .rdata literals every race car
+             * starts from (B3_CARFX_SH_RETAIL) -- neutral daylight, and the
+             * per-probe shade ramp stays at 1.  Same reason fade/sh_scale
+             * keep their defaults: no despawn, no fade-out here. */
+            fxp.slot = -1;
+            fxp.has_normals = 1;   /* the car lists emit the .bgv vn */
+            fxp.paint_index = paint;  /* modelobj+0x59 -> the shine table */
+            fxh = &fxp;
+            /* b3_carfx_ready() is true as soon as ANY of the three pieces
+             * loaded -- shadow art, corona art, or the program -- so on a GL
+             * without shaders it would still say yes while body_begin quietly
+             * did nothing, and the car would draw flat AND at the small
+             * shader-era exposure, i.e. worse than before.  Ask the driver
+             * once whether the program actually binds. */
+            static int s_shine = -1;
+            if (s_shine < 0) {
+                GLint pr = 0;
+                b3_carfx_body_begin(&fxp);
+                glGetIntegerv(0x8B8D /*GL_CURRENT_PROGRAM*/, &pr);
+                b3_carfx_body_end();
+                s_shine = (pr != 0);
+                printf("[Burnout3] car select: hero shine %s\n",
+                       s_shine ? "on (recovered carfx body/glass program)"
+                               : "OFF (no GL2) -- flat menu path");
+            }
+            if (!s_shine) fxh = NULL;
+        }
+        /* the rail's own pose: the SAME two calls its viewport block makes,
+         * glRotatef(145,Y) then glScalef(-1,1,1), so the four thumbnails run
+         * the shine program on the pose they are actually drawn in.  It is
+         * fixed, so it is built once per frame and not once per row. */
+        B3CarFxBodyParams fxr;
+        B3CarFxBodyParams* fxt = NULL;
+        if (fxh) {
+            float ra = cosf(145.0f * DEG_TO_RAD);
+            float rs = sinf(145.0f * DEG_TO_RAD);
+            fxr = fxp;
+            fxr.rot3[0] = -ra; fxr.rot3[1] = 0.0f; fxr.rot3[2] = rs;
+            fxr.rot3[3] = 0.0f; fxr.rot3[4] = 1.0f; fxr.rot3[5] = 0.0f;
+            fxr.rot3[6] = rs;  fxr.rot3[7] = 0.0f; fxr.rot3[8] = ra;
+            fxr.paint_index = 0;   /* the rail always shows paint 0 */
+            fxt = &fxr;
+        }
+        glEnable(GL_DEPTH_TEST);
+        /* floor plate + reflection first (mirrored car, no depth write).
+         * The plane is the WHEEL CONTACT line now, not the OBJ's min-y --
+         * the latter is a pivot-local panel vertex well under the tyres, so
+         * the car floated over its own reflection. */
+        {
+        float fy = prev[B3_MENU_HERO].ymin;
+        b3r_push();
+        /* mirror about the floor plane y = ymin: y' = 2*ymin - y.  With
+         * the x-mirror above this is TWO flips -> winding is back to CCW */
+        b3r_scale(1.0f, -1.0f, 1.0f);
+        b3r_translate(0.0f, -2.0f * fy, 0.0f);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        car_select_draw(&prev[B3_MENU_HERO], 0.0f, 0.0f, 0, NULL);
+        b3r_pop();
+        /* WINDING, and it is LOAD-BEARING for the shine.  The recovered body
+         * shader multiplies BOTH halves of its reflection layer -- the
+         * environment lerp `refl` and the sun glint `spec` -- by
+         *     face = gl_FrontFacing ? 1.0 : 0.0
+         * (the game culls the body and this screen does not, so an inward
+         * fragment seen through an aperture must not take the reflection).
+         * This screen used to set GL_CW here, reasoning from its own single
+         * x-mirror alone.  But the RACE draws through a mirror too -- the
+         * display flip in the PROJECTION at render_frame's `glScalef(-1,1,1);
+         * glFrontFace(GL_CCW)` -- so the two paths have the SAME parity, and
+         * CW here was the opposite sense from the one the car shader is
+         * written against.  Measured with B3_CARFX_ENVDBG=6 (which paints a
+         * back-facing fragment BLACK): 92% of the hero car classified black,
+         * i.e. the whole environment layer and the whole glint were
+         * multiplied by zero and the menu car was showing nothing but
+         * 2*albedo*E -- flat SH-lit paint.  That, not any missing uniform,
+         * is the "no shininess on the car selection screen" report.
+         * Nothing else on this screen reads the winding: culling is off for
+         * the whole 3D block and lighting is disabled. */
+        glFrontFace(GL_CCW);
+        /* the floor itself: a translucent sheet over the mirror */
+        glDepthMask(GL_FALSE);
+        B3R_BATCH_PUSH();
+        {   /* measured at the site: untextured, SRC_ALPHA/ONE_MINUS_SRC_ALPHA,
+             * depth test on (LESS, left alone) with writes off, culling OFF --
+             * and culling is the one that matters, because b3r_end() puts back
+             * the WORLD's cull setting and the hero car drawn straight after
+             * this needs both faces (see car_select_draw's own note).  The
+             * PushAttrib pair is what undoes that. */
+            B3RState bst = { .tex = 0, .mode = B3R_TEX_NONE,
+                             .blend = B3R_BLEND_ALPHA, .alpha_ref = -1.0f,
+                             .depth_mask = 0, .depth_test = 1,
+                             .depth_func = 0, .cull = 0 };
+            b3r_batch_state(&bst);
+            b3r2d_color(0.10f * B3_MENU_RT, 0.12f * B3_MENU_RT,
+                        0.16f * B3_MENU_RT, 0.66f);
+            b3r2d_prim(B3R2D_QUADS);
+            b3r2d_vertex3(-30, fy - 0.01f, -30);
+            b3r2d_vertex3(30, fy - 0.01f, -30);
+            b3r2d_vertex3(30, fy - 0.01f, 30);
+            b3r2d_vertex3(-30, fy - 0.01f, 30);
+            b3r2d_prim_end();
+        }
+        B3R_BATCH_POP();
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+        /* body + wheels + glass.  NO exposure lift on either any more: the
+         * lift was this screen's stand-in for the present composite, an
+         * additive re-draw of the unshaded copy at 0.38 (body) / 0.70
+         * (wheels) that flattened the paint towards its own texel and could
+         * not make a highlight at all.  With the x2 at the end of the block
+         * the body is presented exactly as the race presents it, and the
+         * wheels -- which never touch the program in either path -- are the
+         * same baked list the race draws, doubled by the same factor. */
+        car_select_draw(&prev[B3_MENU_HERO], 0.0f, 0.0f, 1, fxh);
+        }
+        /* thumbnail rail: the roster either side of the hero, in the SAME
+         * rects the backdrop drew their backing plates.  They run the shine
+         * program too now (fxt, the rail's own fixed 145-degree pose): at
+         * 166x82 the sheen is a readable band down the flank rather than the
+         * couple of pixels it would have been on the old 74 px plate, and it
+         * is the same program bound with the same uniforms, so a thumbnail
+         * and the hero cannot disagree about what a car looks like. */
+        for (int r = 0; r < B3_RAIL_N; r++) {
+            if (!rail_show[r]) continue;
+            int t = B3_RAIL_OFF[r] + B3_MENU_HERO;
+            float ry = B3_RAIL_Y(r);
+            int vx = (int)(W * (B3_RAIL_X + 0.004f));
+            int vw = (int)(W * (B3_RAIL_W - 0.008f));
+            int vy = (int)(H * (ry + 0.006f));
+            int vh = (int)(H * (B3_RAIL_H - 0.012f));
+            if (vw < 1) vw = 1;
+            if (vh < 1) vh = 1;
+            glViewport(vx, vy, vw, vh);
+            glClear(GL_DEPTH_BUFFER_BIT);
+            b3r_matrix_mode(B3R_MAT_PROJECTION); b3r_identity();
+            /* the frustum follows the VIEWPORT's own aspect.  The fixed
+             * -0.4..0.4 / -0.3..0.3 pair only matched while the viewport was
+             * W*0.22 x H*0.22 on a 4:3 window; the compact plate is ~2:1, and
+             * a fixed pair would stretch the car across it. */
+            {
+                float fw = 0.32f, fh = fw * (float)vh / (float)vw;
+                b3r_frustum(-fw, fw, -fh, fh, 1.0f, 60.0f);
+            }
+            b3r_matrix_mode(B3R_MAT_MODELVIEW); b3r_identity();
+            b3r_rotate(10.0f, 1, 0, 0);
+            /* same per-car framing as the hero (dim_a), and the same caveat
+             * about the translate running INSIDE the pitch: Rx(10) turns
+             * (0,ty,-d) into y_eye = 0.985*ty + 0.1736*d, so -0.7 left the
+             * car two thirds of the way up its box -- tolerable while the box
+             * was square-ish, glaring once it became the 2:1 plate.  -0.216*d
+             * centres it. */
+            float tdim = VEHICLES[ros[((sel + B3_RAIL_OFF[r]) % n + n) % n]]
+                             .dim_a;
+            if (!(tdim > 0.5f)) tdim = 2.75f;
+            float tdist = tdim * 2.727f;
+            b3r_translate(0.0f, -0.216f * tdist, -tdist);
+            b3r_rotate(145.0f, 0, 1, 0);
+            b3r_scale(-1.0f, 1.0f, 1.0f);
+            /* the same sense as the hero draw above -- see the note there */
+            glFrontFace(GL_CCW);
+            car_select_draw(&prev[t], 0.0f, 0.0f, 1, fxt);
+        }
+        glViewport(0, 0, W, H);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);   /* the car lists enable it */
+        }
+        /* RETAIL'S STEP 3, the present composite's SHIFTLEFTBY1 -- the same
+         * DST_COLOR/ONE full-screen quad b3_postfx_blur draws over a race
+         * frame (FUN_0003DA90's final combiner).  Everything above was
+         * authored in the half space that expects it; the 2D chrome below is
+         * not, and is drawn after, exactly as the race HUD is.  OUTSIDE the
+         * B3_CARSEL_NO3D guard: the backdrop is authored in that half space
+         * too, so a run with the 3D block off still has to be presented. */
+        car_select_present_x2();
+
+        /* ---- 2D chrome ---- */
+        if (getenv("B3_CARSEL_DBG"))
+            b3_hud_draw_rect_px(200, 200, 240, 80, 1.f, 0.f, 1.f, 1.f);
+        const float HDR_R = 0.62f, HDR_G = 0.78f, HDR_B = 0.92f;
+        const VehicleInfo* vi = &VEHICLES[ros[sel]];
+        char hdr[64], plate[64];
+        {
+            char cls[32]; unsigned ci = 0;
+            for (const char* c = vi->class_name; *c && ci + 1 < sizeof cls;
+                 c++) cls[ci++] = (char)toupper((unsigned char)*c);
+            cls[ci] = '\0';
+            int num = 0; sscanf(vi->file, "Car%d", &num);
+            snprintf(hdr, sizeof hdr, "SELECT A %s CAR", cls);
+            snprintf(plate, sizeof plate, "%s TYPE %d", cls, num);
+        }
+        if (s_logo) b3_hud_draw_quad_px(s_logo, 14, 8, 120, 52, 1.f);
+        float hw = b3_hud_text_width(hdr, 1.0f);
+        b3_hud_draw_text(hdr, 624 - hw, 24, 1.0f, HDR_R, HDR_G, HDR_B, 1.f);
+        b3_hud_draw_rect_px(150, 62, 490, 2, 0.30f, 0.58f, 0.82f, 0.7f);
+        /* THUMBNAIL RAIL ARROWS: the two extremes of the rail's band, above
+         * the top plate (y = 86) and below the bottom one (y = 432), centred
+         * on the plate's own x centre (14 + 166/2 = 97) so they cannot drift
+         * from the column.  Solid triangles built out of six 2 px rows --
+         * b3_hud_draw_rect_px is the only 2D primitive this screen has, and
+         * the old bar-plus-stem pair read as a "T" rather than an arrow at
+         * the size the rail is now. */
+        for (int a = 0; a < 6; a++) {
+            int wdt = 4 + a * 4;              /* 4, 8, 12, 16, 20, 24 */
+            b3_hud_draw_rect_px(97 - wdt / 2, 66 + a * 2, wdt, 2,
+                                0.8f, 0.9f, 1.f, 0.85f);
+            b3_hud_draw_rect_px(97 - (24 - a * 4) / 2, 438 + a * 2,
+                                24 - a * 4, 2, 0.8f, 0.9f, 1.f, 0.85f);
+        }
+        /* PLATE EDGES.  The backing plate is a fill that has to read against
+         * a backdrop gradient it now spans four times as much of: measured on
+         * the finished frame, the top row's fill came out within one value of
+         * the wall behind it (42.2 vs 43.2 in blue) while the middle rows
+         * stood 10 clear, so the same plate read as a card in the middle of
+         * the column and as nothing at the top.  A one-pixel edge in the
+         * header rule's own blue makes every row a card whatever the
+         * gradient is doing behind it, and it is drawn in the CHROME pass,
+         * i.e. after the present x2, so it is authored in display space like
+         * the rest of the 2D and cannot be doubled. */
+        for (int r = 0; r < B3_RAIL_N; r++) {
+            if (!rail_show[r]) continue;
+            int px0 = (int)(B3_RAIL_X * 640.0f);
+            int pw  = (int)(B3_RAIL_W * 640.0f);
+            int ph  = (int)(B3_RAIL_H * 480.0f);
+            int py0 = (int)(480.0f - (B3_RAIL_Y(r) + B3_RAIL_H) * 480.0f);
+            const float er = 0.30f, eg = 0.58f, eb = 0.82f, ea = 0.45f;
+            b3_hud_draw_rect_px(px0, py0, pw, 1, er, eg, eb, ea);
+            b3_hud_draw_rect_px(px0, py0 + ph - 1, pw, 1, er, eg, eb, ea);
+            b3_hud_draw_rect_px(px0, py0, 1, ph, er, eg, eb, ea);
+            b3_hud_draw_rect_px(px0 + pw - 1, py0, 1, ph, er, eg, eb, ea);
+        }
+        /* name plate + stat bars, lower right like retail */
+        {
+            float pw = b3_hud_text_width(plate, 0.95f);
+            b3_hud_draw_text(plate, 624 - pw, 336, 0.95f, 1.f, 1.f, 1.f, 1.f);
+            float fm = (mval[sel] - mmin) / (mmax - mmin > 1 ?
+                                             mmax - mmin : 1);
+            float fs = (sval[sel] - smin) / (smax - smin > 1 ?
+                                             smax - smin : 1);
+            const char* lab[2] = { "TOP SPEED", "WEIGHT" };
+            float frac[2] = { fs, fm };
+            for (int b = 0; b < 2; b++) {
+                float bx = 330 + b * 160;
+                b3_hud_draw_text(lab[b], bx, 372, 0.45f,
+                                 HDR_R, HDR_G, HDR_B, 1.f);
+                int segs = 12, lit = 1 + (int)(frac[b] * 11.0f + 0.5f);
+                for (int s = 0; s < segs; s++)
+                    b3_hud_draw_rect_px(bx + s * 12, 390, 9, 12,
+                                        0.55f, 0.75f, 0.95f,
+                                        s < lit ? 0.95f : 0.18f);
+            }
+        }
+        /* footer */
+        b3_hud_draw_rect_px(0, 452, 640, 2, 0.30f, 0.58f, 0.82f, 0.6f);
+        b3_hud_draw_rect_px(0, 454, 640, 26, 0.015f, 0.025f, 0.045f, 0.95f);
+        if (s_bbtn) b3_hud_draw_quad_px(s_bbtn, 18, 458, 18, 18, 1.f);
+        b3_hud_draw_text("BACK", 42, 460, 0.45f, 0.8f, 0.85f, 0.9f, 1.f);
+        b3_hud_draw_text("X COLOR", 180, 460, 0.45f, 0.8f, 0.85f, 0.9f, 1.f);
+        b3_hud_draw_text("CHANGE", 320, 460, 0.45f, 0.8f, 0.85f, 0.9f, 1.f);
+        {
+            float sw = b3_hud_text_width("SELECT", 0.45f);
+            b3_hud_draw_text("SELECT", 596 - sw, 460, 0.45f,
+                             0.8f, 0.85f, 0.9f, 1.f);
+            if (s_abtn)
+                b3_hud_draw_quad_px(s_abtn, 602, 458, 18, 18, 1.f);
+        }
+
+        if (want_pixels) {
+            const char* shot = getenv("B3_MENU_SHOT");
+            if (shot) {
+                unsigned char* px = malloc((size_t)W * H * 3);
+                if (px) {
+                    glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
+                    FILE* fp = fopen(shot, "wb");
+                    if (fp) {
+                        fprintf(fp, "P6\n%d %d\n255\n", W, H);
+                        for (int yy = H - 1; yy >= 0; yy--)
+                            fwrite(px + (size_t)yy * W * 3, 3, W, fp);
+                        fclose(fp);
+                        printf("[Burnout3] car-select shot -> %s\n", shot);
+                    }
+                    free(px);
+                }
+            }
+        }
+        SDL_GL_SwapWindow(g_window);
+        Uint32 now = SDL_GetTicks();
+        if (now - last < 16) SDL_Delay(16 - (now - last));
+        last = now;
+    }
+    for (int t = 0; t < B3_MENU_PREV_N; t++) car_select_free(&prev[t]);
+    if (fx_own) b3_carfx_shutdown();
+    if (backed) return 1;
+    g_fe_music_on = 0;
+    {
+        char full[64];
+        snprintf(full, sizeof full, "%s_%s",
+                 VEHICLES[ros[sel]].class_code, VEHICLES[ros[sel]].file);
+        char* dot = strrchr(full, '.'); if (dot) *dot = '\0';
+        setenv("B3_PLAYER_CAR", full, 1);
+        char pv[8]; snprintf(pv, sizeof pv, "%d", paint);
+        setenv("B3_PLAYER_PAINT", pv, 1);
+        printf("[Burnout3] car select: %s (%s), paint %d\n",
+               full, VEHICLES[ros[sel]].class_name, paint);
+    }
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
+
+#ifndef __ANDROID__
+    /* THE DATA MODEL, before the first asset is touched.  Default is the
+     * user's own Xbox disc (--iso[=path], $B3_ISO); --build is the old
+     * pre-extracted tree.  Everything below still opens "build/..." paths --
+     * src/burnout3_isoshim.h maps them onto the disc.  See
+     * src/burnout3_isodata.h.  (The Android port ships an extracted tree and
+     * stays on the build/ path.) */
+    b3_iso_init(argc, argv);
+#endif
+
 #ifdef __ANDROID__
     /* ANDROID PORT: chdir into the extracted asset tree so every relative
      * "build/..." path below resolves unchanged, and route printf to
@@ -10684,7 +21899,24 @@ int main(int argc, char* argv[]) {
     b3_android_boot();
 #endif
     b3_ai_init();
-    (void)argc; (void)argv;
+    /* CLI: force every feature onto one backend, overriding
+     * build/backends.cfg for this run only (the file is not modified). */
+    for (int ai_ = 1; ai_ < argc; ai_++) {
+        const char* a = argv[ai_];
+        if (!strcmp(a, "--re") || !strcmp(a, "--backend=re")) {
+            b3_backend_force_all(B3_BACKEND_RE);
+        } else if (!strcmp(a, "--retail") || !strcmp(a, "--backend=retail")) {
+            b3_backend_force_all(B3_BACKEND_RETAIL);
+        } else if (!strncmp(a, "--backend", 9)) {
+            fprintf(stderr, "usage: %s [--re | --retail]\n"
+                    "  --re      run ALL systems on the recovered C port\n"
+                    "  --retail  run ALL systems on the game's own x86 under "
+                    "emulation\n"
+                    "  (no flag: per-feature choices from build/backends.cfg)\n",
+                    argv[0]);
+            return 1;
+        }
+    }
     
     printf("========================================\n");
     printf("Burnout 3: Takedown - RE harness\n");
@@ -10693,6 +21925,12 @@ int main(int argc, char* argv[]) {
     printf("Engine:   RenderWare RW36 (confirmed via $Id strings)\n");
 
     printf("Ghidra functions analyzed: 7,434 (corrected ELF mapping)\n");
+    /* A build stamp, because "am I even running my own binary?" is a real
+     * question here: tools/web_smoke.py binds a FIXED port, several agent
+     * worktrees run smokes concurrently, and when that port is already held
+     * the browser is served ANOTHER worktree's build while every gate still
+     * passes. This line is the cheapest way to tell. */
+    printf("build stamp: %s %s\n", __DATE__, __TIME__);
     printf("NOTE: gameplay below is an original harness, not decompiled code.\n\n");
     
     // Init SDL
@@ -10703,10 +21941,11 @@ int main(int argc, char* argv[]) {
     }
     pad_open_first();   // Xbox 360 / any SDL game controller, if present
     
-#ifdef __ANDROID__
-    /* ANDROID PORT: the real context is GLES 2.0; gl4es re-implements the
-     * 2.1 COMPATIBILITY surface this harness draws through (immediate mode,
-     * display lists, GL_QUADS, glPushAttrib) on top of it. */
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
+    /* ANDROID / WEB PORT: the real context is GLES 2.0 (WebGL 1/2 on the web);
+     * gl4es re-implements the 2.1 COMPATIBILITY surface this harness draws
+     * through (immediate mode, display lists, GL_QUADS, glPushAttrib) on top
+     * of it. */
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
@@ -10742,6 +21981,19 @@ int main(int argc, char* argv[]) {
     // Falls back to no-multisample if the driver refuses (offscreen/soft
     // GL often does). Framebuffer reads (postfx copies, captures) resolve
     // implicitly on the default framebuffer, so the pipeline is unchanged.
+    //
+    // WHAT THIS REQUEST IS AND IS NOT, since the two were confused for a
+    // release. This asks for a multisampled DEFAULT FRAMEBUFFER, and while the
+    // aftereffects chain is running the ONLY thing drawn into the default
+    // framebuffer is that chain's final full-screen gamma quad -- a triangle
+    // with no interior edges, which multisampling cannot improve. The scene's
+    // edges are antialiased by the chain's OWN multisampled scene target
+    // (src/burnout3_aftereffects.c, B3_AFX_MSAA_DEF), which reads the SAME
+    // B3_MSAA below so that one env still means one thing.
+    //
+    // The request is kept anyway, because it is not dead: with B3_AFX=0, or on
+    // a context that cannot build the chain, the world is drawn straight into
+    // this framebuffer and this is the only multisampling there is.
     int msaa = 4;
     {
         const char* e = getenv("B3_MSAA");
@@ -10796,6 +22048,21 @@ int main(int argc, char* argv[]) {
         printf("GL context creation failed: %s\n", SDL_GetError());
         return 1;
     }
+    /* PACING, half one of two: reproduce the Xbox's vsync-locked Present.
+     *
+     * Retail's frame governor (FUN_001B58E0, ported in burnout3_frametime.h)
+     * is CATCH-UP ONLY -- its `base` argument is 1 @0x00016C2F, so it never
+     * returns fewer than one 1/60 s sim tick per rendered frame. On the
+     * console the 60 Hz ceiling came from the vblank; a desktop build that
+     * renders at 130 fps therefore simulates 130 ticks a second, i.e. 2.17x
+     * real time. Asking for vsync restores that ceiling. Where the driver
+     * ignores it (offscreen/headless, most compositors' fullscreen bypass)
+     * the sleep limiter at the bottom of the frame loop takes over.
+     *
+     * B3_NO_VSYNC=1 opts out; B3_FIXED_DT (the parity harness) implies it,
+     * because those runs are deliberately free-running and deterministic. */
+    if (!getenv("B3_NO_VSYNC") && !getenv("B3_FIXED_DT"))
+        SDL_GL_SetSwapInterval(1);
 #ifdef __ANDROID__
     /* ANDROID PORT: gl4es is built with NO_INIT_CONSTRUCTOR -- bring it up
      * now that the ES context is current, before the first gl* call.  Then
@@ -10804,34 +22071,113 @@ int main(int argc, char* argv[]) {
     b3_android_gl_init();
     SDL_GL_GetDrawableSize(g_window, &win_w, &win_h);
 #endif
+#ifdef __EMSCRIPTEN__
+    /* WEB PORT: gl4es is built with NO_INIT_CONSTRUCTOR here too -- bring it
+     * up now that the ES context is current, before the first gl* call.  Then
+     * take the size from the CANVAS, which is what the drawable really is:
+     * the shell sizes it, not the SDL_CreateWindow call above. */
+    b3_web_gl_init();
+    SDL_GL_GetDrawableSize(g_window, &win_w, &win_h);
+#endif
+    /* THE RENDERER COMES UP HERE -- after the two ports' gl4es bring-up and
+     * before the first frame of the LOADING SCREEN, which draws through the
+     * same batcher the HUD does and starts a few lines below.  It cannot come
+     * up any earlier than this on the web: b3r resolves its GL 2.0 entry
+     * points through gl4es_GetProcAddress, and gl4es is built with
+     * NO_INIT_CONSTRUCTOR, so asking it for a symbol before b3_web_gl_init()
+     * traps the wasm ("memory access out of bounds") on the very first call.
+     * b3r_init() is idempotent and retries on failure, so the load-time and
+     * first-draw call sites behind it are belt and braces, not the plan. */
+    if (!b3r_init())
+        printf("[Burnout3] FATAL: this GL context has no GL 2.0 surface "
+               "(VBOs + GLSL); nothing can be drawn.\n");
     if (msaa > 1) {
         int got = 0;
         SDL_GL_GetAttribute(SDL_GL_MULTISAMPLESAMPLES, &got);
+#ifdef GL_MULTISAMPLE
+        /* Desktop GL: multisampling is an ENABLE, and it defaults on for a
+         * multisampled drawable -- this makes it explicit.  GLES2 and WebGL
+         * have no such enable at all: multisampling there is a property of the
+         * drawable, requested through the context attributes (SDL_GL_SetAttribute
+         * above / the `antialias` WebGL attribute), and is simply on if the
+         * request was granted.  `got` is what actually reports that. */
         glEnable(GL_MULTISAMPLE);
-        printf("[Burnout3] MSAA: requested %dx, got %dx\n", msaa, got);
+#endif
+        printf("[Burnout3] MSAA: default framebuffer requested %dx, got %dx "
+               "(the SCENE's samples are the [afx] chain-ready line's `msaa`)\n",
+               msaa, got);
     }
-    
+
+    b3_loadscreen_init();            /* loading screen (agent) */
+
+    /* --------------------------------------------------------------
+     * TRACK SELECT.  Runs before any track-dependent load; the choice
+     * lands in B3_TRACK, which every loader already reads.  Skipped for
+     * headless/test runs (offscreen video, autodrive, or an explicit
+     * B3_TRACK), so every suite stays menu-free.
+     *
+     * The table it walks is LOADED AT BOOT from the user's own files
+     * (src/burnout3_trackselect_runtime.h); there is no compiled-in
+     * fallback, because retail's display strings are the publisher's
+     * content.  All tracks unlocked by design -- retail's unlock state is
+     * documented in docs/RE_FRONTEND.md and deliberately not honoured.
+     * Submodes are listed but LOCKED: pure races only for now.
+     * -------------------------------------------------------------- */
+    {
+        const char* vd = getenv("SDL_VIDEODRIVER");
+        int headless = ((vd && strcmp(vd, "offscreen") == 0)
+                    || getenv("B3_AUTODRIVE") || getenv("B3_TRACK"))
+                    && !getenv("B3_MENU");   /* B3_MENU=1 forces the menu */
+        if (!headless) {
+            /* the selector draws with HUD art + GlobalFont, so the HUD
+             * loads first; the later b3_hud_init call becomes a no-op
+             * (it re-loads the same textures -- harmless but wasteful,
+             * so it is guarded there). */
+            b3_hud_init("build/frontend");
+            /* retail flow: track, then car, B from the car screen returns
+             * to the track screen */
+            do {
+                track_select_screen();
+            } while (g_running && car_select_screen());
+        }
+    }
+
+    b3_loadscreen_begin(16);                            /* loading screen (agent) */
+
     // Generate track and meshes
+    b3_loadscreen_phase(0, "NAVIGATION");               /* loading screen (agent) */
+    nav_load();       /* first: init_paths builds the route out of it */
+    /* the collision world moved AHEAD of init_paths: init_route_from_nav
+     * scores its candidate ribbons by how many of their nodes have a
+     * drivable surface under them, which is a b3_ground_probe question.
+     * Nothing between the two touches the route line. */
+    b3_loadscreen_phase(1, "TRACK GEOMETRY");           /* loading screen (agent) */
+    load_real_track();
+    b3_loadscreen_phase(2, "COLLISION");                /* loading screen (agent) */
+    build_collision();
+    b3_loadscreen_phase(3, "ROUTE");                    /* loading screen (agent) */
     init_paths();
-    nav_load();
     route_lane_fixup();   // shift midline points onto the driven lane
     generate_track();
+    b3_loadscreen_phase(4, "ROAD MESH");                /* loading screen (agent) */
     generate_road_mesh();
-    load_real_track();
-    build_collision();
     generate_ground_mesh();
-    
+
     // Init vehicles
+    b3_loadscreen_phase(5, "VEHICLES");                 /* loading screen (agent) */
     init_vehicles();
-    
+
     // Init audio
+    b3_loadscreen_phase(6, "AUDIO");                    /* loading screen (agent) */
     audio_init();
-    
+
     // Init renderer
+    b3_loadscreen_phase(7, "RENDERER");                 /* loading screen (agent) */
     render_init(win_w, win_h);
     IMG_Init(IMG_INIT_PNG);
     b3_carfx_init();                 /* CARFX: art + shine program (before
                                       * load_car_meshes fills its tables) */
+    b3_loadscreen_phase(8, "EFFECTS");                  /* loading screen (agent) */
     b3_boostfx_init();               /* BOOSTFX: coronaboost pools 1/2 */
     /* CRASH-SHOW H8: the particle FX engine (crash dust/debris, tyre
      * smoke, offroad dust, grind sparks).  Art from Data/Global.txd via
@@ -10840,19 +22186,33 @@ int main(int argc, char* argv[]) {
     /* CARFX environment: BOTH inputs recovered [C] -- the nine SH
      * coefficients are .rdata literals (0x003B1900..) installed by
      * b3_carfx_init(); the light RGB is enviro.dat bytes 0x60..0x6B,
-     * selected per track here (docs/RE_CARFX.md 2.7/2.8). */
-    b3_carfx_set_track(getenv("B3_POSTFX_TRACK")
-                       ? getenv("B3_POSTFX_TRACK") : "US_C3_V1");
-    /* POSTFX: world sky + present composite + gamma (burnout3_postfx.c).
-     * The gamma ramp is no longer installed through SDL here; it is a GL
-     * pass at the end of render_frame(). */
-    b3_postfx_init();
-    b3_postfx_set_art("build/postfx", getenv("B3_POSTFX_TRACK")
-                      ? getenv("B3_POSTFX_TRACK") : "US_C3_V1");
+     * selected per track here (docs/RE_CARFX.md 2.7/2.8).
+     * Track selection is the same B3_TRACK-first chain every other
+     * per-track loader uses; these two calls predated B3_TRACK and were
+     * still keyed on B3_POSTFX_TRACK alone, which pinned the light
+     * probes, the reflection envmap, the light RGB and the sky art to
+     * US_C3_V1 on every track the selector chose. */
+    {
+        const char* etid = getenv("B3_TRACK");
+        if (!etid) etid = getenv("B3_POSTFX_TRACK");
+        if (!etid) etid = "US_C3_V1";
+        b3_loadscreen_phase(9, "LIGHTING");             /* loading screen (agent) */
+        b3_carfx_set_track(etid);
+        /* POSTFX: world sky + present composite + gamma
+         * (burnout3_postfx.c).  The gamma ramp is no longer installed
+         * through SDL here; it is a GL pass at the end of
+         * render_frame(). */
+        b3_postfx_init();
+        b3_postfx_set_art("build/postfx", etid);
+    }
     b3_postfx_gl_init();
+    b3_loadscreen_phase(10, "TRACK TEXTURES");          /* loading screen (agent) */
     load_track_textures();
+    b3_loadscreen_phase(11, "CAR MESHES");              /* loading screen (agent) */
     load_car_meshes();
+    b3_loadscreen_phase(12, "TRAFFIC");                 /* loading screen (agent) */
     traffic_init();                  // real .bgd traffic set + spawn table
+    b3_loadscreen_phase(13, "PROPS");                   /* loading screen (agent) */
     {   /* PROPS: destructible track props -- static.dat's +0x3C model table
          * and +0x48 instance transforms, baked by tools/extract_props.py to
          * build/tracks/<ID>/props.bin.  Data-driven: no track constants. */
@@ -10862,14 +22222,18 @@ int main(int argc, char* argv[]) {
         char pdir[256];
         snprintf(pdir, sizeof pdir, "build/tracks/%s", tid);
         b3_props_load(pdir);
+        b3_scenery_load(pdir);   /* the +0x34 instanced scenery, same dir */
     }
+    b3_loadscreen_phase(14, "HUD");                     /* loading screen (agent) */
     b3_hud_init("build/frontend");   // real HUD art from Data/Global.txd
     b3_score_events_init();          // Score/* params -> the retail VDB tune
+    b3_loadscreen_phase(15, "RULES");                   /* loading screen (agent) */
     b3_tdfx_init();                  // takedown slow-mo / camera / callout
     b3_tdfx_event_reset();           // FUN_00025AB0 @0x00025AE5: one crash-
                                      // presentation credit per car per event
     globalus_load("build/Globalus.bin");  // retail string table (callout text)
-    
+    b3_loadscreen_end();                                /* loading screen (agent) */
+
     printf("\nControls:\n");
     printf("  W/Up    - Throttle\n");
     printf("  S/Down  - Brake\n");
@@ -10880,33 +22244,108 @@ int main(int argc, char* argv[]) {
     printf("  T       - Dump gamestate + screenshot to build/ (debugging)\n");
     printf("  ESC     - Quit\n\n");
     
-    Uint32 last_time = SDL_GetTicks();
     
+    /* PACING, half two of two: retail's wall-clock frame governor.
+     *
+     * The old arrangement here stepped the sim exactly 1/60 s per RENDERED
+     * frame and claimed in a comment that this was what the Xbox does. It is
+     * not. FUN_000165F0 runs a fixed-timestep accumulator:
+     *
+     *   00016ABC  CMP [EBP+0x2E20C],0 ; JLE 0x00016C10   ; 0 ticks -> render only
+     *   00016AD0: inner loop -- one 1/60 s sim tick per iteration
+     *   00016ADC    INC [0x004A1EB4] ; CALL FUN_001B5AC0 x2   ; DAT_0060EA1C
+     *   00016BED    i++ ; CMP i,[EBP+0x2E20C] ; JL 0x00016AD0
+     *   00016C2D  PUSH 4 ; PUSH 1 ; CALL FUN_001B58E0    ; base 1, MAX 4
+     *   00016C37  MOV [EBP+0x2E20C],EAX                  ; ticks next frame
+     *
+     * So the tick stays exactly 1/60 s -- every parity measurement is
+     * untouched -- and the NUMBER of ticks per rendered frame floats with the
+     * wall clock, clamped to 4, with the overflow discarded (0x001B59CA, the
+     * spiral-of-death guard). See src/burnout3_frametime.h for the recovery.
+     *
+     * Env, all GLUE and all off the retail path:
+     *   B3_FIXED_DT=<s>      deterministic parity mode: tick = <s>, exactly
+     *                        one tick per frame, no governor, no limiter.
+     *   B3_PACE=0            governor mode 0 (retail's own frame-lock mode,
+     *                        0x001B5A0D) -- the pre-fix behaviour, for A/B.
+     *   B3_PACE_MAX_TICKS=n  clamp override; retail's value is 4. Set 1 on a
+     *                        build too slow to catch up (see below).
+     *   B3_NO_VSYNC=1        skip the swap-interval request.
+     */
+    static B3FrameGov gov;
+    int64_t  gov_freq     = (int64_t)SDL_GetPerformanceFrequency();
+    int64_t  gov_deadline = (int64_t)SDL_GetPerformanceCounter();
+    int      gov_max      = 4;      /* retail PUSHes 4 @0x00016C2D */
+    int      gov_vsync    = 0;
+    float    sim_tick_dt  = 0.016666668f;   /* DAT_0049C120, 0x003B1838 */
+    {
+        const char* fd = getenv("B3_FIXED_DT");
+        float fixed_dt = fd ? (float)atof(fd) : 0.0f;
+        if (fixed_dt > 0.0f) sim_tick_dt = fixed_dt;
+        b3_frame_gov_init(&gov, (double)sim_tick_dt * 1000.0, 0.0, gov_freq);
+        if (fixed_dt > 0.0f) gov.mode = 0;              /* parity: 1 tick/frame */
+        {   const char* p = getenv("B3_PACE");
+            if (p && atoi(p) == 0) gov.mode = 0; }
+        {   const char* m = getenv("B3_PACE_MAX_TICKS");
+            if (m) { gov_max = atoi(m); if (gov_max < 1) gov_max = 1; } }
+        /* Only run the sleep limiter when the driver did NOT give us vsync;
+         * otherwise SwapWindow already provides the Xbox's ceiling and a
+         * second limiter would beat against it down to 30 fps. */
+        gov_vsync = (SDL_GL_GetSwapInterval() > 0);
+        if (gov.mode != 0)
+            printf("[Burnout3] pacing: tick %.5f s, max %d ticks/frame, "
+                   "vsync %s%s\n", sim_tick_dt, gov_max,
+                   gov_vsync ? "on" : "off",
+                   gov_vsync ? "" : " (sleep limiter)");
+    }
+    g_tdfx_real_dt = sim_tick_dt;
+
     while (g_running) {
         Uint32 current_time = SDL_GetTicks();
-        g_delta_time = (current_time - last_time) / 1000.0f;
-        if (g_delta_time > 0.1f) g_delta_time = 0.016f; // Cap at 60fps
-        // B3_FIXED_DT=<seconds>: deterministic step for headless testing
-        // (SDL_VIDEODRIVER=offscreen runs at >1000 fps, where a wall-clock
-        // dt of <1 ms distorts the per-frame parts of the sim).
-        static float fixed_dt = -1.0f;
-        if (fixed_dt < 0.0f) {
-            const char* fd = getenv("B3_FIXED_DT");
-            fixed_dt = fd ? (float)atof(fd) : 0.0f;
+        /* How many 1/60 s sim ticks this rendered frame owes the wall clock.
+         * FUN_001B58E0 @0x001B58E0; base 1 and max 4 are retail's arguments. */
+        int sim_ticks = b3_frame_gov_tick(&gov,
+                                          (int64_t)SDL_GetPerformanceCounter(),
+                                          1, gov_max);
+        {   /* achieved RENDER rate and achieved SIM rate over a 30-frame
+             * window. g_sim_hz/60 is the answer to "is the action running at
+             * the right speed"; g_real_fps/60 no longer is, now that a frame
+             * can carry more than one tick. */
+            static Uint32 w0 = 0; static int wn = 0; static int wt = 0;
+            if (!w0) w0 = current_time;
+            wt += sim_ticks;
+            if (++wn >= 30) {
+                Uint32 el = current_time - w0;
+                if (el > 0) {
+                    g_real_fps = 1000.0f * (float)wn / (float)el;
+                    g_sim_hz   = 1000.0f * (float)wt / (float)el;
+                }
+                w0 = current_time; wn = 0; wt = 0;
+            }
         }
-        // FRAME-LOCKED timing, the retail arrangement: the Xbox steps its
-        // simulation once per rendered frame at the NOMINAL period (1/60,
-        // 0x003B1838), divided by the dilation divisor (DAT_0060EA1C =
-        // period/divisor) -- wall-clock time is never consumed by the sim.
-        // At 58-62 fps the whole game runs within +-3% of real time, with
-        // rendering and physics 1:1 (no tick beat, no interpolation).
-        // B3_FIXED_DT still overrides the nominal period for tests.
-        g_tdfx_real_dt = (fixed_dt > 0.0f) ? fixed_dt : 0.016666668f;
-        g_delta_time   = b3_tdfx_update(g_tdfx_real_dt);
-        last_time = current_time;
-        g_total_time += g_delta_time;
         g_frame_count++;
-        
+        /* B3_EXIT_AT=<race seconds>: quit cleanly once the SIMULATED clock
+         * passes T.  Test runs were bounded by wall clock, which is not the
+         * same span on both backends -- with a fixed dt the RE build
+         * simulates ~2x real time offscreen while all-retail does ~0.25x, so
+         * a "110 s" run gave RE ~220 simulated seconds and retail ~28, and
+         * any per-run count (contacts, slam attempts, takedowns) was an
+         * apples-to-oranges comparison. */
+        {
+            static float exit_at = -2.0f;
+            if (exit_at < -1.0f) {
+                const char* e = getenv("B3_EXIT_AT");
+                exit_at = e ? (float)atof(e) : -1.0f;
+            }
+            if (exit_at > 0.0f && g_race_time >= exit_at) {
+                printf("[Burnout3] B3_EXIT_AT: race clock %.2f >= %.2f, "
+                       "exiting\n", g_race_time, exit_at);
+                track_test_report();
+                g_running = 0;
+            }
+        }
+        b3_raceflow_results_tick();                         /* race flow (agent) */
+
         process_input();
 
         // There is no menu UI, so a boot-time MENU state just looks like a
@@ -10947,78 +22386,95 @@ int main(int argc, char* argv[]) {
                            g_vehicles[ci].track_progress);
             }
         }
-        if ((g_state == RACING || g_state == CRASHED) && !g_paused) {
-            {   // B3_TEST_CRASH_AT=<sec>: push the player through the real
-                // wall-crash consequence path once (wreck + presentation +
-                // trace), to exercise the crash plumbing without a live hit.
-                static float tca = -2.0f;
-                if (tca < -1.0f) {
-                    const char* e = getenv("B3_TEST_CRASH_AT");
-                    tca = e ? (float)atof(e) : -1.0f;
-                }
-                if (tca > 0.0f && g_race_time >= tca
-                    && g_player.crashed_until <= 0.0f) {
-                    tca = -1.0f;
-                    Vehicle* v = &g_player;
-                    v->crashed_until = g_race_time + 5.0f;
-                    v->immune_until  = g_race_time + crash_latch_for(v);
-                    /* PANELS: a real head-on wall normal (opposite the
-                     * car's travel).  The old (0,0,0) made the contact
-                     * impulse vanish, so the injected crash was a straight
-                     * upright slide.  The WALL entry adds no kick of its own
-                     * (the crash-director magnitude is 0.0 BSS), so this
-                     * contact impulse is the whole entry -- the 1:1
-                     * wall-crash shape. */
-                    {
-                        float sp = sqrtf(v->vel.x * v->vel.x
-                                       + v->vel.z * v->vel.z);
-                        Vec3 hn = sp > 0.1f
-                            ? (Vec3){-v->vel.x / sp, 0.0f, -v->vel.z / sp}
-                            : (Vec3){0.0f, 0.0f, 1.0f};
-                        wreck_begin_for(v, v->pos, hn, v->vel,
-                                        B3_WRECK_ENTRY_WALL);
+        /* WEB (B3_WEB_HWPROF): the sim's wall cost, so that "the frame is
+         * 40 ms" can be split into simulation and drawing before anybody goes
+         * looking for a GPU problem. Compiles to nothing off-web. */
+        B3_WEB_T0(t_sim);
+        /* ---- retail's inner loop, 0x00016AD0..0x00016BED ----
+         * `sim_ticks` iterations of ONE 1/60 s tick each. The tick length
+         * never changes, so nothing the parity harness measures moves; only
+         * how many of them a rendered frame carries does. */
+        for (int sim_tick = 0; sim_tick < sim_ticks; sim_tick++) {
+            /* FUN_001B5AC0 twice @0x00016AFC / 0x00016B06: advance the frame
+             * timer. That is what publishes the dilated dt (DAT_0060EA1C) and
+             * the game clock (DAT_0060EA20), so it belongs to the TICK, not
+             * to the rendered frame. */
+            g_delta_time  = b3_tdfx_update(g_tdfx_real_dt);
+            g_total_time += g_delta_time;
+
+            if ((g_state == RACING || g_state == CRASHED) && !g_paused) {
+                {   // B3_TEST_CRASH_AT=<sec>: push the player through the real
+                    // wall-crash consequence path once (wreck + presentation +
+                    // trace), to exercise the crash plumbing without a live hit.
+                    static float tca = -2.0f;
+                    if (tca < -1.0f) {
+                        const char* e = getenv("B3_TEST_CRASH_AT");
+                        tca = e ? (float)atof(e) : -1.0f;
                     }
-                    {   /* the crash entry retail always runs: FUN_0010DCA0
-                         * -> FUN_0010DD20 -> game-context +0x48 ->
-                         * FUN_00197750 -> FUN_00197430.  Without it the
-                         * injected crash arms no takedown claims and so does
-                         * NOT exercise "the real wall-crash consequence path"
-                         * its own comment promises. */
-                        B3TdCause tc;
-                        b3_td_cause_wall(&tc, 0);
-                        b3_td_on_crash(&g_tdr, g_race_time, 0, &tc, NULL);
-                        tdr_trace_claims("test-crash", 0);
+                    if (tca > 0.0f && g_race_time >= tca
+                        && g_player.crashed_until <= 0.0f) {
+                        tca = -1.0f;
+                        Vehicle* v = &g_player;
+                        v->crashed_until = g_race_time + 5.0f;
+                        v->immune_until  = g_race_time + crash_latch_for(v);
+                        /* PANELS: a real head-on wall normal (opposite the
+                         * car's travel).  The old (0,0,0) made the contact
+                         * impulse vanish, so the injected crash was a straight
+                         * upright slide.  The WALL entry adds no kick of its own
+                         * (the crash-director magnitude is 0.0 BSS), so this
+                         * contact impulse is the whole entry -- the 1:1
+                         * wall-crash shape. */
+                        {
+                            float sp = sqrtf(v->vel.x * v->vel.x
+                                           + v->vel.z * v->vel.z);
+                            Vec3 hn = sp > 0.1f
+                                ? (Vec3){-v->vel.x / sp, 0.0f, -v->vel.z / sp}
+                                : (Vec3){0.0f, 0.0f, 1.0f};
+                            wreck_begin_for(v, v->pos, hn, v->vel,
+                                            B3_WRECK_ENTRY_WALL);
+                        }
+                        {   /* the crash entry retail always runs: FUN_0010DCA0
+                             * -> FUN_0010DD20 -> game-context +0x48 ->
+                             * FUN_00197750 -> FUN_00197430.  Without it the
+                             * injected crash arms no takedown claims and so does
+                             * NOT exercise "the real wall-crash consequence path"
+                             * its own comment promises. */
+                            B3TdCause tc;
+                            b3_td_cause_wall(&tc, 0);
+                            b3_td_on_crash(&g_tdr, g_race_time, 0, &tc, NULL);
+                            tdr_trace_claims("test-crash", 0);
+                        }
+                        printf("[Burnout3] t=%.2f TEST CRASH injected\n",
+                               g_race_time);
                     }
-                    printf("[Burnout3] t=%.2f TEST CRASH injected\n",
-                           g_race_time);
                 }
+                game_update();
+                crash_trace_tick();   // user-requested per-frame crash log
             }
-            game_update();
-            crash_trace_tick();   // user-requested per-frame crash log
-        }
-        {   /* test harness: stop after B3_EXIT_AT race seconds */
-            static float exit_at = -2.0f;
-            if (exit_at < -1.0f) {
-                const char* e = getenv("B3_EXIT_AT");
-                exit_at = e ? (float)atof(e) : -1.0f;
+            {   /* CRASH BED: FUN_00150E80(mgr, crash_active).  Retail ORs
+                 * every local player's crashing byte (+0x236) into that
+                 * argument at 0x0014CAA0, and picks the bed's layer off
+                 * the time divisor at 0x00150F4F -- divisor 1 plays
+                 * aGenCrashNN, the dilated crash window plays zSloCrashNN.
+                 * The 0.5 s release is measured on the dilated clock, so
+                 * the dt handed over is g_delta_time. */
+                B3TdfxStatus cbst;
+                b3_tdfx_status(&cbst);
+                b3_music_crash_tick(g_player.crashed_until > 0.0f,
+                                    cbst.divisor, g_delta_time);
             }
-            if (exit_at > 0.0f && g_race_time >= exit_at) g_running = 0;
-        }
-        
-        {   /* CRASH BED: FUN_00150E80(mgr, crash_active).  Retail ORs
-             * every local player's crashing byte (+0x236) into that
-             * argument at 0x0014CAA0, and picks the bed's layer off
-             * the time divisor at 0x00150F4F -- divisor 1 plays
-             * aGenCrashNN, the dilated crash window plays zSloCrashNN.
-             * The 0.5 s release is measured on the dilated clock, so
-             * the dt handed over is g_delta_time. */
-            B3TdfxStatus cbst;
-            b3_tdfx_status(&cbst);
-            b3_music_crash_tick(g_player.crashed_until > 0.0f,
-                                cbst.divisor, g_delta_time);
-        }
+        }   /* end retail inner loop */
+        B3_WEB_T1(B3_WEB_PROF_SIM, t_sim);
+
+        /* (the B3_EXIT_AT stop lives in one place now -- the frame-count
+         * block above, which also prints the exit line and emits the
+         * track-test report.  A second silent copy here was winning the
+         * race and swallowing both.) */
+
         b3_music_pump();                 /* MUSIC: refill the stream */
-        render_frame();
+        {   B3_WEB_T0(t_scene);
+            render_frame();
+            B3_WEB_T1(B3_WEB_PROF_SCENE, t_scene); }
         // Screenshot/dump captures read the BACK buffer, so they must run
         // BEFORE the swap -- after it the back buffer holds stale previous-
         // frame data (the "half of the shot is the last frame" artifact;
@@ -11062,6 +22518,45 @@ int main(int argc, char* argv[]) {
                 free(px);
             }
         }
+        /* SHINE: B3_SHOT_SEQ=<dir> writes a numbered BMP every
+         * B3_SHOT_EVERY frames (default 30) from B3_SHOT_FIRST (default 150),
+         * so ONE headless run yields the frame SEQUENCE a reflection check
+         * needs -- the car's heading, and with it the world-space reflection
+         * vector the env stage is sampled along, sweeps as it drives.  Same
+         * readback and the same gamma/flip as B3_SHOT, so a sequence frame and
+         * a one-shot frame are the same pixels.  Consumed by
+         * tools/validate_car_shine.py; the run ends on B3_EXIT_AT as usual. */
+        const char* seqdir = getenv("B3_SHOT_SEQ");
+        if (seqdir && *seqdir) {
+            static int seq_first = -1, seq_every = -1, seq_n = 0;
+            if (seq_first < 0) {
+                const char* a = getenv("B3_SHOT_FIRST");
+                const char* b = getenv("B3_SHOT_EVERY");
+                seq_first = a ? atoi(a) : 150;
+                seq_every = b ? atoi(b) : 30;
+                if (seq_every < 1) seq_every = 1;
+            }
+            if (g_frame_count >= seq_first
+                && ((g_frame_count - seq_first) % seq_every) == 0) {
+                char sp[512];
+                int sw, sh;
+                snprintf(sp, sizeof sp, "%s/frame_%03d.bmp", seqdir, seq_n++);
+                SDL_GetWindowSize(g_window, &sw, &sh);
+                unsigned char* px = malloc((size_t)sw * sh * 4);
+                if (px) {
+                    glReadPixels(0, 0, sw, sh, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                    b3_gamma_apply_rgba(px, sw * sh);
+                    SDL_Surface* s2 = SDL_CreateRGBSurfaceWithFormatFrom(
+                        px, sw, sh, 32, sw * 4, SDL_PIXELFORMAT_ABGR8888);
+                    if (s2) {
+                        b3_postfx_flip_rows(px, sw, sh);
+                        SDL_SaveBMP(s2, sp);
+                        SDL_FreeSurface(s2);
+                    }
+                    free(px);
+                }
+            }
+        }
         const char* shot = getenv("B3_SHOT");
         static int shot_frame = 0;
         if (!shot_frame) {
@@ -11100,8 +22595,73 @@ int main(int argc, char* argv[]) {
         }
 #endif
         drive_log_tick();   /* B3_DRIVE_LOG: full state, every frame */
+        resize_sweep_tick();/* B3_RESIZE_SWEEP: prove the rebuild path */
 
         SDL_GL_SwapWindow(g_window);   // after all back-buffer captures
+
+        /* PACING: the sleep limiter -- GLUE, standing in for the Xbox's
+         * vblank when the driver gave us no vsync (offscreen, headless, a
+         * compositor bypass). Without an upper bound on the RENDER rate the
+         * governor above cannot hold the sim to 60 Hz, because retail's
+         * governor floors at one tick per rendered frame (base = 1
+         * @0x00016C2F): at 130 fps that is 130 ticks/s, 2.17x real time.
+         *
+         * Deliberately NOT a busy-wait: sleep all but the last millisecond,
+         * then spin only that. Whatever slop is left the governor's 64-bit
+         * remainder carries into the next frame, so the pace stays exact. */
+        /* Trusting SDL_GL_GetSwapInterval() alone is not enough: the
+         * offscreen driver REPORTS interval 1 and never blocks, and real
+         * drivers can be configured to ignore the request. So verify it --
+         * if frames keep arriving faster than the tick period, run the
+         * limiter regardless of what the driver claimed. Measured over a
+         * 30-frame window, hysteretic so it cannot oscillate. */
+        if (gov.mode != 0 && gov_vsync) {
+            static Uint32 vw0 = 0; static int vwn = 0;
+            if (!vw0) vw0 = current_time;
+            if (++vwn >= 30) {
+                Uint32 el = current_time - vw0;
+                float fps = el ? 1000.0f * (float)vwn / (float)el : 0.0f;
+                if (fps > 1.25f / sim_tick_dt) {
+                    printf("[Burnout3] pacing: driver claimed vsync but ran at "
+                           "%.0f fps -- enabling the sleep limiter\n", fps);
+                    gov_vsync = 0;
+                }
+                vw0 = current_time; vwn = 0;
+            }
+        }
+        if (gov.mode != 0 && !gov_vsync) {
+            int64_t now = (int64_t)SDL_GetPerformanceCounter();
+            /* NEVER SLEEP WHEN ALREADY BEHIND.  This limiter exists to stop a
+             * fast machine simulating faster than real time; it has no business
+             * lengthening a frame that is already over budget.  It used to do
+             * exactly that, in two ways:
+             *
+             *   * the RESYNC arm set the deadline to `now` and then advanced it
+             *     a full period, so the frame after a stall busy-waited a whole
+             *     16.7 ms on top of an already-late frame.  Measured on a 3090
+             *     at ~61 ms frames -- 3.7 periods behind, right on the 4-period
+             *     trigger -- it fired roughly one frame in three and showed up
+             *     as ~10 ms in the harness' own `loop` column;
+             *   * the spin ran unconditionally, so even without a resync any
+             *     frame whose advanced deadline landed a hair ahead of `now`
+             *     paid for it.
+             *
+             * Both are now guarded on `gov_deadline > now`.  A frame genuinely
+             * faster than one tick still sleeps the remainder, which is the
+             * whole point of the thing. */
+            if (gov_deadline < now - 4 * gov.period) {
+                gov_deadline = now;      /* resync, and take NO time for it */
+            } else {
+                gov_deadline += gov.period;
+                if (gov_deadline > now) {
+                    int wait_ms = b3_frame_limit_wait_ms(now, gov_deadline,
+                                                         gov_freq);
+                    if (wait_ms > 0) SDL_Delay((Uint32)wait_ms);
+                    while ((int64_t)SDL_GetPerformanceCounter() < gov_deadline)
+                        ;   /* < 1 ms, bounded */
+                }
+            }
+        }
 
         // FPS counter (every 60 frames)
         if (g_frame_count % 60 == 0) {
@@ -11114,8 +22674,14 @@ int main(int argc, char* argv[]) {
                         g_vehicles[ti].sim.speed * 2.2374146f);
             fprintf(stderr, "\n");
         }
-            printf("[Burnout3] FPS: %d | %.0f mph | gear %d | %.0f rpm | Lap: %d/%d\n",
-                   (int)(1.0f / g_delta_time), g_player.sim.speed * 2.2374146f,
+            (g_emu_ai_calls ? printf("[Burnout3] retail AI calls: %lu\n", g_emu_ai_calls) : 0),
+            (g_emu_crash_calls ? printf("[Burnout3] retail chassis resolves: %lu\n", g_emu_crash_calls) : 0),
+            (g_emu_traffic_calls ? printf("[Burnout3] retail traffic picks: %lu\n", g_emu_traffic_calls) : 0),
+            (g_emu_hud_calls ? printf("[Burnout3] retail hud ticks: %lu\n", g_emu_hud_calls) : 0),
+            (g_emu_sfx_calls ? printf("[Burnout3] retail sfx fires: %lu\n", g_emu_sfx_calls) : 0),
+            printf("[Burnout3] FPS: %d (real %.1f, sim %.1f Hz = x%.2f) | %.0f mph | gear %d | %.0f rpm | Lap: %d/%d\n",
+                   (int)(1.0f / g_delta_time), g_real_fps,
+                   g_sim_hz, g_sim_hz / 60.0f, g_player.sim.speed * 2.2374146f,
                    g_player.sim.trans.gear, g_player.sim.rpm,
                    g_current_lap, g_lap_count);
             // B3_TELEM=1: per-second world position + route progress of every
@@ -11158,6 +22724,8 @@ int main(int argc, char* argv[]) {
         }
         printf(" TOTAL=%d RIVALS=%d\n", tot, rt);
     }
+    awl_summary();   /* --- ai wreck log (agent) --- */
+    b3_tpl_summary();   /* --- traffic pop log (agent) --- */
     printf("\n[Burnout3] Goodbye!\n");
     return 0;
 }

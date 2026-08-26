@@ -18,9 +18,6 @@ produce by accident, so it discriminates far better than offset frequency.
 
 Requires: pip install unicorn
 """
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-from b3_paths import game_path, game_root  # noqa: E402
 import importlib.util
 import json
 import struct
@@ -31,6 +28,10 @@ from unicorn import (Uc, UC_ARCH_X86, UC_MODE_32, UC_HOOK_MEM_UNMAPPED,
                      UC_HOOK_MEM_READ, UC_PROT_ALL, UcError)
 from unicorn.x86_const import (UC_X86_REG_ESP, UC_X86_REG_EIP, UC_X86_REG_EAX,
                                UC_X86_REG_ECX, UC_X86_REG_EDX, UC_X86_REG_EBX)
+
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from b3_paths import game_path, game_root  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location("ev", "tools/emulate_vehicle.py")
 ev = importlib.util.module_from_spec(_spec)
@@ -43,7 +44,7 @@ STACK = 0x20000000
 SCRATCH = 0x40000000
 MAGIC_RET = 0x50000000
 
-BGV_PATH = (game_path('pveh/COMP/Car1.bgv'))
+BGV_PATH = game_path('pveh/COMP/Car1.bgv')
 
 HEADER_PTRS = (0x4C, 0x50, 0x54, 0x58, 0x60, 0x64, 0x68)
 

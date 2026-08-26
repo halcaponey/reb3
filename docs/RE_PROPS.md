@@ -1,5 +1,11 @@
 # PROPS — the destructible track props (cones, barrier boards, bulb posts)
 
+> **This is the props evidence record**, and the counterpart of the other
+> `docs/RE_*.md` files. It was written under the name `INTEGRATION_NOTE.md`,
+> which is what a few source comments and validators still call it by; it is
+> published here as `RE_PROPS.md`, which is what it is. Section 10 carries the
+> live open items.
+
 > User request, with `REFERENCE IMAGES/xemu-2026-08-12-13-53-46.png` (an orange
 > cone mid-tumble beside the car at the dirt-shortcut barrier): *the
 > destructible track props should be there as in retail, and react the same way
@@ -323,5 +329,10 @@ tools/validate_td_rules.py   532/532
   item; the contact reports already carry everything it needs.
 * **[?]** LOD1/LOD2 meshes and the `+0x64/+0x68` fade distances are extracted
   but unused; every prop draws LOD0 at any range.
-* **[?]** The generic solver `FUN_00113960` is still unported, so the knock is
-  GLUE (section 7) and the car takes no reaction force from a prop at all.
+* ~~**[?]** The generic solver `FUN_00113960` is still unported, so the knock is
+  GLUE (section 7) and the car takes no reaction force from a prop at all.~~
+  **CLOSED (2026-08-22):** ported — `src/burnout3_props.c` runs `FUN_00113960`'s
+  arm for (car A, prop B) at a resolved contact, with the recovered normal bend
+  (`@0x00113F16`) and restitution (`@0x00113F5C`). The **takedown-rules** side
+  of the object trigger, `FUN_00112E70`, is ported too — `b3_td_object_contact`
+  in `src/burnout3_td_rules.c`, fed by every prop contact.

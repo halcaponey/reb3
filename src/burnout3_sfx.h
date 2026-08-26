@@ -1,5 +1,7 @@
 #ifndef BURNOUT3_SFX_H
 #define BURNOUT3_SFX_H
+
+#include <stddef.h>
 /* Crash / slam / takedown / boost SOUND EFFECTS.
  *
  * This is the game's own audio EVENT system, recovered from the retail XBE
@@ -266,26 +268,68 @@ typedef enum {
 
 /* One wheel as the two emitters read it out of the live record
  * (veh+0x820 + i*0xC0).                                                  */
-typedef struct {
-    float omega;    /* +0x5C rad/s                                        */
-    float radius;   /* +0x50                                              */
-    int   surface;  /* +0xB0 low byte -- the eCS_* id                      */
-    int   contact;  /* +0xB3                                              */
-    int   mode;     /* +0x78 wheel mode, 0..7 (0 = 'Driving')             */
-    float pos[3];   /* +0x00 world position                                */
+/* packed pins the retail offsets; aligned(4) pins only the struct BASE.
+ * No member moves (the offsetof asserts below prove it) -- but with a
+ * 4-aligned base the 4-byte fields ARE 4-aligned, so taking their address
+ * is no longer undefined and -Waddress-of-packed-member goes quiet on the
+ * fields that really are aligned (and still fires on any that are not). */
+typedef struct __attribute__((packed, aligned(4))) B3SfxWheel {
+    // ---- RETAIL WINDOW 0x0000..0x00B4: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    float                pos[3];  /* +0x00 world position                                */
+    unsigned char _pad00[0x44];
+    float                radius;  /* +0x50                                              */
+    unsigned char _pad01[0x8];
+    float                omega;  /* +0x5C rad/s                                        */
+    unsigned char _pad02[0x18];
+    int                  mode;  /* +0x78 wheel mode, 0..7 (0 = 'Driving')             */
+    unsigned char _pad03[0x34];
+    int                  surface;  /* +0xB0 low byte -- the eCS_* id                      */
+
+    // ---- HARNESS SIDE, past the retail window: no recovered
+    // offset in THIS object, so it must not squat on retail's bytes.
+    int                  contact;  /* +0xB3                                              */
 } B3SfxWheel;
+
+#define B3SFXWHEEL_RETAIL_SPAN 0x00B4u
+_Static_assert(offsetof(B3SfxWheel, pos) == 0x0000, "pos off retail");
+_Static_assert(offsetof(B3SfxWheel, radius) == 0x0050, "radius off retail");
+_Static_assert(offsetof(B3SfxWheel, omega) == 0x005C, "omega off retail");
+_Static_assert(offsetof(B3SfxWheel, mode) == 0x0078, "mode off retail");
+_Static_assert(offsetof(B3SfxWheel, surface) == 0x00B0, "surface off retail");
 
 /* Everything the two loop emitters + the gear shot keep between frames.
  * All-zero is a valid initial state; one per car.                        */
-typedef struct {
-    int   surf_voice[4];   /* obj+0x164..+0x170                            */
-    int   surf_row[4];     /* obj+0x174..+0x180, -1 = no voice             */
-    float surf_lag[2];     /* obj+0x184/+0x188                             */
-    float skid_acc[2][2];  /* skid obj+0x24 / +0x2C                        */
-    int   skid_voice[2][3];/* skid obj+0x0C..+0x20                         */
-    int   gear_prev;       /* obj+0x148                                    */
-    int   primed;
+/* packed pins the retail offsets; aligned(4) pins only the struct BASE.
+ * No member moves (the offsetof asserts below prove it) -- but with a
+ * 4-aligned base the 4-byte fields ARE 4-aligned, so taking their address
+ * is no longer undefined and -Waddress-of-packed-member goes quiet on the
+ * fields that really are aligned (and still fires on any that are not). */
+typedef struct __attribute__((packed, aligned(4))) B3SfxDriveState {
+    // ---- RETAIL WINDOW 0x0000..0x0188: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    unsigned char _pad00[0xC];
+    int                  skid_voice[2][3];  /* skid obj+0x0C..+0x20                         */
+    float                skid_acc[2][2];  /* skid obj+0x24 / +0x2C                        */
+    unsigned char _pad01[0x114];
+    int                  gear_prev;  /* obj+0x148                                    */
+    unsigned char _pad02[0x18];
+    int                  surf_voice[4];  /* obj+0x164..+0x170                            */
+    int                  surf_row[4];  /* obj+0x174..+0x180, -1 = no voice             */
+    float                surf_lag[2];  /* obj+0x184/+0x188                             */
+
+    // ---- HARNESS SIDE, past the retail window: no recovered
+    // offset in THIS object, so it must not squat on retail's bytes.
+    int                  primed;  
 } B3SfxDriveState;
+
+#define B3SFXDRIVESTATE_RETAIL_SPAN 0x0188u
+_Static_assert(offsetof(B3SfxDriveState, skid_voice) == 0x000C, "skid_voice off retail");
+_Static_assert(offsetof(B3SfxDriveState, skid_acc) == 0x0024, "skid_acc off retail");
+_Static_assert(offsetof(B3SfxDriveState, gear_prev) == 0x0148, "gear_prev off retail");
+_Static_assert(offsetof(B3SfxDriveState, surf_voice) == 0x0164, "surf_voice off retail");
+_Static_assert(offsetof(B3SfxDriveState, surf_row) == 0x0174, "surf_row off retail");
+_Static_assert(offsetof(B3SfxDriveState, surf_lag) == 0x0184, "surf_lag off retail");
 
 /* One frame of the racecar's state, as FUN_00136120 hands it on. */
 typedef struct {
@@ -630,9 +674,71 @@ unsigned b3_sfx_voices_started(void);
  *  3. SLOW MOTION.  The audio's own gates run off the game clock
  *     DAT_0060EA20, which is the DILATED clock (RE_TAKEDOWN_FX 1.1), so
  *     every crash-side timer stretches with the divisor by construction.
- *     Nothing pitches the effects down; retail's slow-motion "sound" is a
- *     dedicated pre-rendered stream (see RE_SFX.md 6.4), not a mix change.
+ *
+ *     CORRECTION (aftertouch wave).  The old text here said "nothing
+ *     pitches the effects down; retail's slow-motion sound is a dedicated
+ *     pre-rendered stream, not a mix change".  That is WRONG, and the
+ *     evidence is a global written in exact lockstep with the time divisor:
+ *
+ *       DAT_003EBFD0 -- the AUDIO TIME SCALE.  The per-frame audio update
+ *       FUN_001CA530 takes it as its second argument (FUN_00016E00
+ *       @0x00016E22, FUN_000170B0 @0x0001710A, FUN_001354A0 @0x001354C2,
+ *       all alongside the master volume DAT_00411E74 * 1/255 * DAT_003EBFCC)
+ *       and FUN_001CD620 @0x001CD633 stashes it in DAT_004A1EF0.  Every
+ *       voice-parameter update then multiplies the voice's own playback
+ *       rate by it unless the voice's exempt byte is set:
+ *
+ *         FUN_001CAD10 @0x001CADC6   voice+0x0C *= rate  (exempt = +0x33)
+ *         FUN_001CA9A0 @0x001CAC23 / @0x001CACAC          (exempt = +0x33)
+ *         FUN_001CAE30 @0x001CAF5E                        (exempt = +0x33)
+ *         FUN_001CC700 @0x001CC7BA   voice+0x1C *= rate  (exempt = +0x3F)
+ *         FUN_001CC3E0 @0x001CC572                        (exempt = +0x3F)
+ *         FUN_001CC910 @0x001CCAA1                        (exempt = +0x3F)
+ *
+ *       The STREAMED path reads only the volume DAT_004A1EEC and never the
+ *       rate (FUN_001CBA60 @0x001CBAA0), which is why the music keeps its
+ *       tempo through a slow-mo while the effects drop.               [C/S]
+ *
+ *     So retail's slow-motion "sound" IS a mix change: a playback-rate
+ *     scale on every non-exempt voice.  It is a FLAT 0.75 for every
+ *     dilation -- not 1/divisor -- and it is written by the same
+ *     instructions that write the divisor request DAT_0060EA24:
+ *
+ *       0x001188A4 div 5 (aftertouch, race)   0x001188B6 rate 0.75 [0x003A55F8]
+ *       0x0011888E div 3 (aftertouch, crash)  0x001188B6 rate 0.75
+ *       0x00118986 div 4 (aftertouch, crash)  0x001188B6 rate 0.75
+ *       0x001188D6 div 1 (release)            0x001188DC rate 1.00 [0x003B168C]
+ *       0x0002655B div 6 (impact hit)         0x00026561 rate 0.75
+ *       0x00026525 div 1 (impact end)         0x0002652F rate 1.00
+ *       0x00026695 div 1                      0x0002669F rate 1.00
+ *       0x0002678D div 1                      0x00026792 rate 1.00
+ *       0x000269FD div 1                      0x00026A07 rate 1.00
+ *       0x00119C24 div 1 (crash exit)         0x00119C3A rate 1.00
+ *
+ *     ...and NOT by the takedown cinematic (0x0002795F div 5, 0x00027A3D
+ *     div 1, 0x00027BCD) nor by the wreck instant (0x00025D5C div 5):
+ *     those four have no paired DAT_003EBFD0 store, so a takedown
+ *     cinematic slows time WITHOUT pitching the audio.  The full xref set
+ *     for DAT_003EBFD0 is 18 references and this table is all of the ones
+ *     in the dilation family.                                          [C]
  */
+
+/* THE AUDIO TIME SCALE -- DAT_003EBFD0 -> DAT_004A1EF0.
+ *
+ * `rate` multiplies every event voice's playback rate, live (retail applies
+ * it per voice per audio update, so voices already sounding are pitched
+ * too, not just newly started ones).  1.0 = normal, 0.75 = any dilation in
+ * the crash / aftertouch family.  The authority for the value is
+ * b3_tdfx_pitch() in burnout3_takedown.c, which latches it at the same
+ * sites that write the divisor request.
+ *
+ * DEVIATION [S]: retail exempts individual voices through a per-voice byte
+ * (+0x33 / +0x3F above).  This harness has no exempt byte -- every voice in
+ * the event pool is a 3-D effect voice, i.e. the non-exempt class -- and
+ * the music stream is a separate module (burnout3_music.c) that this scale
+ * is deliberately not applied to, which is the streamed path's behaviour.  */
+void  b3_sfx_set_time_scale(float rate);
+float b3_sfx_time_scale(void);
 
 /* Per-frame crash feed.  Call ONCE per rendered frame, with the PLAYER's
  * state, next to b3_sfx_tick().  `crashed` is the harness's veh+0x210,

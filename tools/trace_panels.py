@@ -53,9 +53,6 @@ Usage:
       #     record+0x0C: record+0x10 is the INDEX COUNT, not a byte size
       #     (the old size/2 reading halved every strip).
 """
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-from b3_paths import game_path, game_root  # noqa: E402
 import os
 import struct
 import sys
@@ -66,10 +63,14 @@ from unicorn.x86_const import (UC_X86_REG_ESP, UC_X86_REG_EIP, UC_X86_REG_EAX,
                                UC_X86_REG_ECX, UC_X86_REG_EDX, UC_X86_REG_EBX,
                                UC_X86_REG_ESI, UC_X86_REG_EDI)
 
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from b3_paths import game_path, game_root  # noqa: E402
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from emulate_vehicle import load_elf, PAGE  # noqa: E402
 
-PVEH = (game_path('pveh'))
+PVEH = game_path('pveh')
 
 FUN_RELINK = 0x000310f0
 FUN_CTXINIT = 0x0012fee0

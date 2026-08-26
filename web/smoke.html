@@ -1,0 +1,113 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Burnout 3 -- wasm smoke harness</title>
+<!--
+  web/smoke.html -- the ENGINE's own test page, not the shell.
+
+  It exists so tools/web_smoke.py can boot the wasm engine headlessly against
+  a real Xbox image and watch what it prints.  The shell the player actually
+  uses is a separate deliverable; this page deliberately does the minimum the
+  contract calls for, so that what it proves is the ENGINE and not a shell.
+
+  The ISO arrives as a real File on #iso (set by CDP DOM.setFileInputFiles),
+  which is the same object a user's file picker would hand over -- lazily
+  read from disk, never loaded into memory.
+-->
+<style>
+  html, body { margin: 0; background: #111; color: #ddd;
+               font: 12px ui-monospace, monospace; }
+  canvas { display: block; width: 640px; height: 480px; background: #000; }
+</style>
+
+<input type="file" id="iso">
+<canvas id="canvas" width="640" height="480"></canvas>
+
+<script>
+window.b3 = { log: [], exited: null, error: null, started: false };
+
+function tap(kind, text) {
+  window.b3.log.push(text);
+  // Also to the devtools console, which is what CDP Runtime.consoleAPICalled
+  // streams back to the driver in real time.
+  console.log(kind + '|' + text);
+}
+
+document.getElementById('iso').addEventListener('change', function (ev) {
+  var file = ev.target.files[0];
+  if (!file) return;
+  tap('H', 'smoke: got file ' + file.name + ' (' + file.size + ' bytes)');
+  boot(file);
+});
+
+/* THE AUDIO CONTEXT, made here for the same reason the shell makes one: an
+   AudioContext is window-only, the engine runs on a worker, and the port's
+   audio bridge (web/b3_web.h) needs the page to hand one over as
+   Module.audioContext.  Without it the engine runs silent -- correctly, and
+   the smoke would gate on nothing.
+
+   It starts SUSPENDED unless the browser was told not to require a gesture;
+   tools/web_smoke.py passes --autoplay-policy=no-user-gesture-required, which
+   is what makes the worklet actually pull.  resume() is still called, because
+   a promise that never settles is exactly what a real page sees and the
+   engine must not care either way. */
+function makeAudioContext() {
+  try {
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) { tap('H', 'smoke: no AudioContext in this browser'); return null; }
+    var ctx = new AC();
+    if (ctx.state === 'suspended') { try { ctx.resume(); } catch (e) {} }
+    tap('H', 'smoke: audio context ' + ctx.state + ' @ ' + ctx.sampleRate + ' Hz');
+    return ctx;
+  } catch (e) {
+    tap('H', 'smoke: audio context failed: ' + e);
+    return null;
+  }
+}
+
+function boot(file) {
+  window.b3.started = true;
+  var audioCtx = makeAudioContext();
+  var script = document.createElement('script');
+  /* the build tree, not this directory; Emscripten then resolves
+   * burnout3.wasm and the pthread workers relative to the .js itself */
+  script.src = '../build/web/burnout3.js';
+  script.onload = function () {
+    createB3Module({
+      canvas: document.getElementById('canvas'),
+      audioContext: audioCtx,
+      b3IsoFile: file,
+      arguments: ['--iso=/iso/game.xiso'],
+      b3Env: window.B3_ENV || {},
+      b3CacheMode: window.B3_CACHE_MODE || 'opfs',
+      print:    function (t) { tap('O', t); },
+      printErr: function (t) { tap('E', t); },
+      onExit:   function (c) { window.b3.exited = c; tap('H', 'smoke: exit ' + c); }
+    }).then(function (m) {
+      window.b3.module = m;
+      /* peak wasm heap: HEAPU8.length tracks memory.grow, so sampling it is
+       * the honest "how much memory did the tab need" number */
+      window.b3.heapPeak = 0;
+      setInterval(function () {
+        try {
+          var n = m.HEAPU8.length;
+          if (n > window.b3.heapPeak) window.b3.heapPeak = n;
+        } catch (e) {}
+      }, 250);
+    }).catch(function (e) {
+      window.b3.error = String(e);
+      tap('H', 'smoke: module rejected: ' + e);
+      tap('H', 'smoke: stack: ' + (e && e.stack ? e.stack : '(none)'));
+    });
+  };
+  script.onerror = function () {
+    window.b3.error = 'failed to load burnout3.js';
+    tap('H', 'smoke: failed to load burnout3.js');
+  };
+  document.head.appendChild(script);
+}
+
+window.addEventListener('error', function (e) {
+  window.b3.error = String(e.message);
+  tap('H', 'smoke: window error: ' + e.message);
+});
+</script>

@@ -1,4 +1,13 @@
 #include "burnout3_trackmesh.h"
+/* THE STATE SHADOW HAS TO SEE THIS FILE.  It sets the winding and turns
+ * culling on for the whole world pass (below), and it was the ONE renderer
+ * translation unit not including burnout3_render.h -- so those two calls went
+ * straight to the driver while the shadow kept believing GL's defaults.  A
+ * shim then filtered a later glDisable(GL_CULL_FACE) as redundant and the
+ * frame came back 0.66-1.28% brighter (>2/255) with the mean up 0.2 on every
+ * gate frame.  Same class of defect as the double-sided cars in the first
+ * wave, and found the same way. */
+#include "burnout3_render.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -8,11 +17,20 @@
 #include <GL/gl.h>
 #include <SDL2/SDL_video.h>
 #ifdef __ANDROID__
-/* ANDROID PORT: resolve GL 2.0 through gl4es, not the raw GLES2 driver --
- * see the same block in burnout3_postfx.c for why. */
+/* ANDROID PORT (android/): desktop GL there is gl4es on top of GLES2, so the
+ * GL 2.0 entry points below must be resolved by gl4es' OWN lookup --
+ * SDL_GL_GetProcAddress would hand back the system driver's GLES2 symbols,
+ * which sit outside the program and uniform state gl4es maintains. */
 #include <gl4esinit.h>
 #define SDL_GL_GetProcAddress gl4es_GetProcAddress
 #endif
+/* WEB PORT (web/): gl4es IS GONE from this link, and so is the override.  The
+ * only reason one was ever needed is that gl4es MANGLED its exports to
+ * gl4es_gl* under __EMSCRIPTEN__ to avoid colliding with Emscripten's own
+ * WebGL symbols, so its entry points had to be found through its own lookup.
+ * Those Emscripten symbols are now the ones the engine wants, and plain
+ * SDL_GL_GetProcAddress -- the same call the desktop uses -- returns them.
+ * <GL/gl.h> resolves to web/GL/gl.h, which is GLES2.  See that file. */
 
 // World headroom curve -- TUNED (user-authorized deviation 2026-08-13).
 // Positive lifts, negative compresses, 0 is the identity. See
@@ -25,6 +43,145 @@
 // Minimal OBJ reader: only the subset tools/extract_track.py emits (v, vt, f
 // with v/vt indices, triangles only, usemtl spans, one mtllib). Deliberately
 // not a general OBJ parser.
+
+// ---- WHOLE-FILE TEXT READING ------------------------------------------------
+//
+// THE DEFECT THIS FIXES.  Both readers below used to walk their file with
+// fgets() into a 512-byte stack buffer.  That is a fine idiom on a desktop and
+// a catastrophic one in a browser:
+//
+//   * musl (which is Emscripten's libc) gives every FILE a BUFSIZ = 1024 byte
+//     buffer -- __fdopen.c allocates `sizeof *f + UNGET + BUFSIZ` and sets
+//     f->buf_size = BUFSIZ.  So one read() syscall per KILOBYTE of file.
+//   * the web port links -sPROXY_TO_PTHREAD, which puts main() on a worker
+//     while the JS filesystem stays on the main browser thread.  Emscripten's
+//     _fd_read therefore opens with
+//         if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(91, 0, 1, ...)
+//     -- proxy mode 1, a BLOCKING round trip that the game thread cannot
+//     complete until the main thread returns to its event loop.
+//
+//   US_C3_V1's track.obj is 16 MB, so that is ~16 000 blocking round trips for
+//   one file, and the big tracks (AS_M1_V1, 77 MB) are five times that.
+//   Measured: 5.2 s of warm web load for a file the desktop parses in 0.27 s.
+//
+// Reading the file in ONE fread instead makes it ONE round trip -- musl's
+// fread hands a request larger than the buffer straight to __stdio_read, which
+// reads it directly into the caller's memory (stdio/fread.c, `f->read(f, dest,
+// l)`).  The line splitting then happens in wasm memory, where it costs
+// nothing.
+//
+// EQUIVALENCE TO fgets.  tm_line() returns each line NUL-terminated with the
+// '\n' removed and any '\r' left in place, which is what fgets left minus the
+// newline; no parser below looks at either (they are all sscanf conversions and
+// fixed-prefix strncmp).  The one real behavioural difference is that fgets
+// SPLIT a line longer than 511 bytes into two "lines" and this does not -- an
+// improvement, and moot for the shipped data: the longest line in any track.obj
+// or track.mtl this repo produces is 62 characters.
+//
+// B3_IO_SMALL=1 puts the OLD 1 KB-at-a-time path back, out of the same binary,
+// so the before/after above can be measured without swapping builds -- the same
+// rule the rest of this port's measurements follow (see B3_WEB_PRESENT in
+// docs/web/webprof_sweep.md).  It is a measurement switch and nothing else:
+// both paths hand the parser identical lines.  The other two loaders that had
+// the same defect read it too, so one setting moves all three:
+// burnout3_collision.c (B3COL_IOBUF) and burnout3_carfx.c (B3FX_IOBUF).
+typedef struct {
+    char*  buf;      // the whole file, NUL-terminated  (slurp path)
+    size_t len;
+    size_t pos;
+    FILE*  f;        // non-NULL only under B3_IO_SMALL=1 (the old path)
+    char   line[512];
+} TMText;
+
+static int tm_stdio_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char* e = getenv("B3_IO_SMALL");
+        mode = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return mode;
+}
+
+static int tm_slurp(TMText* t, const char* path) {
+    FILE* f = fopen(path, "rb");
+    long  n;
+    size_t got;
+
+    t->buf = NULL; t->len = 0; t->pos = 0; t->f = NULL;
+    if (!f) return -1;
+    if (tm_stdio_mode()) {
+        /* The size, so the pump's progress fraction means the same thing on
+         * both sides of the A/B -- two seeks against the thousands of reads
+         * this path is here to demonstrate. */
+        if (fseek(f, 0, SEEK_END) == 0 && (n = ftell(f)) >= 0)
+            t->len = (size_t)n;
+        fseek(f, 0, SEEK_SET);
+        t->f = f;
+        return 0;
+    }
+
+    /* The size up front, so the read is one call and the buffer one malloc.
+     * A stream that cannot seek (never the case for these files, but the
+     * loader must not depend on that) falls back to reading in big chunks --
+     * still O(size / 8 MB) syscalls rather than O(size / 1 KB). */
+    if (fseek(f, 0, SEEK_END) == 0 && (n = ftell(f)) >= 0 &&
+        fseek(f, 0, SEEK_SET) == 0) {
+        t->buf = (char*)malloc((size_t)n + 1);
+        if (!t->buf) { fclose(f); return -1; }
+        got = fread(t->buf, 1, (size_t)n, f);
+        t->len = got;
+    } else {
+        size_t cap = 1u << 23;              /* 8 MB */
+        t->buf = (char*)malloc(cap + 1);
+        if (!t->buf) { fclose(f); return -1; }
+        for (;;) {
+            got = fread(t->buf + t->len, 1, cap - t->len, f);
+            t->len += got;
+            if (t->len < cap) break;        /* short read: end of file */
+            {   char* nb = (char*)realloc(t->buf, cap * 2 + 1);
+                if (!nb) { free(t->buf); t->buf = NULL; fclose(f); return -1; }
+                t->buf = nb;
+                cap *= 2;
+            }
+        }
+    }
+    fclose(f);
+    t->buf[t->len] = '\0';
+    return 0;
+}
+
+static void tm_free_text(TMText* t) {
+    if (t->f) { fclose(t->f); t->f = NULL; }
+    free(t->buf); t->buf = NULL; t->len = 0;
+}
+
+/* The next line, or NULL at end of file.  Terminates in place. */
+static char* tm_line(TMText* t) {
+    char* s;
+    char* nl;
+    if (t->f) {
+        if (!fgets(t->line, (int)sizeof t->line, t->f)) return NULL;
+        t->pos += strlen(t->line);
+        return t->line;
+    }
+    if (t->pos >= t->len) return NULL;
+    s  = t->buf + t->pos;
+    nl = (char*)memchr(s, '\n', t->len - t->pos);
+    if (nl) { *nl = '\0'; t->pos = (size_t)(nl - t->buf) + 1; }
+    else    { t->pos = t->len; }            /* last line, no trailing newline */
+    return s;
+}
+
+// ---- THE LOAD PUMP ----------------------------------------------------------
+// See the contract in the header.  Additive: with no callback installed this
+// costs one null test per chunk of lines.
+static TrackMeshPumpFn g_pump_fn;
+static void*           g_pump_user;
+
+void trackmesh_set_pump(TrackMeshPumpFn fn, void* user) {
+    g_pump_fn   = fn;
+    g_pump_user = user;
+}
 
 // Directory part of `path` (including trailing slash) into `dir`.
 static void path_dir(const char* path, char* dir, size_t cap) {
@@ -54,11 +211,12 @@ static void resolve_materials(TrackMesh* m, const char* obj_path, const char* mt
     path_dir(obj_path, dir, sizeof(dir));
     snprintf(mtl_path, sizeof(mtl_path), "%s%s", dir, mtl_name);
 
-    FILE* f = fopen(mtl_path, "r");
-    if (!f) return;
+    TMText mtl;
+    char* line;
+    if (tm_slurp(&mtl, mtl_path) != 0) return;
 
-    char line[512], cur[TRACKMESH_NAME_LEN] = "";
-    while (fgets(line, sizeof(line), f)) {
+    char cur[TRACKMESH_NAME_LEN] = "";
+    while ((line = tm_line(&mtl)) != NULL) {
         char arg[256];
         int ival;
         unsigned uval;
@@ -165,7 +323,7 @@ static void resolve_materials(TrackMesh* m, const char* obj_path, const char* mt
                 grp->alpha = 1;
         }
     }
-    fclose(f);
+    tm_free_text(&mtl);
 }
 
 // Move every decal group behind the rest of the world, keeping the relative
@@ -202,10 +360,10 @@ static void resolve_materials(TrackMesh* m, const char* obj_path, const char* mt
 // this harness's 0.1/5000 near/far -- and, drawn later, wins: the markings
 // shutter in and out as the camera creeps forward.
 //
-// Depth writes are handled per group by trackmesh_group_state()'s
-// glDepthMask(decal ? GL_FALSE : GL_TRUE) -- the exact GL spelling of
-// D3DRS_ZWRITEENABLE := 0 -- and those calls are recorded into the display
-// list, so baking the world costs nothing here.
+// Depth writes are handled per group by the retained renderer's batch key
+// (src/burnout3_render.c group_key()), which reads decal here and turns it
+// into glDepthMask(GL_FALSE) -- the exact GL spelling of
+// D3DRS_ZWRITEENABLE := 0 -- for the batch's whole span.
 //
 // THE RUNTIME LAW OF THE LAYER: there is none beyond this.               [C]
 //
@@ -336,8 +494,10 @@ static void trackmesh_gl_single_sided(void) {
 }
 
 int trackmesh_load(TrackMesh* m, const char* path) {
-    FILE* f = fopen(path, "r");
-    if (!f) return -1;
+    TMText obj;
+    char*  line;
+    long   pump_countdown = 0;
+    if (tm_slurp(&obj, path) != 0) return -1;
 
     memset(m, 0, sizeof(*m));
     int vcap = 1 << 14, tcap = 1 << 14;
@@ -347,7 +507,7 @@ int trackmesh_load(TrackMesh* m, const char* path) {
     m->normals = malloc((size_t)vcap * 3 * sizeof(float));
     m->indices = malloc((size_t)tcap * 3 * sizeof(unsigned));
     if (!m->positions || !m->uvs || !m->colors || !m->normals || !m->indices) {
-        fclose(f); trackmesh_free(m); return -1;
+        tm_free_text(&obj); trackmesh_free(m); return -1;
     }
 
     // Per-corner vt/vn indices, kept only so the expansion pass below can
@@ -358,8 +518,16 @@ int trackmesh_load(TrackMesh* m, const char* path) {
 
     int nuv = 0, nnrm = 0, have_color = 0, have_normal = 0;
     char mtl_name[256] = "";
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
+    while ((line = tm_line(&obj)) != NULL) {
+        /* One pump every 8k lines: often enough that the biggest track's parse
+         * still draws at the loading screen's own 30 Hz ceiling, rare enough
+         * that the test costs nothing.  The fraction is byte progress through
+         * the file, which is what the bar wants. */
+        if (g_pump_fn && --pump_countdown <= 0) {
+            pump_countdown = 8192;
+            g_pump_fn(obj.len ? (float)obj.pos / (float)obj.len : 1.0f,
+                      g_pump_user);
+        }
         if (line[0] == 'v' && line[1] == ' ') {
             if (m->vertex_count >= vcap) {
                 vcap *= 2;
@@ -368,7 +536,7 @@ int trackmesh_load(TrackMesh* m, const char* path) {
                 m->colors = realloc(m->colors, (size_t)vcap * 4 * sizeof(float));
                 m->normals = realloc(m->normals, (size_t)vcap * 3 * sizeof(float));
                 if (!m->positions || !m->uvs || !m->colors || !m->normals) {
-                    fclose(f); free(corner_t); free(corner_n);
+                    tm_free_text(&obj); free(corner_t); free(corner_n);
                     trackmesh_free(m); return -1;
                 }
             }
@@ -466,7 +634,7 @@ int trackmesh_load(TrackMesh* m, const char* path) {
                 tcap *= 2;
                 m->indices = realloc(m->indices, (size_t)tcap * 3 * sizeof(unsigned));
                 if (!m->indices) {
-                    fclose(f); free(corner_t); free(corner_n);
+                    tm_free_text(&obj); free(corner_t); free(corner_n);
                     trackmesh_free(m); return -1;
                 }
                 if (corner_t && corner_n) {
@@ -504,7 +672,13 @@ int trackmesh_load(TrackMesh* m, const char* path) {
             if (m->group_count < TRACKMESH_MAX_GROUPS) {
                 TrackMeshGroup* g = &m->groups[m->group_count++];
                 memset(g, 0, sizeof(*g));
-                strncpy(g->material, name, sizeof(g->material) - 1);
+                /* The sscanf above caps `name` at 63 chars, so this never
+                 * truncates in practice; copy an explicit length and
+                 * terminate rather than lean on strncpy's zero fill. */
+                size_t nlen = strlen(name);
+                if (nlen > sizeof(g->material) - 1) nlen = sizeof(g->material) - 1;
+                memcpy(g->material, name, nlen);
+                g->material[nlen] = '\0';
                 g->first_triangle = m->triangle_count;
                 g->use_vertex_color = 1;   // cleared by the MTL's "# vcolor 0"
                 g->alpha_scalar = 1.0f;    // set by the MTL's "# alpha_scalar"
@@ -519,7 +693,7 @@ int trackmesh_load(TrackMesh* m, const char* path) {
             g->triangle_count = m->triangle_count - g->first_triangle;
         }
     }
-    fclose(f);
+    tm_free_text(&obj);
 
     if (m->vertex_count == 0 || m->triangle_count == 0) {
         free(corner_t); free(corner_n); trackmesh_free(m); return -1;
@@ -684,7 +858,7 @@ int trackmesh_load(TrackMesh* m, const char* path) {
 
 void trackmesh_free(TrackMesh* m) {
     free(m->positions); free(m->uvs); free(m->colors); free(m->normals);
-    free(m->indices); free(m->shine_scratch);
+    free(m->indices);
     for (int g = 0; g < m->group_count; g++) free(m->groups[g].anim);
     memset(m, 0, sizeof(*m));
 }
@@ -761,9 +935,10 @@ void trackmesh_set_group_texture(TrackMesh* m, int group, unsigned gl_texture) {
 // Measured over frames 4169..4171, 0-1 of ~12,000 poster pixels ever resolve
 // to the Backs texture rather than the poster's.
 //
-// This harness could not reorder them in any case: the world is compiled once
-// into a single display list (glNewList / glCallList in burnout3_full.c), so
-// group order is fixed for the whole run and cannot vary with the camera.
+// This harness could not reorder them in any case: the world is baked once
+// into static vertex buffers whose batch order is decided at load
+// (b3r_track_build, src/burnout3_render.c), so group order is fixed for the
+// whole run and cannot vary with the camera.
 //
 // The residual frame-to-frame churn on the board is TEXTURE ALIASING, not
 // depth. Rendered ALONE through B3_TRACK_ONLYMAT below -- with nothing left in
@@ -771,8 +946,9 @@ void trackmesh_set_group_texture(TrackMesh* m, int group, unsigned gl_texture) {
 // shows 6.91% strongly-reversing pixels, against 9.71% in the full scene.
 //
 // => No polygon offset and no extra sort belong here. Do not re-chase this.
-void trackmesh_group_state(const TrackMesh* m, int group, unsigned gl_texture,
-                           int cutout_fallback) {
+void trackmesh_group_material(const TrackMesh* m, int group,
+                              unsigned gl_texture, int cutout_fallback,
+                              int* out_decal, int* out_blend, int* out_test) {
     int decal = 0, blend = 0, test = 0;
     if (group >= 0 && group < m->group_count) {
         const TrackMeshGroup* g = &m->groups[group];
@@ -799,33 +975,18 @@ void trackmesh_group_state(const TrackMesh* m, int group, unsigned gl_texture,
     if (onlymat == (const char*)1) onlymat = getenv("B3_TRACK_ONLYMAT");
     if (onlymat && group >= 0 && group < m->group_count
         && !strstr(m->groups[group].material, onlymat)) {
-        glDepthMask(GL_FALSE);
-        glDisable(GL_BLEND);
-        glEnable(GL_ALPHA_TEST);
-        glAlphaFunc(GL_GREATER, 1.0f);
-        glDisable(GL_TEXTURE_2D);
+        /* "discard everything" as a STATE rather than a skipped draw, so it
+         * works uniformly for every group: GREATER against a reference of 1.0,
+         * which no fragment can pass, and depth writes off. */
+        *out_decal = 1;
+        *out_blend = 0;
+        *out_test  = -1;          /* the caller's "reference 1.0" sentinel */
         return;
     }
 
-    glDepthMask(decal ? GL_FALSE : GL_TRUE);
-    if (blend) {
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    } else {
-        glDisable(GL_BLEND);
-    }
-    if (test) {
-        glEnable(GL_ALPHA_TEST);
-        glAlphaFunc(GL_GREATER, TRACKMESH_ALPHA_REF);
-    } else {
-        glDisable(GL_ALPHA_TEST);
-    }
-    if (gl_texture) {
-        glEnable(GL_TEXTURE_2D);
-        glBindTexture(GL_TEXTURE_2D, gl_texture);
-    } else {
-        glDisable(GL_TEXTURE_2D);
-    }
+    *out_decal = decal;
+    *out_blend = blend;
+    *out_test  = test;
 }
 
 void trackmesh_group_vertex_color(const TrackMesh* m, int group, unsigned v,
@@ -1064,492 +1225,26 @@ int trackmesh_load_frame_textures(TrackMesh* m, TrackMeshTexLoader fn,
     return n;
 }
 
-// Draw one group's triangles with a UV offset. Shared by the scroll pass; the
-// baked-display-list path in the renderer does the same thing with offset 0.
-static int trackmesh_emit_group(const TrackMesh* m, int g, const float uv[2]) {
-    const TrackMeshGroup* grp = &m->groups[g];
-    if (grp->triangle_count <= 0) return 0;
-    const unsigned* idx = m->indices + (size_t)grp->first_triangle * 3;
-    int n = grp->triangle_count * 3;
-    float col[4];
-    glBegin(GL_TRIANGLES);
-    for (int i = 0; i < n; i++) {
-        unsigned v = idx[i];
-        trackmesh_group_vertex_color(m, g, v, col);
-        glColor4fv(col);
-        if (m->uvs)
-            glTexCoord2f(m->uvs[(size_t)v * 2] + uv[0],
-                         m->uvs[(size_t)v * 2 + 1] + uv[1]);
-        glVertex3fv(m->positions + (size_t)v * 3);
-    }
-    glEnd();
-    return grp->triangle_count;
-}
-
-int trackmesh_draw_scroll(const TrackMesh* m) {
-    if (!m || m->anim_groups == 0) return 0;
-    int drawn = 0;
-    glPushAttrib(GL_ENABLE_BIT | GL_DEPTH_BUFFER_BIT | GL_CURRENT_BIT);
-    for (int g = 0; g < m->group_count; g++) {
-        const TrackMeshGroup* grp = &m->groups[g];
-        if (!trackmesh_group_animated(m, g) || grp->triangle_count <= 0) continue;
-        // A frame-cycling group binds THIS FRAME's texture; a scrolling one
-        // binds its only one and moves the UVs instead.
-        trackmesh_group_state(m, g, trackmesh_group_texture(m, g), 0);
-        drawn += trackmesh_emit_group(m, g, grp->uv_offset);
-    }
-    glDepthMask(GL_TRUE);
-    glPopAttrib();
-    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-    return drawn;
-}
-
-// The world fog, as FUN_00038D10 programs it (see TrackScene for the chain).
-//
-//   D3DRS_FOGENABLE     1                        0x00038F47
-//   D3DRS_FOGTABLEMODE  3 = D3DFOG_LINEAR        0x00038F23
-//   D3DRS_FOGSTART      fog_far * 0.05           0x00038ECB
-//   D3DRS_FOGEND        (fog_far-start)/div+start 0x00038EFC
-//   D3DRS_FOGCOLOR      authored colour * 127.5  0x00038E0E (NOT *255)
-//
-// and the fog COORDINATE is not the raw depth: every world vertex program
-// ends with `min oFog, r12.z, c[120].z` with c[120].z = fog_far, so the
-// coordinate is clamped at fog_far and the linear factor never falls below
-//     f_min = (fog_end - fog_far) / (fog_end - fog_start)
-// (0.75 on US_C3_V1: far 1000, start 50, end 3850).
-//
-// THE FOG-COORDINATE CLAMP, and how it is reproduced here.
-//
-// `c[120]` is uploaded by exactly ONE call site in the whole executable --
-// `MOV ECX,0x78 / CALL SetVertexShaderConstant` at 0x00038F59, inside this
-// same world setup (a whole-image scan for `MOV ECX,0x78` feeding either
-// uploader finds one hit; scratchpad cscan.py). Its float4 is built on the
-// stack at ESP+0x40..0x4C and the .z lane is written at 0x00038DD8 from XMM1,
-// which 0x00038D8D loaded as `[ESI + 0x10]` -- the SAME field the very next
-// block turns into D3DRS_FOGSTART and D3DRS_FOGEND:
-//
-//   00038d87  ADD   ESI,0x60e100            ; fog record = 0x0060E100 + env*0x40
-//   00038d8d  MOVSS XMM1,[ESI + 0x10]       ; fog_far
-//   00038dd8  MOVSS [ESP + 0x48],XMM1       ; c[120].z := fog_far
-//   00038f59  MOV   ECX,0x78 / CALL 0x0034f840
-//   00038e09  MOVSS XMM0,[ESI + 0x10]       ; fog_far
-//   00038e10  MULSS XMM0,[0x003a69bc]       ;   * 0.05          -> FOGSTART
-//   00038e23  SUBSS XMM1,XMM0 / DIVSS [ESI+0x14] / ADDSS XMM0   -> FOGEND
-//
-// So `c[120].z` IS `fog_far`, in the same units as FOGSTART/FOGEND, and the
-// floor is a property of the track's own three numbers -- nothing is assumed.
-// (0.75 on US_C3_V1, 0.80 on AS_C1_V1/AS_M1_V1, 0.70 on AS_C2_V1, 0.90 on
-// EU_C3_V1, 0.75 on US_C1_V1.)                                          [C]
-//
-// MECHANISM -- GLUE. Fixed-function GL cannot express the clamp: its linear
-// factor is affine in the fragment's eye distance and clamps to 0, and no
-// choice of GL_FOG_START/GL_FOG_END/GL_FOG_COLOR can make an affine ramp hold
-// still at f_min while still matching the true ramp inside [start, fog_far]
-// (matching the ramp fixes both endpoints, and then the clamp is 0 by
-// construction). GL_FOG_COORD would express it exactly but has to be supplied
-// per vertex, and the world is one baked display list.
-//
-// What IS both exact and cheap is to write the fog coordinate from a vertex
-// shader: with a vertex program bound and NO fragment program, GL 2.0 keeps
-// the whole fixed-function fragment stage -- texturing, alpha test, blend and
-// the linear fog table -- and simply takes the fog coordinate from
-// `gl_FogFragCoord`. That is one line, `min(|z_eye|, fog_far)`, i.e. the
-// microcode's `MIN oFog, r12.z, c[120].z` verbatim, and it works through
-// glCallList because the display list replays vertices into the shader.
-//
-// The GLUE in it is (a) GLSL instead of NV2A microcode and (b) reading the
-// microcode's `r12.z` as the GL eye-space depth |z_eye|. Both fog ramps are
-// programmed from the same recovered fog_start/fog_end, so inside [start,
-// fog_far] this changes nothing; past fog_far it stops the factor falling.
-// B3_TRACK_NOFOGFLOOR=1 falls back to the old unclamped fixed-function fog,
-// which is also what happens if the GL 2.0 entry points are unavailable.
-#ifndef GL_VERTEX_SHADER
-#define GL_VERTEX_SHADER  0x8B31
-#define GL_COMPILE_STATUS 0x8B81
-#define GL_LINK_STATUS    0x8B82
-#endif
-
-static const char* TRACKMESH_FOG_VS =
-    "uniform float uFogFar;\n"
-    "void main() {\n"
-    "  gl_Position    = ftransform();\n"
-    "  gl_FrontColor  = gl_Color;\n"
-    "  gl_BackColor   = gl_Color;\n"
-    "  gl_TexCoord[0] = gl_MultiTexCoord0;\n"
-    // MIN oFog, r12.z, c[120].z  -- the last instruction of every world
-    // vertex program (0x003E88C0 +15 and siblings).
-    "  vec4 e = gl_ModelViewMatrix * gl_Vertex;\n"
-    "  gl_FogFragCoord = min(abs(e.z), uFogFar);\n"
-    "}\n";
-
-static unsigned (*p_glCreateShader)(unsigned);
-static void (*p_glShaderSource)(unsigned, int, const char* const*, const int*);
-static void (*p_glCompileShader)(unsigned);
-static void (*p_glGetShaderiv)(unsigned, unsigned, int*);
-static void (*p_glGetShaderInfoLog)(unsigned, int, int*, char*);
-static unsigned (*p_glCreateProgram)(void);
-static void (*p_glAttachShader)(unsigned, unsigned);
-static void (*p_glLinkProgram)(unsigned);
-static void (*p_glGetProgramiv)(unsigned, unsigned, int*);
-static void (*p_glUseProgram)(unsigned);
-static void (*p_glDeleteShader)(unsigned);
-static void (*p_glDeleteProgram)(unsigned);
-static int (*p_glGetUniformLocation)(unsigned, const char*);
-static void (*p_glUniform1f)(int, float);
-
-static int      g_fogprog_state = -1;   // -1 untried, 0 unavailable, 1 ready
-static unsigned g_fogprog;
-static int      g_fogprog_far;
-
-// Compile the fog-coordinate vertex program. Returns 1 once it is usable.
-static int trackmesh_fogprog(void) {
-    if (g_fogprog_state >= 0) return g_fogprog_state;
-    g_fogprog_state = 0;
-    if (getenv("B3_TRACK_NOFOGFLOOR")) return 0;
-#define B3TM_GET(fn) do { *(void**)(&p_##fn) = SDL_GL_GetProcAddress(#fn); \
-                          if (!p_##fn) return 0; } while (0)
-    B3TM_GET(glCreateShader);  B3TM_GET(glShaderSource);
-    B3TM_GET(glCompileShader); B3TM_GET(glGetShaderiv);
-    B3TM_GET(glGetShaderInfoLog);
-    B3TM_GET(glCreateProgram); B3TM_GET(glAttachShader);
-    B3TM_GET(glLinkProgram);   B3TM_GET(glGetProgramiv);
-    B3TM_GET(glUseProgram);    B3TM_GET(glDeleteShader);
-    B3TM_GET(glDeleteProgram); B3TM_GET(glGetUniformLocation);
-    B3TM_GET(glUniform1f);
-#undef B3TM_GET
-    unsigned vs = p_glCreateShader(GL_VERTEX_SHADER);
-    p_glShaderSource(vs, 1, &TRACKMESH_FOG_VS, NULL);
-    p_glCompileShader(vs);
-    int ok = 0;
-    p_glGetShaderiv(vs, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
-        char log[512];
-        int n = 0;
-        p_glGetShaderInfoLog(vs, (int)sizeof log, &n, log);
-        log[(n > 0 && n < (int)sizeof log) ? n : 0] = 0;
-        fprintf(stderr, "[trackmesh] fog vertex shader failed: %s\n", log);
-        p_glDeleteShader(vs);
-        return 0;
-    }
-    unsigned pr = p_glCreateProgram();
-    p_glAttachShader(pr, vs);
-    p_glLinkProgram(pr);
-    p_glGetProgramiv(pr, GL_LINK_STATUS, &ok);
-    p_glDeleteShader(vs);
-    if (!ok) { p_glDeleteProgram(pr); return 0; }
-    g_fogprog = pr;
-    g_fogprog_far = p_glGetUniformLocation(pr, "uFogFar");
-    g_fogprog_state = 1;
-    return 1;
-}
-
-void trackmesh_fog_begin(const TrackMesh* m) {
-    if (!m || !m->scene.valid || !m->scene.fog_enabled) return;
-    if (getenv("B3_TRACK_NOFOG")) return;
-    GLfloat c[4] = { m->scene.fog_rgb[0], m->scene.fog_rgb[1],
-                     m->scene.fog_rgb[2], 1.0f };
-    glFogi(GL_FOG_MODE, GL_LINEAR);
-    glFogfv(GL_FOG_COLOR, c);
-    glFogf(GL_FOG_START, m->scene.fog_start);
-    glFogf(GL_FOG_END, m->scene.fog_end);
-    glHint(GL_FOG_HINT, GL_NICEST);
-    glEnable(GL_FOG);
-    if (trackmesh_fogprog()) {
-        p_glUseProgram(g_fogprog);
-        if (g_fogprog_far >= 0) p_glUniform1f(g_fogprog_far, m->scene.fog_far);
-    }
-}
-
-void trackmesh_fog_end(void) {
-    if (g_fogprog_state == 1) p_glUseProgram(0);
-    glDisable(GL_FOG);
-}
-
-// x^p for x in [0,1], p > 0, to within about 2% -- the classic exp2/log2
-// bit-trick pair. The shine pass evaluates this once per vertex per frame
-// (about 12k vertices on US_C3_V1) and the result lands in an 8-bit colour
-// channel, so libm's powf would be 50x the cost for no visible difference.
-static float fast_powf(float x, float p) {
-    union { float f; unsigned u; } v;
-    if (x <= 0.0f) return 0.0f;
-    v.f = x;
-    // log2(x) ~ (bits/2^23 - 127) corrected by a quadratic in the mantissa
-    float lg = (float)v.u * (1.0f / 8388608.0f) - 127.0f;
-    float frac = lg - (float)(int)lg;
-    if (frac < 0.0f) frac += 1.0f;
-    lg -= (frac - frac * frac) * 0.346607f;
-    float e = lg * p;
-    if (e < -60.0f) return 0.0f;
-    if (e > 0.0f) return 1.0f;                 // x<=1 and p>0 => x^p <= 1
-    float ef = e - (float)(int)e;
-    if (ef < 0.0f) ef += 1.0f;
-    e += (ef - ef * ef) * 0.346607f;
-    v.u = (unsigned)((e + 127.0f) * 8388608.0f);
-    return v.f;
-}
-
-// The class-1/7/10 additive term, as its own GL pass.
-//
-// THE MECHANISM (tools/extract_track.py's "Shader classes" section carries the
-// byte-level citations). The retail world pixel shaders are single-stage
-// register-combiner programs; the class-1 one (D3DPIXELSHADERDEF at
-// 0x003E8EE8, bound from slot 0x004D6578 by FUN_000393C0) has TWO stages:
-//
-//     stage 0: R0.rgb = 2 * (T0.rgb * V0.rgb)    R0.a = T0.a * V0.a
-//     stage 1: R0.rgb = R0.a * C0.rgb + R0.rgb
-//
-// so the surface is its texture modulated by the vertex colour, PLUS an
-// additive term masked per texel by the texture's alpha channel. V0 comes from
-// the class-1 vertex program at 0x003E88C0, which is the class-0 program plus
-// a Phong specular: it builds R = 2*N*(N.L) - L from the NORMPACKED3 normal at
-// vertex +0x0C and the light direction in constant c[1], normalises the view
-// vector V = position - c[0], and evaluates LIT(R.V) with the exponent taken
-// from constant 0x62.w = the material's +0x08. oD0.rgb is the plain vertex
-// colour; only oD0.w carries the specular, and material flag bit 0x40 selects
-// the variant that multiplies it by the artist-painted vertex alpha.
-// C0.rgb is the scene light colour (DAT_0060E0A0..AC) times material +0x04.
-//
-// So: colour = 2*tex.rgb*vcol.rgb + tex.a * gate * pow(max(R.V,0),power)
-//                                         * light.rgb * strength.
-//
-// The first term is the ordinary modulated base pass; this function draws the
-// second. In GL that is an additive pass (GL_ONE/GL_ONE, depth test LEQUAL,
-// depth writes off) whose fragment colour is tex.alpha * primary colour, which
-// GL_COMBINE expresses exactly as MODULATE(TEXTURE.alpha, PRIMARY.rgb) -- and
-// the per-vertex primary colour is light*strength*gate*specular, computed here
-// because the specular is view dependent and cannot live in a display list.
-//
-// NO LONGER GLUE. The light direction is vertex-shader constant c[0x61], which
-// FUN_00038D10 fills at 0x00038D62..0x00038D92 by negating the float4 at
-// +0x00 of the active light record (DAT_0060E0F0 + DAT_0060E170*0x40) -- and
-// that float4 is enviro.dat +0x80, normalised, copied there by FUN_001888F0's
-// 2-iteration loop at 0x00188B40. The scene light colour is DAT_0060E0A0 =
-// enviro.dat +0x60. tools/extract_track.py's parse_enviro() reads both out of
-// the track's own enviro.dat and writes them into the MTL header, so the
-// values below are the game's, per track. B3_TRACK_SUN still overrides.
-int trackmesh_draw_shine(TrackMesh* m, const float eye[3],
-                         const float light_dir[3]) {
-    if (!m->colors || !m->normals || m->group_count == 0) return 0;
-    if (getenv("B3_TRACK_NOSHINE")) return 0;
-
-    // The pre-2026-08-12 default was a CALIBRATED GUESS -- (0.9, -0.35, -0.25),
-    // fitted to the xemu reference frames -- because the light record had not
-    // been traced back to a shipped file. It is kept only as the fallback for
-    // an OBJ whose MTL carries no scene block.
-    //
-    // THE SIGN QUESTION IS CLOSED, AND THE ANSWER IS "THE LOBE POINTS AWAY
-    // FROM THE SKY". The old comment left it [?]; every link is now read
-    // byte-exact, so it is [C], and the geometric consequence is stated here
-    // because it is the whole behaviour of this term:
-    //
-    //   * the microcode. Re-disassembled from 0x003E88C0 with the canonical
-    //     NV2A field map (scratchpad worldspec/vp3.py; the xvs block is a
-    //     4-byte header {u16 ver 0x2078, u16 count 18} followed by
-    //     instructions in natural DWORD0..3 order, DWORD0 always zero).
-    //     Instruction 0 is `ADD r2.xyz, v0, -c[96]` (A_MUX=V/v0 unnegated,
-    //     C_MUX=C/c[96] with C_NEG set) and instruction 9 is
-    //     `ADD r8.xyz, r7, -c[97]` (A=r7, C=c[97] with C_NEG set), so
-    //     r2 = P - eye and r8 = 2N(N.c97) - c97, exactly as implemented
-    //     below.                                                          [C]
-    //   * c[96] = the float4 at 0x004D67D0 with .y += 5.0 (literal 5.0 at
-    //     0x003B1694, added at 0x00038F63..0x00038F79), uploaded by
-    //     SetVertexShaderConstant(ECX=0x60) at 0x00039128. 0x004D67D0 is the
-    //     camera world position: the sky dome uses it as the translation row
-    //     of its world matrix (0x00032601..0x0003262D) and the CAR vertex
-    //     program takes the same address as its eye constant c[108]
-    //     (FUN_00031690 @0x00031750).                                     [C]
-    //   * c[97] = -(light record +0x00) -- XORPS against a broadcast
-    //     0x80000000 at 0x00038D4C..0x00038D65 -- and light record +0x00 is
-    //     enviro.dat +0x80 normalised in place (FUN_001888F0's MOVAPS pair at
-    //     0x00188B50/0x00188B57).                                         [C]
-    //   * enviro.dat +0x80 is the sun's DOWNWARD TRAVEL direction on all 36
-    //     shipped tracks: its y is -sin(elevation) for round elevations
-    //     (-0.2588 = 15 deg, -0.3420 = 20, -0.4226 = 25, -0.5 = 30,
-    //     -0.6428 = 40, -0.7071 = 45), never positive, and the vector is
-    //     already unit (scratchpad worldspec/envdump.py).                 [C]
-    //
-    // Put together: because reflect2(A) := 2N(N.A) - A obeys
-    // reflect2(-A) = -reflect2(A), the term equals
-    //     ( reflect2(enviro+0x80) . unit(eye - P) )^power
-    // i.e. textbook Phong with L := enviro.dat+0x80 -- a light vector that
-    // points BELOW the horizon. The lobe therefore sits below the surface for
-    // anything facing the sky, and the term is identically zero on level
-    // road: measured 0.0000 on every GL_road5/6/7 group at frame 1100, and it
-    // only fires where the surface is above the eye (uphill crests, max 0.21)
-    // or near-vertical (signs, shopfronts, class 2 glass, where it reaches
-    // ~1.0). That is what the shipped shader computes, and it means THIS TERM
-    // CANNOT BE THE SOURCE OF A BROAD ADDITIVE LIFT ON THE NEAR ROAD.
-    //
-    // The old guess's large contribution was standing in for the three things
-    // that were actually missing -- the shadow sheets' alpha scalar, the
-    // 64/255 alpha reference and the fog -- all of which are recovered now.
-    float L[3] = { 0.900f, -0.350f, -0.250f };
-    float LC[3] = { 1.0f, 1.0f, 1.0f };
-    int have_light = 1;
-    if (m->scene.valid) {
-        L[0] = m->scene.light_dir[0];
-        L[1] = m->scene.light_dir[1];
-        L[2] = m->scene.light_dir[2];
-        LC[0] = m->scene.light_rgb[0];
-        LC[1] = m->scene.light_rgb[1];
-        LC[2] = m->scene.light_rgb[2];
-    }
-    if (light_dir) { L[0] = light_dir[0]; L[1] = light_dir[1]; L[2] = light_dir[2]; }
-    {
-        const char* e = getenv("B3_TRACK_SUN");
-        if (e && strcmp(e, "none") == 0) {
-            have_light = 0;
-        } else if (e && sscanf(e, "%f,%f,%f", &L[0], &L[1], &L[2]) == 3) {
-            have_light = 1;
-        }
-    }
-    if (have_light) {
-        float n = sqrtf(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
-        if (n < 1e-6f) return 0;
-        L[0] /= n; L[1] /= n; L[2] /= n;
-    }
-
-    // c[96] IS NOT THE RAW CAMERA POSITION. FUN_00038D10 copies the float4 at
-    // 0x004D67D0 into the constant and then adds the literal 5.0 (0x003B1694)
-    // to its .y lane before the upload:
-    //     00038F63  MOVSS XMM0,[ESP+0x24]        ; the .y lane
-    //     00038F71  ADDSS XMM0,[0x003B1694]      ; + 5.0
-    //     00038F79  MOVSS [ESP+0x24],XMM0
-    //     0003911F  LEA EDX,[ESP+0x20] / MOV ECX,0x60 / CALL SetVSConst  [C]
-    // The port used the raw camera position, which tilts the view vector on
-    // the near road by a couple of degrees. Recovered value, no fitting.
-    float E[3] = { eye[0], eye[1] + 5.0f, eye[2] };
-
-    if (m->shine_scratch_verts < m->vertex_count) {
-        float* p = realloc(m->shine_scratch,
-                           (size_t)m->vertex_count * 3 * sizeof(float));
-        if (!p) return 0;
-        m->shine_scratch = p;
-        m->shine_scratch_verts = m->vertex_count;
-    }
-
-    // B3_TRACK_SHINE_STATS=1: report what the specular term actually evaluates
-    // to this frame (how many vertices land on the lit side of the lobe, and
-    // how strong the term gets). Diagnostic only, off by default.
-    int stats = getenv("B3_TRACK_SHINE_STATS") != NULL;
-    double st_sum = 0.0; float st_max = 0.0f; long st_n = 0, st_pos = 0;
-    double g_sum = 0.0; float g_max = 0.0f; long g_n = 0;
-
-    int drawn = 0, state = 0;
-    for (int g = 0; g < m->group_count; g++) {
-        const TrackMeshGroup* grp = &m->groups[g];
-        if (grp->shine_strength <= 0.0f || grp->triangle_count <= 0) continue;
-        if (!grp->gl_texture) continue;
-
-        if (!state) {
-            state = 1;
-            glPushAttrib(GL_ENABLE_BIT | GL_DEPTH_BUFFER_BIT | GL_TEXTURE_BIT
-                         | GL_FOG_BIT | GL_CURRENT_BIT);
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_ONE, GL_ONE);
-            glDepthMask(GL_FALSE);
-            glDepthFunc(GL_LEQUAL);
-            glDisable(GL_ALPHA_TEST);
-            glEnable(GL_TEXTURE_2D);
-            // FOG ON AN ADDITIVE PASS. In retail this term is part of the same
-            // pixel-shader result the final combiner fogs:
-            //     out = f*(base + spec) + (1-f)*fogColour
-            // Splitting it into two GL passes gives
-            //     [f*base + (1-f)*fogColour] + <this pass>
-            // so this pass must contribute exactly f*spec -- attenuated by the
-            // fog factor but adding NO fog colour. GL's fog equation
-            // f*C + (1-f)*Cfog does exactly that with Cfog = black, so the
-            // additive pass runs the same fog range with a black fog colour.
-            if (m->scene.valid && m->scene.fog_enabled
-                && !getenv("B3_TRACK_NOFOG")) {
-                GLfloat black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-                glFogi(GL_FOG_MODE, GL_LINEAR);
-                glFogfv(GL_FOG_COLOR, black);
-                glFogf(GL_FOG_START, m->scene.fog_start);
-                glFogf(GL_FOG_END, m->scene.fog_end);
-                glEnable(GL_FOG);
-            } else {
-                glDisable(GL_FOG);
-            }
-            // fragment = texture.alpha * primary.rgb
-            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
-            glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_RGB, GL_MODULATE);
-            glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE0_RGB, GL_TEXTURE);
-            glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND0_RGB, GL_SRC_ALPHA);
-            glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE1_RGB, GL_PRIMARY_COLOR);
-            glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND1_RGB, GL_SRC_COLOR);
-        }
-        // The shine term is gated on tex.a, and a frame-cycling material's
-        // alpha mask changes with the frame, so bind the frame the base pass
-        // just drew rather than frame 0's texture.
-        glBindTexture(GL_TEXTURE_2D, trackmesh_group_texture(m, g));
-
-        // Per-vertex specular for exactly the vertices this group touches.
-        const unsigned* idx = m->indices + (size_t)grp->first_triangle * 3;
-        int n = grp->triangle_count * 3;
-        glBegin(GL_TRIANGLES);
-        for (int i = 0; i < n; i++) {
-            unsigned v = idx[i];
-            const float* P = m->positions + (size_t)v * 3;
-            const float* N = m->normals + (size_t)v * 3;
-            const float* C = m->colors + (size_t)v * 4;
-            float gate = grp->shine_gate ? C[3] : 1.0f;
-            float s = 0.0f;
-            if (gate > 0.0f) {
-                if (grp->shine_power <= 0.0f || !have_light) {
-                    // class 10 is emissive (no specular at all), and with no
-                    // light direction the factor is pinned at 1 -- see above.
-                    s = 1.0f;
-                } else {
-                    float ndl = N[0] * L[0] + N[1] * L[1] + N[2] * L[2];
-                    float R[3] = { 2.0f * N[0] * ndl - L[0],
-                                   2.0f * N[1] * ndl - L[1],
-                                   2.0f * N[2] * ndl - L[2] };
-                    float V[3] = { P[0] - E[0], P[1] - E[1], P[2] - E[2] };
-                    float vl = sqrtf(V[0] * V[0] + V[1] * V[1] + V[2] * V[2]);
-                    if (vl > 1e-6f) {
-                        float rv = (R[0] * V[0] + R[1] * V[1] + R[2] * V[2]) / vl;
-                        if (rv > 0.0f) s = fast_powf(rv, grp->shine_power);
-                    }
-                }
-            }
-            s *= gate * grp->shine_strength;
-            if (stats) {
-                st_n++; st_sum += s;
-                if (s > 0.0f) st_pos++;
-                if (s > st_max) st_max = s;
-                g_n++; g_sum += s;
-                if (s > g_max) g_max = s;
-            }
-            // C0.rgb = scene light colour * material +0x04 -- the material
-            // apply multiplies the two at 0x000394D7..0x00039518 (class 1) and
-            // 0x0003941A (class 7) and hands the product to FUN_0034E9A0 as
-            // combiner factor 0. The light colour is enviro.dat +0x60, warm on
-            // most tracks (US_C3_V1: 0.992, 0.894, 0.675).
-            glColor3f(s * LC[0], s * LC[1], s * LC[2]);
-            glTexCoord2fv(m->uvs + (size_t)v * 2);
-            glVertex3fv(P);
-        }
-        glEnd();
-        drawn += grp->triangle_count;
-        if (stats && g_n > 0) {
-            fprintf(stderr, "   [shinegrp] %-22s tris=%5d tex=%3u str=%.2f "
-                    "pow=%.2f gate=%d  meanS=%.4f maxS=%.4f\n",
-                    grp->material, grp->triangle_count, grp->gl_texture,
-                    grp->shine_strength, grp->shine_power, grp->shine_gate,
-                    g_sum / (double)g_n, g_max);
-            g_sum = 0.0; g_max = 0.0f; g_n = 0;
-        }
-    }
-    if (state) {
-        glPopAttrib();
-        glColor3f(1.0f, 1.0f, 1.0f);
-    }
-    if (stats)
-        fprintf(stderr, "[shine] L=(%.3f %.3f %.3f) c96=(%.1f %.1f %.1f) "
-                "verts=%ld lit=%ld (%.2f%%) mean=%.4f max=%.4f tris=%d\n",
-                L[0], L[1], L[2], E[0], E[1], E[2], st_n, st_pos,
-                st_n ? 100.0 * (double)st_pos / (double)st_n : 0.0,
-                st_n ? st_sum / (double)st_n : 0.0, st_max, drawn);
-    return drawn;
-}
+/* The GL emission that used to live below this line -- the vertex-array
+ * scratch, trackmesh_draw_scroll(), the fog vertex program with
+ * trackmesh_fog_begin/end, and trackmesh_draw_shine() -- moved into
+ * src/burnout3_render.c when the renderer became retained.  Their recovered
+ * arithmetic and every citation with it went along; this file is now the
+ * LOADER and the material MODEL, and issues no draw calls at all.
+ *
+ * What each one became:
+ *   trackmesh_group_state()   -> trackmesh_group_material(), above: the same
+ *                                decode, handed back as three ints instead of
+ *                                six glEnable/glDisable pairs per group.
+ *   trackmesh_fog_begin/end   -> b3r_fog(), two uniforms.  The coordinate
+ *                                clamp that needed a whole vertex program is
+ *                                one min() in the world vertex shader.
+ *   trackmesh_draw_scroll()   -> b3r_track_draw_scroll(): the same groups in
+ *                                the same order out of a static VBO, with the
+ *                                UV offset as a uniform rather than a CPU
+ *                                rewrite of every vertex.
+ *   trackmesh_draw_shine()    -> b3r_track_draw_shine(): the same per-vertex
+ *                                specular, into a dynamic colour buffer that
+ *                                is uploaded once a frame instead of once a
+ *                                group.
+ */

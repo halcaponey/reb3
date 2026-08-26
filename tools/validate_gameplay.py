@@ -1520,11 +1520,32 @@ def _tri_key(v0, v1, v2, styp):
 
 
 def _route_points():
-    import re
-    pts = re.findall(r"\{\s*(-?[\d.]+)f,\s*(-?[\d.]+)f,\s*(-?[\d.]+)f\}",
-                     open(os.path.join(os.path.dirname(__file__), "..", "src",
-                                       "burnout3_track_paths.h")).read())
-    return [(float(a), float(b), float(c)) for a, b, c in pts][:1029]
+    """US_C3_V1 probe points, in RAW GAME SPACE (z NOT negated) -- which is
+    what _unit_of() and the collision rigs below address.
+
+    This used to slurp the first 1029 `{x,y,z}` literals out of
+    src/burnout3_track_paths.h, i.e. that header's B3_CENTERLINE (1013 rows)
+    followed by the first 16 rows of its B3_WALL_A.  The header was baked GAME
+    DATA pinned to this one track and has been purged; the SAME pools live in
+    build/tracks/US_C3_V1/route.bin ('B3RT' v3), already verified identical to
+    the header rows once z is flipped back.  The order and the 1029 cut are
+    reproduced exactly so PROBE_CASES keeps addressing the same points."""
+    path = os.path.join(os.path.dirname(__file__), "..", "build", "tracks",
+                        "US_C3_V1", "route.bin")
+    with open(path, "rb") as f:
+        d = f.read()
+    assert d[:4] == b"B3RT", "%s is not a route.bin" % path
+    ver, wall, center = struct.unpack_from("<III", d, 4)
+    assert ver == 3, "route.bin version %d" % ver
+    base = 0x28
+
+    def pool(off, n):
+        return [struct.unpack_from("<3f", d, off + i * 12) for i in range(n)]
+
+    wall_a = pool(base, wall)
+    centre = pool(base + wall * 2 * 12, center)
+    pts = centre + wall_a                      # the header's own order
+    return [(x, y, -z) for x, y, z in pts][:1029]
 
 
 def _unit_of(x, z):

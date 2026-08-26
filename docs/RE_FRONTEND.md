@@ -1,5 +1,17 @@
 # Frontend / HUD assets and sound trigger logic (Burnout 3: Takedown, Xbox)
 
+> **Status (2026-08-22).** Append-only record; §6.6 and §6.10 supersede §4 and
+> §6.5. Specifically: the in-race HUD layout **was** recovered — every element
+> resolves through the retail rule `anchor = vp.min + SLOT_TABLE[slot]*vp.size`
+> (`B3HUD_SLOT_TABLE_VA 0x003FD410`), so the "calibrated from a reference
+> gameplay frame, the numeric init was NOT recovered" verdict applies only to
+> the remaining `[S-ref]` inset. Lap counts come from the recovered per-event
+> value, not the hardcoded 3. And the two generated headers this document names
+> as deliverables — `src/burnout3_trackselect.h` and `src/burnout3_font.h` —
+> **no longer exist**: they are `*_runtime.h` loaders reading the user's own
+> files, and `tools/gen_trackselect.py` now actively refuses to write into
+> `src/`. Its `--check` invocation is dead. Everything else stands as recorded.
+
 Session 2026-08-10. Provenance marks as in RE_NOTES.md: **[C]** confirmed
 (two independent derivations, or read off the bytes and validated by full
 extraction), **[S]** single-source, **[?]** open.
@@ -1095,7 +1107,8 @@ working unchanged.
 
 ## 6.10 The CORNER PLATES and the OPPONENT TAGS — CRACKED (2026-08-12, HUD-fidelity session)
 
-Three user reports against `Downloads/xemu-2026-08-12-16-23-19.png`:
+Three user reports against the reference capture
+`xemu-2026-08-12-16-23-19.png` (not shipped -- see `REFERENCE IMAGES/`):
 **(A)** the POS/LAP plates render flipped with inverted alpha, **(B)** the
 HUD does not alpha-blend like retail, **(C)** retail tags rivals with a
 position ordinal / a triangle and the port has no such element. All three
@@ -1353,3 +1366,273 @@ The HUD's public API gained one entry point,
 `b3_hud_opponent_tag(screen_x, screen_y, distance, place, visible)` —
 see `src/burnout3_hud.h` for the integration note on what the caller must
 project and which depth it must pass.
+
+---
+
+## 7. The TRACK SELECT screen — recovered 2026-08-20 (track-select session)
+
+Deliverable pair: this section and the generated header
+`src/burnout3_trackselect.h` (regenerate with
+`python3 tools/gen_trackselect.py`, verify with `--check`).
+
+### 7.1 There are TWO retail flows, and only one of them is a "track select"
+
+| flow | entry | screens | what it picks |
+|---|---|---|---|
+| **A — Single Event** | Globalus 209 `SINGLE EVENT` | 227 `SELECT REGION` → 232 `SELECT LOCATION` (a satellite **map**, not a list) → 245/246 `SELECT EVENT` | a *location* then an *event*; the event carries the track variant |
+| **B — custom race** | Globalus 213 `SET UP YOUR OWN RACE OR CRASH EVENTS`, 218 `TWO PLAYER` | 329 `SELECT MODE` → 378 `SELECT REGION` → **383 `SELECT TRACK`** → 385 `SELECT OPTIONS` | region, then one of 20 tracks, then laps/difficulty/opponents |
+
+Flow **B** is the one the port wants: it is the only place retail lets you
+name a track directly, with all-tracks-unlocked semantics
+(Globalus 2558, *"RACE OR CRASH IN LOCATIONS AND CARS UNLOCKED IN BURNOUT
+WORLD TOUR"*; 2559, *"PICK A TRACK AND TAKE ON UP TO FIVE OTHER
+RACERS"*). Softkey labels for it: 382 `Change Region`, 384 `Change
+Track`, 317 `Back`, 320/684 `Confirm`.
+
+### 7.2 The list flow B builds — FUN_00079590 (offline) / FUN_0008D020 (online) [C]
+
+`Tracks/tlist.bin` is loaded **verbatim** to `0x004D3000` — `+0x04` count
+(36), `+0x08` flagsA, `+0x208` flagsB, `+0x408` the packed u64 ids
+(`DAT_004D3408` / `DAT_004D340C`). The builder walks `0 .. count-1` **in
+tlist order** and keeps a track only if all four hold:
+
+```
+0x00079778  CALL FUN_001AECC0                 ; base-40 decode -> [ESP+0x28]
+0x0007977D  MOV  AL, byte ptr [ESP+0x2B]      ; buf[3] = the C/M/P letter
+0x00079784  CMP  AL, 0x4D  / JZ skip          ; drop every 'M' track   (8)
+0x00079797  CALL FUN_001575A0 (ESI=0x4D3000)  ; -> flagsA[i] != 0
+0x0007979E  JNZ  skip                         ; drop every 'P' track   (8)
+0x000797A6  CALL FUN_0001BCC0 / JZ skip       ; the UNLOCK predicate (7.5)
+0x000797B1  CALL FUN_00157630                 ; region from id[0]
+0x000797B6  CMP  EAX,[ESP+0x1C] / JNZ skip    ; must equal chosen region
+0x000797DF  MOV  EAX,[EAX*4 + 0x39ED70]       ; Title Case directional name
+0x000797E8  MOV  EAX, 0x4E9                   ; ...or Globalus 1257 fallback
+```
+
+What survives: the **20 circuit tracks** — 6 USA, 8 Europe, 6 Far East —
+in tlist order. `B3_TRACKS[i].in_custom` precomputes the two static
+filters. Screen state, all [C] from the same function:
+
+| field | meaning |
+|---|---|
+| `+0x20` | screen mode; selects which row-kind table is used |
+| `+0x24` (u16) | highlighted row |
+| `+0xCC + r*4` | region ids; count at `+0xEC`; cursor at `+0x6B4` |
+| `+0xF0 + n*8` | the built track ids; count at `+0x1E0`; cursor at `+0x6B8` |
+| `+0x190 + n*4` | the built Globalus name indices (parallel to the ids) |
+| `+0xC8` / `+0xCA` (u16) | lap **min / max**; cursor at `+0x6C0` |
+
+The row-kind tables are three tiny arrays at `DAT_003900E0 = {0,1,3}`,
+`DAT_003900EC = {0,1,2}`, `DAT_003900F4 = {2}` — so the default mode's
+rows are, in order, **REGION (kind 0), TRACK (kind 1), LAPS (kind 3)**.
+Value editing is a wrapping cycle: `if (++v >= n) v = base;`, driven by
+`FUN_00017910`. Row labels come from the 685‑708 Globalus block —
+685 `REGION`, 698 `TRACK`, 700 `LAPS`, 689 `DIFFICULTY`, 692 `OPPONENTS`
+— with Title Case *values* (716/717/718 `USA`/`Europe`/`Far East`,
+`DAT_0039ED70[i]` for the track, 937/938 `Lap`/`Laps`).
+
+### 7.3 What the screen actually SHOWS — and the one thing it does not [S]
+
+**There is no per-track preview photograph in the shipped art.** All three
+plausible candidates in `build/frontend/` are something else, established
+by looking at the decoded images:
+
+| set | size | what it really is |
+|---|---|---|
+| `HD*.png` × 10 | 256×256 | crash-results **newspaper front pages** — “ALPINE SMASH!”, “SILVER LAKE LUNACY!”, “GRAPE HARVEST CRUSHED!”. Matches Globalus 1731/1733/1812/1814 verbatim. |
+| `<venue>-st1/-st2.png` × 20 | 256×256 | **Signature Takedown Polaroids** — “Avalanche!”, “Tunnel Of Shove”, “Gone Fishin’”, two per crash venue. |
+| `PC*.png` × 10 | 256×128 | the ten special-event reward **POSTCARDS** (7.6). |
+
+What the map/track screens do use is a **satellite map zoom chain**, per
+region (all [S], from the assets):
+
+```
+World_Map (1024x512)                       the globe
+  -> USA / Europe / FarEast (256x256)      flat silhouette region icons
+  -> USA1 / EUROPE1 / ASIA1 (512x512)      satellite continent
+  -> US_LSAT / EU_LSAT / AU_LSAT (256x256) satellite region
+  -> SATMAP<R>_L1..L4 (64x32 -> 512x256)   a 4-step LOD chain
+  -> SATMAP<R>n_1 | SATMAP<R>n_2           n = 1..3; the _1 and _2 halves
+     (2 x 256x256 = 512x256)               STITCH SEAMLESSLY into one map
+```
+
+The `_1|_2` seam test is decisive: pasting `SATMAPU1_1` beside
+`SATMAPU1_2` (and likewise for E and A, n = 1..3) produces a continuous
+512×256 aerial photo with no visible join. So `_1`/`_2` are **left and
+right halves of one map**, *not* the V1/V2 track variants. Also on the
+map: `Circuit_line` / `Circuit_glow` (the route outline sprites),
+`StartFlag`, `CarArrow` (the cursor — `FUN_000DC3E0` binds it by name at
+its very first instruction), and `Padlock` for a locked entry.
+
+`Alaska.png` (128×256) is a separate silhouette piece for the USA icon.
+
+Layout sketch — flow B, structure [C], pixel coordinates [?]:
+
+```
+ +--------------------------------------------------------------+
+ |  SELECT TRACK                          (Globalus 383, HeadFont)
+ |                                                              |
+ |   +--------------------------------------------+             |
+ |   |                                            |             |
+ |   |     SATMAP<R>n_1 | SATMAP<R>n_2            |  <- 512x256 |
+ |   |     + Circuit_line / Circuit_glow overlay  |     region  |
+ |   |     + StartFlag, CarArrow cursor           |     map     |
+ |   +--------------------------------------------+             |
+ |                                                              |
+ |     REGION   <   USA                      >    (685 / 716)   |
+ |  >  TRACK    <   Silver Lake Southbound   >    (698 / 0x39ED70)
+ |     LAPS     <   3 Laps                   >    (700 / 938)   |
+ |                                                              |
+ |   (A) Confirm            (B) Back                            |
+ +--------------------------------------------------------------+
+```
+
+Navigation: **up/down** moves the highlighted row (`screen+0x24`),
+**left/right** cycles that row's value with wraparound, **A** confirms,
+**B** backs out to `SELECT REGION`. Fonts are the three compiled into the
+XBE (section 6.1): `HeadFont` for the caps-only screen title, `GlobalFont`
+for the rows, `SmallFont` for hints.
+
+The only frontend layout call recovered numerically is in the *track
+records* screen `FUN_000B4650`, which does
+`FUN_000F0EA0(84.0f, 240.0f, 30.0f, 40.0f, ...)` after resolving
+`DAT_0039ECE0[track]` — one x/y/w/h quadruple, interpretation [S]. Every
+other coordinate is [?]: the FE screens are data-driven and the texture
+names they consume (`.rdata` pool `0x003998A0..0x00399DE8`) have **zero**
+address references anywhere in `default.xbe` — verified by a byte-aligned
+4-byte immediate scan of every `PT_LOAD` byte *and* by Ghidra xrefs. The
+same scan finds the 36-entry name tables immediately, so the tooling is
+sound; the FE binding genuinely is not in code.
+
+### 7.4 The region-map LOCATION list (flow A) — FUN_000DF960 [C]
+
+```c
+switch (screen[0x254]) { case 0: base = 0; case 1: base = 9; case 2: base = 21; }
+i    = base + screen[0x27C];                       /* 0..27 */
+kind = DAT_0039F978[ DAT_0039F990[i] ];            /* 0x2F race, 0x32 crash */
+name = DAT_0039F9B0[i];                            /* Globalus venue name  */
+screen[0x4C] = DAT_0039FA20[i];                    /* meaning not recovered [?] */
+```
+
+28 map slots: **9 USA + 12 Europe + 7 Far East**. Splitting them by
+`kind` gives exactly **18 race locations = the 18 venues** and **10 crash
+locations = the 10 circuit venues** — which is the independent
+confirmation that `HD*` and `*-st*` belong to the crash venues, not to
+track select. The whole table is emitted as `B3_LOCATIONS[]`.
+
+Headers: 228 `SELECT A REGION FOR RACE OR CRASH EVENTS`; 234/235/236
+`WELCOME TO THE USA… PLEASE SELECT A LOCATION` (and Europe / the Far
+East); 233 `PLEASE SELECT A LOCATION`.
+
+### 7.5 The UNLOCK model — DAT_0044D0CC [C]
+
+Retail stores per-track availability in a **36-byte array at
+`DAT_0044D0CC`**, indexed by tlist index, one byte per track.
+
+* **Read** — `FUN_0001BCC0(id_lo, id_hi)`: `FUN_001575F0(id) < 0 → 0`,
+  else `i = FUN_00158640(id)`, `i == -1 → 1`, else `DAT_0044D0CC[i]`.
+  Every menu that offers a track calls this one predicate.
+* **Write** — `FUN_0001C9D0(profile)` clears all 36 bytes, then walks the
+  **73 World Tour events** (`e = 0 .. 0x48`) and, for each event that is
+  live (`DAT_0044D01F[e]`), flagged (`DAT_0039E2A8[e]`, a 73-byte table)
+  and **completed in the profile** (`*(char *)(profile + 0x386 + e) > 0`),
+  resolves the event's track id from `DAT_0039DF38[e*2]` /
+  `DAT_0039DF3C[e*2]` and sets that track's byte. A **Grand Prix** entry
+  (`hi == 0 && lo < 7`) instead expands through `PTR_DAT_003ED0F8[lo]` for
+  `DAT_0039E778[lo]` rounds (`{3,3,3,3,4,4,4}`), unlocking every round's
+  track. Finally `DAT_0044D164 = popcount(DAT_0044D0CC[0..35])`.
+
+So the *save* holds per-event medals at `profile + 0x386 + event_index`;
+the per-track array is **derived** on every profile load. Event metadata
+sits at `DAT_0039E348`, stride 0x0C, 73 rows of
+`{unlock-hint Globalus idx (0xFFFFFFFF = always open), description,
+event-name}` — read by `FUN_001585F0(i, ?, locked)`, which returns `+0`
+when locked and `+4` otherwise. Row 4's `+0` is Globalus 2694,
+*"GET BRONZE IN WATERFRONT BURNING LAP TO UNLOCK THIS EVENT."*
+
+**Deliberate deviation.** The port ships **all 36 tracks unlocked**. There
+is no World Tour progression in the harness, so there is no profile to
+derive `DAT_0044D0CC` from; the array is modelled as all-ones
+(`b3_track_unlocked(i) == 1` in the header). This is a decision, not an
+oversight, and it is the *only* deviation — retail's other three filters
+(`'M'`, flagsA, region) still apply. Locking is **not** implemented; if it
+is ever wanted, `FUN_0001BCC0` is the single hook.
+
+### 7.6 The ten SPECIAL EVENTS and their postcards [C ids, S art]
+
+`FUN_00158610(id)` linear-searches `DAT_0039E880`, ten packed u64 event
+ids, terminating past `0x0039E8CF`. Two parallel 10-entry Globalus tables
+follow: `0x0039E8D0` the *"UNLOCK THE SPECIAL EVENT IN X"* hints and
+`0x0039E8F8` the *"<X> POSTCARD"* reward names. The ten decode to
+`0E0504EUC1V1` (Winter City), `0E0502EUC2V1` (Alpine), `0E0501EUC4V1`
+(Vineyard), `0E050AASC2V1` (Dockside), `0E0500ASC3V1` (Island Paradise),
+`0E0503ASC1V1` (Golden City), `0E0505USP2V2` (Mountain Parkway),
+`0E0506EUP2V2` (Continental Run), `0E050DUSC3V1` (Silver Lake),
+`000508USM1V2` (the World Grand Prix) — a 1:1 match with the ten `PC*.png`
+textures, and `PCus-p2p2a` / `PCeu-p2p2` pin themselves to the `USP2` /
+`EUP2` ids. Emitted as `B3_SPECIAL_EVENTS[]`.
+
+### 7.7 Race settings for a single race [C]
+
+* **Laps.** Every `Gamedata.bgd` carries an `OFFSGRCF` event (offline
+  single race) and an `ONSGRCF` event (online); the lap count is that
+  event record's `P+0x3B8`. Offline: **3** on every circuit except Alpine
+  (`EU_C2_*` = 2 offline / 3 online), **2** on the four M venues, **1** on
+  the four P venues. The histogram over all 36 tracks is
+  **18 × 3 laps, 10 × 2, 8 × 1** — so the port's hardcoded 3 is right for
+  exactly half of them and wrong for the other half. Use
+  `B3_TRACKS[i].laps`.
+* **Grid = 6.** The event SPATIAL record holds six 0x50-byte start-grid
+  slots (`S+0x000/0x050/0x0A0/0x0F0/0x140/0x190`), and all six are
+  populated with a non-zero position on **all 36 shipped tracks**
+  (checked by the generator). Corroborated twice in Globalus: 2559 *"…TAKE
+  ON UP TO FIVE OTHER RACERS"* and 720 *"This game mode requires a maximum
+  of 6 players"*.
+* **Track directory** — `FUN_001574F0` builds `tracks/<REG>/<Cn>_<Vn>/`
+  from the packed id; `B3_TRACKS[i].dir` is the `<REG>/<Cn>_<Vn>` half.
+* Difficulty (Globalus 346/347/348 `Easy`/`Medium`/`Hard`) and the lap
+  min/max at `screen+0xC8`/`+0xCA` are **[?]** — the values behind those
+  two fields were not recovered.
+
+### 7.8 The variant naming retail uses [C]
+
+V1/V2 are **not** called "forward/reverse" anywhere in the shipped
+strings. Retail names them by compass direction, in three parallel
+36-entry tables all indexed by tlist index:
+
+| table | casing | example |
+|---|---|---|
+| `DAT_0039ECE0` | UPPERCASE | `SILVER LAKE SOUTHBOUND` (Globalus 1278) |
+| `DAT_0039ED70` | Title Case | `Silver Lake Southbound` (Globalus 1314) |
+| `DAT_0039EE00` | venue only | `SILVER LAKE` (Globalus 1261) |
+
+`FUN_00158680(i)` is the accessor for the third and returns Globalus 1258
+`UNKNOWN TRACK` for a negative index; the Title Case path falls back to
+1257 `Unknown Track` instead. Note Globalus **1262 `TEST TRACK`** sits in
+the middle of the venue-name run but appears in **none of the three name
+tables** — the shipped venue names are 1259‑1261 and 1263‑1277, 18 of
+them. (1262 does have three unaligned code immediates, at 0x00165FEE /
+0x001809CC / 0x002027C9; a dev leftover, not a selectable venue.)
+
+### 7.9 Open [?]
+
+* Every FE **pixel coordinate** except `FUN_000B4650`'s
+  `(84, 240, 30, 40)`. The screens are data-driven and the texture-name
+  pool is unreferenced by address.
+* `DAT_0039FA20[28]`, the second per-location byte (0 for the first few
+  slots of each region, 1 afterwards). Consumed as `screen+0x4C`.
+* Which of `SATMAP<R>1..3` a given location shows, and the marker
+  coordinates on the map. The data around `0x0039F880..0x0039F974`
+  decodes plausibly as u16 pairs but no consumer was located.
+* The lap min/max values at `screen+0xC8`/`+0xCA`.
+* The `OFFBTRCF` event slot present in every `Gamedata.bgd` alongside
+  `OFFSGRCF` / `OFFRRGEF` / `OFFBRLPF` (single race / road rage / burning
+  lap). Its four-letter mode code is not decoded.
+
+### 7.10 Reproduce
+
+```
+python3 tools/extract_tlist.py            # the 36-track registry
+python3 tools/gen_trackselect.py          # -> src/burnout3_trackselect.h
+python3 tools/gen_trackselect.py --check  # fails if the header is stale
+```

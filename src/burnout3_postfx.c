@@ -9,6 +9,9 @@
  * -DB3_POSTFX_NO_GL.
  */
 #include "burnout3_postfx.h"
+/* the retained renderer: the dome and the two full-screen quads draw through
+ * it now, so this file emits no fixed-function geometry at all */
+#include "burnout3_render.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -20,14 +23,22 @@
 #include <SDL2/SDL_image.h>
 #include <GL/gl.h>
 #ifdef __ANDROID__
-/* ANDROID PORT (android/): desktop GL here is gl4es on top of GLES2, so the
- * GL 2.0 entry points below MUST be resolved by gl4es' own lookup.
- * SDL_GL_GetProcAddress would hand back the raw GLES2 driver symbols, which
- * (a) cannot compile this file's GLSL 1.10 source and (b) sit outside the
- * program/uniform state gl4es maintains for the fixed-function emulation --
- * the next immediate-mode draw would silently unbind the program. */
+/* ANDROID PORT (android/): desktop GL there is gl4es on top of GLES2, so the
+ * GL 2.0 entry points below must be resolved by gl4es' OWN lookup --
+ * SDL_GL_GetProcAddress would hand back the system driver's GLES2 symbols,
+ * which sit outside the program and uniform state gl4es maintains. */
 #include <gl4esinit.h>
 #define SDL_GL_GetProcAddress gl4es_GetProcAddress
+#endif
+/* WEB PORT (web/): gl4es IS GONE from this link, and so is the override.  The
+ * only reason one was ever needed is that gl4es MANGLED its exports to
+ * gl4es_gl* under __EMSCRIPTEN__ to avoid colliding with Emscripten's own
+ * WebGL symbols, so its entry points had to be found through its own lookup.
+ * Those Emscripten symbols are now the ones the engine wants, and plain
+ * SDL_GL_GetProcAddress -- the same call the desktop uses -- returns them.
+ * <GL/gl.h> resolves to web/GL/gl.h, which is GLES2.  See that file. */
+#ifdef __EMSCRIPTEN__
+#include "b3_web.h"          /* the frame profiler -- see b3_web.h */
 #endif
 #endif
 
@@ -349,7 +360,13 @@ float b3_postfx_blur_strength(float speed_mph, float boost_ramp)
     t = (speed_mph - B3_BLUR_MPH_ON) / (B3_BLUR_MPH_FULL - B3_BLUR_MPH_ON);
     if (t < 0.0f) t = 0.0f;
     if (t > 1.0f) t = 1.0f;
-    t = t * t;                          /* GLUE: quiet at cruise, hard at top */
+    /* GLUE: quiet at cruise, hard at top. The exponent used to be a hard
+     * square; it is B3_BLUR_SHAPE now and 1.35, because a square gave away
+     * the entire middle of the speed range -- see the retune note in the
+     * header. powf(0,e) is 0 and powf(1,e) is 1 for every e > 0, so both
+     * ramp endpoints, and validate_postfx C6's assertions about them, are
+     * untouched by the choice of exponent. */
+    t = powf(t, B3_BLUR_SHAPE);
 
     /* the recovered FOV law's shape, 1-(r-1)^2, peaks at r == 1 */
     boost = boost_ramp - 1.0f;
@@ -668,24 +685,125 @@ static float postfx_sky_gain(void)
     return gain;
 }
 
-/* Emit one dome as immediate-mode triangles. `unit` selects which texcoord
- * set feeds glTexCoord2f: 0 = the gradient LUT, 1 = the cloud sheet.
- * tc0.u is now the vertex's OWN azimuth: the LUT stopped being horizontally
- * uniform the moment passes 2 and 3 went in. */
-static void postfx_emit_dome(const B3SkyVertex *v, int unit)
+/* Emit one dome. `unit` selects which texcoord set is used: 0 = the gradient
+ * LUT, 1 = the cloud sheet.  tc0.u is the vertex's OWN azimuth: the LUT
+ * stopped being horizontally uniform the moment passes 2 and 3 went in.
+ *
+ * THE DOME IS THE SAME 264 VERTICES EVERY FRAME, drawn three times (ground,
+ * sky, clouds) through a 1344-entry index list that already exists. As
+ * immediate mode that was 1344 x 2 = 2688 GL calls per dome and 8064 a frame,
+ * for geometry that never changes -- only the modelview and the bound texture
+ * do. Drawing it from a static array through the index list it already has
+ * costs five calls a dome and submits bit-identical vertices in bit-identical
+ * order.
+ *
+ * The arrays are derived once, on first use, because b3_sky_build() writes the
+ * retail-layout B3SkyVertex (packed, with a colour field GL never reads) in
+ * WORLD space, and what GL wants is a plain float3 with Z negated -- RE_NOTES
+ * 12: the harness mirrors the D3D left-handed world into GL by negating Z on
+ * every mesh, and the dome follows the same convention so the cloud panorama
+ * runs the same way round as the world. */
+static float g_dome_pos[2][B3_SKY_VERTS * 3];    /* [0] ground, [1] sky */
+static float g_dome_tc[2][B3_SKY_VERTS * 2];     /* [0] tc0,    [1] tc1 */
+static float g_dome_gnd_tc[B3_SKY_VERTS * 2];
+static int   g_dome_arrays;
+
+static void postfx_dome_arrays(void)
 {
     int i;
-    glBegin(GL_TRIANGLES);
-    for (i = 0; i < B3_SKY_INDICES; i++) {
-        const B3SkyVertex *p = &v[g_sky_i[i]];
-        if (unit == 0) glTexCoord2f(p->tc0[0], p->tc0[1]);
-        else           glTexCoord2f(p->tc1[0], p->tc1[1]);
-        /* RE_NOTES 12: the harness mirrors the D3D left-handed world into GL
-         * by negating Z on every mesh. The dome follows the same convention so
-         * the cloud panorama runs the same way round as the world. */
-        glVertex3f(p->pos[0], p->pos[1], -p->pos[2]);
+
+    if (g_dome_arrays) return;
+    for (i = 0; i < B3_SKY_VERTS; i++) {
+        g_dome_pos[0][i * 3 + 0] =  g_gnd_v[i].pos[0];
+        g_dome_pos[0][i * 3 + 1] =  g_gnd_v[i].pos[1];
+        g_dome_pos[0][i * 3 + 2] = -g_gnd_v[i].pos[2];
+        g_dome_pos[1][i * 3 + 0] =  g_sky_v[i].pos[0];
+        g_dome_pos[1][i * 3 + 1] =  g_sky_v[i].pos[1];
+        g_dome_pos[1][i * 3 + 2] = -g_sky_v[i].pos[2];
+        g_dome_gnd_tc[i * 2 + 0] = g_gnd_v[i].tc0[0];
+        g_dome_gnd_tc[i * 2 + 1] = g_gnd_v[i].tc0[1];
+        g_dome_tc[0][i * 2 + 0]  = g_sky_v[i].tc0[0];
+        g_dome_tc[0][i * 2 + 1]  = g_sky_v[i].tc0[1];
+        g_dome_tc[1][i * 2 + 0]  = g_sky_v[i].tc1[0];
+        g_dome_tc[1][i * 2 + 1]  = g_sky_v[i].tc1[1];
     }
-    glEnd();
+    g_dome_arrays = 1;
+}
+
+/* THE DOME, RETAINED.  It was 264 static vertices replayed three times a
+ * frame through a 1 344-entry index list from CLIENT memory -- which is the
+ * one shape a retained path cannot leave alone, because a client-side
+ * glVertexPointer is reinterpreted as an offset the moment any VBO is bound.
+ * De-indexed into one static buffer per (mesh, texcoord set) it is three
+ * glDrawArrays over 20 KB apiece, uploaded once.
+ *
+ * Layout 5 floats: x y z u v.  No colour channel -- the dome never had a
+ * per-vertex colour, and the constant glColor4f the caller sets is what
+ * modulates it, exactly as before. */
+#define B3_DOME_VARIANTS 3
+static unsigned g_dome_vbo[B3_DOME_VARIANTS];
+
+static unsigned postfx_dome_vbo(int variant)
+{
+    float *buf;
+    const float *pos, *tc;
+    int i;
+
+    if (variant < 0 || variant >= B3_DOME_VARIANTS) return 0;
+    if (g_dome_vbo[variant]) return g_dome_vbo[variant];
+    postfx_dome_arrays();
+    if (variant == 0) { pos = g_dome_pos[0]; tc = g_dome_gnd_tc; }
+    else              { pos = g_dome_pos[1]; tc = g_dome_tc[variant - 1]; }
+
+    buf = (float *)malloc((size_t)B3_SKY_INDICES * 5 * sizeof(float));
+    if (!buf) return 0;
+    for (i = 0; i < B3_SKY_INDICES; i++) {
+        unsigned short vi = g_sky_i[i];
+        buf[i * 5 + 0] = pos[vi * 3 + 0];
+        buf[i * 5 + 1] = pos[vi * 3 + 1];
+        buf[i * 5 + 2] = pos[vi * 3 + 2];
+        buf[i * 5 + 3] = tc[vi * 2 + 0];
+        buf[i * 5 + 4] = tc[vi * 2 + 1];
+    }
+    g_dome_vbo[variant] = b3r_vbo_upload(buf, (long)B3_SKY_INDICES * 5, 0);
+    free(buf);
+    return g_dome_vbo[variant];
+}
+
+/* The dome's own state, as the tint the retained program multiplies.  It used
+ * to be a glColor4f the fixed-function MODULATE picked up; there is no fixed
+ * function left, so it is a uniform. */
+static void postfx_dome_state(unsigned tex, float g)
+{
+    B3RState st;
+    st.tex        = tex;
+    st.mode       = B3R_TEX_MODULATE;
+    st.blend      = -1;      /* the sky pass' own raw sequence owns these */
+    st.alpha_ref  = -1.0f;
+    st.depth_mask = -1;
+    st.depth_test = -1;
+    st.depth_func = 0;
+    st.cull       = -1;
+    /* b3r_state, not b3r_batch_state: the dome draws straight through
+     * b3r_draw() rather than the batcher, so a deferred tuple would never be
+     * applied -- and with no program bound the dome falls through to fixed
+     * function, where generic attribute 0 aliases gl_Vertex and the result is
+     * a flat, untextured dome with no cloud sheet at all. */
+    b3r_state(&st);
+    (void)g;
+}
+
+static void postfx_emit_dome(const B3SkyVertex *v, int unit)
+{
+    B3RVtxFmt f;
+    int variant = (v == g_gnd_v) ? 0 : (unit ? 2 : 1);
+    unsigned vbo = postfx_dome_vbo(variant);
+
+    if (!vbo) return;
+    f.vbo = vbo; f.stride = 5;
+    f.off_uv = 3; f.off_col = -1; f.n_col = 0; f.off_nrm = -1;
+    b3r_arrays_fmt(&f);
+    b3r_draw(0, B3_SKY_INDICES);
 }
 
 void b3_postfx_sky_draw(const float eye[3], float far_clip, float progress)
@@ -707,26 +825,23 @@ void b3_postfx_sky_draw(const float eye[3], float far_clip, float progress)
 
     /* [C] FUN_000323D0: alpha test off (RS 0x3B), alpha blend off (RS 0x3C),
      * ZWRITEENABLE off (RS 0x40), CULLMODE = D3DCULL_NONE (RS 0x93). */
-    glPushAttrib(GL_ENABLE_BIT | GL_DEPTH_BUFFER_BIT | GL_TEXTURE_BIT
-                 | GL_CURRENT_BIT | GL_POLYGON_BIT | GL_COLOR_BUFFER_BIT);
-    glDisable(GL_LIGHTING);
+    b3r_state_push();
     glDisable(GL_CULL_FACE);
     glDisable(GL_BLEND);
-    glDisable(GL_ALPHA_TEST);
     /* [C] the dome shader's final combiner is ABCD = ZERO,ZERO,R0.rgb,ZERO
      * (def 0x003E9B08 +0x20) — the FOG register appears nowhere in it, unlike
      * the six world defs whose final combiner is 0x130C0300. The sky is never
      * fogged, so make sure a fog state left on by the world cannot touch it. */
-    glDisable(GL_FOG);
     glDepthMask(GL_FALSE);
     glEnable(GL_DEPTH_TEST);
-    glEnable(GL_TEXTURE_2D);
-    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
 
-    glMatrixMode(GL_MODELVIEW);
-    glPushMatrix();
-    glTranslatef(eye[0], eye[1], eye[2]);
-    glScalef(scale, scale, scale);
+    b3r_matrix_mode(B3R_MAT_MODELVIEW);
+    b3r_push();
+    b3r_translate(eye[0], eye[1], eye[2]);
+    b3r_scale(scale, scale, scale);
+    /* the retained program draws both dome passes; the blend / depth / cull
+     * sequence around them stays the raw GL it always was */
+    b3r_begin();
 
     /* dome pass A — the 64x32 LUT over both hemispheres, opaque.
      *
@@ -736,7 +851,8 @@ void b3_postfx_sky_draw(const float eye[3], float far_clip, float progress)
      * Under GL_MODULATE this is exactly `gain * LUT.rgb`. */
     {
         float sg = postfx_sky_gain();
-        glColor4f(sg, sg, sg, 1.0f);
+        postfx_dome_state(g_tex_lut, sg);
+        b3r_color(sg, sg, sg, 1.0f);
     }
     glBindTexture(GL_TEXTURE_2D, g_tex_lut);
     postfx_emit_dome(g_gnd_v, 0);
@@ -783,20 +899,21 @@ void b3_postfx_sky_draw(const float eye[3], float far_clip, float progress)
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glBindTexture(GL_TEXTURE_2D, g_tex_clouds);
-        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
         /* The recovered C0 = (0.5, 0.5, 0.5, 1.0), times the (now identity)
          * B3_SKY_RT_GAIN so the whole dome still scales together under the
          * B3_POSTFX_SKYGAIN override. */
         {
             float cg = B3_SKY_CLOUD_C0_RGB * postfx_sky_gain();
-            glColor4f(cg, cg, cg, B3_SKY_CLOUD_C0_A);
+            postfx_dome_state(g_tex_clouds, cg);
+            b3r_color(cg, cg, cg, B3_SKY_CLOUD_C0_A);
         }
         postfx_emit_dome(g_sky_v, 1);
-        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
     }
 
-    glPopMatrix();
-    glPopAttrib();
+    b3r_end();
+    b3r_arrays_none();
+    b3r_pop();
+    b3r_state_pop();
     glDepthMask(GL_TRUE);
 }
 
@@ -847,6 +964,8 @@ static void (*p_glDeleteProgram)(unsigned);
 static int  (*p_glGetUniformLocation)(unsigned, const char*);
 static void (*p_glUniform1i)(int, int);
 static void (*p_glUniform1f)(int, float);
+static void (*p_glUniformMatrix4fv)(int, int, unsigned char,
+                                    const float*);
 static void (*p_glActiveTexture)(unsigned);
 
 static int postfx_glsl_load(void)
@@ -864,18 +983,56 @@ static int postfx_glsl_load(void)
     B3PF_GET(glUseProgram);     B3PF_GET(glDeleteShader);
     B3PF_GET(glDeleteProgram);  B3PF_GET(glGetUniformLocation);
     B3PF_GET(glUniform1i);      B3PF_GET(glUniform1f);
+    B3PF_GET(glUniformMatrix4fv);
     B3PF_GET(glActiveTexture);
 #undef B3PF_GET
     state = 1;
     return 1;
 }
 
-/* Compile one fragment-only program. Returns 0 on any failure. */
+/* THE ONE VERTEX STAGE ALL THREE POSTFX PROGRAMS SHARE.
+ *
+ * They used to have none: each was a FRAGMENT-ONLY program riding the
+ * fixed-function vertex stage, reading its texcoord out of gl_TexCoord[0].
+ * WebGL has no fixed-function vertex stage and no gl_TexCoord, so each gets
+ * this -- the same shared attribute locations everything else uses, and the
+ * projection*modelview the retained matrix stack composes, which for these
+ * passes is the 0..1 ortho postfx_2d_begin() pushes. */
+static const char *POSTFX_VS =
+    "#ifdef GL_ES\n"
+    "precision highp float;\n"
+    "#endif\n"
+    "uniform mat4 uMVP;\n"
+    "attribute vec3 aPos;\n"
+    "attribute vec2 aUV;\n"
+    "attribute vec4 aCol;\n"
+    "varying vec2 vUV;\n"
+    "varying vec4 vCol;\n"
+    "void main(){\n"
+    "  gl_Position = uMVP * vec4(aPos, 1.0);\n"
+    "  vUV  = aUV;\n"
+    "  vCol = aCol;\n"
+    "}\n";
+
+/* Compile one program: the shared vertex stage above plus `src`. */
 static unsigned postfx_build_fs(const char *src, const char *what)
 {
-    unsigned fs, pr;
+    unsigned fs, vs, pr;
     int ok = 0;
 
+    vs = p_glCreateShader(GL_VERTEX_SHADER);
+    p_glShaderSource(vs, 1, &POSTFX_VS, NULL);
+    p_glCompileShader(vs);
+    p_glGetShaderiv(vs, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        int n = 0;
+        p_glGetShaderInfoLog(vs, (int)sizeof log, &n, log);
+        log[(n > 0 && n < (int)sizeof log) ? n : 0] = 0;
+        fprintf(stderr, "[postfx] %s vertex shader failed: %s\n", what, log);
+        p_glDeleteShader(vs);
+        return 0;
+    }
     fs = p_glCreateShader(GL_FRAGMENT_SHADER);
     p_glShaderSource(fs, 1, &src, NULL);
     p_glCompileShader(fs);
@@ -887,43 +1044,103 @@ static unsigned postfx_build_fs(const char *src, const char *what)
         log[(n > 0 && n < (int)sizeof log) ? n : 0] = 0;
         fprintf(stderr, "[postfx] %s shader failed: %s\n", what, log);
         p_glDeleteShader(fs);
+        p_glDeleteShader(vs);
         return 0;
     }
     pr = p_glCreateProgram();
+    p_glAttachShader(pr, vs);
     p_glAttachShader(pr, fs);
+    b3r_attr_bind(pr);
     p_glLinkProgram(pr);
     p_glGetProgramiv(pr, GL_LINK_STATUS, &ok);
     p_glDeleteShader(fs);
+    p_glDeleteShader(vs);
     if (!ok) { p_glDeleteProgram(pr); return 0; }
+    /* the ortho these passes draw under; uploaded per use by
+     * postfx_prog_matrix() because the stack is the caller's */
     return pr;
+}
+
+/* Hand a postfx program the matrix the retained stack currently holds. */
+static void postfx_prog_matrix(unsigned pr)
+{
+    int loc;
+    if (!pr || !p_glGetUniformLocation || !p_glUniformMatrix4fv) return;
+    loc = p_glGetUniformLocation(pr, "uMVP");
+    if (loc >= 0) p_glUniformMatrix4fv(loc, 1, 0, b3r_mvp());
 }
 
 /* Push the 2D state both full-screen passes want: an identity 0..1 ortho, no
  * depth, no lighting, no culling, no alpha test. Paired with postfx_2d_end. */
 static void postfx_2d_begin(void)
 {
-    glPushAttrib(GL_ENABLE_BIT | GL_DEPTH_BUFFER_BIT | GL_TEXTURE_BIT
-                 | GL_CURRENT_BIT | GL_COLOR_BUFFER_BIT | GL_VIEWPORT_BIT);
-    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
-    glOrtho(0.0, 1.0, 0.0, 1.0, -1.0, 1.0);
-    glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadIdentity();
+    b3r_state_push();
+    b3r_matrix_mode(B3R_MAT_PROJECTION); b3r_push(); b3r_identity();
+    b3r_ortho(0.0, 1.0, 0.0, 1.0, -1.0, 1.0);
+    b3r_matrix_mode(B3R_MAT_MODELVIEW);  b3r_push(); b3r_identity();
     glDisable(GL_DEPTH_TEST);
     glDepthMask(GL_FALSE);
-    glDisable(GL_LIGHTING);
     glDisable(GL_CULL_FACE);
-    glDisable(GL_ALPHA_TEST);
-    glDisable(GL_FOG);
     glDisable(GL_BLEND);
-    glEnable(GL_TEXTURE_2D);
-    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    /* GEOMETRY ONLY.  These passes bind their own recovered programs (the
+     * gamma composite, the present blend) and run a recovered sequence of raw
+     * blend / depth / texture-enable calls between the draws, so the batcher
+     * must touch neither.  All it replaces is glBegin. */
+    b3r2d_begin_raw();
 }
 
 static void postfx_2d_end(void)
 {
-    glMatrixMode(GL_PROJECTION); glPopMatrix();
-    glMatrixMode(GL_MODELVIEW);  glPopMatrix();
-    glPopAttrib();
+    b3r2d_end();
+    b3r_matrix_mode(B3R_MAT_PROJECTION); b3r_pop();
+    b3r_matrix_mode(B3R_MAT_MODELVIEW);  b3r_pop();
+    b3r_state_pop();
     glDepthMask(GL_TRUE);
+}
+
+/* WHICH PROGRAM DRAWS THE NEXT QUAD.
+ *
+ * These passes used to have an answer for free: the fixed-function vertex
+ * stage drew everything, and a fragment-only program just replaced the
+ * fragment half.  With no fixed-function stage left, every quad has to name
+ * its program.  There are exactly two kinds here:
+ *
+ *   postfx_use_b3r()  -- the plain quads (the sharp frame, the present
+ *                        doubling, the web reduce).  The retained program
+ *                        does a MODULATE, so the texture and the constant
+ *                        tint travel as its uniforms; everything else about
+ *                        the pass -- blend, depth, viewport, texture
+ *                        parameters -- stays the raw GL sequence it was.
+ *   postfx_use_prog() -- the recovered blur-tap and gamma programs, unchanged
+ *                        except that they are handed the ortho as uMVP.
+ */
+static void postfx_use_b3r(unsigned tex, float r, float g, float b, float a)
+{
+    B3RState st;
+    b3r2d_set_raw(0);
+    st.tex        = tex;
+    st.mode       = tex ? B3R_TEX_MODULATE : B3R_TEX_NONE;
+    st.blend      = -1;          /* the caller's raw sequence owns all of  */
+    st.alpha_ref  = -1.0f;       /* these; see the B3RState comment        */
+    st.depth_mask = -1;
+    st.depth_test = -1;
+    st.depth_func = 0;
+    st.cull       = -1;
+    b3r_batch_state(&st);
+    b3r_color(r, g, b, a);
+}
+
+static void postfx_use_prog(unsigned pr)
+{
+    b3r2d_set_raw(1);
+    b3r_use_program_via((void (*)(unsigned))p_glUseProgram, pr);
+    postfx_prog_matrix(pr);
+}
+
+static void postfx_use_none(void)
+{
+    b3r2d_flush();
+    b3r_use_program_via((void (*)(unsigned))p_glUseProgram, 0);
 }
 
 /* One screen-covering quad. `z` zooms the texture coordinates about the
@@ -931,12 +1148,17 @@ static void postfx_2d_end(void)
 static void postfx_quad(float z)
 {
     const float c = B3_BLUR_CENTER_X, d = B3_BLUR_CENTER_Y;
-    glBegin(GL_QUADS);
-    glTexCoord2f(c + (0.0f - c) * z, d + (0.0f - d) * z); glVertex2f(0.0f, 0.0f);
-    glTexCoord2f(c + (1.0f - c) * z, d + (0.0f - d) * z); glVertex2f(1.0f, 0.0f);
-    glTexCoord2f(c + (1.0f - c) * z, d + (1.0f - d) * z); glVertex2f(1.0f, 1.0f);
-    glTexCoord2f(c + (0.0f - c) * z, d + (1.0f - d) * z); glVertex2f(0.0f, 1.0f);
-    glEnd();
+    /* postfx_2d_begin() left a 0..1 ortho on the stack and the batcher's
+     * vertex stage is an ftransform(), so these stay the same two numbers. */
+    b3r2d_prim(B3R2D_QUADS);
+    b3r2d_uv(c + (0.0f - c) * z, d + (0.0f - d) * z); b3r2d_vertex(0.0f, 0.0f);
+    b3r2d_uv(c + (1.0f - c) * z, d + (0.0f - d) * z); b3r2d_vertex(1.0f, 0.0f);
+    b3r2d_uv(c + (1.0f - c) * z, d + (1.0f - d) * z); b3r2d_vertex(1.0f, 1.0f);
+    b3r2d_uv(c + (0.0f - c) * z, d + (1.0f - d) * z); b3r2d_vertex(0.0f, 1.0f);
+    b3r2d_prim_end();
+    /* ONE DRAW PER QUAD, as before: the callers change raw GL state between
+     * quads, so nothing here may be held back for a later batch. */
+    b3r2d_flush();
 }
 
 /* The same quad, tessellated so a per-vertex weight can stand in for retail's
@@ -952,7 +1174,7 @@ static void postfx_quad_masked(float z, float k, int weight_is_rgb)
     static const float cy[4] = {0.0f, 0.0f, 1.0f, 1.0f};
     int gx, gy, c;
 
-    glBegin(GL_QUADS);
+    b3r2d_prim(B3R2D_QUADS);
     for (gy = 0; gy < G; gy++) {
         for (gx = 0; gx < G; gx++) {
             for (c = 0; c < 4; c++) {
@@ -965,23 +1187,124 @@ static void postfx_quad_masked(float z, float k, int weight_is_rgb)
                 if (m < 0.0f) m = 0.0f;
                 if (m > 1.0f) m = 1.0f;
                 m = powf(m, B3_BLUR_MASK_POW) * k;
-                if (weight_is_rgb) glColor4f(m, m, m, 1.0f);
-                else               glColor4f(1.0f, 1.0f, 1.0f, m);
-                glTexCoord2f(B3_BLUR_CENTER_X + dx * z,
-                             B3_BLUR_CENTER_Y + dy * z);
-                glVertex2f(px, py);
+                if (weight_is_rgb) b3r2d_color(m, m, m, 1.0f);
+                else               b3r2d_color(1.0f, 1.0f, 1.0f, m);
+                b3r2d_uv(B3_BLUR_CENTER_X + dx * z,
+                         B3_BLUR_CENTER_Y + dy * z);
+                b3r2d_vertex(px, py);
             }
         }
     }
-    glEnd();
+    b3r2d_prim_end();
+    b3r2d_flush();
 }
 
 /* Copy the back buffer into g_tex_frame. The texture asks the driver to keep
  * its mip chain current (GL_GENERATE_MIPMAP, core since GL 1.4) because the
  * blur half of the composite samples level B3_PRESENT_BLUR_LOD — retail's
  * 160x120 surface is exactly level 2 of its 640x480 one. */
+/* WEB: THIS IS THE FRAME'S ONE CANDIDATE PIPELINE STALL, so it is timed on its
+ * own rather than folded into whichever pass called it.  A readback hiding
+ * inside a shader pass's number is a readback nobody finds.  How it is kept
+ * off the readback path, and what it cost when it was not, is the long note
+ * over postfx_web_grab_mask() below; B3_WEB_HWPROF's readPixels counter is
+ * what proves which path a given browser takes.  b3_web_hwprof_on() gates the
+ * timing, so an unprofiled run pays nothing for it. */
+static void postfx_grab_frame_inner(int w, int h);
+
 static void postfx_grab_frame(int w, int h)
 {
+#ifdef __EMSCRIPTEN__
+    if (b3_web_hwprof_on()) {
+        double t = b3_web_now_ms();
+        postfx_grab_frame_inner(w, h);
+        b3_web_prof(B3_WEB_PROF_GRAB, b3_web_now_ms() - t);
+        return;
+    }
+#endif
+    postfx_grab_frame_inner(w, h);
+}
+
+#ifdef __EMSCRIPTEN__
+/* ============================ WEB: KEEPING THE GRAB OFF gl4es' READBACK PATH
+ *
+ * MEASURED, and it is the largest single cost in this port's frame.  gl4es
+ * implements glCopyTexSubImage2D twice (its texture_read.c:151):
+ *
+ *     copytex = (dst.format==GL_RGBA && dst.type==GL_UNSIGNED_BYTE)
+ *            || (dst.format==fb.IMPLEMENTATION_COLOR_READ_FORMAT
+ *                && dst.type==fb.IMPLEMENTATION_COLOR_READ_TYPE);
+ *     if (copytex || !colormask[0] || !colormask[1]
+ *                 || !colormask[2] || !colormask[3])
+ *          gles_glCopyTexSubImage2D(...);            // a GPU-side blit
+ *     else { malloc(w*h*4);
+ *            gl4es_glReadPixels(...);                // GPU -> CPU, SYNCHRONOUS
+ *            gl4es_glTexSubImage2D(...); }           // CPU -> GPU
+ *
+ * This texture is GL_RGB (it has to be -- see the allocation below), and the
+ * framebuffer's read format is RGBA/UNSIGNED_BYTE (the port prints it in the
+ * "web: gpu =" line at boot), so NEITHER of the first two clauses holds, and
+ * the frame took the readback.  Every frame.  Full canvas.
+ *
+ * WHAT THAT COST, RTX 3090 through ANGLE/Vulkan, headless, US_C3_V1 in race,
+ * B3_WEB_HWPROF=60:
+ *
+ *     readPixels     1.00 per frame, 300 kpx
+ *     texture upload 1.33 per frame, 903 KiB   (the readback going back up)
+ *     the grab       4.3 - 8.0 ms of a 30 - 46 ms frame
+ *     the GPU        0.02 - 0.03 ms of backlog  <- IT IS DOING NOTHING
+ *     achieved       "FPS: 59 (real 21.9, sim 59.9 Hz)"
+ *
+ * That last line is the reported symptom exactly.  A readback is not merely
+ * slow in itself: it drains the pipeline, so the CPU waits out the GPU and the
+ * GPU then waits out the CPU, and the two stop overlapping for the rest of the
+ * frame.  render_frame() went 14.8 -> 28.8 ms for a grab that is 8 ms.
+ *
+ * THE FIX IS THE THIRD CLAUSE.  Masking one channel off makes gl4es take the
+ * blit unconditionally, and the channel to mask is ALPHA, for the reason that
+ * makes this safe rather than clever: THE DESTINATION IS GL_RGB AND HAS NO
+ * ALPHA TO LOSE.  gl4es' own comment on that clause worries that a driver may
+ * honour the mask during the copy; here there is nothing for it to honour.
+ *
+ * The mask is restored to all-open, which is this engine's resting state and
+ * not an assumption: burnout3_hud.c uses the same (1,1,1,0) mask for retail's
+ * 0x010101 plates and restores all-open at :362 and :639, and
+ * burnout3_full.c:1354 sets all-open.  The grab runs after all of them.
+ *
+ * WHY NOT SIMPLY ALLOCATE THE TEXTURE RGBA, which satisfies clause 1 with no
+ * state change at all: because the context is created alpha:false, so the
+ * drawing buffer HAS NO ALPHA, and GLES2/WebGL make it INVALID_OPERATION to
+ * CopyTexSubImage into a destination carrying a component the read buffer
+ * lacks.  Tried; the copy is silently dropped, the gamma pass samples an
+ * undefined texture, and --pin-frame 240 comes out mean (0,0,0) against the
+ * reference's (113,107,101).  A black screen.
+ *
+ * AND WHAT THE REAL FIX IS, when somebody has the frame to spend on it: draw
+ * the scene into an app-owned RGBA FBO and let the gamma pass sample that
+ * texture directly.  Then there is no copy to argue about, the 16-bit depth
+ * limitation goes with it (an app-owned depth attachment can be 24-bit), and
+ * this whole function disappears.  That is a renderer change, not a postfx
+ * one, and it belongs with the pass migration.
+ *
+ * B3_WEB_GRAB_MASK=0 turns this off so the A/B can be run out of one binary;
+ * B3_WEB_HWPROF's readPixels-per-frame counter is what it is read from. */
+static int postfx_web_grab_mask(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("B3_WEB_GRAB_MASK");
+        on = (e && *e) ? (atoi(e) != 0) : 1;
+    }
+    return on;
+}
+#endif
+
+static void postfx_grab_frame_inner(int w, int h)
+{
+#ifdef __EMSCRIPTEN__
+    int masked = postfx_web_grab_mask();
+    if (masked) glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+#endif
     if (!g_tex_frame || g_frame_w != w || g_frame_h != h) {
         if (!g_tex_frame) glGenTextures(1, &g_tex_frame);
         glBindTexture(GL_TEXTURE_2D, g_tex_frame);
@@ -989,17 +1312,217 @@ static void postfx_grab_frame(int w, int h)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+#ifndef __EMSCRIPTEN__
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL,
                         B3_PRESENT_BLUR_LOD);
         glTexParameteri(GL_TEXTURE_2D, GL_GENERATE_MIPMAP, GL_TRUE);
+#else
+        /* WEB: this grab is NPOT (the canvas is 640x480, 1280x720, whatever
+         * the page is), and on GLES2/WebGL1 -- which is what gl4es runs on --
+         * an NPOT texture MAY NOT HAVE MIPMAPS, and GL_TEXTURE_BASE_LEVEL /
+         * GL_TEXTURE_MAX_LEVEL do not exist at all (they are GLES3).  Asking
+         * anyway leaves the texture MIPMAP-INCOMPLETE, and sampling an
+         * incomplete texture through gl4es' fixed-function path returns the
+         * vertex colour -- white.  Step 1 of the present composite draws this
+         * texture opaque over the whole screen, so the entire world went
+         * white while the HUD (drawn afterwards) survived.
+         *
+         * Dropping the three calls keeps level 0 -- which is all step 1 needs
+         * and all the composite's arithmetic depends on.  The cost is that
+         * step 2's radial taps sample full-res instead of the 1/4-res
+         * reduction, so the blur is subtly sharper than retail's; the frame
+         * itself, and the x2 in step 3, are unchanged.  See web/README.md. */
+#endif
+#ifndef __EMSCRIPTEN__
         glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 0, 0, w, h, 0);
+#else
+        /* WEB: allocate first, then copy INTO it.  glCopyTexImage2D on an
+         * NPOT target (the canvas is 640x480, 1280x720, whatever the page
+         * is) leaves gl4es' texture in a state it will not sample -- the
+         * framebuffer genuinely holds the scene at this point (measured:
+         * "fb pixels 3d3c30 008359 ...") and the copy reports no GL error,
+         * yet every sample came back white.  Allocating with glTexImage2D and
+         * filling with glCopyTexSubImage2D is the same two steps every later
+         * frame already takes, and it samples correctly.
+         *
+         * AND IT STAYS GL_RGB -- it cannot be RGBA, and the alpha mask above is
+         * there because it cannot.  See postfx_web_grab_mask(): the drawing
+         * buffer is alpha:false, so an RGBA destination makes the copy
+         * INVALID_OPERATION and the frame comes out black. */
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0,
+                     GL_RGB, GL_UNSIGNED_BYTE, NULL);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
+#endif
         g_frame_w = w; g_frame_h = h;
     } else {
         glBindTexture(GL_TEXTURE_2D, g_tex_frame);
         glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
     }
+#ifdef __EMSCRIPTEN__
+    /* All-open is this engine's resting state, not a guess -- see the note
+     * over postfx_web_grab_mask(). */
+    if (masked) glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+#endif
 }
+
+#ifdef __EMSCRIPTEN__
+/* ================================================ WEB: THE RADIAL BLUR IS OFF
+ *
+ * USER-DIRECTED, WEB ONLY (2026-08-23).  On the web the radial half of the
+ * present composite is DISABLED BY DEFAULT.  Two reasons, one visual and one
+ * about cost:
+ *
+ *  * IT GHOSTED.  The taps are 16 zoomed samples of the frame, and retail
+ *    takes them from a 160x120 reduction of its 640x480 render target -- a
+ *    box-filtered LOD 2.  This port selected that reduction with
+ *    GL_TEXTURE_BASE_LEVEL on a driver-generated mip chain, which is exactly
+ *    what an NPOT texture on GLES2 / WebGL1 may not have; the web build had to
+ *    drop it (commit "Web black screen: an NPOT grab may not have mipmaps on
+ *    WebGL1") and the taps fell back to level 0.  16 sharp offset copies of the
+ *    frame summed together is not a smear, it is SIXTEEN FRAMES AT ONCE, which
+ *    is what the user saw and called "smudged".
+ *
+ *  * IT WAS THE MOST EXPENSIVE THING IN THE FRAME.  With the blur gone the
+ *    recovered composite collapses to its third step alone -- see below -- so
+ *    the frame grab (a full-canvas glCopyTexSubImage2D), the opaque step-1
+ *    repaint and the 16-tap shader pass all disappear with it.
+ *
+ * WHAT SURVIVES IS THE EXPOSURE.  The composite is
+ *
+ *     out.rgb = 2 * ( T0.rgb + C0.a * T1.rgb )
+ *
+ * and turning the blur off is C0.a = 0, which leaves out.rgb = 2 * T0.rgb.
+ * T0 IS THE BACK BUFFER -- step 1 copies it to a texture and paints it back
+ * over itself, a 1:1 texel-aligned identity -- so the whole pass reduces to
+ * step 3, the combiner's SHIFTLEFTBY1, drawn as one untextured DST_COLOR/ONE
+ * quad.  The picture keeps retail's tonality exactly; only the smear is gone.
+ * The gamma ramp (b3_postfx_gamma) is untouched and still runs last.
+ *
+ * B3_WEB_BLUR=1 puts the blur back, and when it comes back it comes back in
+ * RETAIL'S SHAPE: postfx_web_quarter() builds the 1/4-res reduction in an
+ * explicit FBO by two bilinear halvings -- which is precisely the pair of 2x2
+ * box filters GL_GENERATE_MIPMAP performs to reach level B3_PRESENT_BLUR_LOD
+ * -- and the taps sample THAT.  So the A/B is blur-off vs a blur with the
+ * right prefilter, never the ghosting one again.
+ *
+ * None of this is compiled on any other target: the desktop path below still
+ * grabs, still selects the mip level and still runs all three steps. */
+/* 0 = off (the default), 1 = on with the 1/4-res reduction, 2 = on sampling
+ * the FULL-RES frame -- which is what shipped between the black-screen fix and
+ * this one, kept switchable so the ghosting can be reproduced side by side
+ * instead of described. */
+static int postfx_web_blur_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("B3_WEB_BLUR");
+        on = (e && *e) ? atoi(e) : 0;
+        if (on < 0) on = 0;
+    }
+    return on;
+}
+
+/* ------------------------------------- the 1/4-res reduction, in an FBO
+ *
+ * Entry points come through the same gl4es lookup the GLSL loader uses, so no
+ * header on any target has to grow a GL 3.0 declaration. */
+#ifndef GL_FRAMEBUFFER
+#define GL_FRAMEBUFFER        0x8D40
+#endif
+#ifndef GL_COLOR_ATTACHMENT0
+#define GL_COLOR_ATTACHMENT0  0x8CE0
+#endif
+#ifndef GL_FRAMEBUFFER_COMPLETE
+#define GL_FRAMEBUFFER_COMPLETE 0x8CD5
+#endif
+
+static void     (*p_glGenFramebuffers)(int, unsigned*);
+static void     (*p_glBindFramebuffer)(unsigned, unsigned);
+static void     (*p_glFramebufferTexture2D)(unsigned, unsigned, unsigned,
+                                            unsigned, int);
+static unsigned (*p_glCheckFramebufferStatus)(unsigned);
+
+static int     g_web_red_state = -1;   /* -1 untried, 0 unavailable, 1 ready  */
+static GLuint  g_web_red_fbo[2], g_web_red_tex[2];
+static int     g_web_red_w, g_web_red_h;
+
+static int postfx_web_reduce_init(void)
+{
+    if (g_web_red_state >= 0) return g_web_red_state;
+    g_web_red_state = 0;
+#define B3PF_FBO(fn) do { *(void**)(&p_##fn) = SDL_GL_GetProcAddress(#fn); \
+                          if (!p_##fn) return 0; } while (0)
+    B3PF_FBO(glGenFramebuffers);        B3PF_FBO(glBindFramebuffer);
+    B3PF_FBO(glFramebufferTexture2D);   B3PF_FBO(glCheckFramebufferStatus);
+#undef B3PF_FBO
+    p_glGenFramebuffers(2, g_web_red_fbo);
+    glGenTextures(2, g_web_red_tex);
+    g_web_red_state = 1;
+    return 1;
+}
+
+/* Reduce g_tex_frame (w x h, level 0) to w/4 x h/4 and return that texture, or
+ * 0 if FBOs are unavailable -- in which case the caller falls back to the
+ * full-res sample, i.e. today's behaviour.  Leaves the draw framebuffer bound
+ * back to 0 and the viewport back at w x h. */
+static GLuint postfx_web_quarter(int w, int h)
+{
+    int i, sw = w, sh = h;
+    GLuint src = g_tex_frame;
+
+    if (!postfx_web_reduce_init()) return 0;
+
+    if (g_web_red_w != w || g_web_red_h != h) {
+        for (i = 0; i < 2; i++) {
+            int tw = w >> (i + 1), th = h >> (i + 1);
+            if (tw < 1) tw = 1;
+            if (th < 1) th = 1;
+            glBindTexture(GL_TEXTURE_2D, g_web_red_tex[i]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            /* RGBA, not RGB: RGBA/UNSIGNED_BYTE is the one colour-renderable
+             * texture format WebGL 1 GUARANTEES for a colour attachment. */
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tw, th, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            p_glBindFramebuffer(GL_FRAMEBUFFER, g_web_red_fbo[i]);
+            p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                     GL_TEXTURE_2D, g_web_red_tex[i], 0);
+            if (p_glCheckFramebufferStatus(GL_FRAMEBUFFER)
+                    != GL_FRAMEBUFFER_COMPLETE) {
+                p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                glViewport(0, 0, w, h);
+                g_web_red_state = 0;
+                return 0;
+            }
+        }
+        p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        g_web_red_w = w; g_web_red_h = h;
+    }
+
+    /* Two bilinear halvings == the two 2x2 box filters that build mip level
+     * B3_PRESENT_BLUR_LOD.  A single 4x bilinear shrink would NOT: it averages
+     * 2x2 texels out of the 4x4 the level covers, and aliases. */
+    glDisable(GL_BLEND);
+    for (i = 0; i < 2; i++) {
+        int tw = sw >> 1, th = sh >> 1;
+        if (tw < 1) tw = 1;
+        if (th < 1) th = 1;
+        p_glBindFramebuffer(GL_FRAMEBUFFER, g_web_red_fbo[i]);
+        glViewport(0, 0, tw, th);
+        glBindTexture(GL_TEXTURE_2D, src);
+        postfx_use_b3r(src, 1.0f, 1.0f, 1.0f, 1.0f);
+        postfx_quad(1.0f);
+        src = g_web_red_tex[i];
+        sw = tw; sh = th;
+    }
+    p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, w, h);
+    return g_web_red_tex[1];
+}
+#endif  /* __EMSCRIPTEN__ */
 
 /* ---------------------------------------------------- the present composite
  *
@@ -1117,11 +1640,16 @@ static int postfx_taps_init(void)
     if (!postfx_glsl_load()) return 0;
 
     snprintf(fs, sizeof fs,
+        "#ifdef GL_ES\n"
+        "precision highp float;\n"
+        "#endif\n"
+        "varying vec2 vUV;\n"
+        "varying vec4 vCol;\n"
         "uniform sampler2D uFrame;\n"
         "uniform float uW;\n"                     /* C0.a / B3_BLUR_TAPS     */
         "void main() {\n"
         "  vec2 c = vec2(%.9g, %.9g);\n"          /* [C] the (0.5,0.5) centre */
-        "  vec2 d = gl_TexCoord[0].xy - c;\n"
+        "  vec2 d = vUV - c;\n"
         "  float r = length(d) / 0.7071068;\n"
         "  float m = clamp((r - %.9g) / (1.0 - %.9g), 0.0, 1.0);\n"
         "  m = pow(m, %.9g) * uW;\n"
@@ -1140,11 +1668,11 @@ static int postfx_taps_init(void)
     pr = postfx_build_fs(fs, "present tap");
     if (!pr) return 0;
 
-    p_glUseProgram(pr);
+    b3r_use_program_via((void (*)(unsigned))p_glUseProgram, pr);
     loc = p_glGetUniformLocation(pr, "uFrame");
     if (loc >= 0) p_glUniform1i(loc, 0);
     g_taps_w_loc = p_glGetUniformLocation(pr, "uW");
-    p_glUseProgram(0);
+    b3r_use_program_via((void (*)(unsigned))p_glUseProgram, 0);
 
     g_taps_prog  = pr;
     g_taps_state = 1;
@@ -1177,8 +1705,34 @@ void b3_postfx_blur(int w, int h, float speed_mph, float boost_ramp,
     s     = b3_postfx_blur_strength(speed_mph, boost_ramp) * blur_scale;
     alpha = b3_postfx_present_alpha(s);
 
+#ifdef __EMSCRIPTEN__
+    /* WEB DEFAULT: C0.a = 0 -- see the note above postfx_web_blur_on(). */
+    if (!postfx_web_blur_on()) alpha = 0.0f;
+#endif
+
     /* With the x2 disabled and no blur there is nothing to do at all. */
     if (!present_on && alpha <= 0.002f) return;
+
+#ifdef __EMSCRIPTEN__
+    {   double t_prof = b3_web_now_ms();
+#endif
+
+#ifdef __EMSCRIPTEN__
+    /* WEB, C0.a == 0: out.rgb = 2 * T0.rgb, and T0 IS the back buffer, so the
+     * grab and step 1 are an identity round trip.  Step 3 alone is the whole
+     * pass.  (Guarded, so the desktop path still runs all three and stays
+     * byte-identical.) */
+    if (present_on && alpha <= 0.002f) {
+        postfx_2d_begin();
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_DST_COLOR, GL_ONE);
+        postfx_use_b3r(0, 1.0f, 1.0f, 1.0f, 1.0f);
+        postfx_quad(1.0f);
+        postfx_2d_end();
+        b3_web_prof(B3_WEB_PROF_BLUR, b3_web_now_ms() - t_prof);
+        return;
+    }
+#endif
 
     postfx_grab_frame(w, h);
     postfx_2d_begin();
@@ -1187,8 +1741,10 @@ void b3_postfx_blur(int w, int h, float speed_mph, float boost_ramp,
     if (present_on) {
         /* step 1 — the sharp frame, opaque */
         glDisable(GL_BLEND);
-        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+#ifndef __EMSCRIPTEN__
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+#endif  /* WEB: GL_TEXTURE_BASE_LEVEL is GLES3; asking on WebGL1 is an error */
+        postfx_use_b3r(g_tex_frame, 1.0f, 1.0f, 1.0f, 1.0f);
         postfx_quad(1.0f);
 
         /* step 2 — the radial accumulation, at the recovered 1/4 resolution,
@@ -1201,44 +1757,64 @@ void b3_postfx_blur(int w, int h, float speed_mph, float boost_ramp,
             /* BASE_LEVEL selects the recovered 1/4-res reduction for the
              * shader exactly as it does for the 16-quad path, so both sample
              * the very same texels. */
+#ifndef __EMSCRIPTEN__
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL,
                             B3_PRESENT_BLUR_LOD);
+#else
+            /* WEB (B3_WEB_BLUR=1): there is no mip chain to select, so the
+             * reduction is built explicitly -- two bilinear halvings into an
+             * FBO, which is the same pair of 2x2 box filters.  Sampling the
+             * FULL-RES frame here is what ghosted; if the FBO path is
+             * unavailable the taps fall back to it and say nothing, which is
+             * why this switch is off by default. */
+            if (postfx_web_blur_on() != 2) {
+                GLuint q = postfx_web_quarter(w, h);
+                if (q) glBindTexture(GL_TEXTURE_2D, q);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_ONE, GL_ONE);
+            }
+#endif
             if (postfx_taps_init()) {
                 /* ONE draw, one rounding -- see postfx_taps_init(). */
-                p_glUseProgram(g_taps_prog);
+                postfx_use_prog(g_taps_prog);
                 if (g_taps_w_loc >= 0) p_glUniform1f(g_taps_w_loc, wgt);
-                glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
                 postfx_quad(1.0f);
-                p_glUseProgram(0);
+                postfx_use_none();
             } else {
+                postfx_use_b3r(g_tex_frame, 1.0f, 1.0f, 1.0f, 1.0f);
                 for (tap = 1; tap <= B3_BLUR_TAPS; tap++)
                     postfx_quad_masked(powf(B3_BLUR_ZOOM_A, (float)tap),
                                        wgt, 1);
             }
+#ifndef __EMSCRIPTEN__
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
-            glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+#else
+            glBindTexture(GL_TEXTURE_2D, g_tex_frame);
+#endif
         }
 
         /* step 3 — the combiner's SHIFTLEFTBY1 */
-        glDisable(GL_TEXTURE_2D);
         glEnable(GL_BLEND);
         glBlendFunc(GL_DST_COLOR, GL_ONE);
-        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+        postfx_use_b3r(0, 1.0f, 1.0f, 1.0f, 1.0f);
         postfx_quad(1.0f);
-        glEnable(GL_TEXTURE_2D);
     } else {
         /* B3_POSTFX_PRESENT=0: the pre-recovery behaviour, an alpha-over of
          * the zoomed taps with no x2. Kept so the wave's before/after
          * measurements can be reproduced from one binary. */
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        postfx_use_b3r(g_tex_frame, 1.0f, 1.0f, 1.0f, 1.0f);
         for (tap = 1; tap <= B3_BLUR_TAPS; tap++)
             postfx_quad_masked(powf(B3_BLUR_ZOOM_A, (float)tap),
                                2.0f * alpha / (float)(tap + 1), 0);
-        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
     }
 
     postfx_2d_end();
+#ifdef __EMSCRIPTEN__
+    b3_web_prof(B3_WEB_PROF_BLUR, b3_web_now_ms() - t_prof);
+    }   /* the profiler scope opened above */
+#endif
 }
 
 /* ------------------------------------------------------- the gamma ramp pass
@@ -1256,10 +1832,15 @@ void b3_postfx_blur(int w, int h, float speed_mph, float boost_ramp,
  * value is i/255, and floor((i/255)*256) == i for every i in 0..255.
  */
 static const char *POSTFX_GAMMA_FS =
+    "#ifdef GL_ES\n"
+    "precision highp float;\n"
+    "#endif\n"
+    "varying vec2 vUV;\n"
+    "varying vec4 vCol;\n"
     "uniform sampler2D uFrame;\n"
     "uniform sampler2D uRamp;\n"
     "void main() {\n"
-    "  vec3 c = texture2D(uFrame, gl_TexCoord[0].xy).rgb;\n"
+    "  vec3 c = texture2D(uFrame, vUV).rgb;\n"
     "  gl_FragColor = vec4(texture2D(uRamp, vec2(c.r, 0.5)).r,\n"
     "                      texture2D(uRamp, vec2(c.g, 0.5)).r,\n"
     "                      texture2D(uRamp, vec2(c.b, 0.5)).r, 1.0);\n"
@@ -1300,10 +1881,10 @@ static int postfx_gamma_init(void)
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 1, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, rgba);
 
-    p_glUseProgram(pr);
+    b3r_use_program_via((void (*)(unsigned))p_glUseProgram, pr);
     loc = p_glGetUniformLocation(pr, "uFrame"); if (loc >= 0) p_glUniform1i(loc, 0);
     loc = p_glGetUniformLocation(pr, "uRamp");  if (loc >= 0) p_glUniform1i(loc, 1);
-    p_glUseProgram(0);
+    b3r_use_program_via((void (*)(unsigned))p_glUseProgram, 0);
 
     g_gamma_prog  = pr;
     g_gamma_state = 1;
@@ -1313,6 +1894,9 @@ static int postfx_gamma_init(void)
 
 int b3_postfx_gamma(int w, int h)
 {
+#ifdef __EMSCRIPTEN__
+    double t_prof = b3_web_now_ms();
+#endif
     if (w <= 0 || h <= 0) return 0;
     if (!postfx_gamma_init()) return 0;
 
@@ -1321,25 +1905,28 @@ int b3_postfx_gamma(int w, int h)
     postfx_grab_frame(w, h);
 
     postfx_2d_begin();
-    p_glActiveTexture(0x84C1 /*GL_TEXTURE1*/);
-    glEnable(GL_TEXTURE_2D);
+    b3r_gl_active_texture_via((void (*)(unsigned))p_glActiveTexture, 0x84C1 /*GL_TEXTURE1*/);
     glBindTexture(GL_TEXTURE_2D, g_tex_ramp);
-    p_glActiveTexture(0x84C0 /*GL_TEXTURE0*/);
-    glEnable(GL_TEXTURE_2D);
+    b3r_gl_active_texture_via((void (*)(unsigned))p_glActiveTexture, 0x84C0 /*GL_TEXTURE0*/);
     glBindTexture(GL_TEXTURE_2D, g_tex_frame);
+#ifndef __EMSCRIPTEN__
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+#endif  /* WEB: GLES3-only pname; the grab has level 0 and nothing else */
     glDisable(GL_BLEND);
-    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
 
-    p_glUseProgram(g_gamma_prog);
+    postfx_use_prog(g_gamma_prog);
     postfx_quad(1.0f);
-    p_glUseProgram(0);
+    postfx_use_none();
 
-    p_glActiveTexture(0x84C1);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glDisable(GL_TEXTURE_2D);
-    p_glActiveTexture(0x84C0);
+    b3r_gl_active_texture_via((void (*)(unsigned))p_glActiveTexture, 0x84C1);
+    /* glDisable(GL_TEXTURE_2D) IS how a unit is switched off; the unbind that
+     * used to precede it is not, and on WebGL it is harmful -- see the note by
+     * b3_hud_load_texture() in burnout3_hud.c. */
+    b3r_gl_active_texture_via((void (*)(unsigned))p_glActiveTexture, 0x84C0);
     postfx_2d_end();
+#ifdef __EMSCRIPTEN__
+    b3_web_prof(B3_WEB_PROF_GAMMA, b3_web_now_ms() - t_prof);
+#endif
     return 1;
 }
 

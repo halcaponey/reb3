@@ -1,5 +1,16 @@
 # Car-vs-car collision — the recovered chain (2026-08-11)
 
+> **Status (2026-08-22).** §11 landed after §§1–10 were written and they were
+> not reconciled, so read the later section as authoritative where they
+> disagree: **`FUN_00112E70` (car vs type-3 object) is ported** as
+> `b3_carcol_resolve_traffic()`, despite the "[S, not ported]" mark in the
+> overview chain and its listing under §10 "Open / not ported". `FUN_00113890`
+> (type-5) *is* still genuinely open. The acceptance count in the header line
+> is also stale — §11 records the current, larger figure. Hull extraction is
+> now the `hulls` stage in `tools/cextract/cx_cars_hull.c`; the
+> `emulate_carcol.py --extract-hulls` path still works and produces identical
+> bytes.
+
 How Burnout 3 makes two *vehicles* collide with each other: pair enumeration,
 the convex-hull narrow phase, the mutual response, and the slam/takedown
 classification that turns a contact into a takedown.
@@ -475,3 +486,171 @@ real calls and not just against the port's own bookkeeping.
 * The producer side of the slam report (what the game-context virtual `+0x64`
   does before `FUN_001989A0`) — RE_GAMEPLAY §8 already lists the slam boost
   transfer as [S].
+
+---
+
+## Driving through traffic: two independent causes
+
+**C-1 — a WRECKED traffic car was a ghost.** [C] `FUN_00113960` @0x00113B75
+forces the UN-crashed car to kind 2 = immovable, so a racer hitting a wreck
+receives exactly zero and 100% of the impulse and separation go to the wreck.
+Retail can do that because a crashed car keeps running its own solver, whose
+integrator drains those accumulators and shoves the wreck aside. The port
+reproduced the resolve faithfully (`burnout3_carcol.c:712`) but nothing
+consumed the wreck's accumulators — `carcol_pass()`'s integrate loop
+(`full.c:11086`), `traffic_update()` (`full.c:7690`) and the pose path all skip
+`t->crashed_until > g_race_time`, while `traffic_render()` gates on `t->active`
+ALONE (`full.c:8261`) and still draws it. Measured, COMP/Car1 at 45 m/s into a
+wrecked HEVYCAR11: racer `imp_force (0,0,0)`, `dv = 0.0000 m/s`, while the
+wreck took `(842, 5778, 17218)`. The same pair alive gives the racer
+`dv = -18.0 m/s`. It compounds: a wreck is a stationary roadblock for 5 s, and
+every car that piles into it becomes another drive-through body.
+
+Not the cause, ruled out with evidence: the entity list does NOT hold copies —
+`carcol_fill_racer` sets `b->rb = &v->fsim.rb` and `carcol_fill_traffic` sets
+`b->rb = &t->rb` (`full.c:9761`, `:10012`). The write-back was never the bug.
+
+**C-2 — the traffic broadphase box was LITERALS, not the hull.** The racer path
+takes its box from the .bgv body box (v+0x1D0/+0x1E0); traffic hardcoded
+`x = +-1.0`, `y = [-0.2, 1.2]` and took only Z from the mesh length. Against
+the actual hulls that is badly undersized for anything larger than a small car:
+
+| car | hull box (x, y) | old literal |
+|---|---|---|
+| HEVY_Car34 | x +-1.30, y -> **2.95** | y -> 1.20 |
+| HEVY_Car24 (trailer) | x +-1.23, y -> **3.69** | y -> 1.20 |
+| HEVY_Car23 (tractor) | x +-1.32, y -> 2.45 | y -> 1.20 |
+| COMP_Car12 | x +-1.08 | x +-1.00 |
+
+Trucks and trailers had 60-70% of their height outside the box, so the pair
+never reached the narrow phase and the car drove straight through. The box is
+now derived from the hull vertices (cached per class, with the old literals as
+the fallback when a hull has no verts, so it cannot collapse to a point).
+
+**Measured in game**, 150 s autodrive, same pair budget: player-vs-traffic
+contacts **17-22 -> 69-74**, a 3.4x increase. `validate_carcol` 1037/1037
+(+25 cases covering the kind-2 contract and one real integrator frame).
+
+**C-3 - a live traffic car was routed through the WRONG RESOLVE.** [C]
+This is what "live traffic never gets shoved" actually was, and the answer is
+not a reconciliation law. See the next section.
+
+---
+
+## Live traffic is not a vehicle - the TYPE-3 arm, FUN_00112E70 [C]
+
+The traffic spawn `FUN_001A2B20` registers every traffic car (and every
+trailer and towed partner) through **`FUN_00111620`** @0x001A2DB0 / 0x001A2EEA
+/ 0x001A3088, and that function writes:
+
+```
+obj+0x00 = 3                             <- the TYPE BYTE
+obj+0x04 = trafficrec + 0x70             <- its own 4x4, not a frame object
+obj+0x08 = *(trafficrec+0xB0) + 0xE80    <- the MODEL's box
+obj+0x0C = trafficrec                    <- NOT a vehicle record
+```
+
+There is no vehicle record behind a live traffic car, so there is **no rigid
+body, no +0xF0/+0x100/+0x110/+0x120/+0x130 accumulators and nothing to
+integrate.** All it carries is a 4x4 at `+0x70` and a scalar speed at `+0xC4`.
+`FUN_0010FB70` hands the narrow phase the model's own hull at `model+0x1060`.
+
+`FUN_00111CD0` @0x00111D6E routes a pair with **exactly one type-3 handle** to
+`FUN_00112E70` (other side 0/1/2/4) or `FUN_001135E0` (6/7), ordering the pair
+so the CAR is A - never to `FUN_001121F0`. And `FUN_00114610` @0x00114613
+rejects a **type-3 vs type-3** pair outright: retail never resolves live
+traffic against live traffic at all.
+
+### FUN_00112E70, in order
+
+| # | addr | what |
+|---|---|---|
+| 1 | `0x00112EC4` | A is a car and `veh+0x1353 & 2` -> return |
+| 2 | `0x00112ED1` | `veh+0x210 == 0` arms the RUB, but only if `abs(posA.y - posB.y) <= 2.0` [`0x003B1688`]; a crashed car can only reach the crash arm |
+| 3 | `0x00113005` | `FUN_00040AE0` inverts B's frame on the stack; `FUN_0010FB70` supplies B's hull |
+| 4 | `0x0011302B` | the CONVEX HULL narrow phase runs - **only** to set `crashable = hit && DAT_0039AE50[classB*7 + classA]`. Its point, normal and separation are discarded |
+| 5 | `0x00113069` | a type-3 record with `+0x174 & 8` is never crashable |
+| 6 | `0x0011308E` | the RESPONSE narrow phase is a **2-D CAPSULE** test in (x,z): each body's axis runs `at*(bbmin.z + bbmax.x)` -> `at*(bbmax.z - bbmax.x)` about its origin, radius `bbmax.x`. `FUN_0010FCE0` returns the closest points and the distance |
+| 7 | `0x001131B6` | `gap = dist - (B.bbmax.x + A.bbmax.x)`; `gap > 0` -> return |
+| 8 | `0x00113245` | `n = normalize2(pA - pB)`, y = 0. `pair+0x10 = n`, `pair+0x2C = 1` |
+| 9 | `0x0011329A` | trigger, gated on `crashable && !(veh+0x1353 & 0x10) && veh+0x152C < 0`: `vrel = B.at*(rec+0xC4) - A.at*(veh+0xBC)` (no angular term on either side), `vn = abs(dot3(vrel,n)) * 2.2369363`, `pair+0x20 = mass_A * 2.0 * vn * 0.1 * 0.5` |
+| 10 | `0x00113386` | `FUN_00017310` (game mode 6, or sub-mode 3/4/5) picks `abs(vrel) vs authority*20` [`0x003EBE48`] over `vn vs authority*75` [`0x003EBE44`]; over the bar the RUB flag is cleared @0x001133E4 |
+| 11 | `0x001133E9` | `veh+0x212` set and `veh+0x215 != 3` -> straight to the crash arm |
+| 12 | `0x0011340C` | **THE RUB.** `vehA+0x130 += n * pen` - **100 % of the penetration to the CAR, no mass split.** Contact point = `pA - A.bbmax.x*n` with `y = frameA.pos.y + 0.1` [`0x003EBE40`]; force = `n * min(mass, 2000) * 100.0` [`0x003EBE6C`] through `FUN_001205E0`; then `gamectx->vt[0x54](vehA, trafficrec)`; `pair+0x00 = cp`. **Nothing at all is written to the traffic car.** |
+| 13 | `0x00113522` | **THE CRASH.** `pair+0x2C = 1`, `vehA+0x211 = 1`, `FUN_0010DCA0` crashes the car, then `FUN_00114910` and `FUN_00113960` |
+
+### FUN_00114910 - the promotion [C-disasm]
+
+`*param_1 = 4`: the type byte becomes **4**. A real **0x2430-byte vehicle
+record** is taken from the collision world's own pool (`world+0x33780`, 64
+slots, live array `world+0xE6B80` counted at `world+0xE6C8C`) and
+`FUN_00120BA0` seeds it from the traffic record: the frame from `rec+0x70`
+(into `veh+0x204`, inverse at `veh+0x70`), `veh+0x2420 = rec+0x173`,
+`veh+0x242A = rec+0x176`, mass/inertia from the car config at
+`0x479560 + rec[0x176]*0xB0`, **`veh+0xBC = rec+0xC4`** @0x00120DDD and
+**`veh+0xB0..0xB8 = frame.at * speed`** @0x00120E20/0x00120E2E/0x00120E3C, and
+`veh+0x242B = DAT_0073BB8C` @0x00120E44 - exactly the test `FUN_0010FBC0` uses
+to give type 4 class **3**, "the designated big-hit traffic vehicle". The
+handle is relinked (`+0x04 = newveh+0x204`, `+0x08 = newveh+0x1D0`,
+`+0x0C = newveh`), a trailer (`rec+0x110`) and a tractor (`rec+0x10C`) are
+promoted recursively and cross-linked through `+0x2424/+0x2428`, and then the
+traffic-manager slot is freed (`FUN_001A3970`) and **its lane cursor
+destroyed** - `rec+0x114` reset to 0xFF/defaults @0x00114BAC.. and cleared.
+
+`FUN_00113960` is then re-run over the SAME pair @0x001135CF. Neither
+`FUN_0010DCA0` nor `FUN_0010E580` writes `veh+0x210` (both are 37/46
+-instruction dispatchers), so the car is still un-crashed and `FUN_00113960`
+@0x00113B75 forces it to kind 2 - IMMOVABLE. The freshly promoted car
+therefore takes **100 % of the separation and 100 % of the impulse.** That is
+the launch.
+
+### So: retail never reconciles a shoved traffic car with its lane
+
+Below the bar the traffic car is not shoved - the CAR is pushed out instead,
+by the whole penetration, which is why one frame clears the overlap. Above the
+bar the lane cursor ceases to exist. There is no blend-back law and no traffic
+integrator; the only state machine is
+**path follower (type 3) -> one-way promotion -> vehicle (type 4)**.
+
+Measured under Unicorn (COMP/Car1, 1200 kg, into a HEVY/Car11 traffic car):
+
+| closing | outcome | racer | traffic car |
+|---|---|---|---|
+| 20.6 mph | rub | deflection 0.4977 m, force 120 kN at the contact | nothing |
+| 111.8 mph | crash + promote | crashes, kind 2, receives nothing | impulse (2766, 1986, 28348), deflection 0.456 m |
+
+### What the port does with that
+
+`b3_carcol_resolve_traffic()` (`src/burnout3_carcol.c`) is FUN_00112E70's live
+arm; `b3_carcol_seg_closest2d()` is FUN_0010FCE0. In this harness one
+`TrafficCar` covers both retail states, so **`traffic && !crashed` is retail's
+type-3 handle** and **`traffic && crashed` is retail's promoted type-4
+vehicle** (which keeps the FUN_00113960 arm it already had, and the
+`carcol_pass()` wreck integrator that consumes its accumulators). The pair
+dispatch in `carcol_pass()` routes accordingly and applies FUN_00114610's
+type-3-vs-type-3 rejection to two live traffic bodies.
+
+Acceptance: `tools/validate_carcol.py` **1296/1296** - +259 cases over the
+previous 1037, every one a field-for-field diff against `FUN_00112E70` /
+`FUN_0010FCE0` executed under Unicorn (`tools/emulate_carcol.py`:
+`Session.seed_traffic` / `resolve_traffic` / `seg_closest2d`, with
+`FUN_00114910` hooked so the promotion is performed on the harness's own
+record and `FUN_00113960` then runs for real over it).
+
+Two things in the recovered code a clean-room version would not produce, and
+the port reproduces anyway:
+
+* `FUN_0010FCE0`'s degeneracy test @0x0010FD5F is
+  `abs(dot(d1,d2)) <= 1.5258789e-05` - it rejects **orthogonal** segments, not
+  parallel ones, and returns the sentinel `1000.0` [`0x003B16CC`] leaving
+  every output untouched;
+* it only ever evaluates the four endpoint-onto-the-other-segment
+  projections, so two segments that genuinely cross report a non-zero
+  distance.
+
+**Still open [?]:** retail also routes **type-4 vs type-3** (a promoted wreck
+into a live traffic car) through `FUN_00112E70` - that is its pile-up cascade.
+The port leaves wreck-vs-traffic on the `FUN_00113960` arm it already had,
+because whether the promoted car's `veh+0x210` is set by the time that pair is
+tested is not established, and that is what decides whether the cascade takes
+the rub or goes straight to the crash.

@@ -26,9 +26,6 @@ Three kinds of check, in the project's usual order of trustworthiness:
 
 Run:  python3 tools/validate_postfx.py            (add -v for the full list)
 """
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-from b3_paths import game_path, game_root  # noqa: E402
 import ctypes
 import math
 import os
@@ -36,12 +33,17 @@ import struct
 import subprocess
 import sys
 import tempfile
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from b3_paths import game_path, game_root  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ELF = os.path.join(ROOT, "build", "burnout3.elf")
 HDR = os.path.join(ROOT, "src", "burnout3_postfx.h")
 SRC = os.path.join(ROOT, "src", "burnout3_postfx.c")
-GAME = (game_root())
+AFX_HDR = os.path.join(ROOT, "src", "burnout3_aftereffects.h")
+AFX_SRC = os.path.join(ROOT, "src", "burnout3_aftereffects.c")
+GAME = game_root()
 TRACKS = os.path.join(GAME, "Tracks")
 
 PASS, FAIL = [], []
@@ -749,6 +751,114 @@ def section_d(defs):
 #     of 16 additive 8-bit quads.
 #   * the RESIZE fix: b3_postfx_flip_rows, exercised at a width ABOVE the 2048
 #     the old fixed 8192-byte scratch row silently clamped to.
+# ---------------------------------------------------------------- section F
+# THE AFTEREFFECTS CHAIN'S LAWS, EXECUTED.
+#
+# src/burnout3_aftereffects.c is compiled with -DB3_AFX_NO_GL (alongside
+# burnout3_postfx.c, whose GLUE speed ramp it reuses -- one law, not two) and
+# its three pure functions are RUN, not read.
+#
+# What these legs are really protecting is the honesty of the split.  The
+# chain adds effects retail does not have (docs/RE_POSTFX.md 4d.3 is a clean
+# negative: retail changes NO post-processing during a crash or during time
+# dilation), so the one invariant that must never rot is that all of it is
+# INERT when the game is not in one of those states -- an ordinary racing
+# frame has to come out of the new chain on exactly the old recovered
+# equation.  F3 and F6 are that invariant.
+def section_f(defs):
+    if not os.path.isfile(AFX_SRC):
+        check("F0 src/burnout3_aftereffects.c exists", False, AFX_SRC)
+        return
+    adefs = {}
+    for line in open(AFX_HDR):
+        line = line.strip()
+        if not line.startswith("#define "):
+            continue
+        parts = line[8:].split(None, 1)
+        if len(parts) != 2:
+            continue
+        adefs[parts[0]] = parts[1].split("/*")[0].strip()
+
+    tmp = tempfile.mkdtemp(prefix="b3afx_")
+    so = os.path.join(tmp, "afx_probe.so")
+    cmd = ["gcc", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
+           "-DB3_AFX_NO_GL", "-DB3_POSTFX_NO_GL", "-shared", "-fPIC",
+           "-I" + os.path.join(ROOT, "src"), AFX_SRC, SRC, "-o", so, "-lm"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    check("F0 burnout3_aftereffects.c compiles clean with -DB3_AFX_NO_GL "
+          "-Werror", r.returncode == 0, r.stderr.strip()[:400])
+    if r.returncode != 0:
+        return
+
+    lib = ctypes.CDLL(so)
+    for fn in ("b3_afx_crash_weight", "b3_afx_blur_s", "b3_afx_mask_r0"):
+        getattr(lib, fn).restype = ctypes.c_float
+    lib.b3_afx_crash_weight.argtypes = [ctypes.c_int]
+    lib.b3_afx_blur_s.argtypes = [ctypes.c_float, ctypes.c_float, ctypes.c_int]
+    lib.b3_afx_mask_r0.argtypes = [ctypes.c_float]
+    lib.b3_postfx_blur_strength.restype = ctypes.c_float
+    lib.b3_postfx_blur_strength.argtypes = [ctypes.c_float, ctypes.c_float]
+    lib.b3_postfx_present_alpha.restype = ctypes.c_float
+    lib.b3_postfx_present_alpha.argtypes = [ctypes.c_float]
+
+    # F1 the crash weight is 0 exactly when time is NOT dilated
+    check("F1 crash weight is 0 at divisor 1 (and at 0, and negative)",
+          all(lib.b3_afx_crash_weight(d) == 0.0 for d in (-3, 0, 1)))
+
+    # F2 the retail dilation ladder 3/4/5/6 -> 1 - 1/N
+    bad = [(d, lib.b3_afx_crash_weight(d)) for d in (3, 4, 5, 6)
+           if abs(lib.b3_afx_crash_weight(d) - (1.0 - 1.0 / d)) > 1e-6]
+    check("F2 crash weight is 1 - 1/N over the retail ladder 3/4/5/6 "
+          "(RE_TAKEDOWN_FX 1.2)", not bad, str(bad))
+
+    # F3 THE INVARIANT: at divisor 1 the new law IS the old law, exactly.
+    same = True
+    for mph in (0, 15, 30, 45, 60, 75, 90, 105, 120, 150):
+        for br in (0.0, 0.5, 1.0, 2.0):
+            if lib.b3_afx_blur_s(mph, br, 1) != \
+               lib.b3_postfx_blur_strength(mph, br):
+                same = False
+    check("F3 at divisor 1 b3_afx_blur_s IS b3_postfx_blur_strength, bit for "
+          "bit -- the new chain changes nothing about ordinary driving", same)
+
+    # F4 dilation only ever ADDS smear, and monotonically
+    mono = True
+    for mph in (0, 60, 120):
+        v = [lib.b3_afx_blur_s(mph, 0.0, d) for d in (1, 3, 4, 5, 6)]
+        if any(b < a for a, b in zip(v, v[1:])):
+            mono = False
+    check("F4 s is non-decreasing along the dilation ladder", mono)
+
+    # F5 the mask's inner radius: endpoints, clamping, direction
+    r0 = as_float(defs["B3_BLUR_MASK_R0"])
+    rc = as_float(adefs["B3_AFX_CRASH_MASK_R0"])
+    check("F5 mask r0 runs from the old GLUE radius at weight 0 to "
+          "B3_AFX_CRASH_MASK_R0 at weight 1, clamped outside [0,1]",
+          abs(lib.b3_afx_mask_r0(0.0) - r0) < 1e-6
+          and abs(lib.b3_afx_mask_r0(1.0) - rc) < 1e-6
+          and abs(lib.b3_afx_mask_r0(-5.0) - r0) < 1e-6
+          and abs(lib.b3_afx_mask_r0(5.0) - rc) < 1e-6,
+          "%.4f %.4f" % (lib.b3_afx_mask_r0(0.0), lib.b3_afx_mask_r0(1.0)))
+
+    # F6 the recovered composite alpha law still bounds the result, crash
+    # term included -- C0.a = min(s,2)*0.5 can never exceed 1.
+    worst = max(lib.b3_postfx_present_alpha(lib.b3_afx_blur_s(mph, br, d))
+                for mph in (0, 60, 120, 200) for br in (0.0, 1.0, 2.0)
+                for d in (1, 3, 4, 5, 6))
+    check("F6 C0.a stays inside the recovered [0,1] even at full crash "
+          "weight and top speed", worst <= 1.0, "worst %.4f" % worst)
+
+    # F7 the bloom threshold is BELOW the point the recovered x2 clips at.
+    # This is the whole argument for the number: above 0.5 render-target the
+    # present pass saturates, so a threshold at or above 0.5 would select
+    # only pixels that are already lost.  It was 0.60 once and selected
+    # NOTHING -- bloom on and bloom off came out bit-identical.
+    thr = as_float(adefs["B3_AFX_BLOOM_THRESHOLD"])
+    check("F7 the bloom threshold sits below the x2's clip point (0.5 RT), "
+          "so it selects highlights that still carry detail",
+          0.0 < thr < 0.5, "threshold %.3f" % thr)
+
+
 def section_e(img, defs):
     src = open(SRC).read()
 
@@ -1021,6 +1131,7 @@ def main():
     section_c(defs)
     section_d(defs)
     section_e(img, defs)
+    section_f(defs)
 
     n = len(PASS) + len(FAIL)
     print("\nvalidate_postfx: %d/%d" % (len(PASS), n))

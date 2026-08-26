@@ -32,15 +32,15 @@ Key game code (burnout3.elf VAs, see docs/RE_BGD.md for the chain):
         hands each to FUN_001a4260, which appends ".btv" and loads the traffic
         vehicle via the .bgv relinker FUN_000310f0
 """
+import struct, sys, os, glob
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 from b3_paths import game_path, game_root  # noqa: E402
-import struct, sys, os, glob
 
 BASE = 0x320000
 CS = " -/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_"
 
-DEFAULT = (game_path('Tracks/AS/C1_V1/Gamedata.bgd'))
+DEFAULT = game_path('Tracks/AS/C1_V1/Gamedata.bgd')
 
 
 def b40(v):

@@ -140,6 +140,7 @@ def c_floats(text):
 def parse_emit(src):
     rows = []
     for line in block(src, "EMIT").splitlines():
+        line = undesignate(line)
         m = re.match(r"\s*\{\s*(\d+),\s*([-\d.]+)f,\s*\{(.*?)\},\s*(.*?)\}\s*,?\s*$",
                      line)
         if not m:
@@ -155,16 +156,28 @@ def parse_emit(src):
 def parse_surf(src):
     rows = []
     for m in re.finditer(r"\{\s*([-\d.]+)f,\s*([-\d.]+)f,\s*([-\d.]+)f,\s*(N|\d+),\s*(\d+)\s*\}",
-                         block(src, "SURF")):
+                         undesignate(block(src, "SURF"))):
         emit = 0x1A if m.group(4) == "N" else int(m.group(4))
         rows.append((float(m.group(1)), float(m.group(2)),
                      float(m.group(3)), emit, int(m.group(5))))
     return rows
 
 
+
+def undesignate(line):
+    """Strip `.field = ` so the positional row regexes below accept BOTH forms.
+
+    The tables were converted to designated initializers because a positional
+    one cannot survive a parity relayout -- inserting padding shifts every
+    value and nothing complains. These parsers read the source text, so they
+    have to tolerate the new form."""
+    return re.sub(r'\.\w+\s*=\s*', '', line)
+
 def parse_desc(src):
     rows = []
     for line in block(src, "DESC").splitlines():
+        line = undesignate(line)
+        line = undesignate(line)
         m = re.match(r'\s*\{\s*"([a-z0-9]+)",\s*(\d+),\s*(\d+),\s*'
                      r'([-\d.]+)f,\s*([-\d.]+)f,\s*'
                      r'\{(0x[0-9a-f]+),\s*(0x[0-9a-f]+),\s*(0x[0-9a-f]+)\},\s*'

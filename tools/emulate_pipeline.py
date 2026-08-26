@@ -102,9 +102,16 @@ CTX1      = 0x30020000   # damage/visual ctx (v+0xCC4)
 WHEELF    = 0x30024000   # 4 x 0x40 wheel frame matrices (v+0xCC8..)
 SOUP_HDR  = 0x30028000   # {count, records*, types*}
 SOUP_REC  = 0x30028040
-SOUP_TYPE = 0x30028800
+# CAPACITY. Each record is 0x40 bytes, so SOUP_TYPE must sit at least
+# SOUP_MAX*0x40 past SOUP_REC or writing the soup runs straight through the
+# type table. It used to sit at 0x30028800 -- 0x7C0 bytes, i.e. room for just
+# THIRTY-ONE triangles -- while the harness was uploading up to 120. The
+# overflow corrupted the type table and the collision quietly stopped holding
+# the car up, which is what dropped it through the floor under physics=retail.
+SOUP_MAX  = 256
+SOUP_TYPE = SOUP_REC + SOUP_MAX * 0x40
 REGION_LO = 0x30000000
-REGION_SZ = 0x2A000
+REGION_SZ = 0x30000   # must cover SOUP_TYPE + SOUP_MAX*2
 
 STACK_BASE = 0x20000000
 STACK_SIZE = 0x100000
@@ -132,27 +139,41 @@ CAR = dict(
 )
 
 
-def _load_car_vdb():
-    """Pull the full COMPCAR1 64-param set out of burnout3_car_physics.h so
-    the seeded config is the real one, not a hand-copied subset."""
-    path = os.path.join(_here, '..', 'src', 'burnout3_car_physics.h')
-    params = {}
-    with open(path) as f:
-        active = False
-        for line in f:
-            if 'B3_CARPARAMS_COMPCAR1[]' in line:
-                active = True
-                continue
-            if active:
-                if line.strip().startswith('};'):
-                    break
-                line = line.strip()
-                if line.startswith('{'):
-                    body = line[1:line.index('}')]
-                    off_s, val_s = body.split(',')[:2]
-                    params[int(off_s.strip().rstrip('u'), 0)] = \
-                        float(val_s.strip().rstrip('f'))
-    return params
+def _load_car_vdb(car='COMPCAR1'):
+    """Pull the full COMPCAR1 64-param set out of the RUNTIME asset
+    build/cars/car_physics.bin so the seeded config is the real one, not a
+    hand-copied subset.
+
+    This used to parse src/burnout3_car_physics.h, which no longer exists: the
+    per-car vdb.xml tuning is game data and is loaded at run time now
+    (src/burnout3_car_physics_runtime.h).  Same numbers, same order -- the
+    header's "%.9g" round-tripped a float, so the asset carries exactly the
+    bits the header's literals compiled to.  Format: cx_extract.h, 'B3CP' v1.
+    """
+    path = os.environ.get(
+        'B3_CAR_PHYSICS_BIN',
+        os.path.join(_here, '..', 'build', 'cars', 'car_physics.bin'))
+    with open(path, 'rb') as f:
+        d = f.read()
+    if len(d) < 16 or d[:4] != b'B3CP':
+        raise SystemExit('%s is not a B3CP asset -- run '
+                         'tools/cextract/build.sh && cxtract --only car_tuning '
+                         '--out .' % path)
+    ver, ncar, nparam = struct.unpack_from('<III', d, 4)
+    if ver != 1:
+        raise SystemExit('%s is B3CP v%d, expected v1' % (path, ver))
+    base = 16 + ncar * 40
+    seen = 0
+    for i in range(ncar):
+        o = 16 + i * 40
+        cid = d[o:o + 16].split(b'\0')[0].decode('ascii', 'replace')
+        n = struct.unpack_from('<I', d, o + 36)[0]
+        if cid == car:
+            return {struct.unpack_from('<H', d, base + (seen + k) * 8)[0]:
+                    struct.unpack_from('<f', d, base + (seen + k) * 8 + 4)[0]
+                    for k in range(n)}
+        seen += n
+    raise SystemExit('%s carries no car %s' % (path, car))
 
 CFG = _load_car_vdb()          # offset -> value, the real 0x1D0 struct image
 

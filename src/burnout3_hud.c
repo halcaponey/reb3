@@ -73,7 +73,13 @@
  * The drawing code itself is original harness code, NOT decompiled.
  */
 #include "burnout3_hud.h"
-#include "burnout3_font.h"
+#include "burnout3_emu.h"
+#include "burnout3_backend.h"
+#include "burnout3_render.h"          /* the retained 2D batcher (b3r2d_*)   */
+#include "burnout3_font_runtime.h"    /* runtime: the XBE glyph metrics, out of
+                                       * build/frontend/font.bin             */
+#include "burnout3_hudstr_runtime.h"  /* runtime: the plate/ticker LABELS, out
+                                       * of the user's Data/Globalus.bin     */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -139,24 +145,28 @@ static B3TickRow g_tick[B3_HUD_TICK_ROWS];
 static int       g_tick_order[B3_HUD_TICK_ROWS];  /* obj+0x688 list, head first */
 static int       g_tick_n;
 
-/* Row table.  `label` is the Data/Globalus.bin entry the constructor
- * FUN_0004BFC0 loads into row+0x04 (byte offset / 4); `thresh` is the
- * float FUN_0004D310 pushes at that row's FUN_0004D130 call site;
- * `probed` marks the five... six slots retail actually probes.      [C] */
+/* Row table.  `str` is the Data/Globalus.bin ENTRY INDEX the constructor
+ * FUN_0004BFC0 loads into row+0x04 (the imm32 it loads, / 4); `thresh` is
+ * the float FUN_0004D310 pushes at that row's FUN_0004D130 call site;
+ * `probed` marks the five... six slots retail actually probes.      [C]
+ *
+ * The English text that used to sit in a `label` column here is GONE: it is
+ * the publisher's, and b3_hud_tick_label() now reads it out of the user's own
+ * Globalus.bin at exactly this index (burnout3_hudstr_runtime.h).  The index
+ * is recovered code, not game data, so it stays. */
 static const struct {
-    const char *label;
     int         str;      /* Globalus.bin entry index                    */
     float       thresh;   /* [ebp+8] at the probe site                   */
     int         probed;   /* 0 = FUN_0004D310 never probes this slot     */
     int         rec;      /* score-object offset of its B3CatRecord      */
 } B3_TICK[B3_HUD_TICK_ROWS] = {
-    { "ONCOMING",   B3HUD_TICK_STR_ONCOMING / 4, B3HUD_TICK_ONC_MIN, 1, 0x374 },
-    { "DRIFT",      B3HUD_TICK_STR_DRIFT    / 4, 0.0f, 1, 0x390 },
-    { "NEAR MISS",  B3HUD_TICK_STR_NEARMISS / 4, 0.0f, 1, 0x418 },
-    { "AIR",        B3HUD_TICK_STR_AIR      / 4, 0.0f, 0, 0x358 },
-    { "TAILGATING", B3HUD_TICK_STR_TAILGATE / 4, 1.0f, 1, 0x598 },
-    { "GRINDING",   B3HUD_TICK_STR_GRINDING / 4, 1.0f, 1, 0x5C4 },
-    { "RUBBING",    B3HUD_TICK_STR_RUBBING  / 4, 1.0f, 1, 0x564 }
+    { B3HUD_TICK_STR_ONCOMING / 4, B3HUD_TICK_ONC_MIN, 1, 0x374 },
+    { B3HUD_TICK_STR_DRIFT    / 4, 0.0f, 1, 0x390 },
+    { B3HUD_TICK_STR_NEARMISS / 4, 0.0f, 1, 0x418 },
+    { B3HUD_TICK_STR_AIR      / 4, 0.0f, 0, 0x358 },
+    { B3HUD_TICK_STR_TAILGATE / 4, 1.0f, 1, 0x598 },
+    { B3HUD_TICK_STR_GRINDING / 4, 1.0f, 1, 0x5C4 },
+    { B3HUD_TICK_STR_RUBBING  / 4, 1.0f, 1, 0x564 }
 };
 
 /* FUN_0004D310's probe order -- it is also the row-list push order, so
@@ -185,7 +195,43 @@ static B3HudCallout g_earn_callout;
 static int   g_last_pos = -1;
 static float g_pos_callout_t = 99.f;
 
-/* ---- texture loading -------------------------------------------------- */
+/* ---- texture loading -------------------------------------------------- *
+ *
+ * NAME 0 IS NOT "NO TEXTURE", AND THE ENGINE MUST NEVER SELECT IT.
+ *
+ * Desktop GL has a DEFAULT TEXTURE OBJECT at name 0, so `glBindTexture(target,
+ * 0)` reads as "unbind" and costs nothing: the object exists, it is incomplete,
+ * and an incomplete texture behaves as if texturing were switched off.  WebGL
+ * deleted that object.  There, binding 0 leaves the target with NOTHING bound,
+ * and any call that then touches the target is an error.
+ *
+ * That is where the port's one console warning came from, and it took a stack
+ * to find because no line of this engine is in it:
+ *
+ *     b3_loadscreen_frame -> b3_hud_draw_rect_px -> state_begin
+ *       -> gl4es_glPushAttrib -> realize_textures -> realize_1texture
+ *         -> glTexParameteri x4   ->  "WebGL: INVALID_OPERATION:
+ *                                      texParameter: no texture bound"
+ *
+ * gl4es DEFERS sampler state: glTexParameteri records into the bound texture's
+ * gltexture_t and the real call is made later, from realize_1texture(), for
+ * whichever texture is bound when a draw or a state push forces a flush
+ * (src/gl/texture_params.c).  Its own texture-0 stand-in, glstate->texture.zero,
+ * is calloc'd -- so `actual` is all zeroes while `sampler` holds the GL
+ * defaults -- and the first flush that finds it selected therefore emits
+ * exactly four parameter calls (MIN, MAG, WRAP_S, WRAP_T) against a target with
+ * nothing bound.  Four warnings, once, and never again, because gl4es then
+ * records them as applied.
+ *
+ * The trigger was a texture LOADER ending with a tidy-up unbind, and the first
+ * loading-screen frame after it.  So the loaders no longer unbind: they leave
+ * the texture they just built selected, which is legal everywhere.  Nothing
+ * depended on the unbind -- every textured draw in this engine binds its own
+ * texture first, and every untextured one says so with glDisable(GL_TEXTURE_2D),
+ * which is what "no texture" actually means in fixed-function GL.
+ *
+ * B3_WEB_TEXAUDIT=<n> (web/b3_web_lib.js) is the instrument: it reports every
+ * texParameter call made with nothing bound, with the wasm stack of each. */
 
 GLuint b3_hud_load_texture(const char *path) {
     SDL_Surface *img = IMG_Load(path);
@@ -227,6 +273,11 @@ static int load_strip(const char *dir, const char *stem, GLuint *out, int n,
 }
 
 int b3_hud_init(const char *dir) {
+    /* idempotent: the track selector initialises the HUD before the main
+     * init sequence reaches its own call */
+    static int done = 0;
+    if (done) return 1;
+    done = 1;
     int loaded = 0;
     g_font_global = load_from(dir, "GlobalFont", &loaded);
     g_panel       = load_from(dir, "hud_element01", &loaded);
@@ -266,8 +317,8 @@ int b3_hud_init(const char *dir) {
  * All internal drawing is in the game's 640x480 virtual space, y down.    */
 
 static void vtx(float x, float y) {
-    glVertex2f(x * (2.f / B3HUD_VIRT_W) - 1.f,
-               1.f - y * (2.f / B3HUD_VIRT_H));
+    b3r2d_vertex(x * (2.f / B3HUD_VIRT_W) - 1.f,
+                 1.f - y * (2.f / B3HUD_VIRT_H));
 }
 
 /* The AMBIENT 2D state FUN_001C72F0 establishes for the whole HUD pass:
@@ -279,24 +330,35 @@ static void vtx(float x, float y) {
  * (post-fx, or any composite) that is the "HUD doesn't alpha-blend
  * right" symptom.  Blend equation and mask are now set explicitly. */
 static void state_begin(void) {
-    glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    b3r_state_push();
     glDisable(GL_DEPTH_TEST);
-    glDisable(GL_LIGHTING);
-    glDisable(GL_ALPHA_TEST);
+    /* car display lists (menu previews, race passes) may leave face
+     * culling on; the HUD's y-down px quads wind clockwise and would be
+     * culled SILENTLY -- PushAttrib(GL_ENABLE_BIT) above restores it */
+    glDisable(GL_CULL_FACE);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glBlendEquation(GL_FUNC_ADD);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);   /* 0x010101 [C] */
-    glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadIdentity();
-    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+    b3r_matrix_mode(B3R_MAT_MODELVIEW);  b3r_push(); b3r_identity();
+    b3r_matrix_mode(B3R_MAT_PROJECTION); b3r_push(); b3r_identity();
+    /* The batcher's vertex shader is an ftransform(), so it reads the two
+     * identity matrices just loaded -- b3r2d_begin() has to come AFTER them.
+     * b3r_init() is idempotent and near-free once resolved; it is called here
+     * because the first HUD consumers (the loading screen, the track
+     * selector) run long before the track load site that normally opens the
+     * retained path. */
+    b3r_init();
+    b3r2d_begin();
 }
 
 static void state_end(void) {
-    glMatrixMode(GL_PROJECTION); glPopMatrix();
-    glMatrixMode(GL_MODELVIEW);  glPopMatrix();
+    b3r2d_end();
+    b3r_matrix_mode(B3R_MAT_PROJECTION); b3r_pop();
+    b3r_matrix_mode(B3R_MAT_MODELVIEW);  b3r_pop();
     glBlendEquation(GL_FUNC_ADD);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glPopAttrib();
+    b3r_state_pop();
 }
 
 /* ===================================================================== *
@@ -310,16 +372,14 @@ static void tex_quad_px(GLuint tex, float x, float y, float w, float h,
                         float u0, float v0, float u1, float v1,
                         float alpha) {
     if (!tex) return;
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glColor4f(1.f, 1.f, 1.f, alpha);
-    glBegin(GL_QUADS);
-    glTexCoord2f(u0, v0); vtx(x, y);
-    glTexCoord2f(u1, v0); vtx(x + w, y);
-    glTexCoord2f(u1, v1); vtx(x + w, y + h);
-    glTexCoord2f(u0, v1); vtx(x, y + h);
-    glEnd();
-    glDisable(GL_TEXTURE_2D);
+    b3r2d_texture(tex);
+    b3r2d_color(1.f, 1.f, 1.f, alpha);
+    b3r2d_prim(B3R2D_QUADS);
+    b3r2d_uv(u0, v0); vtx(x, y);
+    b3r2d_uv(u1, v0); vtx(x + w, y);
+    b3r2d_uv(u1, v1); vtx(x + w, y + h);
+    b3r2d_uv(u0, v1); vtx(x, y + h);
+    b3r2d_prim_end();
 }
 
 /* ---- text ------------------------------------------------------------- */
@@ -347,9 +407,8 @@ static void text_pass(const B3Font *f, GLuint tex, const char *s,
                       float x, float y, const B3TextStyle *st,
                       const float top[4], const float bot[4]) {
     float base = y + f->line_h * st->scale;
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glBegin(GL_QUADS);
+    b3r2d_texture(tex);
+    b3r2d_prim(B3R2D_QUADS);
     for (; *s; s++) {
         unsigned char c = (unsigned char)*s;
         if (c < 0x20 || c > 0x7E) continue;
@@ -362,17 +421,22 @@ static void text_pass(const B3Font *f, GLuint tex, const char *s,
             float y1 = y0 + g->h * st->scale;
             float s0 = (base - y0) * st->shear;
             float s1 = (base - y1) * st->shear;
-            glColor4f(top[0], top[1], top[2], top[3]);
-            glTexCoord2f(g->u0, g->v0); vtx(x0 + s0, y0);
-            glTexCoord2f(g->u1, g->v0); vtx(x1 + s0, y0);
-            glColor4f(bot[0], bot[1], bot[2], bot[3]);
-            glTexCoord2f(g->u1, g->v1); vtx(x1 + s1, y1);
-            glTexCoord2f(g->u0, g->v1); vtx(x0 + s1, y1);
+            b3r2d_color(top[0], top[1], top[2], top[3]);
+            b3r2d_uv(g->u0, g->v0); vtx(x0 + s0, y0);
+            b3r2d_uv(g->u1, g->v0); vtx(x1 + s0, y0);
+            b3r2d_color(bot[0], bot[1], bot[2], bot[3]);
+            b3r2d_uv(g->u1, g->v1); vtx(x1 + s1, y1);
+            b3r2d_uv(g->u0, g->v1); vtx(x0 + s1, y1);
         }
         x += g->advance * st->scale;
     }
-    glEnd();
-    glDisable(GL_TEXTURE_2D);
+    b3r2d_prim_end();
+    /* NO trailing b3r2d_texture(0) here: it would flush, and draw_text()
+     * calls this NINE times with the same texture and the same state.
+     * Leaving the selection alone is what collapses a whole string -- and
+     * every string that follows it -- into ONE glDrawArrays.  Nothing
+     * depends on the old glDisable(GL_TEXTURE_2D): every draw site in this
+     * file selects its own texture (or 0) before its first vertex. */
 }
 
 /* The game's own text shadow, recovered from FUN_0004B4D0 (RE_FRONTEND
@@ -472,12 +536,18 @@ static const B3TextStyle STYLE_TAG = {
     B3_SHADOW_RGBA, B3HUD_SHADOW_A_MED
 };
 
-/* Globalus.bin entries 146..148 [C]. */
+/* The in-race position ordinal.  The six English literals that used to sit in
+ * a table here are GONE -- they are Globalus entries, i.e. the publisher's
+ * text -- and this now defers to b3_hud_place_ordinal(), which reads the run
+ * FUN_0018F060 itself indexes (B3HUD_TAG_STR_1ST = entry 1993, @0x0018EDBB)
+ * out of the user's own Globalus.bin.  The stale comment that used to name
+ * "entries 146..148" was wrong: 146..148 are the Xbox Live invite strings;
+ * the two "1st".."6th" runs in the shipped file are 587 (the results screens'
+ * eight-entry run) and 1993 (the six-entry in-race one this wants).      [C] */
 static const char *ordinal(int p) {
-    static const char *tab[] = {"1st", "2nd", "3rd", "4th", "5th", "6th"};
     if (p < 1) p = 1;
     if (p > 6) p = 6;
-    return tab[p - 1];
+    return b3_hud_place_ordinal(p);
 }
 
 /* ===================================================================== *
@@ -538,8 +608,12 @@ static const float B3_SPARK_RAMP[3][4] = {
  * WRAP + alpha for the PLATE, and switches to CLAMP + ADDITIVE for the
  * sparks / earn / tread / core / edge / over, restoring both at the end.
  * COLORWRITEENABLE is 0x010101 (RGB, no alpha write) in both.       [C] */
+/* Each of the three moves state the 2D batcher does NOT own (the blend
+ * equation, the colour mask, the sampler wrap), so each has to flush first:
+ * whatever is already buffered belongs to the state that is about to go. */
 static void state_plate(void) {              /* FUN_001C8470(1) + preset 0 */
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    b3r2d_flush();
+    b3r2d_blend(B3R_BLEND_ALPHA);
     glBlendEquation(GL_FUNC_ADD);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
@@ -547,7 +621,10 @@ static void state_plate(void) {              /* FUN_001C8470(1) + preset 0 */
 }
 
 static void state_fire(void) {               /* FUN_001C8470(0) + preset 1 */
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    b3r2d_flush();
+    /* preset 1's SRCBLEND/DESTBLEND pair is glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+     * -- the enum pair B3R_BLEND_SA_ONE resolves to in b3r_state(). */
+    b3r2d_blend(B3R_BLEND_SA_ONE);
     glBlendEquation(GL_FUNC_ADD);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -555,9 +632,10 @@ static void state_fire(void) {               /* FUN_001C8470(0) + preset 1 */
 }
 
 static void state_restore(void) {            /* back to the ambient 2D state */
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    b3r2d_flush();
+    b3r2d_blend(B3R_BLEND_ALPHA);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glDisable(GL_TEXTURE_2D);
+    b3r2d_texture(0);
 }
 
 /* A textured axis-aligned rect with one colour, the shape FUN_001C7430
@@ -566,14 +644,14 @@ static void rect_c(GLuint tex, const float c[4],
                    float x0, float y0, float x1, float y1,
                    float u0, float v0, float u1, float v1) {
     if (!tex) return;
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glColor4f(c[0], c[1], c[2], c[3]);
-    glBegin(GL_QUADS);
-    glTexCoord2f(u0, v0); vtx(x0, y0);
-    glTexCoord2f(u1, v0); vtx(x1, y0);
-    glTexCoord2f(u1, v1); vtx(x1, y1);
-    glTexCoord2f(u0, v1); vtx(x0, y1);
-    glEnd();
+    b3r2d_texture(tex);
+    b3r2d_color(c[0], c[1], c[2], c[3]);
+    b3r2d_prim(B3R2D_QUADS);
+    b3r2d_uv(u0, v0); vtx(x0, y0);
+    b3r2d_uv(u1, v0); vtx(x1, y0);
+    b3r2d_uv(u1, v1); vtx(x1, y1);
+    b3r2d_uv(u0, v1); vtx(x0, y1);
+    b3r2d_prim_end();
 }
 
 /* frame = (int)(rate * clock) % count  [C: FUN_00049FD0 / AD0 / A470] */
@@ -680,7 +758,12 @@ static void boost_update(B3BoostHud *b, const B3HudBoostIn *in, float dt) {
 static void boost_plate(float x, float y, float w, float h, float A,
                         int segments) {
     if (!g_tread || A <= 0.f) return;
-    glEnable(GL_TEXTURE_2D);
+    b3r2d_texture(g_tread);
+    /* state_plate()'s wrap mode belongs to the TEXTURE OBJECT, and the
+     * batcher only binds at flush time -- so BoostBits has to be the bound
+     * one here.  The redundant bind is safe: the next batch is this same
+     * texture, so whichever way b3r_state()'s bind cache falls, GL ends up
+     * holding g_tread. */
     glBindTexture(GL_TEXTURE_2D, g_tread);
     state_plate();
 
@@ -698,10 +781,13 @@ static void boost_plate(float x, float y, float w, float h, float A,
         rect_c(g_tread, B3_PLATE_COL, x + w * split, y, x + w * A, y + h,
                0.f, cv0, 1.f, cv0 + B3HUD_PLATE_VH);
     }
-    /* leave the texture as the fire sections expect it */
+    /* leave the texture as the fire sections expect it -- but only after the
+     * plate rects have actually been DRAWN under the wrapping sampler, or the
+     * body rect's u 0..A*6 would clamp instead of tile.  The flush also binds
+     * g_tread, which is what the two calls below act on. */
+    b3r2d_flush();
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glDisable(GL_TEXTURE_2D);
 }
 
 /* FUN_000496E0: the BoostBits tread band, 9 segments wide at full fill.
@@ -720,8 +806,8 @@ static void boost_tread(float bx, float by, float w, float h, float B,
     const float ys = B3HUD_TREAD_HSCALE * h;
     const float vr[3] = { B3HUD_TREAD_V0, B3HUD_TREAD_V1, B3HUD_TREAD_V2 };
 
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, g_tread);
+    b3r2d_texture(g_tread);
+    glBindTexture(GL_TEXTURE_2D, g_tread);   /* state_fire's wrap is g_tread's */
     state_fire();
 
     float x = -B3HUD_TREAD_OVERLAP * w;
@@ -756,18 +842,17 @@ static void boost_tread(float bx, float by, float w, float h, float B,
              * and 0.55+0.45a alpha remap were the [S-ref] layer
              * intensities and are gone; the capture shows the game emits
              * exactly lerp(C0, C1, mix) * node.rgba.                 [C] */
-            glBegin(GL_QUADS);
-            glColor4f(ca[0], ca[1], ca[2], ca[3]);
-            glTexCoord2f(u0, vr[k]);     vtx(bx + x,        by + ay0);
-            glTexCoord2f(u1, vr[k]);     vtx(bx + x + segw, by + by0);
-            glColor4f(cb[0], cb[1], cb[2], cb[3]);
-            glTexCoord2f(u1, vr[k + 1]); vtx(bx + x + segw, by + by1);
-            glTexCoord2f(u0, vr[k + 1]); vtx(bx + x,        by + ay1);
-            glEnd();
+            b3r2d_prim(B3R2D_QUADS);
+            b3r2d_color(ca[0], ca[1], ca[2], ca[3]);
+            b3r2d_uv(u0, vr[k]);     vtx(bx + x,        by + ay0);
+            b3r2d_uv(u1, vr[k]);     vtx(bx + x + segw, by + by0);
+            b3r2d_color(cb[0], cb[1], cb[2], cb[3]);
+            b3r2d_uv(u1, vr[k + 1]); vtx(bx + x + segw, by + by1);
+            b3r2d_uv(u0, vr[k + 1]); vtx(bx + x,        by + ay1);
+            b3r2d_prim_end();
         }
         x += segw;
     }
-    glDisable(GL_TEXTURE_2D);
 }
 
 /* FUN_00049FD0: the BoostFireEdge plume that burns off the bar.
@@ -805,7 +890,6 @@ static void boost_edge(float bx, float by, float w, float h, float B,
     const float lean_low = 1.0f;
     const float y_bot    = h;
 
-    glEnable(GL_TEXTURE_2D);
     state_fire();
 
     float rate = B3HUD_EDGE_RATE;
@@ -813,14 +897,14 @@ static void boost_edge(float bx, float by, float w, float h, float B,
     for (int layer = 0; layer < 5 && span > 0.001f; layer++) {
         int fi = strip_frame(rate, clock, g_edge_n);
         if (!g_edge[fi]) break;
-        glBindTexture(GL_TEXTURE_2D, g_edge[fi]);
+        b3r2d_texture(g_edge[fi]);
         /* vertex colour is node.rgba = pure opaque WHITE; the plume's
          * brightness is the texture's alone (the old k*(0.55+0.85*flame)
          * grey ramp was [S-ref] glue and is gone).                    [C] */
-        glColor4f(1.f, 1.f, 1.f, 1.f);
+        b3r2d_color(1.f, 1.f, 1.f, 1.f);
         const int N = 4;                            /* the game emits 5 columns */
         for (int half = 0; half < 2; half++) {
-            glBegin(GL_QUAD_STRIP);
+            b3r2d_prim(B3R2D_QUAD_STRIP);
             for (int i = 0; i <= N; i++) {
                 float t   = (float)i / (float)N;    /* 0 tail .. 1 head */
                 float yt  = y_top - t * t * curve * B * h;
@@ -833,23 +917,22 @@ static void boost_edge(float bx, float by, float w, float h, float B,
                     yb = y_in + (yb - y_in) * a;
                 }
                 if (half == 0) {
-                    glTexCoord2f(t, B3HUD_EDGE_V0);
+                    b3r2d_uv(t, B3HUD_EDGE_V0);
                     vtx(x0 + span * t * lean_top, by + yt);
-                    glTexCoord2f(t, B3HUD_EDGE_V1);
+                    b3r2d_uv(t, B3HUD_EDGE_V1);
                     vtx(x0 + span * t * lean_bot, by + ym);
                 } else {
-                    glTexCoord2f(t, B3HUD_EDGE_V1);
+                    b3r2d_uv(t, B3HUD_EDGE_V1);
                     vtx(x0 + span * t * lean_bot, by + ym);
-                    glTexCoord2f(t, B3HUD_EDGE_V2);
+                    b3r2d_uv(t, B3HUD_EDGE_V2);
                     vtx(x0 + span * t * lean_low, by + yb);
                 }
             }
-            glEnd();
+            b3r2d_prim_end();
         }
         rate *= B3HUD_FLAME_RATE_DECAY;
         span  = floorf((span - 0.001f) / step) * step;
     }
-    glDisable(GL_TEXTURE_2D);
 }
 
 /* FUN_00049AD0 -- the BoostFireCore blobs.  Not magenta: the game emits
@@ -873,7 +956,6 @@ static void boost_core(float bx, float by, float w, float h, float B,
     const float ya    = B3HUD_CORE_YTOP * h;
     const float yb    = B3HUD_CORE_YBOT * h;
 
-    glEnable(GL_TEXTURE_2D);
     state_fire();
 
     float rate = B3HUD_CORE_RATE;
@@ -887,24 +969,23 @@ static void boost_core(float bx, float by, float w, float h, float B,
         if (x0 < xend) {
             x0 = xend;
             /* the tail: same rect shape, colour lerped to black */
-            glBindTexture(GL_TEXTURE_2D, g_core[fi]);
-            glBegin(GL_QUADS);
-            glColor4f(0.f, 0.f, 0.f, B3_CORE_COL[3]);
-            glTexCoord2f(0.f, 0.f); vtx(bx, by + y0);
-            glColor4f(B3_CORE_COL[0], B3_CORE_COL[1], B3_CORE_COL[2],
-                      B3_CORE_COL[3]);
-            glTexCoord2f(1.f, 0.f); vtx(bx + xend, by + y0);
-            glTexCoord2f(1.f, 1.f); vtx(bx + xend, by + y1);
-            glColor4f(0.f, 0.f, 0.f, B3_CORE_COL[3]);
-            glTexCoord2f(0.f, 1.f); vtx(bx, by + y1);
-            glEnd();
+            b3r2d_texture(g_core[fi]);
+            b3r2d_prim(B3R2D_QUADS);
+            b3r2d_color(0.f, 0.f, 0.f, B3_CORE_COL[3]);
+            b3r2d_uv(0.f, 0.f); vtx(bx, by + y0);
+            b3r2d_color(B3_CORE_COL[0], B3_CORE_COL[1], B3_CORE_COL[2],
+                        B3_CORE_COL[3]);
+            b3r2d_uv(1.f, 0.f); vtx(bx + xend, by + y0);
+            b3r2d_uv(1.f, 1.f); vtx(bx + xend, by + y1);
+            b3r2d_color(0.f, 0.f, 0.f, B3_CORE_COL[3]);
+            b3r2d_uv(0.f, 1.f); vtx(bx, by + y1);
+            b3r2d_prim_end();
         }
         rect_c(g_core[fi], B3_CORE_COL, bx + x0, by + y0, bx + x1, by + y1,
                0.f, 0.f, 1.f, 1.f);
         rate *= B3HUD_FLAME_RATE_DECAY;
         flip ^= 1;
     }
-    glDisable(GL_TEXTURE_2D);
 }
 
 /* FUN_0004A470 -- the BoostFireOver streak band.  Also yellow, not
@@ -927,20 +1008,18 @@ static void boost_over(float bx, float by, float w, float h, float B,
     const float xs[4] = { x0, x1, x2, x3 };
     const float ea[4] = { 0.f, 1.f, 1.f, 0.f };   /* the end fade */
 
-    glEnable(GL_TEXTURE_2D);
     state_fire();
-    glBindTexture(GL_TEXTURE_2D, g_over[fi]);
-    glBegin(GL_QUAD_STRIP);
+    b3r2d_texture(g_over[fi]);
+    b3r2d_prim(B3R2D_QUAD_STRIP);
     for (int i = 0; i < 4; i++) {
         float k = ea[i];
-        glColor4f(B3_OVER_COL[0] * k, B3_OVER_COL[1] * k,
-                  B3_OVER_COL[2] * k, B3_OVER_COL[3] * k);
+        b3r2d_color(B3_OVER_COL[0] * k, B3_OVER_COL[1] * k,
+                    B3_OVER_COL[2] * k, B3_OVER_COL[3] * k);
         float u = (xs[i] - x0) * us;
-        glTexCoord2f(u, 0.f); vtx(bx + xs[i], by);
-        glTexCoord2f(u, 1.f); vtx(bx + xs[i], by + y1);
+        b3r2d_uv(u, 0.f); vtx(bx + xs[i], by);
+        b3r2d_uv(u, 1.f); vtx(bx + xs[i], by + y1);
     }
-    glEnd();
-    glDisable(GL_TEXTURE_2D);
+    b3r2d_prim_end();
 }
 
 /* FUN_00049E40: the EARN indicator.  A single BoostEarnFlame quad,
@@ -970,11 +1049,9 @@ static void boost_earn_flame(float bx, float by, float w, float h,
     const float c[4] = { B3_EARN_COL[0] * base * k, B3_EARN_COL[1] * base * k,
                          B3_EARN_COL[2] * base * k, B3_EARN_COL[3] };
 
-    glEnable(GL_TEXTURE_2D);
     state_fire();
     rect_c(g_earnflame, c, bx + x0, by + y0, bx + x1, by + y1,
            0.f, 0.f, 1.f, 1.f);
-    glDisable(GL_TEXTURE_2D);
 }
 
 /* Draw order is FUN_0004AE40's:
@@ -1026,7 +1103,7 @@ static void elem_boost(const B3BoostHud *b) {
 /* Row i's label scale, in atlas px -> screen px.  FUN_0004B280 multiplies
  * every glyph field by (box.w/210) * GlobalFont+0x08 * 26, and the glyph
  * records hold texture-normalised numbers, so dividing by the atlas size
- * puts it back in the atlas pixels src/burnout3_font.h stores.      [C] */
+ * puts it back in the atlas pixels build/frontend/font.bin holds.   [C] */
 static float tick_scale_x(float node_w) {
     return (node_w / B3HUD_TICK_W) * B3HUD_TICK_FONT_SCALE
            * B3HUD_TICK_TEXT_EM / (float)b3_font_globalfont.tex_w;
@@ -1037,7 +1114,7 @@ static float tick_scale_y(float node_h) {
 }
 
 /* GlobalFont's ' ' record advances 7 atlas px (retail record 0x003C8758,
- * +0x18 = 0.02734375 * 256); src/burnout3_font.h -- which this module
+ * +0x18 = 0.02734375 * 256); build/frontend/font.bin -- which this module
  * cannot edit -- stores 8 for it, a generator artefact.  The ticker uses
  * the recovered number so its label metrics match the game's to the
  * 0.003 px the rest of the table already achieves.                  [C] */
@@ -1069,9 +1146,8 @@ static void tick_text_pass(const char *s, float pen, float y,
                            float sx, float sy,
                            const float top[4], const float bot[4]) {
     const B3Font *f = &b3_font_globalfont;
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, g_font_global);
-    glBegin(GL_QUADS);
+    b3r2d_texture(g_font_global);
+    b3r2d_prim(B3R2D_QUADS);
     for (; *s; s++) {
         unsigned char c = (unsigned char)*s;
         if (c < 0x20 || c > 0x7E) continue;
@@ -1081,17 +1157,17 @@ static void tick_text_pass(const char *s, float pen, float y,
             float y0 = y   + g->yoff * sy;
             float x1 = x0 + g->w * sx;
             float y1 = y0 + g->h * sy;
-            glColor4f(top[0], top[1], top[2], top[3]);
-            glTexCoord2f(g->u0, g->v0); vtx(x0, y0);
-            glTexCoord2f(g->u1, g->v0); vtx(x1, y0);
-            glColor4f(bot[0], bot[1], bot[2], bot[3]);
-            glTexCoord2f(g->u1, g->v1); vtx(x1, y1);
-            glTexCoord2f(g->u0, g->v1); vtx(x0, y1);
+            b3r2d_color(top[0], top[1], top[2], top[3]);
+            b3r2d_uv(g->u0, g->v0); vtx(x0, y0);
+            b3r2d_uv(g->u1, g->v0); vtx(x1, y0);
+            b3r2d_color(bot[0], bot[1], bot[2], bot[3]);
+            b3r2d_uv(g->u1, g->v1); vtx(x1, y1);
+            b3r2d_uv(g->u0, g->v1); vtx(x0, y1);
         }
         pen += tick_advance(c, g) * sx;
     }
-    glEnd();
-    glDisable(GL_TEXTURE_2D);
+    b3r2d_prim_end();
+    /* no trailing untexture -- see text_pass() */
 }
 
 /* FUN_0004D130, verbatim: one category probe.  Returns 1 when it created
@@ -1161,6 +1237,41 @@ static int tick_probe(int i, const B3HudTickIn *rec, float clock, float dt) {
 /* FUN_0004D310's row walk: age, fade/shrink out, stack 26 px apart.  [C] */
 static void tick_update(const B3HudState *st, float dt) {
     int fired = 0;
+
+    /* hud=retail: FUN_0004D310 itself. B3HudTickIn is the score object's
+     * B3CatRecord and B3TickRow is the element's row slot, both at retail's
+     * offsets, so the probe inputs and the row state cross as themselves.
+     * The draw NODE does not cross -- retail builds its own 2D node and this
+     * harness draws its own row art, which is the LOOK the parity rules
+     * leave relaxed. What comes back is the logic: which rows are live,
+     * their tier, timer, stacking y and order. */
+    if (b3_backend_get(B3_FEAT_HUD) == B3_BACKEND_RETAIL) {
+        float recs[6][7], rows[7][7];
+        int order[7], n = 0;
+        for (int k = 0; k < 6; k++) {
+            const B3HudTickIn *in = &st->ticker[B3_TICK_PROBE[k]];
+            recs[k][0] = in->value;      recs[k][1] = in->clock;
+            recs[k][2] = in->prev_value; recs[k][3] = (float)in->open;
+            recs[k][4] = (float)in->tier;
+            recs[k][5] = (float)(signed char)in->prev_tier;
+            recs[k][6] = (float)in->count;
+        }
+        if (b3_emu_hud_tick(dt, recs, rows, order, &n)) {
+            for (int i = 0; i < B3_HUD_TICK_ROWS && i < 7; i++) {
+                B3TickRow *r = &g_tick[i];
+                r->live  = (int)rows[i][0];
+                r->timer = rows[i][1];
+                r->y     = rows[i][2];
+                r->tier  = (int)rows[i][3];
+                r->flash = rows[i][4];
+                r->phase = rows[i][5];
+                r->pulse = rows[i][6];
+            }
+            g_tick_n = n;
+            for (int i = 0; i < n; i++) g_tick_order[i] = order[i];
+            return;
+        }
+    }
     for (int k = 0; k < 6; k++) {
         int i = B3_TICK_PROBE[k];
         fired |= tick_probe(i, &st->ticker[i], st->race_clock, dt);
@@ -1218,24 +1329,24 @@ static void tick_update(const B3HudState *st, float dt) {
  * the vertex construction at 0x0004BD60..0x0004BE79.                [C] */
 static void tick_star(float cx, float cy, float hx, float hy,
                       float u0, float u1, const float rgba[4]) {
-    glColor4f(rgba[0], rgba[1], rgba[2], rgba[3]);
-    glTexCoord2f(u0, B3HUD_TICK_STAR_V0); vtx(cx - hx, cy - hy);
-    glTexCoord2f(u1, B3HUD_TICK_STAR_V0); vtx(cx + hx, cy - hy);
-    glTexCoord2f(u1, B3HUD_TICK_STAR_V1); vtx(cx + hx, cy + hy);
-    glTexCoord2f(u0, B3HUD_TICK_STAR_V1); vtx(cx - hx, cy + hy);
+    b3r2d_color(rgba[0], rgba[1], rgba[2], rgba[3]);
+    b3r2d_uv(u0, B3HUD_TICK_STAR_V0); vtx(cx - hx, cy - hy);
+    b3r2d_uv(u1, B3HUD_TICK_STAR_V0); vtx(cx + hx, cy - hy);
+    b3r2d_uv(u1, B3HUD_TICK_STAR_V1); vtx(cx + hx, cy + hy);
+    b3r2d_uv(u0, B3HUD_TICK_STAR_V1); vtx(cx - hx, cy + hy);
 }
 
 static void tick_star_spin(float cx, float cy, float r, float phase,
                            const float rgba[4]) {
     float s = sinf(phase), c = cosf(phase);
-    glColor4f(rgba[0], rgba[1], rgba[2], rgba[3]);
-    glTexCoord2f(B3HUD_TICK_PEND_U0, B3HUD_TICK_STAR_V0);
+    b3r2d_color(rgba[0], rgba[1], rgba[2], rgba[3]);
+    b3r2d_uv(B3HUD_TICK_PEND_U0, B3HUD_TICK_STAR_V0);
     vtx(cx + r * s, cy + r * c);
-    glTexCoord2f(B3HUD_TICK_PEND_U1, B3HUD_TICK_STAR_V0);
+    b3r2d_uv(B3HUD_TICK_PEND_U1, B3HUD_TICK_STAR_V0);
     vtx(cx + r * c, cy - r * s);
-    glTexCoord2f(B3HUD_TICK_PEND_U1, B3HUD_TICK_STAR_V1);
+    b3r2d_uv(B3HUD_TICK_PEND_U1, B3HUD_TICK_STAR_V1);
     vtx(cx - r * s, cy - r * c);
-    glTexCoord2f(B3HUD_TICK_PEND_U0, B3HUD_TICK_STAR_V1);
+    b3r2d_uv(B3HUD_TICK_PEND_U0, B3HUD_TICK_STAR_V1);
     vtx(cx - r * c, cy + r * s);
 }
 
@@ -1301,9 +1412,8 @@ static void tick_draw_row(const B3TickRow *r, const char *label) {
     float hx  = half * fw;
     float hy  = half * fh;
 
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, g_stars);
-    glBegin(GL_QUADS);
+    b3r2d_texture(g_stars);
+    b3r2d_prim(B3R2D_QUADS);
     if (r->pulse > 0.f) {                              /* @0x0004BCEA      */
         float col[4] = {1.f, 1.f, 1.f, a * r->pulse};
         tick_star_spin(cx + adv * (float)(r->tier > 0 ? r->tier : 0), cy,
@@ -1317,14 +1427,13 @@ static void tick_draw_row(const B3TickRow *r, const char *label) {
                       B3HUD_TICK_STAR_U0, B3HUD_TICK_STAR_U1, col);
         }
     }
-    glEnd();
-    glDisable(GL_TEXTURE_2D);
+    b3r2d_prim_end();
 }
 
 static void elem_ticker(void) {
     for (int k = 0; k < g_tick_n; k++) {
         int i = g_tick_order[k];
-        tick_draw_row(&g_tick[i], B3_TICK[i].label);
+        tick_draw_row(&g_tick[i], b3_hud_tick_label(i));
     }
 }
 
@@ -1367,7 +1476,6 @@ static void plate_3slice(float x, float y, float w, float h,
                          float s0, float s1) {
     const float *c = B3_PLATE_NODE_RGBA;
     if (!g_panel) return;
-    glEnable(GL_TEXTURE_2D);
     if (s0 > 0.f)                                   /* @0x00048468 */
         rect_c(g_panel, c, x, y, x + s0 * w, y + h,
                0.f, B3HUD_EL_V0, B3HUD_EL_U1, B3HUD_EL_V1);
@@ -1376,7 +1484,8 @@ static void plate_3slice(float x, float y, float w, float h,
     if (s1 > 0.f)                                   /* @0x0004850D */
         rect_c(g_panel, c, x + (1.f - s1) * w, y, x + w, y + h,
                B3HUD_EL_U2, B3HUD_EL_V0, 1.f, B3HUD_EL_V1);
-    glDisable(GL_TEXTURE_2D);
+    /* no trailing untexture: the three plates all draw hud_element01, so
+     * leaving it selected merges POS + LAP + SPEED into one draw. */
 }
 
 /* cap fraction = texels / ((V1-V0)*32) * H/W -- the cap keeps the
@@ -1435,9 +1544,12 @@ static void elem_position(int position, int n_cars) {
               pen_for_ink(f, num, ax + POS_NUM_DX, &STYLE_GOLD_POS),
               y_for_ink(f, num, ay + PLATE_NUM_DY, &STYLE_GOLD_POS),
               &STYLE_GOLD_POS);
-    draw_text(f, g_font_global, "POS",              /* Globalus 2002 [C] */
-              pen_for_ink(f, "POS", ax + POS_COL_DX, &STYLE_WHITE_LABEL),
-              y_for_ink(f, "POS", ay + PLATE_LABEL_DY, &STYLE_WHITE_LABEL),
+    /* the label is Globalus entry B3HUD_STR_POS/4 = 2002, out of the user's
+     * own file -- the English literal that used to be here was retail text */
+    const char *lbl = b3_hudstr(B3HUD_STR_POS / 4);
+    draw_text(f, g_font_global, lbl,
+              pen_for_ink(f, lbl, ax + POS_COL_DX, &STYLE_WHITE_LABEL),
+              y_for_ink(f, lbl, ay + PLATE_LABEL_DY, &STYLE_WHITE_LABEL),
               &STYLE_WHITE_LABEL);
     draw_text(f, g_font_global, den,
               pen_for_ink(f, den, ax + POS_COL_DX, &STYLE_GOLD_FRAC),
@@ -1464,9 +1576,11 @@ static void elem_lap(int lap, int total_laps) {
               pen_for_ink(f, num, ax + LAP_NUM_DX - nw, &STYLE_GOLD_POS),
               y_for_ink(f, num, ay + PLATE_NUM_DY, &STYLE_GOLD_POS),
               &STYLE_GOLD_POS);
-    draw_text(f, g_font_global, "LAP",              /* Globalus 2003 [C] */
-              pen_for_ink(f, "LAP", ax + LAP_COL_DX, &STYLE_WHITE_LABEL),
-              y_for_ink(f, "LAP", ay + PLATE_LABEL_DY, &STYLE_WHITE_LABEL),
+    /* Globalus entry B3HUD_STR_LAP/4 = 2003, out of the user's own file */
+    const char *lbl = b3_hudstr(B3HUD_STR_LAP / 4);
+    draw_text(f, g_font_global, lbl,
+              pen_for_ink(f, lbl, ax + LAP_COL_DX, &STYLE_WHITE_LABEL),
+              y_for_ink(f, lbl, ay + PLATE_LABEL_DY, &STYLE_WHITE_LABEL),
               &STYLE_WHITE_LABEL);
     draw_text(f, g_font_global, den,
               pen_for_ink(f, den, ax + LAP_COL_DX, &STYLE_GOLD_FRAC),
@@ -1517,10 +1631,12 @@ static void elem_speed(float mph) {
                   &STYLE_GOLD_BIG);
         pen += g->advance * STYLE_GOLD_BIG.scale + SPEED_TRACK;
     }
-    draw_text(f, g_font_global, "mph",              /* Globalus 1987 [C] */
-              pen_for_ink(f, "mph", ax + SPEED_UNIT_DX,
+    /* Globalus entry B3HUD_STR_MPH/4 = 1987, out of the user's own file */
+    const char *unit = b3_hudstr(B3HUD_STR_MPH / 4);
+    draw_text(f, g_font_global, unit,
+              pen_for_ink(f, unit, ax + SPEED_UNIT_DX,
                           &STYLE_GOLD_LABEL),
-              y_for_ink(f, "mph", ay + SPEED_UNIT_DY, &STYLE_GOLD_LABEL),
+              y_for_ink(f, unit, ay + SPEED_UNIT_DY, &STYLE_GOLD_LABEL),
               &STYLE_GOLD_LABEL);
 }
 
@@ -1550,12 +1666,13 @@ const char *b3_hud_place_ordinal(int place) {
      * which is consistent with the six-car race grid; a seventh place
      * would read the next table entry, so the element simply draws
      * nothing there.  (The other "1st".."8th" run at entry 587 is a
-     * different table, used by the results screens.)                 [C] */
-    static const char *const ORD[6] = {
-        "1st", "2nd", "3rd", "4th", "5th", "6th"
-    };
+     * different table, used by the results screens.)                 [C]
+     *
+     * The six English literals that used to be tabulated here are GONE: they
+     * are the publisher's Globalus text, and the INDEX is what the port
+     * recovered.  b3_hudstr() resolves it against the user's own file. */
     if (place < 1 || place > 6) return NULL;
-    return ORD[place - 1];
+    return b3_hudstr((unsigned)(B3HUD_TAG_STR_1ST / 4 + place - 1));
 }
 
 /* The alpha envelope: TAG_ALPHA, faded out past TAG_FADE_FAR at
@@ -1622,20 +1739,22 @@ int b3_hud_opponent_tag(float screen_x, float screen_y, float distance,
     if (sy > B3HUD_VIRT_H + size_y * B3HUD_TAG_HALF) return 0;
 
     state_begin();
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);   /* preset 0 [C] */
+    b3r2d_blend(B3R_BLEND_ALPHA);                        /* preset 0 [C] */
 
     if (distance >= B3HUD_TAG_DIST) {
         /* FAR: a flat three-vertex triangle, apex DOWN, no texture.
          * FUN_001C7C90 @0x0018F757 with the verts built @0x0018F6D7. */
         float hw = size * B3HUD_TAG_TRI_W;               /* @0x0018F6E3 */
         float hh = size_y * B3HUD_TAG_HALF;              /* @0x0018F373 */
-        glDisable(GL_TEXTURE_2D);
-        glColor4f(STYLE_TAG.top[0], STYLE_TAG.top[1], STYLE_TAG.top[2], a);
-        glBegin(GL_TRIANGLES);
+        b3r2d_texture(0);
+        b3r2d_color(STYLE_TAG.top[0], STYLE_TAG.top[1], STYLE_TAG.top[2], a);
+        /* B3R2D_TRIANGLES is the batcher's glBegin(GL_TRIANGLES): the three
+         * vertices below reach the GPU as one glDrawArrays(GL_TRIANGLES). */
+        b3r2d_prim(B3R2D_TRIANGLES);
         vtx(sx - hw, sy - hh);
         vtx(sx + hw, sy - hh);
         vtx(sx,      sy + hh);
-        glEnd();
+        b3r2d_prim_end();
     } else {
         /* NEAR: the ordinal, floors applied (@0x0018F761..@0x0018F78F). */
         const char *ord = b3_hud_place_ordinal(place);
@@ -1742,14 +1861,12 @@ static void elem_music(const B3HudMusicIn *m) {
         float capl = plate_cap(B3HUD_CAP_L_NUM, bh, bw);
         float capr = plate_cap(B3HUD_CAP_R_NUM, bh, bw);
         const float col[4] = {1.f, 1.f, 1.f, a};
-        glEnable(GL_TEXTURE_2D);
         rect_c(g_panel, col, bx, by, bx + capl * bw, by + bh,
                0.f, B3HUD_EL_V0, B3HUD_EL_U1, B3HUD_EL_V1);
         rect_c(g_panel, col, bx + capl * bw, by, bx + (1.f - capr) * bw,
                by + bh, B3HUD_EL_U1, B3HUD_EL_V0, B3HUD_EL_U2, B3HUD_EL_V1);
         rect_c(g_panel, col, bx + (1.f - capr) * bw, by, bx + bw, by + bh,
                B3HUD_EL_U2, B3HUD_EL_V0, 1.f, B3HUD_EL_V1);
-        glDisable(GL_TEXTURE_2D);
     }
 
     /* the EA TRAX badge: right half of the sheet, stood up a quarter
@@ -1758,16 +1875,14 @@ static void elem_music(const B3HudMusicIn *m) {
         float ix = bx + B3HUD_TRAX_PAD;
         float iy = by + (bh - B3HUD_TRAX_ICON) * 0.5f;
         float s = B3HUD_TRAX_ICON;
-        glEnable(GL_TEXTURE_2D);
-        glBindTexture(GL_TEXTURE_2D, g_eatrax);
-        glColor4f(1.f, 1.f, 1.f, a);
-        glBegin(GL_QUADS);
-        glTexCoord2f(1.0f, 0.f); vtx(ix,     iy);
-        glTexCoord2f(1.0f, 1.f); vtx(ix + s, iy);
-        glTexCoord2f(0.5f, 1.f); vtx(ix + s, iy + s);
-        glTexCoord2f(0.5f, 0.f); vtx(ix,     iy + s);
-        glEnd();
-        glDisable(GL_TEXTURE_2D);
+        b3r2d_texture(g_eatrax);
+        b3r2d_color(1.f, 1.f, 1.f, a);
+        b3r2d_prim(B3R2D_QUADS);
+        b3r2d_uv(1.0f, 0.f); vtx(ix,     iy);
+        b3r2d_uv(1.0f, 1.f); vtx(ix + s, iy);
+        b3r2d_uv(0.5f, 1.f); vtx(ix + s, iy + s);
+        b3r2d_uv(0.5f, 0.f); vtx(ix,     iy + s);
+        b3r2d_prim_end();
     }
 
     float tx = bx + B3HUD_TRAX_TEXT_X;
@@ -2286,35 +2401,35 @@ static float g_blade_t;              /* 0 .. 1, how far the blades are in */
 /* One rule: LAB_000B53F0's two quads, split at the horizontal midpoint,
  * colour1 (black) at both screen edges and colour0 at the centre. */
 static void blade_rule(float y, float a) {
-    glDisable(GL_TEXTURE_2D);
-    glBegin(GL_QUADS);
+    b3r2d_texture(0);
+    b3r2d_prim(B3R2D_QUADS);
     for (int i = 0; i < 2; i++) {
         float x0 = i ? B3HUD_VIRT_W * 0.5f : 0.f;
         float x1 = i ? B3HUD_VIRT_W        : B3HUD_VIRT_W * 0.5f;
         float k0 = i ? 1.f : 0.f, k1 = i ? 0.f : 1.f;
-        glColor4f(B3_BLADE_RULE_R * k0, B3_BLADE_RULE_G * k0,
-                  B3_BLADE_RULE_B * k0, a); vtx(x0, y);
-        glColor4f(B3_BLADE_RULE_R * k1, B3_BLADE_RULE_G * k1,
-                  B3_BLADE_RULE_B * k1, a); vtx(x1, y);
-        glColor4f(B3_BLADE_RULE_R * k1, B3_BLADE_RULE_G * k1,
-                  B3_BLADE_RULE_B * k1, a); vtx(x1, y + B3_BLADE_RULE_H);
-        glColor4f(B3_BLADE_RULE_R * k0, B3_BLADE_RULE_G * k0,
-                  B3_BLADE_RULE_B * k0, a); vtx(x0, y + B3_BLADE_RULE_H);
+        b3r2d_color(B3_BLADE_RULE_R * k0, B3_BLADE_RULE_G * k0,
+                    B3_BLADE_RULE_B * k0, a); vtx(x0, y);
+        b3r2d_color(B3_BLADE_RULE_R * k1, B3_BLADE_RULE_G * k1,
+                    B3_BLADE_RULE_B * k1, a); vtx(x1, y);
+        b3r2d_color(B3_BLADE_RULE_R * k1, B3_BLADE_RULE_G * k1,
+                    B3_BLADE_RULE_B * k1, a); vtx(x1, y + B3_BLADE_RULE_H);
+        b3r2d_color(B3_BLADE_RULE_R * k0, B3_BLADE_RULE_G * k0,
+                    B3_BLADE_RULE_B * k0, a); vtx(x0, y + B3_BLADE_RULE_H);
     }
-    glEnd();
-    glColor4f(1.f, 1.f, 1.f, 1.f);
+    b3r2d_prim_end();
+    b3r2d_color(1.f, 1.f, 1.f, 1.f);
 }
 
 /* FUN_001C1930's flat untextured quad. */
 static void blade_bar(float y, float h) {
     if (h <= 0.f) return;
-    glDisable(GL_TEXTURE_2D);
-    glColor4f(0.f, 0.f, 0.f, 1.f);
-    glBegin(GL_QUADS);
+    b3r2d_texture(0);
+    b3r2d_color(0.f, 0.f, 0.f, 1.f);
+    b3r2d_prim(B3R2D_QUADS);
     vtx(0.f, y);              vtx(B3HUD_VIRT_W, y);
     vtx(B3HUD_VIRT_W, y + h); vtx(0.f, y + h);
-    glEnd();
-    glColor4f(1.f, 1.f, 1.f, 1.f);
+    b3r2d_prim_end();
+    b3r2d_color(1.f, 1.f, 1.f, 1.f);
 }
 
 static void elem_crash_blades(const B3HudCrashIn *in, float dt) {
@@ -2352,11 +2467,15 @@ static int crash_cinema_on(void) { return g_blade_t > 0.f; }
  *      3 (0.50, 0.45)  <- the centre
  *      4 (0.00, 1.00)  5 (0.50, 1.00)  6 (1.00, 1.00)
  *    and the primitive table @0x00388928, five bytes per entry
- *    { count, i0, i1, i2, i3 } walked count..1 (0x00050031):
- *      UP    4: 2,3,1,0      (the top band)
- *      DOWN  4: 6,3,5,4      (the bottom band)
+ *    { count, i0, i1, i2, i3 }, whose bytes in the image are
+ *      04 00 01 03 02 | 04 04 05 03 06 | 03 00 03 04 07 | 03 02 03 06 07
+ *    walked count..1 (0x00050031), so the EMITTED order is
+ *      UP    4: 2,3,1,0      (the top wedge)
+ *      DOWN  4: 6,3,5,4      (the bottom wedge)
  *      LEFT  3: 4,3,0        (the left triangle)
  *      RIGHT 3: 6,3,2        (the right triangle)
+ *    and each row goes out as a TRIANGLE STRIP: both emit sites call
+ *    FUN_001C7710, the strip batcher (0x000500FC, 0x000501C0).
  *    The loop advances the table pointer by 5 and the alpha pointer by 4
  *    until it reaches 0x0038893C (0x00050101..0x0005012A).
  *
@@ -2374,15 +2493,23 @@ static int crash_cinema_on(void) { return g_blade_t > 0.f; }
  *    the U coordinate mirrored (u := 1 - u), colour 0x003FCF80 and
  *    alpha^2 -- the gloss highlight.
  *
- *  UVs [S]  the callback reads them from a RUNTIME table at 0x0054F680
- *    that FUN_00265D10 fills from four ValueDB scalars (0x0054F664 /
- *    0x0054F678 / 0x0054F6D4 / 0x0054F6E0), none of which are in the
- *    image.  Its SHAPE is recovered: u takes one value at the box's
- *    x = 0 and x = 1 and the other at x = 0.5, v runs top -> centre ->
- *    bottom -- i.e. the sprite is mirrored about the box's vertical
- *    centreline.  This port instead maps the whole "Aftertouch" sprite
- *    into each wedge with a per-direction 90-degree UV rotation, which is
- *    what makes the sprite's arrowhead point outward in every wedge.
+ *  UVs [C]  the callback reads them from a RUNTIME table at 0x0054F680,
+ *    indexed by the VERTEX INDEX (`mov eax,[ecx+0x54f680]` @0x0005004F
+ *    with ecx = idx*8), so it is seven (u,v) pairs, one per vertex, and
+ *    FUN_00265D10 (0x00265D10..0x00265DA8) fills all seven from four
+ *    ValueDB scalars: u = 0x0054F6D4 at the box's x = 0.5 and 0x0054F678
+ *    at x = 0/1, v = 0x0054F664 at y = 0 and 0x0054F6E0 at y = 1, with
+ *    the centre vertex's v taken from 0x0054F6BC.
+ *
+ *    Those four were previously logged as "not in the image".  They ARE:
+ *    each has a compiled-in default written by a one-instruction C++
+ *    dynamic initialiser -- 0x00265C80/0x00265C60/0x00265CA0/0x00265CC0 --
+ *    and 0x0054F6BC is derived from two of them @0x00265CE0 as
+ *    vTOP + (vBOTTOM - vTOP)*0.45, the same 0.45 as the centre vertex's
+ *    box y, which proves v is linear in y.  The values are half-texel UVs
+ *    for a 64x64 sheet (0.5/64, 32.5/64, 63.5/64): pass 1 covers the
+ *    sheet's RIGHT half (the badge) and pass 2's u := 1 - u its LEFT half
+ *    (the soft gloss).  See burnout3_hud.h B3HUD_AT_U_EDGE et al.
  * ===================================================================== */
 
 /* the seven unit vertices, @0x003FCF38 */
@@ -2396,8 +2523,16 @@ static const float B3_AT_V[7][2] = {
     { B3HUD_AT_VX_RIGHT, B3HUD_AT_VY_BOTTOM },   /* 6 */
 };
 
-/* the primitive table @0x00388928, already walked in the retail order
- * (count..1) so the winding matches. */
+/* The primitive table @0x00388928, stored here ALREADY WALKED in retail's
+ * order.  Executed evidence, read straight out of build/burnout3.elf:
+ *
+ *   0x00388928: 04 00 01 03 02 | 04 04 05 03 06 | 03 00 03 04 07 |
+ *               03 02 03 06 07                             (stride 5)
+ *
+ * and the emit loop at 0x00050031 indexes tbl[edi] with edi counting DOWN
+ * from tbl[0] (`movzx ecx,byte [eax+edi]` ... `dec edi` / `jne`), so the
+ * vertices leave in REVERSE table order -- UP as 2,3,1,0, DOWN as 6,3,5,4,
+ * LEFT as 4,3,0, RIGHT as 6,3,2, which is what the rows below hold.   [C] */
 static const unsigned char B3_AT_PRIM[4][5] = {
     { 4, 2, 3, 1, 0 },   /* UP    */
     { 4, 6, 3, 5, 4 },   /* DOWN  */
@@ -2405,21 +2540,27 @@ static const unsigned char B3_AT_PRIM[4][5] = {
     { 3, 6, 3, 2, 0 },   /* RIGHT */
 };
 
-/* The RECOVERED UV shape (see the note above): u takes one value at the
- * box's x = 0 and x = 1 and the other at x = 0.5, v runs top -> centre ->
- * bottom -- the sprite (the right half of the badge, an arrowhead swoosh
- * with its point at +u) is MIRRORED about the box's vertical centreline,
- * composing the closed gold "eye" the retail reference shows (user image
- * xemu-2026-08-13-14-27-52 top right). The exact ValueDB endpoints are
- * not in the image; 0/1 endpoints fitted to the reference ([S], look-
- * authorized). The old per-wedge 90-degree rotation drew four rotated
- * arrowheads instead of the eye -- user report. */
+/* The UVs, now read out of the image rather than fitted (burnout3_hud.h,
+ * B3HUD_AT_U_EDGE / U_MID / V_TOP / V_BOTTOM).  u takes U_EDGE at the
+ * box's x = 0 and x = 1 and U_MID at x = 0.5, so the sprite is MIRRORED
+ * about the box's vertical centreline and the two halves compose the
+ * closed "eye" the retail reference shows; v is linear in the box's y.
+ *
+ * The endpoints matter: "Aftertouch" is a TWO-SPRITE 64x64 sheet -- the
+ * crisp badge in its right half (u 32.5/64 .. 63.5/64, what pass 1 draws)
+ * and a soft glow in its left half (u 0.5/64 .. 32.5/64, what pass 2's
+ * u := 1 - u mirror draws).  The fitted 0/1 endpoints squeezed the WHOLE
+ * sheet into each wedge, so every wedge painted the badge AND the blurred
+ * glow side by side, in pass 1's opaque colour -- the "smudged and
+ * doubled" crosshair the user reported (build/debug_dump_081).       [C] */
 static float g_at_clock;                 /* stands in for [0x004AE200] */
 
 static void at_uv(int rot, float x, float y, float *u, float *v) {
     (void)rot;
-    *u = fabsf(x - 0.5f) * 2.0f;   /* 1 at both edges, 0 at the centreline */
-    *v = y;                        /* top -> centre -> bottom */
+    *u = B3HUD_AT_U_MID
+       + (B3HUD_AT_U_EDGE - B3HUD_AT_U_MID) * fabsf(x - 0.5f) * 2.0f;
+    *v = B3HUD_AT_V_TOP
+       + (B3HUD_AT_V_BOTTOM - B3HUD_AT_V_TOP) * y;
 }
 
 static void at_wedge(GLuint tex, int prim, float x, float y, float w, float h,
@@ -2427,20 +2568,36 @@ static void at_wedge(GLuint tex, int prim, float x, float y, float w, float h,
     const unsigned char *p = B3_AT_PRIM[prim];
     int n = p[0], i;
     if (alpha <= 0.f) return;
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glColor4f(col[0], col[1], col[2], col[3] * alpha);
-    glBegin(GL_TRIANGLE_FAN);
+    b3r2d_texture(tex);
+    b3r2d_color(col[0], col[1], col[2], col[3] * alpha);
+    /* A TRIANGLE STRIP, not a fan.  Both emit sites (0x000500FC pass 1 and
+     * 0x000501C0 pass 2) call FUN_001C7710 -- the engine's STRIP batcher,
+     * the sibling of the rect batcher FUN_001C7430 (RE_FRONTEND 6.7.3) --
+     * and that is the primitive type all the way down to the pushbuffer:
+     * FUN_001C7710 selects batch kind 2 (`mov esi,2` @0x001C7720, consumed
+     * by FUN_001C6A20 @0x001C6AE8), the flusher FUN_001C69C0 reads the kind
+     * back @0x001C69FC and looks the D3D primitive type up in the stride-12
+     * table @0x003A7C28, whose row 2 is 6 = D3DPT_TRIANGLESTRIP.  (Row 0,
+     * the rect batcher's kind, is 8 = D3DPT_QUADLIST, which pins the Xbox
+     * enum.  NO batcher in the image ever selects 7 = D3DPT_TRIANGLEFAN.)
+     * It matters because the four-vertex rows put three COLLINEAR box-edge
+     * vertices in one primitive: UP is TR, C, TM, TL with TR/TM/TL all on
+     * y = 0.  As a strip that is (TR,C,TM) + (C,TM,TL) = the whole top
+     * wedge.  As a FAN it is (TR,C,TM) + (TR,TM,TL), and the second
+     * triangle has ZERO AREA -- so the top and bottom wedges only ever
+     * painted their RIGHT half and the badge came out lopsided: one clean
+     * half-glyph on the right, a clipped one on the left, reading as a
+     * smudged, doubled crosshair (user report, build/debug_dump_081).  [C] */
+    b3r2d_prim(B3R2D_TRI_STRIP);
     for (i = 1; i <= n; i++) {
         const float *vv = B3_AT_V[p[i]];
         float u, t;
         at_uv(prim, vv[0], vv[1], &u, &t);
         if (mirror_u) u = 1.f - u;         /* pass 2, 0x00050180 */
-        glTexCoord2f(u, t);
+        b3r2d_uv(u, t);
         vtx(x + vv[0] * w, y + vv[1] * h);
     }
-    glEnd();
-    glDisable(GL_TEXTURE_2D);
+    b3r2d_prim_end();
 }
 
 /* Draw the cursor into the recovered 54x36 box at (bx, by). */
@@ -2487,14 +2644,14 @@ static void elem_aftertouch_arrow(float bx, float by, float h, float v) {
     }
 
     /* pass 2 (0x00050130): the gloss highlight, additive, alpha^2 */
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    b3r2d_blend(B3R_BLEND_SA_ONE);
     for (i = 0; i < 4; i++) {
         if (al[i] <= B3HUD_AT_ALPHA_MIN) continue;   /* 0x00050168 */
         at_wedge(g_aftertouch, i, bx, by,
                  B3HUD_IMPACT_BOX_W, B3HUD_IMPACT_BOX_H, GLOSS,
                  al[i] * al[i], 1);
     }
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    b3r2d_blend(B3R_BLEND_ALPHA);
 }
 
 /* ---- "(A) IMPACT TIME" ---------------------------------------------- *
@@ -2510,7 +2667,8 @@ static void elem_aftertouch_arrow(float bx, float by, float h, float v) {
 
 static void elem_impact_time(const B3HudCrashIn *in) {
     B3TextStyle st;
-    const char *s = "IMPACT TIME";     /* Globalus 2191                  */
+    /* Globalus entry B3HUD_IMPACT_STR/4 = 2191, out of the user's own file */
+    const char *s = b3_hudstr(B3HUD_IMPACT_STR / 4);
     float w, x, gx;
 
     if (!in || !in->active || !in->aftertouch) return;
@@ -2636,7 +2794,7 @@ const char *b3_hud_callout_text(int cat, int tier) {
 
 const char *b3_hud_tick_label(int row) {
     if (row < 0 || row >= B3_HUD_TICK_ROWS) return NULL;
-    return B3_TICK[row].label;
+    return b3_hudstr((unsigned)B3_TICK[row].str);
 }
 
 void b3_hud_boost_event(int cat, int tier) {
@@ -2655,11 +2813,11 @@ void b3_hud_boost_event(int cat, int tier) {
  * B3HUD_MIX_* defines. */
 static void solid_px(float x, float y, float w, float h,
                      float r, float g, float b, float a) {
-    glDisable(GL_TEXTURE_2D);
-    glColor4f(r, g, b, a);
-    glBegin(GL_QUADS);
+    b3r2d_texture(0);
+    b3r2d_color(r, g, b, a);
+    b3r2d_prim(B3R2D_QUADS);
     vtx(x, y); vtx(x + w, y); vtx(x + w, y + h); vtx(x, y + h);
-    glEnd();
+    b3r2d_prim_end();
 }
 
 void b3_hud_pause_mixer(const float vals[3]) {
@@ -2872,6 +3030,67 @@ void b3_hud_draw(float mph, float boost_frac, int lap, int total_laps,
         g_pos_callout_t = 0.5f;
     }
     b3_hud_draw_state(&st, dt_s);
+}
+
+/* ------------------------------------------------------------------------
+ * Public text drawing, for the harness's menus (the track selector).
+ * GlobalFont, the game's own HUD face; gradient white with a dark outline,
+ * the same style the tick rows use.  Returns the drawn width in pixels.
+ * ---------------------------------------------------------------------- */
+float b3_hud_draw_text(const char *s, float x, float y, float scale,
+                       float r, float g, float b, float a) {
+    const B3Font *f = &b3_font_globalfont;
+    if (!s || !g_font_global) return 0.f;
+    /* self-contained: the in-race callers wrap whole draw groups in
+     * state_begin/end, but a public entry must not depend on the caller's
+     * matrices -- the first consumer (the track selector) drew every glyph
+     * through its own glOrtho and the text collapsed into a corner pixel. */
+    state_begin();
+    B3TextStyle st;
+    memset(&st, 0, sizeof st);
+    st.scale = scale;
+    st.top[0] = r; st.top[1] = g; st.top[2] = b; st.top[3] = a;
+    st.bot[0] = r * 0.72f; st.bot[1] = g * 0.72f; st.bot[2] = b * 0.72f;
+    st.bot[3] = a;
+    st.outline[0] = 0.05f; st.outline[1] = 0.05f; st.outline[2] = 0.08f;
+    st.outline[3] = a;
+    draw_text(f, g_font_global, s, x, y, &st);
+    state_end();
+    return text_width(f, s, scale);
+}
+
+/* Pixel-space quad in the HUD's 640x480 virtual canvas (b3_hud_draw_quad
+ * takes NDC -1..+1, which its first external consumer misread as pixels). */
+void b3_hud_draw_quad_px(GLuint tex, float x, float y, float w, float h,
+                         float alpha) {
+    /* vtx() is already y-down; the old B3HUD_VIRT_H - (y+h) pre-flip
+     * double-flipped every public quad into a mirrored position. */
+    state_begin();
+    tex_quad_px(tex, x, y, w, h, 0.f, 0.f, 1.f, 1.f, alpha);
+    state_end();
+}
+
+void b3_hud_draw_quad_uv_px(GLuint tex, float x, float y, float w, float h,
+                            float u0, float v0, float u1, float v1,
+                            float alpha) {
+    state_begin();
+    tex_quad_px(tex, x, y, w, h, u0, v0, u1, v1, alpha);
+    state_end();
+}
+
+void b3_hud_draw_rect_px(float x, float y, float w, float h,
+                         float r, float g, float b, float a) {
+    state_begin();
+    b3r2d_texture(0);
+    b3r2d_color(r, g, b, a);
+    b3r2d_prim(B3R2D_QUADS);
+    vtx(x, y); vtx(x + w, y); vtx(x + w, y + h); vtx(x, y + h);
+    b3r2d_prim_end();
+    state_end();
+}
+
+float b3_hud_text_width(const char *s, float scale) {
+    return s ? text_width(&b3_font_globalfont, s, scale) : 0.f;
 }
 
 void b3_hud_shutdown(void) {

@@ -26,6 +26,8 @@
 #ifndef BURNOUT3_CRASH_H
 #define BURNOUT3_CRASH_H
 
+#include <stddef.h>   /* offsetof, for the parity assertions */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -59,78 +61,128 @@ typedef struct B3CrashPoly {
 //   +0xD0 wall count, +0xD4 ground count, +0xDC surface flags u16
 //     (lowest nonzero low byte wins)
 // ---------------------------------------------------------------------------
+// At the offsets FUN_0011AEF0 uses in the 0xE0-byte stack struct it builds at
+// ESP+0x80 (see the block comment above). Packed with explicit padding and
+// asserted, so this is a real view of that record rather than a repack of it.
 typedef struct {
-    float inv[4][4];       // world -> body
-    float wall_cent[4];
-    float gnd_cent[4];
-    float gnd_n[4];
-    float wall_nmin[4];
-    float wall_nmax[4];
-    float bbmax[4];        // veh+0x1D0  (proved max by the clip driver's slab
-    float bbmin[4];        // veh+0x1E0   bounds; loaded from .bgv+0xE80/+0xE90
-                           //             by FUN_00122830 [C-disasm])
-    int wall_count;
-    int gnd_count;
-    unsigned short flags;
+    float inv[4][4];       // +0x00  world -> body (copy of veh+0x70)
+    float wall_cent[4];    // +0x40
+    float gnd_cent[4];     // +0x50
+    float gnd_n[4];        // +0x60
+    float wall_nmin[4];    // +0x70
+    float wall_nmax[4];    // +0x80
+    unsigned char _pad90[0x20];
+    float bbmax[4];        // +0xB0  (copy of veh+0x1D0, from .bgv+0xE80)
+    float bbmin[4];        // +0xC0  (copy of veh+0x1E0, from .bgv+0xE90)
+    int wall_count;        // +0xD0
+    int gnd_count;         // +0xD4
+    unsigned char _padD8[0x4];
+    unsigned short flags;  // +0xDC  lowest nonzero low byte wins
+    unsigned char _padDE[0x2];
 } B3CrashContactAcc;
+
+_Static_assert(sizeof(B3CrashContactAcc) == 0xE0, "contact acc is 0xE0");
+_Static_assert(offsetof(B3CrashContactAcc, wall_cent)  == 0x40, "acc wall_cent");
+_Static_assert(offsetof(B3CrashContactAcc, gnd_cent)   == 0x50, "acc gnd_cent");
+_Static_assert(offsetof(B3CrashContactAcc, gnd_n)      == 0x60, "acc gnd_n");
+_Static_assert(offsetof(B3CrashContactAcc, wall_nmin)  == 0x70, "acc wall_nmin");
+_Static_assert(offsetof(B3CrashContactAcc, wall_nmax)  == 0x80, "acc wall_nmax");
+_Static_assert(offsetof(B3CrashContactAcc, bbmax)      == 0xB0, "acc bbmax");
+_Static_assert(offsetof(B3CrashContactAcc, bbmin)      == 0xC0, "acc bbmin");
+_Static_assert(offsetof(B3CrashContactAcc, wall_count) == 0xD0, "acc wall_count");
+_Static_assert(offsetof(B3CrashContactAcc, gnd_count)  == 0xD4, "acc gnd_count");
+_Static_assert(offsetof(B3CrashContactAcc, flags)      == 0xDC, "acc flags");
 
 // ---------------------------------------------------------------------------
 // The vehicle fields FUN_0011AEF0 and its callees touch, by live offset.
 // (Tagged: burnout3_td_rules.h forward-declares it for the wall trigger.)
 // ---------------------------------------------------------------------------
 typedef struct B3CrashVehicle {
-    float frame[4][4];        // [veh+0x204] rows: right / up / at / pos
-    float inv[4][4];          // veh+0x70   world->body inverse frame
-    float iinv_world[3][4];   // veh+0x40   world inverse inertia rows
-    float vel[4];             // veh+0xB0   (vel[3] = +0xBC speed magnitude)
-    float dir[4];             // veh+0xC0   unit travel direction (w = +0xCC)
-    float omega[4];           // veh+0xD0
-    float force_acc[4];       // veh+0xF0
-    float imp[4];             // veh+0x110  linear impulse accumulator
-    float ang_imp[4];         // veh+0x120  angular impulse accumulator
-    float defl[4];            // veh+0x130  deflection (added to pos, cleared)
-    float bbmax[4];           // veh+0x1D0
-    float bbmin[4];           // veh+0x1E0
-    float mass;               // veh+0x1F0
+    // ---- RETAIL WINDOW 0x0000..0x1600: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    unsigned char _pad00[0x40];
+    float                iinv_world[3][4];  // veh+0x40   world inverse inertia rows
+    float                inv[4][4];  // veh+0x70   world->body inverse frame
+    float                vel[4];  // veh+0xB0   (vel[3] = +0xBC speed magnitude)
+    float                dir[4];  // veh+0xC0   unit travel direction (w = +0xCC)
+    float                omega[4];  // veh+0xD0
+    unsigned char _pad01[0x10];
+    float                force_acc[4];  // veh+0xF0
+    unsigned char _pad02[0x10];
+    float                imp[4];  // veh+0x110  linear impulse accumulator
+    float                ang_imp[4];  // veh+0x120  angular impulse accumulator
+    float                defl[4];  // veh+0x130  deflection (added to pos, cleared)
+    unsigned char _pad03[0x20];
+    float                contact_pt[4];  // veh+0x160  world contact point
+    float                contact_n[4];  // veh+0x170  contact normal (wall: flattened
+    unsigned char _pad04[0x10];
+    unsigned short       surface;  // veh+0x190  u16 surface flags of the contact
+    unsigned char _pad05[0x2];
+    float                impact;  // veh+0x194  impact magnitude (wall path) /
+    int                  contact_state;  // veh+0x198  0 none / 1 wall / 2 ground
+    unsigned char _pad06[0x34];
+    float                bbmax[4];  // veh+0x1D0
+    float                bbmin[4];  // veh+0x1E0
+    float                mass;  // veh+0x1F0
+    unsigned char _pad07[0x1A];
+    unsigned char        asleep;  // veh+0x20E (FUN_00125100 clears it: any crash
+    unsigned char _pad08[0x1144];
+    unsigned char        flags1353;  // veh+0x1353 (bit0|bit2 = response disabled;
+    unsigned char _pad09[0x54];
+    float                surface_grip;  // veh+0x13A8 (class-0 velocity scrub factor)
+    unsigned char _pad0A[0x58];
+    float                ground_frac;  // veh+0x1404 (<= 0.1 -> impulse applied at the
+    unsigned char _pad0B[0x2C];
+    float                drift_dir;  // veh+0x1434 (sign flipped when gear == -1)
+    unsigned char _pad0C[0x90];
+    int                  gear;  // veh+0x14C8 (-1 = reverse)
+    unsigned char _pad0D[0x58];
+    int                  drift_state;  // veh+0x1524 (1/2 = drifting: linear-only)
+    unsigned char _pad0E[0xC];
+    float                authority;  // veh+0x1534 (crash thresholds scale by it)
+    unsigned char _pad0F[0x6];
+    unsigned char        no_scrub;  // veh+0x153E (non-class-0: skip the 0.99 scrub)
+    unsigned char _pad10[0xC1];
 
-    // outputs of the response
-    float contact_pt[4];      // veh+0x160  world contact point
-    float contact_n[4];       // veh+0x170  contact normal (wall: flattened
-                              //            into the right/at plane)
-    unsigned short surface;   // veh+0x190  u16 surface flags of the contact
-    float impact;             // veh+0x194  impact magnitude (wall path) /
-                              //            raw impulse (ground path); feeds
-                              //            the crash probability rolls
-                              //            (FUN_0010ED30: rand < (impact-8000)
-                              //            /17000) [C-disasm]
-    int contact_state;        // veh+0x198  0 none / 1 wall / 2 ground
-
-    // inputs / state
-    float surface_grip;       // veh+0x13A8 (class-0 velocity scrub factor)
-    float ground_frac;        // veh+0x1404 (<= 0.1 -> impulse applied at the
-                              //            contact point WITH torque)
-    float drift_dir;          // veh+0x1434 (sign flipped when gear == -1)
-    int   drift_state;        // veh+0x1524 (1/2 = drifting: linear-only)
-    float authority;          // veh+0x1534 (crash thresholds scale by it)
-    unsigned char no_scrub;   // veh+0x153E (non-class-0: skip the 0.99 scrub)
-    unsigned char flags1353;  // veh+0x1353 (bit0|bit2 = response disabled;
-                              //            bit3 = wall-crash trigger blocked)
-    int   gear;               // veh+0x14C8 (-1 = reverse)
-    int   racecar_class;      // racecar+0x1920 (2 never wall-crashes)
-    int   is_class0;          // racecar class == 0 (players): second poly set
-                              //            + surface-grip scrub path
-    int   party_mode;         // FUN_00017310 result (crash-party thresholds)
-
-    // second poly set (veh+0x1590, count veh+0x3A50): other-car hull polys.
+    // ---- HARNESS SIDE, past the retail window: no recovered
+    // offset in THIS object, so it must not squat on retail's bytes.
+    float                frame[4][4];  // [veh+0x204] rows: right / up / at / pos
+    int                  racecar_class;  // racecar+0x1920 (2 never wall-crashes)
+    int                  is_class0;  // racecar class == 0 (players): second poly set
+    int                  party_mode;  // FUN_00017310 result (crash-party thresholds)
+    int                  set2_count;  
+    int                  crashed;  // wall-crash entry fired
+    unsigned char        surf_bit15;  // racecar+0x15CC := surface flags >> 15
     const B3CrashPoly* set2;
-    int set2_count;
-
-    // crash-decision outputs (the real code calls FUN_0010DCA0 here)
-    int crashed;              // wall-crash entry fired
-    unsigned char surf_bit15; // racecar+0x15CC := surface flags >> 15
-    unsigned char asleep;     // veh+0x20E (FUN_00125100 clears it: any crash
-                              //            kick WAKES the body)
 } B3CrashVehicle;
+
+#define B3CRASHVEHICLE_RETAIL_SPAN 0x1600u
+_Static_assert(offsetof(B3CrashVehicle, iinv_world) == 0x0040, "iinv_world off retail");
+_Static_assert(offsetof(B3CrashVehicle, inv) == 0x0070, "inv off retail");
+_Static_assert(offsetof(B3CrashVehicle, vel) == 0x00B0, "vel off retail");
+_Static_assert(offsetof(B3CrashVehicle, dir) == 0x00C0, "dir off retail");
+_Static_assert(offsetof(B3CrashVehicle, omega) == 0x00D0, "omega off retail");
+_Static_assert(offsetof(B3CrashVehicle, force_acc) == 0x00F0, "force_acc off retail");
+_Static_assert(offsetof(B3CrashVehicle, imp) == 0x0110, "imp off retail");
+_Static_assert(offsetof(B3CrashVehicle, ang_imp) == 0x0120, "ang_imp off retail");
+_Static_assert(offsetof(B3CrashVehicle, defl) == 0x0130, "defl off retail");
+_Static_assert(offsetof(B3CrashVehicle, contact_pt) == 0x0160, "contact_pt off retail");
+_Static_assert(offsetof(B3CrashVehicle, contact_n) == 0x0170, "contact_n off retail");
+_Static_assert(offsetof(B3CrashVehicle, surface) == 0x0190, "surface off retail");
+_Static_assert(offsetof(B3CrashVehicle, impact) == 0x0194, "impact off retail");
+_Static_assert(offsetof(B3CrashVehicle, contact_state) == 0x0198, "contact_state off retail");
+_Static_assert(offsetof(B3CrashVehicle, bbmax) == 0x01D0, "bbmax off retail");
+_Static_assert(offsetof(B3CrashVehicle, bbmin) == 0x01E0, "bbmin off retail");
+_Static_assert(offsetof(B3CrashVehicle, mass) == 0x01F0, "mass off retail");
+_Static_assert(offsetof(B3CrashVehicle, asleep) == 0x020E, "asleep off retail");
+_Static_assert(offsetof(B3CrashVehicle, flags1353) == 0x1353, "flags1353 off retail");
+_Static_assert(offsetof(B3CrashVehicle, surface_grip) == 0x13A8, "surface_grip off retail");
+_Static_assert(offsetof(B3CrashVehicle, ground_frac) == 0x1404, "ground_frac off retail");
+_Static_assert(offsetof(B3CrashVehicle, drift_dir) == 0x1434, "drift_dir off retail");
+_Static_assert(offsetof(B3CrashVehicle, gear) == 0x14C8, "gear off retail");
+_Static_assert(offsetof(B3CrashVehicle, drift_state) == 0x1524, "drift_state off retail");
+_Static_assert(offsetof(B3CrashVehicle, authority) == 0x1534, "authority off retail");
+_Static_assert(offsetof(B3CrashVehicle, no_scrub) == 0x153E, "no_scrub off retail");
 
 // FUN_001B09C0 [C]: Sutherland-Hodgman clip of a closed polygon against the
 // slab [lo, hi] on one component (axis 0=x,1=y,2=z). Returns the output count.
@@ -144,6 +196,24 @@ int b3_crash_box_clip(const float bbmax[4], const float bbmin[4],
 
 void b3_crash_acc_init(B3CrashContactAcc* acc, const float inv[4][4],
                        const float bbmax[4], const float bbmin[4]);
+
+// FUN_0011AC30's GEOMETRY ADMISSION on its own [C] -- 1 when this polygon
+// would enter one of the accumulators, i.e. when RETAIL WOULD SEE IT AT ALL.
+//
+// It is the pair of gates that make retail ride over a low curb:
+//   * the near-vertical SLIVER REJECT, |n.y| < 0.2 [0x3A69B4] plus
+//     FUN_0011ABB0's `|dy| < 0.5 [0x3B1684] && dx^2+dz^2 < 0.2` on all three
+//     edges -- a curb riser with a vertical edge dies here;
+//   * the BOX CLIP against veh+0x1D0/+0x1E0 (FUN_001B0C00), which on
+//     COMPCAR1 puts the chassis floor 0.1612 m above the road, so a 0.1526 m
+//     median never reaches it.
+//
+// Exposed because the harness has a SECOND wall-contact producer -- the
+// sphere sweep in mesh_collide -- whose crash reports must be admitted by
+// retail's rule, not by the sphere's. `inv` is the body's inverse frame
+// (veh+0x70); `bbmax`/`bbmin` are veh+0x1D0/+0x1E0. Poly is GAME space.
+int b3_crash_poly_admits(const B3CrashPoly* poly, const float inv[4][4],
+                         const float bbmax[4], const float bbmin[4]);
 
 // FUN_0011AC30 [C] (normal race mode; the crash-party '&' skip is [S]):
 // transform the poly into body space, reject wall slivers, clip against the
@@ -708,19 +778,68 @@ void b3_wreck_aftertouch(B3WreckState* w, float dir_x, float dir_z);
 //            reads (FUN_0004FCA0 @0x0004FCF0/0x0004FD18): +0x140C > 0 lights
 //            the UP wedge, +0x1408 > 0 the RIGHT wedge.
 //
-//   IMPACT TIME  0x0011889A  in a RACE the crashed stage sets the global time
-//            divisor [0x0060EA24] = 5 while bit 4 of veh+0x13FC is set, i.e.
-//            while pad+0x84 -- the BOOST button -- is non-zero, and restores
-//            it to 1 on release (0x001188D6).  Single player only
-//            ([0x0073A1C0] == 1).  In the crash-junction family the divisor
-//            is 3/4 instead.  veh+0x4AC7 latches "engaged".
+//   IMPACT TIME  0x0011885F..0x001188E4 -- the whole state machine, and it
+//            writes the time divisor [0x0060EA24] and the AUDIO TIME SCALE
+//            [0x003EBFD0] with the same pair of instructions every time:
+//
+//              gate      [0x0073A1C0] == 1        @0x0011885F
+//                        -- the LOCAL PLAYER COUNT (FUN_00017C50 indexes the
+//                        per-player arrays with `i < [0x0073A1C0]`), so
+//                        Impact Time is SINGLE PLAYER ONLY.  In split screen
+//                        the whole block is skipped and [esp+0x1D] stays 0,
+//                        which also gates the steer consume off.
+//              gate      [0x005A3759] != 0 requires the game-context state
+//                        vtbl+0x94 == 3          @0x0011882E..0x00118856
+//
+//              RACE arm  (FUN_00017310(0x4A71A0) == 0, i.e. no crash-junction
+//                        presentation is live)          @0x0011889A
+//                        veh+0x13FC & 4  -- pad+0x84, the BOOST button --
+//                        held  ->  divisor 5   @0x001188A4
+//                                  rate  0.75  @0x001188B6 [0x003A55F8]
+//                                  veh+0x4AC7 = 1 (engaged) @0x001188BE
+//                        not held -> [esp+0x1D] = 0, fall to the release
+//              CRASH arm (FUN_00017310 != 0)             @0x00118875
+//                        [esp+0x13] (the crash-junction aftertouch latch,
+//                        built @0x0011847B..0x001184F3) selects
+//                        divisor 3 @0x0011888E when veh+0x3A74 <  0
+//                        divisor 4 @0x00118986 when veh+0x3A74 >= 0
+//                        -- i.e. the crashbreaker window halves the dilation
+//                        -- both with rate 0.75 through the same @0x001188AE
+//              release   @0x001188CC only when veh+0x4AC7 was set:
+//                                  divisor 1   @0x001188D6
+//                                  rate  1.0   @0x001188DC [0x003B168C]
+//                                  veh+0x4AC7 = 0
+//
+//            So RELEASING runs the crash FASTER than holding: divisor 1
+//            against 5 (race) or 3/4 (crash junction).  The audio scale is a
+//            FLAT 0.75 for every one of those divisors, never 1/divisor.
+//            The ten paired divisor/rate write sites across the whole image
+//            are tabulated in burnout3_sfx.h section 3; note the takedown
+//            cinematic and the wreck instant are NOT among them.
 //
 //   CONSUME  0x001189A3..0x00118CD3, gated on
-//              engaged (the same held-boost flag, [esp+0x1D]) || veh+0x4AC3
+//              veh+0x4AC3 (the per-car aftertouch PERMISSION byte) AND,
+//              unless the bypass arm is taken, the held flag [esp+0x1D]
+//              @0x00118943..0x0011899D.  The bypass is
+//              `[esp+0x1F]` (the game-context object is [0x004D4798]) or
+//              the context virtual vtbl+0xC0 -- the AI/attract arms, which
+//              steer without a pad.
+//              CORRECTION: an older revision of this note read the gate as
+//              `engaged || veh+0x4AC3`.  It is an AND, not an OR -- 4AC3
+//              is required on every arm.  The port's `if (!in->engaged)`
+//              is still the right race-path behaviour (4AC3 enabled, no
+//              bypass), but the shape of the condition is as above.
 //              && (veh+0x1530 < 5.0 || crashbreaker armed)   [0x001189AB]
 //              && veh+0xBC > 1.0        (speed, the vel 4-vector's w lane)
 //              && |h| + |v| > 0.5       [0x00118A0D, 0x003B1684]
 //            veh+0x1530 is the CRASH CLOCK (FUN_0011BE50 @0x0011BE98).
+//            veh+0xC0 is the UNIT TRAVEL DIRECTION and veh+0xB0 the
+//            VELOCITY -- the integrator FUN_00109560 advances position by
+//            `frame.pos += veh+0xB0 * dt` and reseeds +0xC0 from the frame's
+//            row2 when the body sleeps, so measuring the yaw error off +0xC0
+//            and rotating +0xB0 are the same vector.  FUN_00013C60 (which
+//            Ghidra decompiles to an empty body) is dot3: MULPS then two
+//            SHUFPS/ADDSS folds @0x00013C69..0x00013C88.            [C]
 //
 //            The direction is SCREEN-RELATIVE.  veh+0x1410 holds the camera
 //            orientation as a packed quaternion (FUN_00117240 @0x0011867F);
@@ -855,6 +974,36 @@ void b3_wreck_set_world_resolve(B3ObbPlaneFn narrow_phase,
 
 int b3_wreck_world_contact(B3WreckState* w, const float hit_pos[3],
                            const float hit_n[3]);
+
+// ---------------------------------------------------------------------------
+// THE SAME PASS, over the SOUP -- which is what FUN_00122D00 actually hands
+// FUN_00107950 / FUN_00109EA0, and what a live caller must use.
+//
+// `b3_wreck_world_contact` above resolves ONE plane.  Calling it once per
+// gathered polygon is NOT retail: retail's narrow phase walks the whole soup
+// itself, sums the clipping faces' normals, averages their clipped centroids
+// and emits a SINGLE contact, and FUN_00109EA0 runs exactly once per frame on
+// it (@0x00122F81).  Resolving per polygon instead applies N impulses, N
+// friction damps and N push-outs per frame -- measured on a wall-adjacent
+// wreck, that launched the body over a kilometre off the track.
+//
+// It also fixes the geometry: the plane form has to fabricate a square around
+// the point it is given, so handing it a triangle's first vertex loses every
+// face bigger than ~6 m (78.7% of the near-vertical faces on the shipped
+// US_C3_V1 soup).  This form clips the real triangles.
+//
+// `polys` are the gathered world triangles in HARNESS space; the chirality
+// mirror to game space happens inside.  Install the narrow phase with
+// b3_wreck_set_world_soup (same reason the pair above is installed rather
+// than linked); without it this returns 0 and does nothing.
+typedef int (*B3ObbSoupFn)(const struct B3RigidBody* rb,
+                           const float bbmin[3], const float bbmax[3],
+                           const B3WorldPoly* polys, int npoly,
+                           B3WorldContact* out);
+void b3_wreck_set_world_soup(B3ObbSoupFn soup_phase);
+
+int b3_wreck_world_contact_soup(B3WreckState* w, const B3WorldPoly* polys,
+                                int npoly);
 
 // ---------------------------------------------------------------------------
 // THE SUBSTEP HOOK -- `FUN_0011AEF0` where FUN_0011BE50 actually calls it.

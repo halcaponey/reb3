@@ -38,6 +38,11 @@ Usage: python3 tools/validate_crash_traj.py [--quick]
 import importlib.util
 import math
 import os
+
+# The drivers link burnout3_backend.c; pin them to the RE path so a
+# flipped build/backends.cfg cannot change what this suite measures.
+os.environ['B3_BACKENDS'] = '/dev/null'
+
 import struct
 import subprocess
 import sys
@@ -164,7 +169,9 @@ int main(int argc, char** argv) {
 
     if (!strcmp(argv[1], "traj")) {
         int n = atoi(argv[3]);
-        B3RigidBody rb; memset(&rb, 0, sizeof rb);
+        B3RigidBody rb; float rb__frame_store[4][4];
+    memset(&rb, 0, sizeof rb);
+    b3_rigid_body_bind_frame(&rb, rb__frame_store);
         read_frame(rb.frame);
         char k[40];
         for (int i = 0; i < 4; i++) {
@@ -214,7 +221,9 @@ int main(int argc, char** argv) {
        between two rendered frames, which is the thing the eye sees. */
     if (!strcmp(argv[1], "seq")) {
         int n = atoi(argv[3]);
-        B3RigidBody rb; memset(&rb, 0, sizeof rb);
+        B3RigidBody rb; float rb__frame_store[4][4];
+    memset(&rb, 0, sizeof rb);
+    b3_rigid_body_bind_frame(&rb, rb__frame_store);
         read_frame(rb.frame);
         char k[40];
         for (int i = 0; i < 4; i++) {
@@ -286,7 +295,9 @@ int main(int argc, char** argv) {
     /* FUN_00123FD0 @0x001248EA scrape differential: report the force and
        torque the scrape adds to the accumulators */
     if (!strcmp(argv[1], "scrape")) {
-        B3RigidBody rb; memset(&rb, 0, sizeof rb);
+        B3RigidBody rb; float rb__frame_store[4][4];
+    memset(&rb, 0, sizeof rb);
+    b3_rigid_body_bind_frame(&rb, rb__frame_store);
         read_frame(rb.frame);
         char k[40];
         for (int i = 0; i < 4; i++) {
@@ -359,6 +370,10 @@ def build_driver(defines=(), tag=''):
     r = subprocess.run(['cc', '-O2', '-Isrc'] + list(defines)
                        + ['-o', exe, src,
                           'src/burnout3_crash.c', 'src/burnout3_vehicle_sim.c',
+                          # burnout3_crash.c carries the crash=retail switch;
+                          # B3_BACKENDS is pinned to /dev/null so this always
+                          # measures the RE path.
+                          'src/burnout3_backend.c', 'src/burnout3_emu.c',
                           '-lm'], cwd=_root, capture_output=True, text=True)
     if r.returncode != 0:
         print(r.stderr)
@@ -959,7 +974,8 @@ def _c_omega2_limit():
                 ' return -1; }\n'
                 'int main(void){printf("%.9g\\n", B3_SLEEP_OMEGA2_LIMIT);'
                 'return 0;}\n')
-    r = subprocess.run(['cc', '-O2', '-Isrc', '-o', exe, src, '-lm'],
+    r = subprocess.run(['cc', '-O2', '-Isrc', '-o', exe, src,
+                        'src/burnout3_backend.c', 'src/burnout3_emu.c', '-lm'],
                        cwd=_root, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(r.stderr)
@@ -978,7 +994,9 @@ def _c_sleep(exe, over):
             f.write(SLEEP_DRIVER_C)
         r = subprocess.run(['cc', '-O2', '-Isrc', '-o', exe2, src,
                             'src/burnout3_crash.c',
-                            'src/burnout3_vehicle_sim.c', '-lm'],
+                            'src/burnout3_vehicle_sim.c',
+                            'src/burnout3_backend.c', 'src/burnout3_emu.c',
+                            '-lm'],
                            cwd=_root, capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(r.stderr)
@@ -1010,7 +1028,9 @@ int b3_ground_probe(float x, float y, float z, float* h, float n[3]) {
 }
 int main(int argc, char** argv) {
     if (argc < 11) return 2;
-    B3RigidBody rb; memset(&rb, 0, sizeof rb);
+    B3RigidBody rb; float rb__frame_store[4][4];
+    memset(&rb, 0, sizeof rb);
+    b3_rigid_body_bind_frame(&rb, rb__frame_store);
     rb.frame[0][0] = rb.frame[1][1] = rb.frame[2][2] = rb.frame[3][3] = 1.0f;
     for (int i = 0; i < 3; i++) rb.inv_inertia_body[i][i] =
         rb.inv_inertia_world[i][i] = 0.001f;

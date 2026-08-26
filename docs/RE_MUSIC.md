@@ -1,5 +1,22 @@
 # EA TRAX — the music system (Burnout 3: Takedown, Xbox)
 
+> **Status (2026-08-22): the extraction is C now.** Where this document says
+> `python3 tools/extract_eatrax.py` or `tools/extract_rws.py`, the live
+> implementations are `tools/cextract/cx_audio_eatrax.c` and `cx_audio_rws.c`;
+> the Python paths are forwarding shims onto the immutable archive and produce
+> identical bytes by gate.
+>
+> **Status (2026-08-25): there is no manual step left, anywhere.** EA TRAX used
+> to need one, because its stage forked `ffmpeg` for the WMA streams and was
+> therefore kept out of the game link (`CX_SKIP`). The WMA now decodes **in
+> process**, so `build/music/track_NN.wav` materialises out of the disc on
+> demand exactly like track geometry and car paint — and, for the first time,
+> **music exists on the web**, where there was no process to fork and no
+> browser codec to delegate to. See §2.1 for the decoder and its gate.
+>
+> One song at a time, not 44: see §2.2. The old "EA TRAX music unavailable
+> until extracted" notice is gone with the condition that produced it.
+
 Module: `src/burnout3_music.c` / `.h` (playback + selection),
 `src/burnout3_hud.c` (the now-playing banner, also RE_FRONTEND §6.9).
 Tools: `tools/extract_eatrax.py` (banks → `build/music`),
@@ -128,11 +145,123 @@ Those are the three shortest tracks on the soundtrack and they land in
 exactly the three slots the table puts them in. Every other entry decodes
 to 1:35–4:16, i.e. all 44 are full songs.
 
-`tools/extract_eatrax.py` carves each entry out as a standalone ASF and
-lets `ffmpeg` write `build/music/track_NN.wav` at **44100 Hz mono s16** —
-the harness's device format, so playback needs no resampling — plus
-`build/music/eatrax.txt`, the manifest the validator cross-checks. 44/44
-decode, peak 24413–32768, no silent entries.
+The `eatrax` stage carves each entry out as a standalone ASF and decodes it
+to `build/music/track_NN.wav` at **44100 Hz mono s16** — the harness's device
+format, so playback needs no resampling — plus `build/music/eatrax.txt`, the
+manifest the validator cross-checks. 44/44 decode, peak 24413–32768, no silent
+entries.
+
+---
+
+### 2.1 The decoder [C: the codec identification]
+
+**What the disc actually contains**, measured from the entries' own ASF
+headers (the `WAVEFORMATEX` inside each Stream Properties object) rather than
+from the XWB format dword, which only says "tag 2 = WMA" and stops:
+
+| | |
+|---|---|
+| codec | `wFormatTag 0x0161` — **WMA v2, standard profile** |
+| channels | 2 |
+| bitrate | 160 kb/s **CBR** |
+| block align | 7431 B @44.1 kHz · 6827 B @48 kHz (one superframe, ~0.37 s) |
+| extradata | 10 bytes, `flags2 = 0x000F` (exp-VLC + bit reservoir + variable block length) |
+
+**All 885 payloads in all 33 banks are this**, with only the sample rate
+varying: 44100 Hz for the 44 EA TRAX and the 34 `ovid/movie.xwb` entries (78
+payloads), 48000 Hz for every DJ / crash-FM / per-track bank (807). Not one is
+WMA Pro, Lossless or Voice.
+
+That single fact chose the library. **Rockbox's `libwma`** decodes exactly
+WMA v1/v2 standard — the set this disc contains and nothing more — in fixed
+point, with no allocator, no threads, no I/O and no build system of its own.
+It is ~10 k lines vendored by `tools/fetch_wma.sh` into `third_party/`
+(gitignored, pinned by commit and sha256, LGPL 2.1-or-later, unmodified). The
+alternative, a `--disable-everything --enable-decoder=wmav2` libavcodec, would
+have needed its own `configure` run inside `emconfigure` for the web and a
+second one natively, both pinned — for a decoder that handles a superset of
+what is here.
+
+**WebCodecs is not an option on the web.** The browser decode API's codec
+registry is a closed list and `wmav2` is not on it; no shipping engine exposes
+a WMA decoder. Compiling the same C to wasm is the only route, which is why
+"fixed point, no dependencies" was the requirement and not merely a nicety.
+
+The adapter is this project's own code, in `tools/cextract/wma/`: a shim for
+the three Rockbox firmware headers the vendored files expect (`platform.h`,
+`codecs.h`, `codecs/lib/codeclib.h`), an **in-memory ASF demuxer** (`b3_wma.c`
+— Rockbox's own `libasf/asf.c` is a *streaming* reader written against its
+codec callback table, and our payloads arrive whole), and the decode driver.
+`b3_wma_stub.c` is linked instead when `third_party/` is absent, so a fresh
+clone still builds and reports the one command that fixes it.
+
+**Two conventions `libwma` does not document**, both found by one full-file
+cross-correlation against ffmpeg and both exact:
+
+* **Polarity is inverted.** Rockbox's fixed-point IMDCT carries the opposite
+  sign to FFmpeg's float one. Inaudible on a DAP; against an oracle it is the
+  difference between +78 dB and −2 dB, and it matters here because this engine
+  mixes music with crash beds and engine loops decoded by something else.
+* **4096 samples of priming**, exactly `2 × frame_len`: one frame of MDCT
+  overlap latency, one frame dropped by `wma_decode_superframe_init()`'s
+  `nb_frames--` on the first packet. FFmpeg discards it; so do we, so the
+  output starts on the same sample.
+
+**The gate** is `tools/validate_wma.py`, and its oracle rule is deliberately
+*not* the byte-identity every other stage uses — the archived Python shelled
+out to `ffmpeg` too, so there was never a reproducible byte string to compare
+against. It runs the real stage twice, once in process and once with
+`B3_FFMPEG=1` (the escape hatch the shipping code still carries), and scores
+the 44 pairs:
+
+| | bar | measured |
+|---|---|---|
+| SNR | ≥ 40 dB | **58.4 – 79.9 dB**, median 78.2 |
+| correlation | ≥ 0.999 | **1.000000** on all 44 |
+| duration | ±100 ms | **−46.4 ms**, consistently |
+| clipping | none introduced | **0 tracks** |
+
+The −46.4 ms is one 2048-sample frame: FFmpeg flushes its decoder at end of
+stream and emits the final MDCT overlap, `libwma` has no flush entry point and
+stops when the packets do. It is the last frame of a three-minute song and it
+is reported rather than hidden. Spot checks across the 48 kHz DJ banks and the
+`Movie` bank score 72.2–80.7 dB on the same terms.
+
+---
+
+### 2.2 One song at a time — why music is not a "family"
+
+Every other asset family in `src/burnout3_isodata.c` materialises whole,
+because the families are cheap and their members are read together. Music is
+the one family where that is exactly wrong: all 44 songs is **722 MB** of
+44.1 kHz mono s16 and **22.7 s** of decoding, and the game plays *one*, chosen
+by a shuffle, moving on three minutes later.
+
+So the unit is a **song**, not the family. `map_lookup()` pulls the index out
+of `build/music/track_NN.wav` and keys the unit `T:eatrax:<n>`, so it is
+stamped, memoised and retried like every other unit;
+`cx_extract_eatrax_one()` decodes just that song, touching neither the
+manifest nor `Globalus.bin`.
+
+There was a second trap, and it is the more interesting one.
+`b3_music_init()` decided which songs were playable **by opening all 44** —
+free when the stage was not linked and the answer was always "no", and a
+722 MB boot once it was. **Asking by opening is the extraction.** So music
+borrows the answer the track selector already uses for the same problem:
+`b3_iso_music_available()` answers off the two wave banks (a memoised stat),
+and returns −1 in build mode to mean "probe the tree the way you always did".
+
+Measured, offscreen, disc-only, 219 s of autodrive:
+
+```
+[Burnout3] REAL audio: 0 engine loops, EA TRAX 44/44 tracks
+[Burnout3] iso: 20       eatrax -> music/track_20.wav  (0.58 s)
+[Burnout3] iso: 41       eatrax -> music/track_41.wav  (0.71 s)
+```
+
+44 reported playable with **nothing decoded at boot**; two songs decoded
+because two songs played. 35 MB of cache instead of 722 MB, and the 0.6 s
+lands inside `b3_music_pump()`'s 11.9 s read-ahead ring, so it is never heard.
 
 The string ids in the C table are the game's; the *text* is ASCII-folded
 (U+2019 → `'`) because the recovered GlobalFont only carries glyphs

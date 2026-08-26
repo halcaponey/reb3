@@ -6,14 +6,19 @@
 // on the same flat-plane ground, and prints one JSON object per frame.
 // validate_port.py compares this against the real-code trajectory.
 //
-// Build: cc -O2 -Isrc -o build/dump_traj tools/dump_traj.c \
+// Build: cc -O2 -Isrc -o build/dump_traj tools/dump_traj.c
 //        src/burnout3_vehicle_sim.c -lm
+// (no trailing backslash: it would splice the next line into this comment)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include "burnout3_vehicle_sim.h"
-#include "burnout3_car_physics.h"
+// The per-car VDB tuning is a RUNTIME asset now: burnout3_car_physics.h is
+// gone and this loads build/cars/car_physics.bin at first use instead.  Same
+// numbers -- the header's "%.9g" round-tripped a float, so the asset carries
+// exactly the bits its literals compiled to (proof: the purge-2 parity dump).
+#include "burnout3_car_physics_runtime.h"
 // The relocated FUN_0011AEF0 slot in b3_vehicle_step_full's substep calls
 // through B3VehicleFull.chassis_resolve, and the response it points at
 // (b3_crash_response) lives in burnout3_crash.c.  The Makefile rule for this
@@ -145,7 +150,7 @@ static void load_state(B3VehicleFull* v, const char* path) {
         w->cur_len = g_kv_val(buf, key, w->cur_len);
         snprintf(key, sizeof key, "w%d_contact", i);
         w->contact = (unsigned char)g_kv_val(buf, key, 0);
-        w->frame_y = w->prev_len;
+        v->wheel_frame_y[i] = w->prev_len;
     }
     B3EngineTransmission* t = &v->trans;
     t->omega = g_kv_val(buf, "t_omega", t->omega);
@@ -235,8 +240,10 @@ static int wcontact_mode(const char* path) {
     fclose(f);
     if (n < 77) { fprintf(stderr, "wcontact: got %d floats, need 77\n", n);
                   return 1; }
-    B3RigidBody rb;
+    B3RigidBody rb; float rb__frame_store[4][4];
     memset(&rb, 0, sizeof rb);
+    /* bind AFTER the memset -- it would zero the frame pointer */
+    b3_rigid_body_bind_frame(&rb, rb__frame_store);
     int k = 0;
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 4; c++) rb.frame[r][c] = buf[k++];
@@ -305,8 +312,10 @@ static int class7_mode(const char* path) {
     fclose(f);
     if (n < 87) { fprintf(stderr, "class7: got %d floats, need 87\n", n);
                    return 1; }
-    B3RigidBody rb;
+    B3RigidBody rb; float rb__frame_store[4][4];
     memset(&rb, 0, sizeof rb);
+    /* bind AFTER the memset -- it would zero the frame pointer */
+    b3_rigid_body_bind_frame(&rb, rb__frame_store);
     int k = 0;
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 4; c++) rb.frame[r][c] = buf[k++];
@@ -503,9 +512,16 @@ int main(int argc, char** argv) {
     }
     B3PhysicsConfig cfg;
     b3_physics_defaults(&cfg);
-    for (int i = 0; i < 64; i++)
-        b3_config_set_by_offset(&cfg, B3_CARPARAMS_COMPCAR1[i].offset,
-                                B3_CARPARAMS_COMPCAR1[i].value);
+    {   /* COMPCAR1's 64 VDB overrides, out of build/cars/car_physics.bin */
+        const B3CarPhysics* pc = b3_car_physics_find("COMPCAR1");
+        if (!pc) {
+            fprintf(stderr, "build/cars/car_physics.bin carries no COMPCAR1\n");
+            return 1;
+        }
+        for (int i = 0; i < pc->n_params; i++)
+            b3_config_set_by_offset(&cfg, pc->params[i].offset,
+                                    pc->params[i].value);
+    }
 
     // Car1.bgv real geometry (same values emulate_pipeline.py seeds)
     static const float wheels_xz[4][2] = {

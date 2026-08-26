@@ -1,5 +1,15 @@
 # Burnout 3 gameplay rules — scoring, boost, takedowns, out-of-control
 
+> **Status (2026-08-22).** The "NOT integrated (no green case)" list in §10 is
+> stale and contradicted by this file's own §8: **slam boost transfer** is
+> closed `[C]` with a green suite, and **denied / lucky escape** is ported
+> (`FUN_00195CE0` in `src/burnout3_td_rules.c`). The earn-event half of the
+> integration has also moved out of `burnout3_full.c` into
+> `src/burnout3_score_events.c`, with its own differential suite executing air,
+> oncoming, drift, near-miss, rubbing and the crash gate against retail — so the
+> §5 events marked `[S logic]` are no longer un-executed. The parameter tables,
+> object model and address ledgers are correct as written.
+
 Recovered 2026-08-10 from the analyzed `burnout3.elf` (addresses are the
 corrected VAs; `.text` = flat + 0x10000). Everything marked **[C]** is either
 execution-verified by a green differential case in `tools/validate_gameplay.py`
@@ -361,10 +371,32 @@ v+0x13E0/+0x13E4/+0x13E8 via FUN_00134710): **Steer Away Time 0.3 s**,
 
 ## 8. Open items — [S]/[?]
 
-* **Slam boost transfer**: exact executed quantities of FUN_001989A0
-  (`BarSizes[0]/(tier+1)` vs the stored 180-unit param; super-slam table
-  selection reads the VICTIM's crash/speed state) — needs a differential case
-  with the FX call environment; NOT integrated.
+* ~~**Slam boost transfer**~~ — **CLOSED [C]**, tools/validate_takedown_score.py
+  (988/988). The whole of FUN_001989A0's score half now runs under Unicorn
+  with FUN_00197F90 and FUN_0019A050 live, and src/burnout3_td_rules.c
+  reproduces it. The executed quantities:
+  * attacker gain `= D[0x3F72E4]/(tier+1) × (mult+bonus) × ctx_vtable[0xAC]`,
+    into +0x11D8 (earned) and +0x11D4 (meter, clamped to +0x11D0) — and
+    **suppressed entirely** when FUN_00017310 (crash party) is true.
+  * victim loss `= D[0x3F72E4]/(tier+1) × mult` — **no bonus, no context
+    scale** — floored at 0, and skipped whole when either peg flag
+    (+0x11EC/+0x11ED) is set; on reaching 0 while +0x11EE and not +0x11F1 it
+    raises the forced min-burn stop +0x11EF.
+  * the parameter at 0x003F73EC is NOT the boost quantum: it is the per-slam
+    energy accumulated into the attacker's +0x1588 and the victim's +0x1594.
+    The quantum is 0x003F72E4 (240 compiled).
+  * super-slam selection is `victim.respawning(+0x18FB) || clock <
+    victim+0x1410 + 3.0 || victim_speed × 2.2369363 < 70`, both boundaries
+    STRICT; the victim already being WRECKED (+0x18FA) is irrelevant here.
+  * `Slam Type BP[type] / Super Slam Type BP[type] + Burning Slam Extra`
+    lands in +0x111C **and +0x1180** (the aggressive subtotal), never
+    +0x117C (takedown-only).
+  * the type is FUN_00197F90's geometry, 0 glance / 1 rear / 2,3 the two
+    sides; it is the ONLY input to the message ladder DAT_003A4B18, indexed
+    `type*4 + cheap + 2*burning`.
+  * the slam `strength` argument is consumed by exactly one thing: the AI
+    victim's grudge `+0x23E0 = min(+0x23E0 + (+0x23F0)×strength, +0x23F4)`,
+    and only when the victim is class 1 and the attacker class 0.
 * **+0x11F1 writer** (boost ramp-done): consumed by the transmission and by
   FUN_0017A480 (+0x56 echo), set somewhere in the input stage (0x118xxx)
   — [?].

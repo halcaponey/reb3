@@ -8,10 +8,10 @@ makes every address a file offset. Section deltas differ per section, so all
 absolute data references (float constants, strings, vtables, jump tables)
 resolve to the wrong bytes. This rebuilds the real VA space instead.
 """
+import struct, sys, os
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 from b3_paths import game_path, game_root  # noqa: E402
-import struct, sys, os
 
 XOR_EP = {'retail': 0xA8FC57AB, 'debug': 0x94859D4B, 'chihiro': 0x40B5C16E}
 XOR_KT = {'retail': 0x5B6D40B6, 'debug': 0xEFB1F152, 'chihiro': 0x2290059D}

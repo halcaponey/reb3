@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "burnout3_td_rules.h"
+#include "burnout3_backend.h"
+#include "burnout3_emu.h"
 #include "burnout3_crash.h"
 
 #include <math.h>
@@ -116,9 +118,16 @@ void b3_td_reset(B3TdRules* R, int ncars)
         c->recover_at = -1.0f;
         c->shunt_victim_time = -1.0f;
         c->view_dist2 = -1.0f;                /* ladder input unknown */
+        /* +0x1410 == score+0x340.  The score reset FUN_00192EA0 @0x00193020
+         * stores [0x003B16C0] == -1.0 there, NOT a far-past sentinel -- so
+         * for the first 2.0 s of a race every slam is a "Super Slam". [C] */
+        c->crash_stamp = -1.0f;
+        c->boost_size = 720.0f;               /* +0x11D0 bar 0 (RE_GAMEPLAY)*/
+        c->boost_mult = 1.0f;                 /* +0x11E4                    */
         b3_td_cause_none(&c->cause);
         for (j = 0; j < B3_TDR_MAX_CARS; j++) c->claim[j] = TDR_CLAIM_IDLE;
     }
+    b3_td_slam_params_defaults(&b3_td_slam_params);
 }
 
 void b3_td_rules_init(void) { /* legacy entry; state lives in the caller's B3TdRules */ }
@@ -128,6 +137,217 @@ void b3_td_set_car(B3TdRules* R, int slot, int cls, int grid)
     if (!tdr_valid(R, slot)) return;
     R->car[slot].cls = cls;
     R->car[slot].grid = grid;
+}
+
+void b3_td_set_frame(B3TdRules* R, int slot, const float m[4][4])
+{
+    if (!tdr_valid(R, slot)) return;
+    if (!m) { R->car[slot].frame_valid = 0; return; }
+    memcpy(R->car[slot].frame, m, sizeof R->car[slot].frame);
+    R->car[slot].frame_valid = 1;
+}
+
+/* ---------------------------------------------------------------------------
+ * THE SLAM SCORER -- FUN_001989A0's BP / boost / stat half.
+ * Header section 1b carries the recovery; every number here is executed
+ * retail (tools/validate_takedown_score.py).
+ * ------------------------------------------------------------------------- */
+B3TdSlamParams b3_td_slam_params = {
+    {20, 20, 20, 20}, {30, 30, 30, 30}, 15, 360.0f, 240.0f, 1.0f, 0
+};
+
+void b3_td_slam_params_defaults(B3TdSlamParams* p)
+{
+    static const B3TdSlamParams d = {
+        {20, 20, 20, 20},   /* 0x003F7448 */
+        {30, 30, 30, 30},   /* 0x003F7458 */
+        15,                 /* 0x003F7444 */
+        360.0f,             /* 0x003F73EC */
+        240.0f,             /* 0x003F72E4 */
+        1.0f,               /* game-mode vtable +0xAC in a normal race */
+        0                   /* FUN_00017310 */
+    };
+    if (p) *p = d;
+}
+
+/* FUN_000FF160 @0x000FF160: the angle in DEGREES between two 3-vectors.
+ * Retail normalises both with RSQRTSS and takes atan2(d, sqrt(1-d*d)) on the
+ * dot, i.e. asin, then (pi/2 - asin) * rad2deg == acos.  RSQRTSS is a 12-bit
+ * approximation, so the port uses the exact acos; the differential's cases
+ * stay clear of the 45/135/30/25 edges by more than that error. [GLUE] */
+static float tdr_angle_deg(const float a[3], const float b[3])
+{
+    double da = (double)a[0] * a[0] + (double)a[1] * a[1] + (double)a[2] * a[2];
+    double db = (double)b[0] * b[0] + (double)b[1] * b[1] + (double)b[2] * b[2];
+    double d;
+    if (da <= 0.0 || db <= 0.0) return 0.0f;
+    d = ((double)a[0] * b[0] + (double)a[1] * b[1] + (double)a[2] * b[2])
+        / (sqrt(da) * sqrt(db));
+    if (d > 1.0) d = 1.0;
+    if (d < -1.0) d = -1.0;
+    return (float)(acos(d) * 57.29577951308232);
+}
+
+static float tdr_dot3(const float a[3], const float b[3])
+{
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+/* retail's sign extract, verbatim: (bits & 0xBF800000) | 0x3F800000 maps any
+ * float to +-1.0f (0x00198126..0x0019815A). */
+static float tdr_signf(float v)
+{
+    unsigned u;
+    float out;
+    memcpy(&u, &v, 4);
+    u = (u & 0xBF800000u) | 0x3F800000u;
+    memcpy(&out, &u, 4);
+    return out;
+}
+
+int b3_td_slam_type(const float am[4][4], const float vm[4][4])
+{
+    float sep[3], h, dot0, dot1, side;
+    int k;
+    if (!am || !vm) return B3_TDR_SLAM_GLANCE;
+
+    /* 0x00197FAB: FUN_000FF160(victim.at, attacker.at) -- row 2 of each. */
+    h = tdr_angle_deg(vm[2], am[2]);
+
+    if (h < B3_TDR_TYPE_HEADING_LO) {                    /* 0x00197FC1 */
+        /* 0x00197FCF: sep = victim.pos - attacker.pos, then the angle
+         * against the ATTACKER's at axis. */
+        for (k = 0; k < 3; k++) sep[k] = vm[3][k] - am[3][k];
+        if (tdr_angle_deg(sep, am[2]) < B3_TDR_TYPE_REAR_CONE)   /* 0x00197FF6 */
+            return B3_TDR_SLAM_REAR;                     /* 0x00198009 */
+        return B3_TDR_SLAM_GLANCE;                       /* 0x0019817F */
+    }
+    if (h >= B3_TDR_TYPE_HEADING_HI) return B3_TDR_SLAM_GLANCE;  /* 0x0019801F */
+
+    /* 0x00198031: sep = attacker.pos - victim.pos, NORMALISED (FUN_00011640). */
+    for (k = 0; k < 3; k++) sep[k] = am[3][k] - vm[3][k];
+    {
+        double n = sqrt((double)sep[0] * sep[0] + (double)sep[1] * sep[1]
+                        + (double)sep[2] * sep[2]);
+        if (n > 0.0) for (k = 0; k < 3; k++) sep[k] = (float)(sep[k] / n);
+    }
+    dot0 = tdr_dot3(am[0], vm[2]);      /* attacker RIGHT . victim AT   */
+    dot1 = tdr_dot3(sep, vm[0]);        /* sep_hat       . victim RIGHT */
+
+    /* 0x001980A9..0x00198118: acos(dot0) in degrees, inside 25 deg of either
+     * pole.  Retail spells acos as (pi/2 - asin) to reuse FPATAN. */
+    {
+        double d = dot0;
+        double deg;
+        if (d > 1.0) d = 1.0;
+        if (d < -1.0) d = -1.0;
+        deg = acos(d) * 57.29577951308232;
+        if (!(deg < B3_TDR_TYPE_SIDE_CONE
+              || deg > 180.0 - B3_TDR_TYPE_SIDE_CONE))
+            return B3_TDR_SLAM_GLANCE;                   /* 0x00198118 */
+    }
+    side = tdr_signf(dot1) - tdr_signf(dot0);
+    return (side == 0.0f) ? B3_TDR_SLAM_SIDE_A + 1       /* 0x00198169 -> 3 */
+                          : B3_TDR_SLAM_SIDE_A;          /* 0x00198174 -> 2 */
+}
+
+int b3_td_slam_cheap(const B3TdRules* R, float clock, int victim)
+{
+    const B3TdCar* V;
+    if (!tdr_valid(R, victim)) return 0;
+    V = &R->car[victim];
+    if (V->respawning) return 1;                         /* 0x00198AC6 */
+    if (clock < V->crash_stamp + B3_TDR_CHEAP_CRASH_S) return 1;  /* 0x00198AF6 */
+    if (V->speed_ms * B3_TDR_MPH < B3_TDR_CHEAP_MPH) return 1;    /* 0x00198B13 */
+    return 0;
+}
+
+int b3_td_slam_bp(int type, int cheap, int burning)
+{
+    const B3TdSlamParams* P = &b3_td_slam_params;
+    int bp;
+    if (type < 0 || type > 3) type = 0;
+    bp = cheap ? P->super_bp[type] : P->slam_bp[type];   /* 0x00198B63/6C */
+    if (burning) bp += P->burning_bp;                    /* 0x00198B7B    */
+    return bp;
+}
+
+/* FUN_001989A0's second half, in retail's own order. */
+static void tdr_slam_score(B3TdRules* R, float clock, int attacker, int victim,
+                           float strength, int kind)
+{
+    const B3TdSlamParams* P = &b3_td_slam_params;
+    B3TdCar* A = &R->car[attacker];
+    B3TdCar* V = &R->car[victim];
+    int type, cheap, bp;
+    float g;
+
+    /* the type: retail computes it from the two pv+0x204 matrices.  Copied
+     * out first: B3TdCar is packed, so its members are not safely aliasable
+     * as float[4][4]. */
+    type = B3_TDR_SLAM_GLANCE;
+    if (A->frame_valid && V->frame_valid) {
+        float am[4][4], vm[4][4];
+        memcpy(am, A->frame, sizeof am);
+        memcpy(vm, V->frame, sizeof vm);
+        type = b3_td_slam_type((const float (*)[4])am, (const float (*)[4])vm);
+    }
+    cheap = b3_td_slam_cheap(R, clock, victim);
+
+    A->slam_kind    = type;                    /* +0x11F4 @0x00198B4x */
+    A->slam_cheap   = (unsigned char)cheap;    /* +0x11F8             */
+    A->slam_burning = A->boosting;             /* +0x11F9, read via +0x133C */
+
+    bp = b3_td_slam_bp(type, cheap, A->slam_burning);
+    A->bp            += bp;                    /* +0x111C @0x0019A31B */
+    A->bp_aggressive += bp;                    /* +0x1180             */
+
+    A->slams_made  += 1;                       /* +0x1174 @0x00198B91 */
+    A->slam_energy += P->slam_energy;          /* +0x1588             */
+    A->last_slam_time = clock;                 /* +0x158C             */
+    A->slam_type   = kind;                     /* +0x159C             */
+
+    /* the attacker's boost gain, suppressed entirely in crash party
+     * (FUN_00017310 @0x00198C0x). */
+    if (!P->crash_party) {
+        g = P->boost_quantum / (float)(A->boost_tier + 1);
+        g *= (A->boost_bonus + A->boost_mult);
+        g *= P->boost_scale;                   /* ctx vtable +0xAC    */
+        A->boost_earned += g;                  /* +0x11D8             */
+        A->boost_meter  += g;                  /* +0x11D4             */
+        if (A->boost_meter > A->boost_size) A->boost_meter = A->boost_size;
+    }
+    A->last_slam_kind = type;                  /* +0x15A0             */
+    A->aggressor      = victim;                /* +0x16BC             */
+    A->aggressor_time = clock;                 /* +0x16C0             */
+
+    /* -- the victim side ------------------------------------------------- */
+    V->times_slammed  += 1;                    /* +0x1590             */
+    V->slammed_energy += P->slam_energy;       /* +0x1594             */
+    V->slam_time       = clock;                /* +0x1598 THE OOC STAMP */
+    V->slam_type       = kind;                 /* +0x159C             */
+
+    if (!V->boost_peg_a && !V->boost_peg_b) {  /* 0x00198CFx          */
+        float d = P->boost_quantum / (float)(V->boost_tier + 1);
+        d *= V->boost_mult;                    /* NO bonus, NO scale  */
+        V->boost_meter -= d;
+        if (V->boost_meter <= 0.0f) {
+            V->boost_meter = 0.0f;
+            if (V->boosting && !V->boost_ramp_done)
+                V->boost_forcestop = 1;        /* +0x11EF             */
+        }
+    }
+    V->last_slam_kind = type;                  /* +0x15A0             */
+    V->aggressor      = attacker;              /* +0x16BC             */
+    V->aggressor_time = clock;                 /* +0x16C0             */
+
+    /* the AI's grudge: only an AI victim slammed by a HUMAN. */
+    if (V->cls == 1 && A->cls == 0) {          /* 0x00198D5x          */
+        float a = V->ai_aggression + V->ai_aggr_step * strength;
+        if (a > V->ai_aggr_cap) a = V->ai_aggr_cap;
+        V->ai_aggression = a;                  /* +0x23E0             */
+    }
+    if (A->cls == 0) A->human_slam = 1;        /* +0x1B94 @0x00198D95 */
 }
 
 /* ---------------------------------------------------------------------------
@@ -170,30 +390,16 @@ void b3_td_contact(B3TdRules* R, float clock, float dt, int a, int b,
 /* ---------------------------------------------------------------------------
  * FUN_001989A0 -- the slam handler.  NO CRASH CALL EXISTS IN IT.
  *
- * Reproduced here: exactly the fields that drive the trigger flow.  The
- * boost transfer and the Slam/Super-Slam BP tables (0x003F7448 / 0x003F7458,
- * selected by FUN_00197F90 and the victim's crashed/70 mph test) are [S] in
- * docs/RE_GAMEPLAY.md 8 and deliberately left to the score module.
+ * Reproduced here in full: the trigger fields AND the BP / boost / stat
+ * consequences.  The Slam / Super-Slam tables (0x003F7448 / 0x003F7458), the
+ * type selector FUN_00197F90 and the boost transfer used to be [S] and left
+ * to "the score module"; they are now executed retail -- header section 1b
+ * and tools/validate_takedown_score.py.
  * ------------------------------------------------------------------------- */
 static void tdr_apply_slam(B3TdRules* R, float clock, int attacker, int victim,
                            float strength, int type)
 {
-    B3TdCar* A = &R->car[attacker];
-    B3TdCar* V = &R->car[victim];
-    (void)strength;
-
-    /* attacker side (iVar2 in the decompile, param_2's racecar) */
-    A->slams_made++;                       /* +0x1174 @0x00198C2F */
-    A->last_slam_time = clock;             /* +0x158C @0x00198C43 */
-    A->aggressor = victim;                 /* +0x16BC @0x00198CE2 */
-    A->aggressor_time = clock;             /* +0x16C0 @0x00198CDB */
-
-    /* victim side (iVar3, param_1's racecar) */
-    V->times_slammed++;                    /* +0x1590 */
-    V->slam_time = clock;                  /* +0x1598 -- THE OOC STAMP */
-    V->slam_type = type;                   /* +0x159C */
-    V->aggressor = attacker;               /* +0x16BC */
-    V->aggressor_time = clock;             /* +0x16C0 */
+    tdr_slam_score(R, clock, attacker, victim, strength, type);
 }
 
 /* FUN_00197BE0 -- the kind 5/6 gate in front of FUN_001989A0.
@@ -281,6 +487,20 @@ int b3_td_slam_report(B3TdRules* R, float clock, int kind,
 {
     if (!tdr_valid(R, attacker) || !tdr_valid(R, victim) || attacker == victim)
         return 0;
+
+    /* backends.cfg td_rules=retail: hand the game's OWN slam gate
+     * (FUN_00197BE0) our racecar bytes. B3TdCar is retail-shaped, so the cars
+     * scatter in at the racecar's own offsets and the verdict plus the mutated
+     * cars come back -- nothing converted. Unlike carcol this feature is
+     * STATEFUL, so the emulated world keeps the per-car score state between
+     * calls. A negative return means the sidecar is unavailable; fall through
+     * to the RE path rather than dropping the event. */
+    if (b3_backend_get(B3_FEAT_TD_RULES) == B3_BACKEND_RETAIL) {
+        int v = b3_emu_td_slam(clock, R->ncars, attacker, victim, strength,
+                               kind, R->car, sizeof R->car[0]);
+        if (v >= 0) return v;
+    }
+
     switch (kind) {                                /* FUN_00029F30 @0x00029F40 */
     case B3_TDR_KIND_RUB:
         tdr_contact_stamp(R, clock, attacker, victim);

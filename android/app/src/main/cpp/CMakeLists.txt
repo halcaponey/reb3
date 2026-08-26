@@ -106,6 +106,7 @@ set(B3_SRCS
     ${B3_SRC}/burnout3_full.c
     ${B3_SRC}/burnout3_vehicle_sim.c
     ${B3_SRC}/burnout3_trackmesh.c
+    ${B3_SRC}/burnout3_render.c
     ${B3_SRC}/burnout3_hud.c
     ${B3_SRC}/burnout3_collision.c
     ${B3_SRC}/burnout3_crash.c

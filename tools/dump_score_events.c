@@ -65,7 +65,6 @@ static void load_rec(B3CatRecord* r, int base, const float* minima)
     r->value      = gf(base + 0x00);
     r->clock      = gf(base + 0x04);
     r->prev_value = gf(base + 0x08);
-    r->minima     = minima;
     r->tier       = (signed char)img[base + 0x11];
     r->prev_tier  = (signed char)img[base + 0x12];
     r->count      = (signed char)img[base + 0x13];
@@ -95,10 +94,10 @@ static void load_state(B3ScoreEvents* s)
     load_rec(&s->onc,   ONC_REC, b3_score_params.onc_minima);
     load_rec(&s->drift, DRF_REC, b3_score_params.drift_minima);
     load_rec(&s->nm,    NM_REC,  b3_score_params.nm_minima);
-    s->air_active   = img[0x368];
-    s->onc_active   = img[0x384];
-    s->drift_active = img[0x3A0];
-    s->nm_active    = img[0x428];
+    s->air.active   = img[0x368];
+    s->onc.active   = img[0x384];
+    s->drift.active = img[0x3A0];
+    s->nm.active    = img[0x428];
     s->air_scored   = img[0x3C8];
     s->onc_scored   = img[0x3C9];
     s->drift_scored = img[0x3CA];
@@ -130,11 +129,10 @@ static void load_state(B3ScoreEvents* s)
     s->rub.value      = gf(RUB_REC + 0x00);
     s->rub.clock      = gf(RUB_REC + 0x04);
     s->rub.prev_value = gf(RUB_REC + 0x08);
-    s->rub.minima     = b3_score_params.rub_minima;
     s->rub.tier       = (signed char)img[0x575];
     s->rub.prev_tier  = (signed char)img[0x576];
     s->rub.count      = (signed char)img[0x577];
-    s->rub_active     = img[0x574];
+    s->rub.active     = img[0x574];
     s->rub_target     = gi(0x580);
 }
 
@@ -145,10 +143,10 @@ static void store_state(const B3ScoreEvents* s)
     store_rec(&s->onc,   ONC_REC);
     store_rec(&s->drift, DRF_REC);
     store_rec(&s->nm,    NM_REC);
-    img[0x368] = s->air_active;
-    img[0x384] = s->onc_active;
-    img[0x3A0] = s->drift_active;
-    img[0x428] = s->nm_active;
+    img[0x368] = s->air.active;
+    img[0x384] = s->onc.active;
+    img[0x3A0] = s->drift.active;
+    img[0x428] = s->nm.active;
     img[0x3C8] = s->air_scored;
     img[0x3C9] = s->onc_scored;
     img[0x3CA] = s->drift_scored;
@@ -182,7 +180,7 @@ static void store_state(const B3ScoreEvents* s)
     img[0x575] = (unsigned char)s->rub.tier;
     img[0x576] = (unsigned char)s->rub.prev_tier;
     img[0x577] = (unsigned char)s->rub.count;
-    img[0x574] = s->rub_active;
+    img[0x574] = s->rub.active;
     si(0x580, s->rub_target);
 }
 

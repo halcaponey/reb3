@@ -9,6 +9,8 @@
  * Anything marked GLUE is this harness's own, not recovered.
  */
 #include "burnout3_takedown.h"
+#include "burnout3_backend.h"
+#include "burnout3_emu.h"
 
 #include <math.h>
 #include <string.h>
@@ -396,6 +398,17 @@ static struct {
     int             aftertouch_on;
     int             aftertouch_engaged;  /* vehicle +0x4AC7 [C-disasm]     */
 
+    /* DAT_003EBFD0, the AUDIO TIME SCALE.  A LATCH, not a function of the
+     * divisor: retail writes it with the same instructions that write the
+     * divisor request DAT_0060EA24, but only in the crash / aftertouch
+     * family -- the takedown cinematic (0x0002795F div 5, 0x00027A3D div 1,
+     * 0x00027BCD) and the wreck instant (0x00025D5C div 5) have NO paired
+     * store, so those dilate time without pitching the audio.  Deriving it
+     * from `divisor != 1` (what this module used to do) pitched the
+     * cinematic too, which retail does not.  Full table in
+     * burnout3_sfx.h section 3.                                       [C] */
+    float           audio_rate;
+
     /* the player-crash window, RE_TAKEDOWN_FX section 9 */
     int             crash_credit;      /* racecar+0x16C8, 1 at event reset */
     int             crash_req_pending; /* FUN_00025CC0 fires once          */
@@ -441,6 +454,7 @@ void b3_tdfx_init(void)
     G.callout.phase  = 3;
     b3_cam_follow_init(&G.crashcam);
     G.crash_credit = 1;          /* FUN_00025AB0 @0x00025AE5 */
+    G.audio_rate   = B3_TDFX_PITCH_NORMAL;   /* DAT_003EBFD0 image init 1.0 */
 }
 
 /* FUN_00199350 "PostHudCallout" (ESI = callout slot, EDI = message id).
@@ -812,14 +826,19 @@ float b3_tdfx_update(float real_dt)
          * release only fires when the engaged flag veh+0x4AC7 was set. */
         if (G.aftertouch_on) {
             G.timer.requested   = B3_TDFX_DIV_AFTERTOUCH;
+            G.audio_rate        = B3_TDFX_PITCH_DILATED;   /* 0x001188B6 */
             G.aftertouch_engaged = 1;
         } else if (G.aftertouch_engaged) {
             G.timer.requested    = B3_TDFX_DIV_NORMAL;
+            G.audio_rate         = B3_TDFX_PITCH_NORMAL;   /* 0x001188DC */
             G.aftertouch_engaged = 0;
             G.crash_slowmo_on    = 0;
         }
 
-        /* 2. the wreck instant: one request, then it latches. */
+        /* 2. the wreck instant: one request, then it latches.  NOTE
+         * 0x00025D5C writes the divisor ONLY -- no DAT_003EBFD0 store --
+         * so the crash's own slow-mo does not pitch the audio.  Only
+         * aftertouch and the impact-hit machine do.                  [C] */
         if (G.crash_req_pending) {
             G.timer.requested   = B3_TDFX_DIV_AFTERTOUCH;   /* 0x00025D5C */
             G.crash_slowmo_on   = 1;
@@ -844,6 +863,9 @@ float b3_tdfx_update(float real_dt)
         if (G.crash_slowmo_on && !G.impact_active
             && G.timer.clock - G.crash_slowmo_start > B3_TDFX_IMPACT_LEN) {
             G.timer.requested = B3_TDFX_DIV_NORMAL;
+            /* the unmapped @0x00026xxx restores this stands in for DO pair
+             * the divisor with rate 1.0 (0x0002669F / 0x00026792)      [S] */
+            G.audio_rate      = B3_TDFX_PITCH_NORMAL;
             G.crash_slowmo_on = 0;
         }
 
@@ -853,15 +875,18 @@ float b3_tdfx_update(float real_dt)
             if (el > B3_TDFX_IMPACT_LEN) {
                 G.impact_active   = 0;
                 G.timer.requested = B3_TDFX_DIV_NORMAL;     /* 0x00026525 */
+                G.audio_rate      = B3_TDFX_PITCH_NORMAL;   /* 0x0002652F */
                 G.crash_slowmo_on = 0;   /* it took the crash's request */
             } else if (el > 0.0f) {
                 G.timer.requested = B3_TDFX_DIV_IMPACT;     /* 0x0002655B */
+                G.audio_rate      = B3_TDFX_PITCH_DILATED;  /* 0x00026561 */
             }
         }
 
         /* 4. crash-mode exit. */
         if (G.crash_end_pending) {
             G.timer.requested    = B3_TDFX_DIV_NORMAL;      /* 0x00119C24 */
+            G.audio_rate         = B3_TDFX_PITCH_NORMAL;    /* 0x00119C3A */
             G.crash_end_pending  = 0;
             G.crash_slowmo_on    = 0;
             G.impact_active      = 0;
@@ -900,10 +925,13 @@ float b3_tdfx_sim_dt(void) { return G.sim_dt; }
 
 int   b3_tdfx_divisor(void)   { return G.timer.divisor; }
 float b3_tdfx_timescale(void) { return 1.0f / (float)G.timer.divisor; }
+/* DAT_003EBFD0.  A LATCH written at the divisor-request sites, NOT
+ * `divisor != 1`: the takedown cinematic and the wreck instant request a
+ * divisor without touching this global, so they must not pitch the audio.
+ * See the write table in burnout3_sfx.h section 3.                    [C] */
 float b3_tdfx_pitch(void)
 {
-    return (G.timer.divisor == 1) ? B3_TDFX_PITCH_NORMAL
-                                  : B3_TDFX_PITCH_DILATED;
+    return G.audio_rate;
 }
 
 void b3_tdfx_status(B3TdfxStatus *out)
@@ -1211,10 +1239,54 @@ void b3_cam_follow_init(B3CamFollow *st)
     st->look_back = 0;
 }
 
+/* quat -> basis rows. The port computes the basis and derives the quat from
+ * it (cam_quat); retail stores the quat (camera state +0x20) and we need the
+ * basis for the renderer, so this is the same relation read the other way --
+ * a representation change, not a struct-shape conversion. */
+static void cam_basis_from_quat(const float q[4], float basis[9])
+{
+    float x = q[0], y = q[1], z = q[2], w = q[3];
+    basis[0] = 1.0f - 2.0f*(y*y + z*z); basis[1] = 2.0f*(x*y + z*w); basis[2] = 2.0f*(x*z - y*w);
+    basis[3] = 2.0f*(x*y - z*w); basis[4] = 1.0f - 2.0f*(x*x + z*z); basis[5] = 2.0f*(y*z + x*w);
+    basis[6] = 2.0f*(x*z + y*w); basis[7] = 2.0f*(y*z - x*w); basis[8] = 1.0f - 2.0f*(x*x + y*y);
+}
+
 void b3_cam_follow_update(B3CamFollow *st, const float car_rows[12],
                           float speed_ms, float boost_ramp, float dt,
                           B3TdfxCamera *out)
 {
+    /* backends.cfg camera=retail: FUN_0015E550 itself. Its interface is the
+     * car matrix and scalars -- the function's real signature -- and
+     * B3TdfxCamera already holds eye/quat/fov/pitch/yaw, so the result lands
+     * by assignment. The basis is derived from the quat for the renderer. */
+    if (b3_backend_get(B3_FEAT_CAMERA) == B3_BACKEND_RETAIL) {
+        float eye[3], q[4], fov, pit, yw;
+        if (b3_emu_cam(car_rows, speed_ms, boost_ramp, dt,
+                       st->yaw_deg, st->pitch_deg, st->look_back,
+                       eye, q, &fov, &pit, &yw)) {
+            float basis[9];
+            int i;
+            cam_basis_from_quat(q, basis);
+            for (i = 0; i < 3; i++) {
+                out->eye[i]   = eye[i];
+                out->right[i] = basis[i];
+                out->up[i]    = basis[3 + i];
+                out->fwd[i]   = basis[6 + i];
+                out->look[i]  = eye[i] + basis[6 + i] * 10.0f;
+                out->quat[i]  = q[i];
+            }
+            out->quat[3]   = q[3];
+            out->fov       = fov;
+            out->pitch_deg = pit;
+            out->yaw_deg   = yw;
+            out->active    = 1;
+            out->weight    = 1.0f;
+            st->pitch_deg  = pit;
+            st->yaw_deg    = yw;
+            return;
+        }
+    }
+
     float R[3], U[3], F[3], P[3];
     float focus[3], eye[3], off[3];
     float rot[9], tmp[9], basis[9];

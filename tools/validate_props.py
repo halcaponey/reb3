@@ -258,7 +258,12 @@ static void dump_rb(const B3RigidBody* rb) {
 }
 
 static void read_rb(B3RigidBody* rb) {
+    /* the 4x4 is not inline any more; hand this body storage. One slot
+     * per live body in the driver's cases is enough. */
+    static float store[8][4][4]; static int nstore = 0;
+
     memset(rb, 0, sizeof *rb);
+    b3_rigid_body_bind_frame(rb, store[nstore++ % 8]);  /* AFTER the memset */
     for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) rb->frame[r][c] = rf();
     for (int c = 0; c < 4; c++) rb->vel[c] = rf();
     for (int c = 0; c < 4; c++) rb->dir[c] = rf();
@@ -280,6 +285,8 @@ int main(void) {
             for (int c = 0; c < 4; c++) bbmin[c] = rf();
             unsigned s = ru(), i = ru();
             B3RigidBody rb; float mass, com, rad;
+            static float rb__frame_store[4][4];
+            b3_rigid_body_bind_frame(&rb, rb__frame_store);
             b3_props_test_body_setup(frame, bbmax, bbmin, s, i,
                                      &rb, &mass, &com, &rad);
             printf("mass %.9g\ncom %.9g\nradius %.9g\n", mass, com, rad);
@@ -326,7 +333,11 @@ def build_driver():
             "-o", exe, src,
             os.path.join(ROOT, "src", "burnout3_props.c"),
             os.path.join(ROOT, "src", "burnout3_vehicle_sim.c"),
-            os.path.join(ROOT, "src", "burnout3_collision.c")]
+            os.path.join(ROOT, "src", "burnout3_collision.c"),
+            # the retained draw path b3_props_draw() goes through; this driver
+            # never draws, but it links the whole module
+            os.path.join(ROOT, "src", "burnout3_render.c"),
+            os.path.join(ROOT, "src", "burnout3_trackmesh.c")]
            + sdl.stdout.split() + ["-lGL", "-lm"])
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode:

@@ -8,6 +8,8 @@
  */
 #include <stdlib.h>
 #include "burnout3_carcol.h"
+#include "burnout3_backend.h"
+#include "burnout3_emu.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -75,16 +77,15 @@ static void m_mul(float out[4][4], const float a[4][4], const float b[4][4]) {
 int b3_carcol_hull_from_record(const void* rec600, B3CarHull* out) {
     const unsigned char* r = (const unsigned char*)rec600;
     if (!r || !out) return 0;
-    memset(out, 0, sizeof(*out));
-    out->nverts  = r[0x18];
-    out->nplanes = r[0x19];
-    out->nedges  = r[0x1A];
-    if (out->nverts  <= 0 || out->nverts  > B3_HULL_MAX_VERTS)  return 0;
-    if (out->nplanes <= 0 || out->nplanes > B3_HULL_MAX_PLANES) return 0;
-    if (out->nedges  <= 0 || out->nedges  > B3_HULL_MAX_EDGES)  return 0;
-    memcpy(out->planes, r + 0x0A0, (size_t)out->nplanes * 16);
-    memcpy(out->verts,  r + 0x320, (size_t)out->nverts  * 16);
-    memcpy(out->edges,  r + 0x480, (size_t)out->nedges  * 2);
+    /* B3CarHull IS the retail 0x600 record now -- same size, every field at
+     * its own offset -- so this is a copy, not a decode. Copying the WHOLE
+     * record also keeps the parts we have not named (the relink data the
+     * game's own FUN_00122830 walks), which a field-by-field load dropped. */
+    _Static_assert(sizeof(*out) == 0x600, "hull struct must be the record");
+    memcpy(out, r, 0x600);
+    if (out->nverts  == 0 || out->nverts  > B3_HULL_MAX_VERTS)  return 0;
+    if (out->nplanes == 0 || out->nplanes > B3_HULL_MAX_PLANES) return 0;
+    if (out->nedges  == 0 || out->nedges  > B3_HULL_MAX_EDGES)  return 0;
     return 1;
 }
 
@@ -793,9 +794,300 @@ int b3_carcol_resolve_wreck(B3CarBody* A, B3CarBody* B, B3CarContact* out) {
 }
 
 int b3_carcol_resolve(B3CarBody* a, B3CarBody* b, B3CarContact* out) {
+    /* backends.cfg carcol=retail: run the GAME'S resolver over our bytes.
+     * B3RigidBody, B3CarHull and B3CarContact are all retail-shaped now, so
+     * nothing is converted -- the structs go in and come back as themselves.
+     * Retail picks its own arm (FUN_001121F0 / FUN_00113960) from the crashed
+     * flags, so the ordering below is not applied on this path. */
+    if (b3_backend_get(B3_FEAT_CARCOL) == B3_BACKEND_RETAIL &&
+        a->rb && b->rb && a->hull && b->hull) {
+        float ea[9], eb[9];
+        int ca = 0, cb = 0, i;
+        for (i = 0; i < 4; i++) { ea[i] = a->bbmax[i]; ea[4 + i] = a->bbmin[i]; }
+        ea[8] = a->mass;
+        for (i = 0; i < 4; i++) { eb[i] = b->bbmax[i]; eb[4 + i] = b->bbmin[i]; }
+        eb[8] = b->mass;
+        /* the frame pointers are HOST addresses; the reply would overwrite
+         * them with the emulator's, so carry them across */
+        float (*ka)[4] = a->rb->frame, (*kb)[4] = b->rb->frame;
+        if (b3_emu_carcol(a->rb, ea, a->hull, a->rb->frame, a->crashed, a->type,
+                          b->rb, eb, b->hull, b->rb->frame, b->crashed, b->type,
+                          out, a->rb, b->rb, &ca, &cb)) {
+            a->rb->frame = ka;
+            b->rb->frame = kb;
+            out->crash_a = ca;
+            out->crash_b = cb;
+            return out->hit;
+        }
+        a->rb->frame = ka;
+        b->rb->frame = kb;
+    }
+
     /* FUN_00111CD0's ordering + dispatch. */
     if (!a->crashed && !b->crashed)
         return b3_carcol_resolve_alive(a, b, out);
     if (!b->crashed) { B3CarBody* t = a; a = b; b = t; }
     return b3_carcol_resolve_wreck(a, b, out);
+}
+
+/* ==========================================================================
+ * FUN_0010FBC0 / DAT_0039AE50 -- the class map and the crash table.
+ * ======================================================================== */
+int b3_carcol_class(int type, int designated) {
+    switch (type) {
+    case 0: case 2: return 0;
+    case 1:         return 1;
+    case 3:         return 2;                    /* a live traffic car/prop */
+    case 4:         return designated ? 3 : 5;   /* +0x242B == DAT_0073BB8C */
+    default:        return 6;
+    }
+}
+
+/* DAT_0039AE50, read out of build/burnout3.elf; indexed [class_b*7 + class_a]
+ * exactly as FUN_00112E70 @0x0011303B (IMUL 7 on B's class) / @0x0011304E. */
+int b3_carcol_can_crash(int class_b, int class_a) {
+    static const unsigned char T[7][7] = {
+        {1,1,1,1,1,1,0},
+        {0,0,0,0,0,0,0},
+        {1,0,0,1,0,0,0},
+        {0,0,0,0,0,0,0},
+        {0,0,0,0,0,0,0},
+        {0,0,0,0,0,0,0},
+        {0,0,0,0,0,0,0},
+    };
+    if (class_b < 0 || class_b > 6 || class_a < 0 || class_a > 6) return 0;
+    return T[class_b][class_a];
+}
+
+/* --------------------------------------------------------------------------
+ * FUN_0010FCE0 -- closest points between two 2-D segments, [a0,a1] and
+ * [b0,b1].  Returns the distance.
+ *
+ * Verbatim, including the two things a clean-room version would not do:
+ *  - the degeneracy test @0x0010FD5F is |dot(d1,d2)| <= 1.52587890625e-05,
+ *    i.e. it rejects ORTHOGONAL segments (a perfect T-bone), not parallel
+ *    ones, and returns the sentinel 1000.0 [0x003B16CC] leaving every
+ *    output untouched;
+ *  - it only ever considers the four endpoint-onto-the-other-segment
+ *    projections, never the interior/interior solution.
+ * `pa` is the point on segment A (the EDI output), `pb` the point on B
+ * (ESI); `ta`/`tb` are the two clamped parameters ([EBP+0x10]/[EBP+0x14]).
+ * ------------------------------------------------------------------------ */
+float b3_carcol_seg_closest2d(const float a0[2], const float a1[2],
+                              const float b0[2], const float b1[2],
+                              float pa[2], float pb[2],
+                              float* ta, float* tb) {
+    float d1x = a1[0] - a0[0], d1y = a1[1] - a0[1];
+    float d2x = b1[0] - b0[0], d2y = b1[1] - b0[1];
+    if (fabsf(d2y * d1y + d1x * d2x) <= B3_CARCOL_SEG_EPS)
+        return B3_CARCOL_SEG_MISS;                       /* 0x0010FD7E */
+
+    float inv1 = K_ONE / (d1y * d1y + d1x * d1x);
+    float t1 = clamp01(inv1 * ((b0[1]-a0[1])*d1y + (b0[0]-a0[0])*d1x));
+    float t2 = clamp01(inv1 * ((b1[1]-a0[1])*d1y + (b1[0]-a0[0])*d1x));
+    float p1x = a0[0] + t1*d1x, p1y = a0[1] + t1*d1y;
+    float p2x = a0[0] + t2*d1x, p2y = a0[1] + t2*d1y;
+
+    float ex = b0[0]-p1x, ey = b0[1]-p1y;
+    float best = ex*ex + ey*ey;
+    pa[0] = p1x; pa[1] = p1y; pb[0] = b0[0]; pb[1] = b0[1];
+    *ta = t1; *tb = 0.0f;
+
+    ex = b1[0]-p2x; ey = b1[1]-p2y;
+    float d = ex*ex + ey*ey;
+    if (d < best) {
+        best = d;
+        pa[0] = p2x; pa[1] = p2y; pb[0] = b1[0]; pb[1] = b1[1];
+        *ta = t2; *tb = K_ONE;
+    }
+
+    float inv2 = K_ONE / (d2y * d2y + d2x * d2x);
+    float s1 = clamp01(inv2 * ((a0[1]-b0[1])*d2y + (a0[0]-b0[0])*d2x));
+    float s2 = clamp01(inv2 * ((a1[1]-b0[1])*d2y + (a1[0]-b0[0])*d2x));
+    float q1x = b0[0] + s1*d2x, q1y = b0[1] + s1*d2y;
+    float q2x = b0[0] + s2*d2x, q2y = b0[1] + s2*d2y;
+
+    ex = a0[0]-q1x; ey = a0[1]-q1y;
+    d = ex*ex + ey*ey;
+    if (d < best) {
+        best = d;
+        pa[0] = a0[0]; pa[1] = a0[1]; pb[0] = q1x; pb[1] = q1y;
+        *ta = 0.0f; *tb = s1;
+    }
+    ex = a1[0]-q2x; ey = a1[1]-q2y;
+    d = ex*ex + ey*ey;
+    if (d < best) {
+        best = d;
+        pa[0] = a1[0]; pa[1] = a1[1]; pb[0] = q2x; pb[1] = q2y;
+        *ta = K_ONE; *tb = s2;
+    }
+    return sqrtf(best);
+}
+
+/* the 2-D capsule axis of one body: [at*(bbmin.z + bbmax.x),
+ * at*(bbmax.z - bbmax.x)] about its own origin, in (x, z).
+ * FUN_00112E70 @0x0011308E (car) and @0x001130F9 (object). */
+static void capsule_axis(const float (*m)[4], const float bbmax[4],
+                         const float bbmin[4], float p0[2], float p1[2]) {
+    float k = bbmin[2] + bbmax[0];
+    p0[0] = k * m[2][0] + m[3][0];
+    p0[1] = k * m[2][2] + m[3][2];
+    k = bbmax[2] - bbmax[0];
+    p1[0] = k * m[2][0] + m[3][0];
+    p1[1] = k * m[2][2] + m[3][2];
+}
+
+/* --------------------------------------------------------------------------
+ * FUN_00112E70 -- car (A) vs a LIVE traffic car / prop (B, a type-3 handle).
+ * ------------------------------------------------------------------------ */
+int b3_carcol_resolve_traffic(B3CarBody* A, B3CarBody* B, int crash_party,
+                              B3CarContact* out) {
+    memset(out, 0, sizeof(*out));
+
+    const int a_is_car = (A->type == 0 || A->type == 1 || A->type == 2);
+
+    /* @0x00112EC4: veh+0x1353 bit 1 mutes the whole pair. */
+    if (a_is_car && (A->flags_1353 & 2)) return 0;
+
+    /* @0x00112ED1: an UN-crashed car arms the push branch, but only if the
+     * two frame origins are within 2.0 m in y [0x003B1688].  A car that is
+     * already crashed can only ever reach the crash arm below. */
+    int push = 0;
+    if (!A->crashed) {
+        push = 1;
+        if (fabsf(A->rb->frame[3][1] - B->rb->frame[3][1])
+                > B3_CARCOL_OBJ_Y_GATE)
+            return 0;                                    /* @0x00112F0D */
+    }
+    out->impact = 0.0f;                                  /* pair+0x20 = 0 */
+
+    /* @0x0011302B: the CONVEX HULL narrow phase, used ONLY as the crash
+     * permission.  Its contact point, normal and separation are computed on
+     * a stack context here and thrown away -- the physical response below
+     * comes from the capsule test instead. */
+    int crashable = 0;
+    {
+        B3CarContact probe;
+        if (b3_carcol_contact(A, B, &probe)) {
+            crashable = b3_carcol_can_crash(
+                b3_carcol_class(B->type, B->designated),
+                b3_carcol_class(A->type, A->designated));
+        }
+    }
+    /* @0x00113069: a type-3 handle whose record carries +0x174 bit 3 never
+     * crashes anything (the same bit the big-hit window reads). */
+    if (B->type == B3_COL_TYPE_OBJECT && B->no_crash) crashable = 0;
+
+    float n[4] = {0,0,0,0};
+    float pen = 0.0f, pa[2] = {0,0};
+    int   to_crash = 0;
+
+    /* @0x00113082: with the push flag clear (a crashed car, or the y gate
+     * never armed it) the capsule test is skipped outright and the only
+     * remaining question is whether the pair may crash. */
+    if (push) {
+        /* ---- the 2-D capsule test, @0x0011308E..0x001131C6 ------------- */
+        float a0[2], a1[2], b0[2], b1[2], pb[2], ta, tb;
+        capsule_axis((const float (*)[4])A->rb->frame, A->bbmax, A->bbmin,
+                     a0, a1);
+        capsule_axis((const float (*)[4])B->rb->frame, B->bbmax, B->bbmin,
+                     b0, b1);
+        float dist = b3_carcol_seg_closest2d(a0, a1, b0, b1, pa, pb, &ta, &tb);
+        float gap = dist - (B->bbmax[0] + A->bbmax[0]);
+        if (gap > 0.0f) return 0;                        /* @0x001131C6 */
+        pen = -gap;
+
+        float nx = pa[0] - pb[0], nz = pa[1] - pb[1];    /* A away from B */
+        float len = sqrtf(nx*nx + nz*nz);
+        float inv = K_ONE / len;
+        n[0] = nx * inv; n[1] = 0.0f; n[2] = nz * inv; n[3] = 0.0f;
+        v_copy4(out->normal, n);                         /* pair+0x10 */
+        out->hit = 1;                                    /* pair+0x2C */
+        out->pen = pen;
+
+        /* ---- the crash trigger, @0x0011329A..0x001133E4 ---------------- */
+        if (crashable && !(A->flags_1353 & 0x10) && !A->immune) {
+            /* Neither side contributes an angular term: retail builds each
+             * velocity as frame.at * scalar speed (A: veh+0xBC @0x001132BA,
+             * B: trafficrec+0xC4 @0x001132E6) and subtracts. */
+            float vr[4];
+            for (int k = 0; k < 4; k++)
+                vr[k] = B->rb->frame[2][k] * B->speed
+                      - A->rb->frame[2][k] * A->speed;
+            float vn = fabsf(v_dot3(vr, n) * B3_CARCOL_MPH);
+            out->vn_mph = vn;
+            /* pair+0x20 = mass * 2.0 * |vn| * 0.1 * 0.5  @0x00113349 */
+            out->impact = A->mass * K_TWO * vn
+                        * B3_CARCOL_IMPACT_SCALE * K_HALF;
+            float metric, thresh;
+            if (crash_party) {                           /* FUN_00017310 */
+                metric = sqrtf(vr[0]*vr[0] + vr[1]*vr[1] + vr[2]*vr[2])
+                       * B3_CARCOL_MPH;
+                thresh = A->authority * B3_CARCOL_OBJ_MPH_PARTY;
+            } else {
+                metric = vn;
+                thresh = A->authority * B3_CARCOL_OBJ_MPH_RACE;
+            }
+            out->metric_mph = metric;
+            out->thresh_mph = thresh;
+            if (metric > thresh) push = 0;               /* @0x001133E4 */
+        }
+
+        /* @0x001133E9: veh+0x212 set and veh+0x215 != 3 goes straight to
+         * the crash arm WITHOUT consulting the crash table. */
+        if (A->grounded && A->crash_mode != 3) to_crash = 1;
+    }
+
+    if (!to_crash && push) {
+        /* ---- the RUB: 100 % of it lands on the CAR -------------------- */
+        for (int k = 0; k < 4; k++)
+            A->rb->deflection[k] += n[k] * pen;          /* @0x00113431 */
+
+        float cp[4];
+        cp[0] = pa[0] - A->bbmax[0] * n[0];
+        cp[1] = A->rb->frame[3][1] + B3_CARCOL_OBJ_CP_Y;
+        cp[2] = pa[1] - A->bbmax[0] * n[2];
+        cp[3] = 0.0f;
+
+        float m = A->mass;
+        if (m > B3_CARCOL_SHOVE_MASS_CAP) m = B3_CARCOL_SHOVE_MASS_CAP;
+        float f[4];
+        for (int k = 0; k < 4; k++) f[k] = n[k] * (m * B3_CARCOL_OBJ_SHOVE_K);
+        b3_carcol_apply_force(A->rb, A->drift_state, f, cp);  /* @0x001134DE */
+
+        A->contact_pt[0] = cp[0]; A->contact_pt[1] = cp[1];
+        A->contact_pt[2] = cp[2]; A->contact_pt[3] = cp[3];
+        v_copy4(out->point, cp);                         /* pair+0x00 */
+        out->push = 1;
+        return 1;
+    }
+
+    if (!to_crash && !crashable) return out->hit;        /* @0x00113513 */
+
+    /* ---- the CRASH arm, @0x00113522 ---------------------------------- */
+    A->touched = 1;                                      /* veh+0x211 */
+
+    /* FUN_00114910 @0x001135B5 promotes the traffic object: type 3 -> 4, a
+     * real vehicle record out of the collision world's pool, seeded by
+     * FUN_00120BA0 from the traffic record (frame +0x70, veh+0xBC =
+     * rec+0xC4, veh+0xB0 = at * speed), and the traffic-manager slot and
+     * its lane cursor are freed.  The caller performs that flip; here we
+     * only report it and run retail's own follow-up. */
+    /* FUN_00113960 @0x001135CF over the SAME pair.  Neither FUN_0010DCA0
+     * nor FUN_0010E580 writes veh+0x210 (both are 37/46-instruction
+     * dispatchers), so the car is still un-crashed when this runs and
+     * FUN_00113960 @0x00113B75 forces it to kind 2 -- IMMOVABLE.  The newly
+     * promoted car therefore takes 100 % of the separation and 100 % of the
+     * impulse: that is the launch. */
+    {
+        unsigned char keep_type = B->type;
+        B->type = B3_COL_TYPE_LOOSE;      /* it is a vehicle from here on */
+        b3_carcol_resolve_wreck(A, B, out);
+        B->type = keep_type;
+    }
+    out->hit     = 1;
+    out->crash_a = 1;                                    /* FUN_0010DCA0 */
+    out->crash_b = 1;
+    out->promote = 1;
+    return 1;
 }

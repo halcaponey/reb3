@@ -216,6 +216,8 @@
 #ifndef BURNOUT3_PANELS_H
 #define BURNOUT3_PANELS_H
 
+#include <stddef.h>
+
 #include "burnout3_crash.h"          // B3WreckState, B3RigidBody
 
 #ifdef __cplusplus
@@ -271,21 +273,37 @@ enum {
 // One panel in flight.  Frame rows are right/up/at/pos in HARNESS space,
 // exactly like B3WreckState::frame, so the harness builds its GL matrix the
 // same way it does for the shell.
-typedef struct {
-    int   active;
-    int   panel;               // index into B3PanelSet
-    float frame[4][4];
-    float vel[4];              // [3] = speed, as B3RigidBody wants
-    float omega[4];
-    float angmom[4];
-    float iinv_body[3][4];     // +0x10 diag, FUN_00109BB0            [C]
-    float mass;                // +0x1F0 = 260.0, FUN_001069C0 tail   [C]
-    float bbmax[3];            // +0x1D0, recentred                   [C]
-    float bbmin[3];            // +0x1E0, recentred                   [C]
-    float half[3];             // max(|bbmax|,|bbmin|) -- the ground test
-    float life;                // seconds since release
-    float rest;                // seconds resting on the ground
+typedef struct B3PanelPiece {
+    // ---- RETAIL WINDOW 0x0000..0x0200: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    unsigned char _pad00[0x10];
+    float                iinv_body[3][4];  // +0x10 diag, FUN_00109BB0            [C]
+    unsigned char _pad01[0x190];
+    float                bbmax[3];  // +0x1D0, recentred                   [C]
+    unsigned char _pad02[0x4];
+    float                bbmin[3];  // +0x1E0, recentred                   [C]
+    unsigned char _pad03[0x4];
+    float                mass;  // +0x1F0 = 260.0, FUN_001069C0 tail   [C]
+    unsigned char _pad04[0xC];
+
+    // ---- HARNESS SIDE, past the retail window: no recovered
+    // offset in THIS object, so it must not squat on retail's bytes.
+    int                  active;  
+    int                  panel;  // index into B3PanelSet
+    float                frame[4][4];  
+    float                vel[4];  // [3] = speed, as B3RigidBody wants
+    float                omega[4];  
+    float                angmom[4];  
+    float                half[3];  // max(|bbmax|,|bbmin|) -- the ground test
+    float                life;  // seconds since release
+    float                rest;  // seconds resting on the ground
 } B3PanelPiece;
+
+#define B3PANELPIECE_RETAIL_SPAN 0x0200u
+_Static_assert(offsetof(B3PanelPiece, iinv_body) == 0x0010, "iinv_body off retail");
+_Static_assert(offsetof(B3PanelPiece, bbmax) == 0x01D0, "bbmax off retail");
+_Static_assert(offsetof(B3PanelPiece, bbmin) == 0x01E0, "bbmin off retail");
+_Static_assert(offsetof(B3PanelPiece, mass) == 0x01F0, "mass off retail");
 
 // Per-car panel machine -- the fields of the damage ctx this needs.
 typedef struct {

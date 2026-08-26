@@ -18,6 +18,10 @@
 
 #include "burnout3_props.h"
 #include "burnout3_collision.h"
+/* RETAINED RENDERER: the resting props draw from one baked world-space buffer
+ * instead of a glPushMatrix/glCallList pair per instance.  See
+ * src/burnout3_render.h. */
+#include "burnout3_render.h"
 
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F
@@ -118,7 +122,9 @@ typedef struct {
 /* One of the 16 class-6 rigid bodies (gameworld+0xC4380, stride 0x780).
  * The named fields are the body offsets FUN_0011A020 fills in. */
 typedef struct {
-    B3RigidBody rb;        /* +0x10/+0x40 inertia, +0xB0.. dynamics, +0x204  */
+    B3RigidBody rb;        /* +0x10/+0x40 inertia, +0xB0.. dynamics */
+    float rb_frame_store[4][4];   /* the 4x4 is not inline any more.
+                                   * Bound by b3p_bind_body_frames(). */
     float mass;            /* +0x1F0 */
     float com_height;      /* +0x1F4 */
     float radius;          /* +0x1CC */
@@ -132,6 +138,21 @@ typedef struct {
 static B3PropModel* g_model;
 static B3PropInst*  g_inst;
 static B3PropBody   g_body[B3P_MAX_LIVE];
+
+/* Point every pooled body at its own frame storage.
+ *
+ * Idempotent and called from every entry point that can reach the pool, not
+ * just from b3_props_load: the collision path runs before any track's props
+ * are loaded, and while the matrix was inline that harmlessly read zeros.
+ * With the matrix behind a pointer it would read through NULL. */
+static void b3p_bind_body_frames(void)
+{
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    for (int i = 0; i < B3P_MAX_LIVE; i++)
+        b3_rigid_body_bind_frame(&g_body[i].rb, g_body[i].rb_frame_store);
+}
 static float g_clock;      /* our mirror of DAT_0060EA20                     */
 static int g_nmodel, g_ninst;
 static int g_live;
@@ -140,6 +161,8 @@ static float* g_vtx;       /* 8 floats per vertex, HARNESS space            */
 static unsigned short* g_idx;
 static unsigned g_nvtx, g_nidx;
 static char g_dir[512];
+static B3RInstSet*   g_retained;
+static unsigned char* g_retained_skip;   /* one byte per instance */
 
 /* ---- small helpers ---------------------------------------------------- */
 static unsigned rd_u32(const unsigned char* p) {
@@ -373,7 +396,11 @@ static void b3p_integrate(B3RigidBody* rb, float mass, float com, float dt) {
  * inertia tensor transforms as S I S, i.e. the entries with exactly one z
  * index flip sign. */
 static void b3p_mirror_rb(const B3RigidBody* in, B3RigidBody* out) {
+    /* `out` is the caller's body and owns its frame storage; carry the
+     * binding across the zeroing or the writes below go through NULL. */
+    float (*keep_frame)[4] = out->frame;
     memset(out, 0, sizeof *out);
+    out->frame = keep_frame;
     for (int r = 0; r < 3; r++) {
         out->frame[r][0] =  in->frame[r][0];
         out->frame[r][1] =  in->frame[r][1];
@@ -484,26 +511,35 @@ static unsigned load_tex(const char* dir, const char* name) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_GENERATE_MIPMAP, GL_TRUE);
+    b3r_tex_mipmap_pre();
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, c->w, c->h, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, c->pixels);
+    b3r_gen_mipmap();
+    /* GL_GENERATE_MIPMAP is GL 1.4 / GLES1: it does not exist in GLES2, and
+     * therefore not in WebGL either.  Asking for it there is INVALID_ENUM,
+     * the chain never gets built, and a GL_LINEAR_MIPMAP_LINEAR minifier on
+     * a texture with no chain is MIPMAP-INCOMPLETE -- which samples black.
+     * glGenerateMipmap() after the upload is the GL 3.0 / GLES2 spelling of
+     * the same thing, and it is what every target here uses now. */
     SDL_FreeSurface(c);
     return id;
 }
 
 /* ---- load ------------------------------------------------------------- */
 void b3_props_shutdown(void) {
+    if (g_retained) { b3r_inst_free(g_retained); g_retained = NULL; }
+    free(g_retained_skip); g_retained_skip = NULL;
     if (g_model) {
-        for (int i = 0; i < g_nmodel; i++) {
-            if (g_model[i].list) glDeleteLists(g_model[i].list, 1);
+        for (int i = 0; i < g_nmodel; i++)
             if (g_model[i].tex) glDeleteTextures(1, &g_model[i].tex);
-        }
     }
     free(g_model); free(g_inst); free(g_vtx); free(g_idx);
     g_model = NULL; g_inst = NULL; g_vtx = NULL; g_idx = NULL;
     g_nmodel = g_ninst = g_live = g_ready = 0;
     for (int i = 0; i < B3P_MAX_LIVE; i++) {
         memset(&g_body[i], 0, sizeof g_body[i]);
+        /* the memset wiped rb.frame; re-point it at this slot's storage */
+        b3_rigid_body_bind_frame(&g_body[i].rb, g_body[i].rb_frame_store);
         g_body[i].owner = -1;
         g_body[i].lru_key = -1.0f;
     }
@@ -511,6 +547,7 @@ void b3_props_shutdown(void) {
 }
 
 int b3_props_load(const char* track_dir) {
+    b3p_bind_body_frames();   /* the 4x4 is not inline any more */
     b3_props_shutdown();
     if (!track_dir || !track_dir[0]) return 0;
     snprintf(g_dir, sizeof g_dir, "%s", track_dir);
@@ -618,24 +655,41 @@ int b3_props_load(const char* track_dir) {
     }
     free(d);
 
-    /* Textures + one display list per model (the traffic-section pattern). */
-    for (int i = 0; i < g_nmodel; i++) {
-        B3PropModel* m = &g_model[i];
-        m->tex = load_tex(g_dir, m->texture);
-        if (!m->n_index) continue;
-        m->list = glGenLists(1);
-        if (!m->list) continue;
-        glNewList(m->list, GL_COMPILE);
-        glBegin(GL_TRIANGLES);
-        for (unsigned k = 0; k < m->n_index; k++) {
-            unsigned vi = m->first_vertex + g_idx[m->first_index + k];
-            if (vi >= g_nvtx) continue;
-            const float* v = g_vtx + vi * 8;
-            glTexCoord2f(v[6], v[7]);
-            glVertex3f(v[0], v[1], v[2]);
+    for (int i = 0; i < g_nmodel; i++)
+        g_model[i].tex = load_tex(g_dir, g_model[i].texture);
+
+    /* RETAINED: the same baked world-space buffer the scenery pass uses.  No
+     * distance cull is applied (the legacy pass has none either), so
+     * `cull_far` is left at 0 = never culled. */
+    b3r_init();
+    if (b3r_active()) {
+        B3RMeshSrc mesh;
+        mesh.vtx = g_vtx; mesh.stride = 8; mesh.uv_off = 6;
+        mesh.nvtx = g_nvtx; mesh.idx = g_idx; mesh.nidx = g_nidx;
+        B3RModelSrc* ms = (B3RModelSrc*)calloc((size_t)g_nmodel,
+                                               sizeof(B3RModelSrc));
+        B3RInstSrc*  is = (B3RInstSrc*)calloc((size_t)g_ninst,
+                                              sizeof(B3RInstSrc));
+        g_retained_skip = (unsigned char*)calloc((size_t)g_ninst, 1);
+        if (ms && is && g_retained_skip) {
+            for (int i = 0; i < g_nmodel; i++) {
+                ms[i].first_vertex = g_model[i].first_vertex;
+                ms[i].n_vertex     = g_model[i].n_vertex;
+                ms[i].first_index  = g_model[i].first_index;
+                ms[i].n_index      = g_model[i].n_index;
+                ms[i].tex          = g_model[i].tex;
+                ms[i].mat_flags    = g_model[i].mat_flags;
+            }
+            for (int i = 0; i < g_ninst; i++) {
+                is[i].m        = g_inst[i].base;
+                is[i].tint     = g_inst[i].tint;
+                is[i].model    = g_inst[i].model;
+                is[i].cull_far = 0.0f;
+            }
+            g_retained = b3r_inst_build(&mesh, ms, g_nmodel, is, g_ninst);
         }
-        glEnd();
-        glEndList();
+        free(ms);
+        free(is);
     }
 
     /* Ground height under every prop, once -- the props sit on authored
@@ -660,6 +714,8 @@ int b3_props_load(const char* track_dir) {
      * +0x220 = 0 (no owner) and +0x224 = -1.0 -- an EMPTY slot. */
     for (int i = 0; i < B3P_MAX_LIVE; i++) {
         memset(&g_body[i], 0, sizeof g_body[i]);
+        /* the memset wiped rb.frame; re-point it at this slot's storage */
+        b3_rigid_body_bind_frame(&g_body[i].rb, g_body[i].rb_frame_store);
         g_body[i].owner = -1;
         g_body[i].lru_key = -1.0f;
     }
@@ -726,6 +782,8 @@ void b3_props_reset(void) {
     }
     for (int i = 0; i < B3P_MAX_LIVE; i++) {
         memset(&g_body[i], 0, sizeof g_body[i]);
+        /* the memset wiped rb.frame; re-point it at this slot's storage */
+        b3_rigid_body_bind_frame(&g_body[i].rb, g_body[i].rb_frame_store);
         g_body[i].owner = -1;
         g_body[i].lru_key = -1.0f;
     }
@@ -905,6 +963,7 @@ static int b3p_promote(int inst)
     if (slot < 0) return -1;
     B3PropBody* b = &g_body[slot];
     memset(b, 0, sizeof *b);
+    b3_rigid_body_bind_frame(&b->rb, b->rb_frame_store);
     b->owner = inst;
 
     /* +0x204 -> the instance matrix itself (@0x0011A062) */
@@ -939,8 +998,12 @@ void b3_props_test_body_setup(const float frame[4][4], const float bbmax[4],
                               unsigned rng_inc, B3RigidBody* out_rb,
                               float* out_mass, float* out_com_height,
                               float* out_radius) {
+    {   /* the caller owns this body's frame storage; the memset would drop
+     * the binding, so carry the pointer across it */
+    float (*keep_frame)[4] = out_rb->frame;
     memset(out_rb, 0, sizeof *out_rb);
-    memcpy(out_rb->frame, frame, sizeof out_rb->frame);
+    out_rb->frame = keep_frame; }
+    memcpy(out_rb->frame, frame, 16 * sizeof(float));
     unsigned ss = g_rng_state, si = g_rng_inc;
     b3_props_seed(rng_state, rng_inc);
     b3p_body_setup(out_rb, bbmax, bbmin, out_mass, out_com_height, out_radius);
@@ -954,7 +1017,15 @@ float b3_props_test_contact(B3RigidBody* prop_rb, float prop_mass,
                             const B3RigidBody* car_rb, float car_mass,
                             const float point[4], const float normal[4],
                             float out_normal[4], float out_imp[4]) {
+    /* By-value copy: with the frame no longer inline, `car.frame` would alias
+     * the caller's matrix and b3p_contact could write through it. Give the
+     * copy its own storage and copy the rows. */
     B3RigidBody car = *car_rb;
+    float car__frame_store[4][4];
+    /* bind BEFORE the copy: binding zeroes the storage, so filling it first
+     * would be undone. */
+    b3_rigid_body_bind_frame(&car, car__frame_store);
+    memcpy(car__frame_store, car_rb->frame, 16 * sizeof(float));
     return b3p_contact(prop_rb, prop_mass, &car, car_mass, point, normal, 0,
                        out_normal, out_imp);
 }
@@ -963,6 +1034,7 @@ float b3_props_test_contact(B3RigidBody* prop_rb, float prop_mass,
  * driven once per allocated body per frame by the collision manager
  * FUN_00110AF0 @0x00110FB4 with the frame dt.  The WHOLE update. */
 void b3_props_update(float dt) {
+    b3p_bind_body_frames();
     if (!g_ready || dt <= 0.0f) return;
     if (dt > 0.1f) dt = 0.1f;
     g_clock += dt;
@@ -1091,8 +1163,10 @@ int b3_props_collide_car(int car, const float pos[3], const float vel[3],
     /* Compatibility entry: synthesise the car body FUN_00113960 would have
      * had.  Zero omega, unit inverse inertia and a nominal mass -- prefer
      * b3_props_collide_rb(), which gets the real numbers. */
-    B3RigidBody rb;
+    B3RigidBody rb; float rb__frame_store[4][4];
     memset(&rb, 0, sizeof rb);
+    /* bind AFTER the memset -- it would zero the frame pointer */
+    b3_rigid_body_bind_frame(&rb, rb__frame_store);
     if (!pos) return 0;
     float fw[3] = { sinf(yaw), 0.0f, -cosf(yaw) };
     rb.frame[0][0] = -fw[2]; rb.frame[0][2] = fw[0];
@@ -1114,10 +1188,11 @@ int b3_props_collide_rb(int car, B3RigidBody* car_rb, float car_mass,
                         const float half_ext[3], int car_crashed,
                         B3PropHit* out, int max_out)
 {
+    b3p_bind_body_frames();
     /* car_rb is the pipeline's GAME-space body; mirror it into harness space,
      * run the solver there, and mirror any reaction back (only a CRASHED car
      * gets one -- an un-crashed one is role 2, @0x00113B57). */
-    B3RigidBody h;
+    B3_RIGID_BODY_LOCAL(h);
     if (!car_rb) return 0;
     b3p_mirror_rb(car_rb, &h);
     return b3p_collide(car, &h, car_crashed ? car_rb : NULL, car_mass,
@@ -1318,57 +1393,28 @@ int b3_props_nearest(const float pos[3], float* out_dist) {
 
 /* ---- draw ------------------------------------------------------------- */
 void b3_props_draw(void) {
-    if (!g_ready) return;
-
-    GLboolean had_tex = glIsEnabled(GL_TEXTURE_2D);
-    GLboolean had_cull = glIsEnabled(GL_CULL_FACE);
-    GLboolean had_alpha = glIsEnabled(GL_ALPHA_TEST);
-    GLboolean had_blend = glIsEnabled(GL_BLEND);
-
-    glEnable(GL_TEXTURE_2D);
-    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-    /* The prop models are shader class 8/9 -- no D3DCOLOR register, so the
-     * game never modulates them by a baked per-vertex colour.  What it does
-     * have is the per-INSTANCE half-range colour in the transform's w slots,
-     * which is what is used here (doubled, exactly as the world's stage-0
-     * combiner doubles the vertex colour). */
-    glDisable(GL_CULL_FACE);        /* the Z reflection flips the winding */
-
-    int last_model = -1;
+    if (!g_ready || !g_retained) return;
+    /* The props that are still on their authored transform -- which is all of
+     * them until a car hits one -- come out of one baked world-space buffer,
+     * merged into a handful of glDrawArrays.  A KNOCKED or SETTLED prop is no
+     * longer at its baked transform, so it is skipped there and drawn on its
+     * own from the model-space copy; at most B3P_MAX_LIVE = 16 of those exist
+     * at once.
+     *
+     * What this replaces was one glPushMatrix / glMultMatrixf / glCallList /
+     * glPopMatrix per instance plus four SYNCHRONOUS glIsEnabled readbacks. */
+    unsigned char* skip = g_retained_skip;
+    int live = 0;
     for (int i = 0; i < g_ninst; i++) {
-        const B3PropInst* p = &g_inst[i];
-        const B3PropModel* m = &g_model[p->model];
-        if (!m->list) continue;
-
-        if ((int)p->model != last_model) {
-            last_model = (int)p->model;
-            glBindTexture(GL_TEXTURE_2D, m->tex);
-            /* material flag +0x24 bit 0x010 = D3DRS_ALPHATESTENABLE with the
-             * world's fixed GREATER 64/255 (extract_track.py "FLAG BITS"),
-             * bit 0x001 = D3DRS_ALPHABLENDENABLE. */
-            if (m->mat_flags & 0x010u) {
-                glEnable(GL_ALPHA_TEST);
-                glAlphaFunc(GL_GREATER, 64.0f / 255.0f);
-            } else {
-                glDisable(GL_ALPHA_TEST);
-            }
-            if (m->mat_flags & 0x001u) {
-                glEnable(GL_BLEND);
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            } else {
-                glDisable(GL_BLEND);
-            }
-        }
-        glColor4f(p->tint[0], p->tint[1], p->tint[2], 1.0f);
-        glPushMatrix();
-        glMultMatrixf(p->cur);
-        glCallList(m->list);
-        glPopMatrix();
+        skip[i] = (unsigned char)(g_inst[i].state != B3P_REST);
+        live += skip[i];
     }
-
-    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-    if (had_cull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
-    if (had_alpha) glEnable(GL_ALPHA_TEST); else glDisable(GL_ALPHA_TEST);
-    if (had_blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
-    if (!had_tex) glDisable(GL_TEXTURE_2D);
+    int batches = b3r_inst_draw(g_retained, NULL, live ? skip : NULL);
+    for (int i = 0; live && i < g_ninst; i++) {
+        if (!skip[i]) continue;
+        b3r_inst_draw_model(g_retained, (int)g_inst[i].model,
+                            g_inst[i].cur, g_inst[i].tint);
+        batches++;
+    }
+    b3r_stat_set(B3R_STAT_PROPS, batches);
 }

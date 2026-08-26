@@ -153,6 +153,14 @@ typedef struct {
 } B3CarFxBodyParams;
 
 void b3_carfx_body_defaults(B3CarFxBodyParams* p);
+/* 1 while a carfx program is bound.  A draw path that issues its own
+ * glDrawArrays uses it to decide whether to refresh THIS module's
+ * transform uniforms or to bind the retained renderer's program. */
+int  b3_carfx_program_bound(void);
+/* Re-upload the transform: per DRAW, not per car -- a wrecked car's panels
+ * and every wheel push their own matrix after the body pass began. */
+void b3_carfx_sync_matrices(void);
+
 void b3_carfx_body_begin(const B3CarFxBodyParams* p);
 void b3_carfx_body_end(void);
 /* Glass uses the same program with the glass row of the shine table and the

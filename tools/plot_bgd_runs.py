@@ -4,13 +4,13 @@
 Visual ground truth for scan_bgd_paths.py candidates: a real route traces the
 road network; a false positive scatters. Writes build/bgd_overlay.png.
 """
+import struct, sys
+from PIL import Image, ImageDraw
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 from b3_paths import game_path, game_root  # noqa: E402
-import struct, sys
-from PIL import Image, ImageDraw
 
-BGD = (game_path('Tracks/AS/C1_V1/Gamedata.bgd'))
+BGD = game_path('Tracks/AS/C1_V1/Gamedata.bgd')
 OBJ = "build/track.obj"
 
 # (file offset, count, stride) candidates to draw, one color each

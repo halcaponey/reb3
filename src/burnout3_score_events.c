@@ -10,6 +10,8 @@
  * the instruction cited beside it.
  */
 #include "burnout3_score_events.h"
+#include "burnout3_backend.h"
+#include "burnout3_emu.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -119,7 +121,8 @@ void b3_score_events_init(void)
 /* ===================================================================== *
  * FUN_00192D20 -- the category tier tracker (shared by all four events)
  * ===================================================================== */
-void b3_cat_track(B3CatRecord* r, float value, float clock)
+void b3_cat_track(B3CatRecord* r, const float* minima, float value,
+                  float clock)
 {
     int n, i;
     const float* p;
@@ -130,7 +133,7 @@ void b3_cat_track(B3CatRecord* r, float value, float clock)
 
     n = r->count;
     if ((int)r->tier < n - 1 && n != 0) {
-        p = r->minima + n;
+        p = minima + n;
         i = n;
         for (;;) {
             --p;
@@ -207,7 +210,7 @@ int b3_score_events_take_callout(B3ScoreEvents* s, int* cat, int* tier)
  * metres below the minimum); later frames pay only their own step.
  * ===================================================================== */
 static void cat_event(B3ScoreEvents* s, B3BoostBar* bar,
-                      B3CatRecord* rec,
+                      B3CatRecord* rec, const float* minima,
                       unsigned char* active, unsigned char* scored,
                       int state, int use_speed_gate,
                       float speed_mph, float min_mph,
@@ -220,7 +223,7 @@ static void cat_event(B3ScoreEvents* s, B3BoostBar* bar,
     *active = (unsigned char)on;
 
     if (on) {
-        b3_cat_track(rec, rec->value + dist_step, clock);
+        b3_cat_track(rec, minima, rec->value + dist_step, clock);
         if (rec->value > min_dist) {
             /* first payment of this event pays for everything so far */
             float units = (*scored == 0) ? rec->value : dist_step;
@@ -322,13 +325,13 @@ void b3_score_events_crash_reset(B3ScoreEvents* s, float clock)
         s->rub_prev_touch[i] = 0;
     }
 
-    b3_cat_reset(&s->air, clock);    s->air_active   = 0;
-    b3_cat_reset(&s->onc, clock);    s->onc_active   = 0;
-    b3_cat_reset(&s->drift, clock);  s->drift_active = 0;
+    b3_cat_reset(&s->air, clock);    s->air.active   = 0;
+    b3_cat_reset(&s->onc, clock);    s->onc.active   = 0;
+    b3_cat_reset(&s->drift, clock);  s->drift.active = 0;
     /* 0x00193BF0..0x00193C26: the RUBBING record takes the same reset, and
      * score+0x574 (active) / score+0x575 (tier) go back to 0 / -1. */
-    b3_cat_reset(&s->rub, clock);    s->rub_active   = 0;
-    b3_cat_reset(&s->nm, clock);     s->nm_active    = 0;
+    b3_cat_reset(&s->rub, clock);    s->rub.active   = 0;
+    b3_cat_reset(&s->nm, clock);     s->nm.active    = 0;
 
     /* Not reset here (verified against the real block): nm_seen, nm_armed,
      * nm_total, nm_last, nm_chain_end, prev_clock, bp/bp_event, the stats
@@ -348,7 +351,7 @@ void b3_score_events_frame(B3ScoreEvents* s, B3BoostBar* bar,
     }
 
     /* FUN_00196940 -- AIR.  No speed gate: the airborne flag alone opens it. */
-    cat_event(s, bar, &s->air, &s->air_active, &s->air_scored,
+    cat_event(s, bar, &s->air, b3_score_params.air_minima, &s->air.active, &s->air_scored,
               in->airborne, 0, in->speed_mph, 0.0f,
               in->dist_step, in->clock,
               P->air_min_m, P->air_boost_per_m,
@@ -356,7 +359,7 @@ void b3_score_events_frame(B3ScoreEvents* s, B3BoostBar* bar,
               &s->air_total, &s->air_best, &s->air_count);
 
     /* FUN_00196BE0 -- ONCOMING. */
-    cat_event(s, bar, &s->onc, &s->onc_active, &s->onc_scored,
+    cat_event(s, bar, &s->onc, b3_score_params.onc_minima, &s->onc.active, &s->onc_scored,
               in->oncoming, 1, in->speed_mph, P->onc_min_mph,
               in->dist_step, in->clock,
               P->onc_min_m, P->onc_boost_per_m,
@@ -364,7 +367,7 @@ void b3_score_events_frame(B3ScoreEvents* s, B3BoostBar* bar,
               &s->onc_total, &s->onc_best, NULL);
 
     /* FUN_00196E10 -- DRIFT. */
-    cat_event(s, bar, &s->drift, &s->drift_active, &s->drift_scored,
+    cat_event(s, bar, &s->drift, b3_score_params.drift_minima, &s->drift.active, &s->drift_scored,
               in->drifting, 1, in->speed_mph, P->drift_min_mph,
               in->dist_step, in->clock,
               P->drift_min_m, P->drift_boost_per_m,
@@ -564,7 +567,7 @@ void b3_score_events_near_miss(B3ScoreEvents* s, B3BoostBar* bar,
                        (int)s->nm.tier);
         }
         b3_cat_reset(&s->nm, clock);
-        s->nm_active = 0;
+        s->nm.active = 0;
     }
 
     /* ---- 3. award scan -------------------------------------------- */
@@ -588,7 +591,7 @@ void b3_score_events_near_miss(B3ScoreEvents* s, B3BoostBar* bar,
             s->bp += bp;
             s->bp_event += bp;
 
-            s->nm_active = 1;
+            s->nm.active = 1;
             /* the chain record's value IS the chain length; the tier scan
              * is FUN_00192D20's, inlined here in the original */
             s->nm.prev_value = s->nm.value;
@@ -597,7 +600,7 @@ void b3_score_events_near_miss(B3ScoreEvents* s, B3BoostBar* bar,
             s->nm.value = (float)s->nm_chain;
             s->nm.clock = clock;
             if (t < n - 1 && n != 0) {
-                p = s->nm.minima + n;
+                p = b3_score_params.nm_minima + n;
                 k = n;
                 do {
                     --p;
@@ -642,6 +645,13 @@ void b3_score_events_near_miss(B3ScoreEvents* s, B3BoostBar* bar,
  * ===================================================================== */
 void b3_score_events_contact(B3ScoreEvents* s, int id, float clock)
 {
+    /* backends.cfg score=retail: run the GAME'S own entry over our
+     * score object. B3ScoreEvents is retail-shaped, so the bytes go in
+     * and come back as themselves -- nothing converted. */
+    if (b3_backend_get(B3_FEAT_SCORE) == B3_BACKEND_RETAIL &&
+        b3_emu_score("contact", id, s))
+        return;
+
     signed char want = (signed char)id;
     int i;
 
@@ -687,6 +697,13 @@ disarm:
  * ===================================================================== */
 void b3_score_events_mark_contact(B3ScoreEvents* s, int idx, float clock)
 {
+    /* backends.cfg score=retail: run the GAME'S own entry over our
+     * score object. B3ScoreEvents is retail-shaped, so the bytes go in
+     * and come back as themselves -- nothing converted. */
+    if (b3_backend_get(B3_FEAT_SCORE) == B3_BACKEND_RETAIL &&
+        b3_emu_score("mark", idx, s))
+        return;
+
     if (s->race_finished) return;
     if (s->rc_crashed) return;
     if (idx < 0 || idx >= B3_SE_RUB_CARS) return;   /* harness bounds only */
@@ -747,7 +764,7 @@ void b3_score_events_rubbing(B3ScoreEvents* s, B3BoostBar* bar,
         s->rub.value = v;
         s->rub.clock = clock;
         if ((int)s->rub.tier < cnt - 1 && cnt != 0) {
-            const float* p = s->rub.minima + cnt;
+            const float* p = b3_score_params.rub_minima + cnt;
             k = cnt;
             do {
                 --p;
@@ -762,7 +779,7 @@ void b3_score_events_rubbing(B3ScoreEvents* s, B3BoostBar* bar,
         /* 0x00194D32..0x00194E22: "Boost value for rubbing" is a per-second
          * rate -- dt * 15.0 through the standard multiplier and clamp. */
         b3_boost_award(bar, dt * P->rub_boost_per_s);
-        s->rub_active = 1;                   /* 0x00194E2E */
+        s->rub.active = 1;                   /* 0x00194E2E */
         return;
     }
 
@@ -771,13 +788,13 @@ void b3_score_events_rubbing(B3ScoreEvents* s, B3BoostBar* bar,
      * FUN_0019A050 -- the shared aggression/combo payout, which is NOT
      * ported, so the tier is published for the caller instead of an
      * invented BP number. */
-    if (s->rub_active) {
+    if (s->rub.active) {
         if (s->rub.tier >= 0) {              /* 0x00194E64 CMP EAX,-1 */
             s->rub_payout_tier   = s->rub.tier;
             s->rub_payout_target = s->rub_target;
         }
         b3_cat_reset(&s->rub, clock);        /* 0x00194E95..0x00194ECE */
-        s->rub_active = 0;
+        s->rub.active = 0;
     }
 }
 
@@ -804,8 +821,10 @@ void b3_score_events_frame_end(B3ScoreEvents* s)
  * ===================================================================== */
 static void cat_init_n(B3CatRecord* r, const float* minima, int count)
 {
+    /* The reset does not read the table -- the parameter is kept so every
+     * call site still names the minima that belong to the record. */
+    (void)minima;
     memset(r, 0, sizeof(*r));
-    r->minima = minima;
     r->count = (signed char)count;
     r->tier = -1;
     r->prev_tier = -1;

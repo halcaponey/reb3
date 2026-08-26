@@ -30,6 +30,28 @@ Evidence discipline: every address below is in the corrected ELF mapping
 (`build/burnout3.elf`); `[C]` = read out of the binary, `[S]` = shape recovered
 but a value is inferred, `[?]` = not located.
 
+> **Status (2026-08-22) — three blocker statements below have since been
+> unblocked.** The rows and their evidence stand; only the "blocked on" verdicts
+> moved:
+>
+> * **The `.bgd` nav-node walk is no longer a blocker.** The nav graph is
+>   loaded and walked at run time (`route.bin` + `nav_edges.bin`, `B3RtNavSection`
+>   / `nav_replace_car` in `src/burnout3_full.c`), so **PH-10**'s node-graph GLUE
+>   is retired and crash recovery uses retail nav placement. **PH-12**'s route
+>   driver `FUN_00170820` is ported (`src/burnout3_ai.c`, section 16, transcribed
+>   branch for branch). **PH-17** is therefore no longer blocked on PH-10/PH-12 —
+>   its own `beach_time` / `stuck_ref` / `unstuck_side` / `immune_until` marks
+>   are genuinely still GLUE, which is a different statement. The HEADLINE
+>   rollup naming all three as waiting on `FUN_00179760` is stale.
+> * **PH-26's harness hunk landed.** `src/burnout3_panels.c` calls
+>   `b3_rigid_body_world_contact` and `b3_rigid_body_class7_update` directly;
+>   the "ships as idempotent hunk P1" wording is historical.
+> * **Producer names.** Where a row credits `tools/extract_bgv.py` or
+>   `tools/extract_traffic.py` with writing an artefact, the live producers are
+>   `tools/cextract/cx_cars_bgv.c` and `tools/cextract/cx_traffic.c`; the Python
+>   paths are forwarding shims onto the immutable archive. The artefact and its
+>   contents are unchanged — that is what the byte-identity gate guarantees.
+
 ---
 
 ## A. RECOVERED (wave 1: PH-01…PH-04; wave 2: PH-24…PH-26; wave 3: PH-08/B4, PH-27, PH-06/21, PH-22)
@@ -1426,3 +1448,262 @@ under Unicorn with the C port itself on the other side.
 **The single highest-value remaining item** is now the retail road-agent
 driver: bind its path tables, reproduce four-knot interpolation and avoidance,
 and preserve route state through coupled-unit streaming (PH-07/PH-13).
+
+### PH-13a — the branch reassignment is loaded but not consumed *(traffic pop-in)*
+
+**Status: RESOLVED as "not the cause". The branch mechanism is recovered and
+implemented, and retail keeps it CLOSED during a race -- so the port's
+retire-at-the-descriptor-end was faithful all along.**
+
+`FUN_001A20F0` @0x001A2365:
+
+    MOV EAX,[ECX + 0x1920]     ; the selected racecar's mode
+    TEST EAX,EAX
+    JNZ 0x001A23DD             ; nonzero -> 0x001A23EC: MOV [ESI+0x48], 0
+    ...
+    MOV byte ptr [ESI + 0x48], 1
+
+so `agent+0x48 = (racecar+0x1920 == 0) ? 1 : 0`, and `racecar+0x1920 == 1` is
+NORMAL RACING (`B3AiCar.race_mode`). In a race every traffic agent is seeded
+with **zero** branch attempts, `FUN_001A8EE0` never calls the selector, and
+`FUN_0019F1C0` retires at the descriptor end. The harness now seeds the count
+through the same gate, so the mechanism is present, correct, and inert in a
+race exactly as retail leaves it.
+
+An earlier revision of this entry assumed the opposite -- that wiring the
+branch would keep agents alive and cure the pop-in. It would not, and an
+ungated implementation measurably made it worse (visible spawns 11.3 -> 19.6
+per 100 s over 5 runs a side) because it lane-hopped agents 10-20 m at
+junctions retail never lets them take mid-race.
+
+Reported again as "traffic randomly appears to spawn / despawn". Measured with
+`B3_SPAWN_TRACE=1`, counting only the events a driver can SEE -- within 80 m
+ahead, after the t=0 fill:
+
+| | per 100 race-seconds |
+|---|---|
+| visible spawns | ~11 |
+| visible despawns | ~15 |
+
+Both dominant despawn reasons are already annotated as retail's own behaviour:
+`path-end` is `FUN_0019F1C0` retiring at the descriptor end, and
+`raw-path-reseed` is `FUN_001A41A0` retiring the body so the next
+`FUN_001A28B0` pass re-fills the request. The window walk matches too -- the
+port visits the current pool window and two circular predecessors, exactly as
+`FUN_001A28B0` does.
+
+**The one genuine gap.** Retail does not only retire at a descriptor end. Each
+descriptor row carries `FUN_001A0750`'s 0x12-byte branch row (four target
+cursors at `+0x00..+0x07`, four target descriptor bytes at `+0x0C..+0x0F`,
+0xFF = empty); `FUN_001A8EE0` invokes the selector and waits for its **source
+switch row**, and `FUN_001A9040` commits the new `{descriptor, cursor}` so the
+agent CONTINUES. The port loads those rows into `B3TrafficPathData.links`
+(`B3TrafficPathLink`, `sizeof == 0x12` asserted) and bounds-checks them at
+load -- and then nothing reads them.
+
+**What was tried, and why it was reverted.** Wiring the reassignment at the
+descriptor end and picking among the row's live columns:
+
+* The data reads correctly. An audit of this track's rows found 2,917 set
+  columns, **all in range**, 2,908 usable running up and 2,905 running down;
+  a committed branch moves the agent **8-10 m**, i.e. a lane offset at a real
+  junction, not a teleport.
+* Two traps: clamping an out-of-range target cursor to the descriptor end
+  makes the retire test fire again next frame (one slot branched **7,584**
+  times in 213 s, alternating between two descriptors at one branch per
+  frame), and the end rows mostly carry no branch column at all, so triggering
+  there fires ~13 times in 188 s.
+* A/B over **5 runs each side**, same build, `B3_NO_BRANCH` toggling only the
+  commit:
+
+      branch off : 11.3 visible spawns / 100 s, 14.8 despawns
+      branch on  : 19.6 visible spawns / 100 s, 12.3 despawns
+
+  It trades a modest despawn reduction for **nearly double the visible
+  spawns** -- the reported symptom -- because a branched agent hops 8-10 m
+  laterally onto its successor and stays alive to re-enter view. Reverted.
+
+**What the next attempt needs** (do not re-approximate the trigger).
+Items 1 and 2 are now ANSWERED from the decompiler; only 3 is still open.
+
+1. ~~`FUN_001A8EE0`'s selector~~ -- **`FUN_001A0750` IS the selector.**
+   `FUN_001A8E80` calls it as
+
+       FUN_001A0750(agentref+0x118,   /* out: selected descriptor   */
+                    agentref+0x11C,   /* out: selected cursor       */
+                    agentref+0x160,   /* out: the SOURCE SWITCH ROW */
+                    agent+0x4C,       /* in:  lane/side byte        */
+                    (agent+0x4B >> 2) & 1)
+
+   and clears the attempt count (`agent+0x48 = 0`) plus bit 2 of `agent+0x4B`
+   when it succeeds with that flag set.
+
+2. ~~Its source switch row~~ -- **`agentref+0x160`**, and the wait is
+   `FUN_001A8EE0`'s `if (agent+0x30 < agentref+0x160)`: the agent keeps
+   driving until its persistent cursor reaches the switch row, and only then
+   does the commit path run (`agent+0x46 = 6` or `7` selects which).
+   `agentref+0x118 == 0` means "no selection yet", which is what gates the
+   selector call in the first place.
+
+3. **Still open: the lateral.** The 8-10 m hop is the two descriptors' lane
+   offsets disagreeing; retail must carry or recompute the lane across the
+   switch, or the car would visibly sidestep. `agent+0x4C` is fed to the
+   selector as an input and is the obvious candidate to decode next.
+
+Recovered with the Ghidra bridge live on 127.0.0.1:8089
+(`/decompile_function?address=...`), which also independently confirmed the
+drift-gate fix in the same session: `FUN_00105150` reads
+
+    if ((*(int *)(in_ECX + 0x1524) != 2) && (*(int *)(in_ECX + 0x1524) != 1))
+
+i.e. retail tests v+0x1524 against exactly 1 and 2, which is the predicate
+`score_drifting_flag` now uses.
+
+Until those three are recovered, the port retires at the descriptor end, which
+is `FUN_0019F1C0`'s real behaviour for an agent with nowhere to branch.
+
+**Where the visible churn actually comes from** (measured, still open):
+
+A request carries `{first_row, last_row, path_id, direction}`, so an agent owns
+a ROW RANGE inside a descriptor, not the whole thing, and retires at the end of
+its range. Instrumented over 156 race-seconds:
+
+* 730 slot recycles, **median gap 0.02 s** -- the slot is refilled on the very
+  next frame -- and 564 of them come back as a DIFFERENT car model.
+* ~19 of those land within 80 m ahead of the player, which is the reported
+  "traffic randomly appears / disappears": at that distance a body swap reads
+  as a car blinking into a different car.
+
+Both halves are annotated retail behaviour on their own (`FUN_001A41A0`
+retires the body, the next `FUN_001A28B0` pass re-fills the request with a
+freshly drawn class/model/paint, and it never re-seeds in place). What is NOT
+established is the RATE: whether retail's request ranges and window placement
+keep that swap out of the player's view. `FUN_001A2B20` pops one physical
+entry per pass, and the port averages 0.078 spawns/frame, so the port is not
+obviously over-filling -- the open question is the row-range geometry, i.e.
+whether the port's requests are far shorter than retail's.
+
+That is the next thread, and it is a data question (`+0xA4/+0xA8` progress
+window rows and their `{first_row,last_row}` spans) rather than a code one.
+
+---
+
+## 2026-08-19 — the collision SUPPLY, and a suspension ray-length defect
+
+Four defects found by driving the two physics backends on identical AI inputs
+and diffing the trajectories. The first divergence was purely vertical: RE
+carried a steady `vel.y ≈ +0.16` and crept upward while retail oscillated
+about zero and stayed pinned, with X/Z identical to 4 decimals.
+
+**P-1 — the suspension used the COMMON ray length, not the wheel's own.**
+`FUN_00123790`'s tail @0x00123952..0x0012399D turns the parametric hit into a
+distance with THAT WHEEL'S ray (`SUBPS start,end; MULPS; SQRTSS; MULSS`);
+`FUN_001239C0` then divides by the length of the COMMON `rayv` for the contact
+point (SQRTSS @0x00123D9A, DIVSS @0x00123DB1) but subtracts the RAW distance
+for the spring length (@0x00123DF7). Retail really does mix the two. The port
+scaled both by the common ray, which is >= every individual wheel's, so the
+short-ray axle read 6–80 mm deeper into the road than retail — moving the
+bottom-out gate, which is what pins the car vertically. Equal only when front
+and rear geometry match; 24 of the 100 VDB cars differ, and COMPCAR1
+(0.18/0.18) is the one the suite seeded, which is why 153/153 was blind to it.
+Fixed in `b3_prepass`; `validate_port.py` gained `run_prepass_asym_case` so it
+cannot go blind again. Measured in game: the vertical up/down bias went
+**3.70 -> 0.86** (retail 0.92), and the car survived 3516 frames in 240 s
+where it had managed 736.
+
+**P-2 — the chassis soup capacity was 32; retail's is 96.**
+[C] `FUN_0010A8E0` @0x0010A8E0 `cmp dword ptr [soup],0x60`; on the 97th poly
+retail sets `DAT_00478A30` and abandons the kd-walk. Confirmed by the buffer
+itself: `veh+0x200 = &DAT_005A3AA0`, types at 0x005A52B0, `0x1800/0x40 = 96`.
+The port filled 32 in grid-cell scan order, so the wall directly ahead was
+dropped for arbitrary neighbours: 12.0% of wall approaches exceed 32 filtered
+polys, 0.0% exceed 96.
+
+**P-3 — an invented upper bound on the face normal.**
+The port passed `wall_ny_max = 0.45` to both the chassis filter and
+`mesh_collide`'s push-out. `FUN_0011BBE0` bounds the normal only from BELOW
+(`n.y < -0.7`, 0x0039B264 @0x0011BC43); the wall/ground split is
+`FUN_0011AC30`'s `n.y > 0.7` (0x3B17D8). 11.8% of the track's structure faces
+have `|n.y| > 0.45` — every sloped barrier was unconditionally invisible.
+Both call sites now use 0.70, which admits exactly the set retail resolves as
+a WALL. On real track data the missing-wall rate goes 7.33% -> 0.00% with
+P-2 and P-3 together.
+
+**P-4 — the chassis filter bounded Y only.**
+`b3_collision_filter_walls` tested the triangle's Y slab against the box but
+never X or Z, and the wheel gather it draws from walks whole GRID CELLS with
+no per-triangle XZ test either. Chassis walls up to 18 m away were in the
+soup; 77.6% of positions carried one outside retail's own query sphere. That
+matters because retail's wall response is the MIN/MAX of the plane over every
+wall record (@0x0011AE61) — distant faces steer the response, they do not just
+cost time. Measured wall-arm records per frame before the fix: retail
+p50 = 0, p90 = 19; harness p50 = 20, p90 = 48. The XZ test is now applied.
+
+**P-5 (sidecar, fixed in tools/) — SOUP_TYPE overlapped the record array.**
+`b3_emu_server.py` pinned `ep.SOUP_TYPE` to an address only 123 records past
+`SOUP_REC` while `SOUP_CAP` was 256, so past 123 the record array overwrote the
+type table and type words wrote back into records: 126 of 130 type words
+destroyed and a vertex collapsed to the world origin (a track-spanning sliver).
+5.13% of on-road positions gathered >= 123. The retail backend was being
+resolved against corrupted geometry. Removing the override raised the retail
+backend's in-game median from 78 to 117 mph.
+
+**P-6 — the query volume itself: a box where retail uses a SPHERE.**
+[C] `FUN_0011BC60`: the query is a sphere centred on the frame translation
+(`[[veh+0x204]+0x30]`) with radius `|veh+0x1D0.xyz| + veh[0xBC]*DAT_0060EA1C`
+— the norm @0x0011BCD9, SQRTSS @0x0011BD17, `speed*dt` @0x0011BC7A, handed to
+`FUN_001AFF70` @0x0011BD9B whose leaf test is sphere-vs-AABB. For COMPCAR1
+that is 2.56 m at rest and 3.56 m at 60 m/s, against the harness's
+`{5.5, 34.0, 5.5}` box. `b3_collision_gather_sphere` now implements it and
+BOTH backends use it for the set the contact solve sees: the retail soup
+upload, and the RE chassis set (which previously came from a `{4.5, 2.5, 4.5}`
+box over the wheel soup). The WHEEL soup keeps its tall box — the port's
+suspension casts its own rays against it and needs ground under a car well
+above it. The resend threshold went with it: retail re-gathers EVERY frame
+(@0x0011BCE3, called unconditionally @0x0011BF43) and a 2.6 m sphere leaves no
+slack to coast on, so the default is now 0. That is cheaper, not dearer — the
+set is a median 10 triangles against the box's 56.
+
+**P-7 — the substep sweep discarded its own push-out.** The harness walks
+`prev_pos -> pos` in 0.6 m substeps calling `mesh_collide` at each, but it
+re-interpolated `v->pos` from `prev_pos` before every test, so every push-out
+except the last substep's was overwritten. The sweep DETECTED the contact —
+its stated job — while the car kept its uncorrected path and could finish the
+frame behind a one-sided face; and once behind it, `b3_sweep_sphere_ex`'s
+front-face test rejects the very contact that would push it back out, so
+nothing recovers it. That is the wall pop-through. It now advances by the
+per-substep delta from the corrected position.
+
+**Measured, end to end** (240 s autodrive, `B3_WALLDBG` counts a genuine
+segment-through-front-face crossing):
+
+| | before | after |
+|---|---|---|
+| vertical up/down bias (retail 0.92) | 3.70 | 1.08 |
+| genuine wall crossings / 1000 frames | ~2.8 | 0.62 (retail path 0.00) |
+| ai=re physics=re | median 60, max 134 | median 84, max 135 |
+| ai=re physics=retail | median 78, max 136 | median 104, max 127 |
+
+**The 1:1 result.** Autodrive medians cannot settle this — the SAME build
+measured 41 and 58 mph for one config on two runs. Run it deterministically
+instead (`B3_FIXED_DT=0.0166667 B3_TRAJ=1`, `ai=re` so the harness computes
+the inputs and both backends are handed the same ones) and log at 1e-7 rather
+than the 1e-3 the probe used to print — at 1e-3 you measure your own rounding.
+
+Over the first 192 frames (3.2 s), `physics=re` against `physics=retail`:
+
+| axis | bit-identical until | max difference before any 1 mm |
+|---|---|---|
+| X | frame 156 | 9.766e-4 m = **2 ULP** at X ≈ 5000 |
+| Y | frame 32 | 4.570e-5 m = **3 ULP** at Y ≈ 149 |
+| Z | frame 147 | 9.766e-4 m = **4 ULP** at Z ≈ 2000 |
+
+The first difference anywhere is 15 micrometres of Y at frame 32, and it
+self-corrects by frame 36. The two implementations agree to single-precision
+arithmetic; there is no modelling difference left to find at this level.
+
+Past that the trajectories do separate — 1 cm by frame 286, 1 m by frame 672 —
+but that is ULP-level rounding amplified through contacts and the driver's own
+feedback loop, which is Lyapunov divergence and not something a port can
+remove short of being bit-exact. Judge parity on the deterministic envelope
+above, not on where two 145 s autodrive runs end up.

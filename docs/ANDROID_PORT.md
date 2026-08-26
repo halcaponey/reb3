@@ -1,5 +1,32 @@
 # Android port of the reB3 harness
 
+> **Status (2026-08-22).** The Android-native half of this document — the
+> toolchain table, the gl4es rationale, the EGL-rebind story, the layout — is
+> still accurate and is the reason to read it. Three things around it have
+> moved, and the sections that state otherwise are flagged in place below:
+>
+> 1. **The desktop data model changed; Android's did not.** Desktop now boots
+>    ISO-direct off the user's disc (`--iso` / `$B3_ISO`, materialise-on-miss —
+>    see `src/burnout3_isodata.h`). Android deliberately stays on the
+>    pre-extracted `build/` tree, which is the same thing desktop's `--build`
+>    flag selects. That is still the right choice for a packaged APK, but this
+>    document predates the distinction and presents the `build/` tree as *the*
+>    model rather than one of two.
+> 2. **Nothing game-derived is compiled in any more.** The eight generated
+>    `src/` headers are gone, replaced by runtime loaders. §5's claim that
+>    `route.bin` / `grid.bin` / `traffic.bin` can be left out of the APK because
+>    they are baked into headers is **false and will break the packaged build** —
+>    see the correction there.
+> 3. **It has run on hardware since this was written.** §7's "not verified — no
+>    device attached" and §8's "run it on hardware, that is the whole next step"
+>    are superseded by three landed on-device fixes (the gl4es EGL rebind, a
+>    launch-time stack overflow, and the touch/tilt UI). §8's touch-UI item is
+>    likewise done — `b3_touch.c` draws the buttons and adds tilt steering,
+>    which §6.5 documents.
+>
+> There is now also a **web port** (`web/`, `make wasm`) that reuses the same
+> gl4es decision; this document does not mention it. See `web/README.md`.
+
 One checkout, two targets. `make` still produces the desktop binary exactly as
 before; `android/` produces an arm64 APK from **the same `src/*.c`**. There is
 no Android branch and no forked copy of the harness: every platform difference
@@ -49,7 +76,7 @@ Install with `adb install -r android/app/build/outputs/apk/debug/app-debug.apk`.
 
 | Piece | Version | Where it came from |
 |---|---|---|
-| Android Studio | `AI-261.26222.65.2613.16025427` | `~/Downloads/android-studio-quail3-patch1-linux/` — **used only as an inventory source**; the GUI was never launched, and it ships no SDK and no `sdkmanager` |
+| Android Studio | `AI-261.26222.65.2613.16025427` | an unpacked `android-studio-quail3-patch1-linux` tarball — **used only as an inventory source**; the GUI was never launched, and it ships no SDK and no `sdkmanager` |
 | Studio JBR | OpenJDK 25.0.2 | present at `android-studio/jbr`, **not used** — Gradle 8.14.3 does not support Java 25 |
 | JDK for Gradle | OpenJDK **21.0.11** | system, `/usr/lib/jvm/java-21-openjdk-amd64` |
 | Android SDK | installed fresh into `~/Android/Sdk` | `cmdline-tools;latest` (`commandlinetools-linux-15859902`), licences accepted headless via `sdkmanager --licenses` |
@@ -105,9 +132,17 @@ android/
     src/main/assets/burnout3_assets.zip     generated, gitignored
 ```
 
-`app/src/main/cpp/CMakeLists.txt` compiles the **same 19 translation units** the
-Makefile's `SRCS` lists — keep the two lists in lockstep when a module is added.
-`tools/` and the validators stay host-only and are not in the Android build.
+`app/src/main/cpp/CMakeLists.txt` is meant to compile the same translation units
+the Makefile's `SRCS` lists — keep the two lists in lockstep when a module is
+added. `tools/` and the validators stay host-only and are not in the Android
+build.
+
+> **Status (2026-08-22): the two lists are NOT in lockstep.** The CMake list has
+> 21 entries; the Makefile's `SRCS` has 25. Missing from the Android build:
+> `burnout3_ai_avoid.c`, `burnout3_scenery.c`, `burnout3_backend.c` and
+> `burnout3_emu.c`. (`burnout3_isodata.c` is absent by design — Android does not
+> use the ISO path.) This is exactly the drift §8.8 warns about, and it needs
+> fixing in the build files, not here.
 
 ### Include shimming, done without touching the sources
 
@@ -179,13 +214,27 @@ extractor outputs already baked into `src/burnout3_track_paths.h`,
 `burnout3_start_grid.h` and `burnout3_traffic_data.h` at compile time, and
 nothing opens them at runtime.
 
+> **Correction (2026-08-22): no longer true, and leaving them out now breaks
+> the build.** All three headers were deleted when game-derived data was taken
+> out of `src/` (`tools/validate_no_baked_data.py` is the gate). The runtime
+> loaders `open()` these files directly —
+> `src/burnout3_traffic_runtime.h` reads `build/tracks/<id>/traffic.bin`, and
+> the nav/route and start-grid loaders read `route.bin` and `grid.bin`. **The
+> packer must include them.**
+
 ### Refreshing assets after an extractor rerun
 
 ```sh
-python3 tools/extract_track.py …      # or any other tools/extract_*.py
+tools/cextract/build.sh /tmp/cxtract              # build the extractor once
+/tmp/cxtract --track US_C3_V1 --out build --game "<game dir>"
 ./android/pack_assets.sh US_C3_V1     # rebuilds the zip from build/
 cd android && ./gradlew assembleDebug
 ```
+
+(Extraction is the C pipeline now. The `tools/extract_*.py` paths still work —
+they are forwarding shims onto the immutable Python archive that serves as the
+byte-identity oracle — but `cxtract` is the live implementation and is far
+faster.)
 
 `pack_assets.sh` writes `build/ASSET_STAMP` into the zip (track id, timestamp,
 and a sha256 over the packed file list + sizes). `MainActivity` compares the

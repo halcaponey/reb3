@@ -27,6 +27,8 @@
 #ifndef BURNOUT3_GAMEPLAY_H
 #define BURNOUT3_GAMEPLAY_H
 
+#include <stddef.h>
+
 // ---------------------------------------------------------------------------
 // "Boost Bar" group (registrar FUN_0017A0F0, storage 0x3F72DC..0x3F7310).
 // VDB-tuned values; compiled defaults in comments.
@@ -95,22 +97,43 @@ static const float B3_AIR_CAT_MIN[4] = {1115.f, 10.f, 20.f, 35.f};
 // Boost bar state -- mirrors the record at racecar+0x119C (constructor
 // FUN_0017A3C0).  Field comments give the real offsets.
 // ---------------------------------------------------------------------------
-typedef struct {
-    int   tier;        // +0x30  bar tier 0..3, raised per takedown
-    float size;        // +0x34  current bar size  = B3_BAR_SIZE[tier]
-    float meter;       // +0x38  boost units in the bar
-    float earned;      // +0x3C  lifetime units earned (stat)
-    float rate;        // +0x40  drain, units/second = B3_BOOST_RATE
-    float min_units;   // +0x44  engage gate = rate * B3_MIN_BOOST_TIME
-    float mult_base;   // +0x48  earning multiplier = B3_BAR_EARN_MULT[tier]
-    float mult_bonus;  // +0x4C  event bonus multiplier (0 in normal race)
-    float start_time;  // +0x24  clock when boost engaged (the transmission's
-                       //        obj+0x11C0: elapsed = clock - start_time)
-    float end_time;    // +0x28  clock when boost last stopped (-1 = never)
-    int   boosting;    // +0x52
-    int   fixed_burn;  // +0x53  AI minimum-burn commitment
-    int   ramp_done;   // +0x55  = obj+0x11F1, consumed by the transmission
+typedef struct __attribute__((packed)) B3BoostBar {
+    // ---- RETAIL WINDOW 0x0000..0x0058: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    unsigned char _pad00[0x24];
+    float                start_time;  // +0x24  clock when boost engaged (the transmission's
+    float                end_time;  // +0x28  clock when boost last stopped (-1 = never)
+    unsigned char _pad01[0x4];
+    int                  tier;  // +0x30  bar tier 0..3, raised per takedown
+    float                size;  // +0x34  current bar size  = B3_BAR_SIZE[tier]
+    float                meter;  // +0x38  boost units in the bar
+    float                earned;  // +0x3C  lifetime units earned (stat)
+    float                rate;  // +0x40  drain, units/second = B3_BOOST_RATE
+    float                min_units;  // +0x44  engage gate = rate * B3_MIN_BOOST_TIME
+    float                mult_base;  // +0x48  earning multiplier = B3_BAR_EARN_MULT[tier]
+    float                mult_bonus;  // +0x4C  event bonus multiplier (0 in normal race)
+    unsigned char _pad02[0x2];
+    unsigned char        boosting;  // +0x52
+    unsigned char        fixed_burn;  // +0x53  AI minimum-burn commitment
+    unsigned char _pad03[0x1];
+    unsigned char        ramp_done;  // +0x55  = obj+0x11F1, consumed by the transmission
+    unsigned char _pad04[0x2];
 } B3BoostBar;
+
+#define B3BOOSTBAR_RETAIL_SPAN 0x0058u
+_Static_assert(offsetof(B3BoostBar, start_time) == 0x0024, "start_time off retail");
+_Static_assert(offsetof(B3BoostBar, end_time) == 0x0028, "end_time off retail");
+_Static_assert(offsetof(B3BoostBar, tier) == 0x0030, "tier off retail");
+_Static_assert(offsetof(B3BoostBar, size) == 0x0034, "size off retail");
+_Static_assert(offsetof(B3BoostBar, meter) == 0x0038, "meter off retail");
+_Static_assert(offsetof(B3BoostBar, earned) == 0x003C, "earned off retail");
+_Static_assert(offsetof(B3BoostBar, rate) == 0x0040, "rate off retail");
+_Static_assert(offsetof(B3BoostBar, min_units) == 0x0044, "min_units off retail");
+_Static_assert(offsetof(B3BoostBar, mult_base) == 0x0048, "mult_base off retail");
+_Static_assert(offsetof(B3BoostBar, mult_bonus) == 0x004C, "mult_bonus off retail");
+_Static_assert(offsetof(B3BoostBar, boosting) == 0x0052, "boosting off retail");
+_Static_assert(offsetof(B3BoostBar, fixed_burn) == 0x0053, "fixed_burn off retail");
+_Static_assert(offsetof(B3BoostBar, ramp_done) == 0x0055, "ramp_done off retail");
 
 // FUN_0017A3C0 verbatim (reset to tier 0).
 static inline void b3_boost_reset(B3BoostBar* b) {
@@ -229,15 +252,28 @@ static inline float b3_steer_away_response(float base, float t_slam,
 // FUN_001994D0 (validate_gameplay "takedown commit", 3/3 incl. the BP chain
 // executed end-to-end): base takedown BP plus escalation inside the double /
 // spree windows.  State the caller keeps per car: window ends + counts.
-typedef struct {
-    int   takedowns;       // score+0x68
-    int   bp;              // racecar+0x111C accumulated Burnout Points
-    float dbl_window_end;  // sub+0x110 (-1 = closed)
-    int   dbl_count;       // sub+0x114
-    float spree_window_end;// sub+0x118
-    int   spree_count;     // sub+0x11C
-    float last_td_time;    // score+0x500
+typedef struct __attribute__((packed)) B3TakedownScore {
+    // ---- RETAIL WINDOW 0x0000..0x1120: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    unsigned char _pad00[0x110];
+    float                dbl_window_end;  // sub+0x110 (-1 = closed)
+    int                  dbl_count;  // sub+0x114
+    float                spree_window_end;  // sub+0x118
+    int                  spree_count;  // sub+0x11C
+    unsigned char _pad01[0x1000];
+
+    // ---- HARNESS SIDE, past the retail window: no recovered
+    // offset in THIS object, so it must not squat on retail's bytes.
+    int                  takedowns;  // score+0x68
+    int                  bp;  // racecar+0x111C accumulated Burnout Points
+    float                last_td_time;  // score+0x500
 } B3TakedownScore;
+
+#define B3TAKEDOWNSCORE_RETAIL_SPAN 0x1120u
+_Static_assert(offsetof(B3TakedownScore, dbl_window_end) == 0x0110, "dbl_window_end off retail");
+_Static_assert(offsetof(B3TakedownScore, dbl_count) == 0x0114, "dbl_count off retail");
+_Static_assert(offsetof(B3TakedownScore, spree_window_end) == 0x0118, "spree_window_end off retail");
+_Static_assert(offsetof(B3TakedownScore, spree_count) == 0x011C, "spree_count off retail");
 
 static inline void b3_takedown_score_reset(B3TakedownScore* s) {
     s->takedowns = 0;

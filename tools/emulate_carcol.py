@@ -26,9 +26,6 @@ Usage:
   python3 tools/emulate_carcol.py --extract-hulls
   python3 tools/emulate_carcol.py --selftest
 """
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-from b3_paths import game_path, game_root  # noqa: E402
 import glob
 import math
 import os
@@ -41,10 +38,14 @@ from unicorn.x86_const import (UC_X86_REG_ESP, UC_X86_REG_EIP, UC_X86_REG_EAX,
                                UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EDX,
                                UC_X86_REG_ESI, UC_X86_REG_EDI)
 
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from b3_paths import game_path, game_root  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 ELF = os.path.join(ROOT, "build", "burnout3.elf")
-GAME = (game_root())
+GAME = game_root()
 
 PAGE = 0x1000
 
@@ -54,8 +55,13 @@ F_F8D0   = 0x0010F8D0    # two-body contact impulse
 F_1121F0 = 0x001121F0    # racer vs racer
 F_113960 = 0x00113960    # car vs crashed car
 F_1205E0 = 0x001205E0    # force routing
+F_112E70 = 0x00112E70    # car vs a LIVE traffic car (a type-3 object)
+F_FCE0   = 0x0010FCE0    # 2-D segment/segment closest points
 F_DCA0   = 0x0010DCA0    # crash entry (stubbed)
+F_E580   = 0x0010E580    # the other crash entry (stubbed)
+F_114910 = 0x00114910    # traffic object -> real vehicle (hooked, see below)
 F_141700 = 0x00141700    # sound cue (stubbed)
+D_73BB8C = 0x0073BB8C    # the "designated" marker FUN_0010FBC0 compares
 
 G_D5370  = 0x004D5370    # game root pointer
 
@@ -76,8 +82,13 @@ VTABLE    = 0x30025400
 STUB_SLAM = 0x30025600
 CTXBUF    = 0x30026000        # hull query context (0x210)
 SCRATCH   = 0x30028000
+STUB_RUB  = 0x30029000        # game ctx vtable +0x54 (the type-3 rub report)
+STUB_MODE = 0x30029100        # game ctx vtable +0x90 (game mode)
+STUB_SUB  = 0x30029200        # game ctx vtable +0x94 (sub mode)
+TRAFFIC_B = 0x30030000        # a TRAFFIC CAR record (frame at +0x70)
+MODEL_B   = 0x30040000        # its model: box +0xE80/+0xE90, hull +0x1060
 REGION_LO = 0x30000000
-REGION_SZ = 0x40000
+REGION_SZ = 0x80000
 
 STACK_BASE = 0x20000000
 STACK_SIZE = 0x100000
@@ -175,6 +186,35 @@ class Session:
         # DAT_004A52B3 selects the OBB path in FUN_00113960; retail value 0.
         self.uc.mem_write(0x004A52B3, b'\x00')
 
+        # FUN_0010E580 -- the non-car crash entry, no stack args.
+        self.uc.mem_write(F_E580, b'\xC3')
+        # game ctx vtable +0x54: FUN_00112E70's rub report (2 args).
+        self.uc.mem_write(STUB_RUB, b'\xB0\x01\xC2\x08\x00')
+        self.uc.mem_write(VTABLE + 0x54, struct.pack('<I', STUB_RUB))
+        # FUN_00017310's mode test: vtable +0x90 == 6, or +0x94 in {3,4,5}.
+        self.set_game_mode(0, 0)
+        self.uc.mem_write(VTABLE + 0x90, struct.pack('<I', STUB_MODE))
+        self.uc.mem_write(VTABLE + 0x94, struct.pack('<I', STUB_SUB))
+
+        # FUN_00114910 -- the traffic-object PROMOTION.  Retail takes a real
+        # 0x2430 vehicle record out of the collision world's own pool and
+        # FUN_00120BA0 seeds it from the traffic record; here the harness owns
+        # the record (VEH_B), so the hook performs exactly the seeding the
+        # retail path does -- frame from rec+0x70, veh+0xBC = rec+0xC4,
+        # veh+0xB0 = at * speed (0x00120DE3..0x00120E3C) -- and relinks the
+        # object handle: type 3 -> 4, +0x04 -> the new frame, +0x08 -> the new
+        # +0x1D0 box, +0x0C -> the new vehicle.  FUN_00113960 then runs for
+        # real over it, which is where the promoted car gets its impulse.
+        self.uc.mem_write(F_114910, b'\xC2\x18\x00')          # ret 0x18
+        self.promotions = []
+        self.traffic_seed = None
+        def _promote(uc, addr, size, user):
+            sp = uc.reg_read(UC_X86_REG_ESP)
+            obj, marker = struct.unpack('<II', uc.mem_read(sp + 4, 8))
+            self.promotions.append(obj)
+            self._promote_object(obj, marker & 0xFF)
+        self.uc.hook_add(UC_HOOK_CODE, _promote, begin=F_114910, end=F_114910)
+
         # record which vehicle FUN_0010DCA0 (crash entry) is fired for
         self.crashed_vehs = []
         def _dca0(uc, addr, size, user):
@@ -254,6 +294,136 @@ class Session:
         uc.mem_write(obj + 0x04, struct.pack('<I', frame))
         uc.mem_write(obj + 0x08, struct.pack('<I', veh + 0x1D0))
         uc.mem_write(obj + 0x0C, struct.pack('<I', veh))
+
+    # -- the type-3 (live traffic car) side ---------------------------------
+    def set_game_mode(self, mode, sub):
+        """FUN_00017310 -- 'crash party' is game mode 6 or sub-mode 3/4/5."""
+        self.uc.mem_write(STUB_MODE, b'\xB8' + struct.pack('<I', mode) + b'\xC3')
+        self.uc.mem_write(STUB_SUB,  b'\xB8' + struct.pack('<I', sub) + b'\xC3')
+
+    def seed_traffic(self, st):
+        """Seed slot 1 as a LIVE TRAFFIC CAR: a type-3 collision handle whose
+        entity is a traffic record, NOT a vehicle.  FUN_00111620 (called by
+        the traffic spawn FUN_001A2B20) writes exactly this handle:
+            +0x00 type 3   +0x04 rec+0x70 (its own 4x4)
+            +0x08 model+0xE80 (the box)   +0x0C the traffic record
+        and FUN_0010FB70 hands the narrow phase model+0x1060 as the hull."""
+        uc = self.uc
+        uc.mem_write(TRAFFIC_B, b'\0' * 0x200)
+        uc.mem_write(MODEL_B, b'\0' * 0x1700)
+
+        m = st['frame']
+        write_mat(uc, TRAFFIC_B + 0x70, m)
+        uc.mem_write(TRAFFIC_B + 0xB0, struct.pack('<I', MODEL_B))
+        uc.mem_write(TRAFFIC_B + 0xC4, f2b(st.get('speed', 0.0)))
+        uc.mem_write(TRAFFIC_B + 0x174, bytes([st.get('flags_174', 0)]))
+
+        uc.mem_write(MODEL_B + 0xE80, b''.join(f2b(x) for x in st['bbmax']))
+        uc.mem_write(MODEL_B + 0xE90, b''.join(f2b(x) for x in st['bbmin']))
+        # The type-3 path takes the hull straight from the loaded model
+        # (FUN_0010FB70 returns model+0x1060) and FUN_0010AC20 dereferences
+        # the pointer table at +0x00..+0x10, so the record must be relinked
+        # in place -- the same relink FUN_00122C20 performs on the copy it
+        # makes for a vehicle.  [S: the in-place relink site is not located.]
+        rec = bytearray(st['hull'])
+        base = MODEL_B + BGV_HULL_OFF
+        for i, off in enumerate((0x1C, 0xA0, 0x320, 0x480, 0x4F8)):
+            struct.pack_into('<I', rec, i * 4, base + off)
+        uc.mem_write(base, bytes(rec))
+
+        uc.mem_write(OBJ_B, b'\0' * 0x30)
+        uc.mem_write(OBJ_B + 0x00, bytes([3]))
+        uc.mem_write(OBJ_B + 0x04, struct.pack('<I', TRAFFIC_B + 0x70))
+        uc.mem_write(OBJ_B + 0x08, struct.pack('<I', MODEL_B + 0xE80))
+        uc.mem_write(OBJ_B + 0x0C, struct.pack('<I', TRAFFIC_B))
+        uc.mem_write(D_73BB8C, b'\0')
+        self.traffic_seed = dict(st)
+
+    def _promote_object(self, obj, marker):
+        """FUN_00114910 + FUN_00120BA0 over the harness's own record."""
+        uc = self.uc
+        st = self.traffic_seed
+        rec = struct.unpack('<I', uc.mem_read(obj + 0x0C, 4))[0]
+        m = [list(struct.unpack('<4f', uc.mem_read(rec + 0x70 + r * 16, 16)))
+             for r in range(4)]
+        spd = struct.unpack('<f', uc.mem_read(rec + 0xC4, 4))[0]
+
+        uc.mem_write(VEH_B, b'\0' * VEH_SZ)
+        write_mat(uc, FRAME_B, m)                     # veh+0x204 frame object
+        write_mat(uc, VEH_B + 0x70, invert_rigid(m))  # @0x00120D81
+        ii = st.get('inv_inertia', [[1.0 / 900, 0, 0, 0], [0, 1.0 / 1800, 0, 0],
+                                    [0, 0, 1.0 / 1600, 0]])
+        for i in range(3):
+            uc.mem_write(VEH_B + 0x40 + i * 16, b''.join(f2b(x) for x in ii[i]))
+        # veh+0xBC = rec+0xC4 and veh+0xB0.. = frame.at * speed  @0x00120DDD
+        uc.mem_write(VEH_B + 0xBC, f2b(spd))
+        uc.mem_write(VEH_B + 0xC0, b''.join(f2b(x) for x in m[2]))
+        # +0xB0/+0xB4/+0xB8 only -- retail writes the three lanes one at a
+        # time (@0x00120E20/0x00120E2E/0x00120E3C) and leaves +0xBC holding
+        # the speed it stored at 0x00120DDD.
+        for k in range(3):
+            uc.mem_write(VEH_B + 0xB0 + k * 4, f2b(m[2][k] * spd))
+        uc.mem_write(VEH_B + 0x1D0, b''.join(f2b(x) for x in st['bbmax']))
+        uc.mem_write(VEH_B + 0x1E0, b''.join(f2b(x) for x in st['bbmin']))
+        uc.mem_write(VEH_B + 0x1F0, f2b(st['mass']))
+        uc.mem_write(VEH_B + 0x204, struct.pack('<I', FRAME_B))
+        uc.mem_write(VEH_B + 0x208, struct.pack('<I', VEH_B + HULL_OFF))
+        uc.mem_write(VEH_B + 0x13F4, struct.pack('<I', RACE_B))
+        uc.mem_write(VEH_B + 0x242B, bytes([marker]))
+        hull = bytearray(st['hull'])
+        base = VEH_B + HULL_OFF
+        for i, off in enumerate((0x1C, 0xA0, 0x320, 0x480, 0x4F8)):
+            struct.pack_into('<I', hull, i * 4, base + off)
+        uc.mem_write(base, bytes(hull))
+
+        uc.mem_write(obj + 0x00, bytes([4]))          # @0x00114913 *param_1 = 4
+        uc.mem_write(obj + 0x04, struct.pack('<I', FRAME_B))
+        uc.mem_write(obj + 0x08, struct.pack('<I', VEH_B + 0x1D0))
+        uc.mem_write(obj + 0x0C, struct.pack('<I', VEH_B))
+
+    def seg_closest2d(self, a0, a1, b0, b1):
+        """FUN_0010FCE0(EDX=b1, ECX=b0, [+8]=a0, [+0xC]=a1, ESI=pB, EDI=pA,
+        [+0x10]=&tA, [+0x14]=&tB) -> distance in XMM0."""
+        uc = self.uc
+        base = SCRATCH + 0x100
+        addr = {}
+        for i, (nm, v) in enumerate((('a0', a0), ('a1', a1),
+                                     ('b0', b0), ('b1', b1))):
+            addr[nm] = base + i * 0x10
+            uc.mem_write(addr[nm], b''.join(f2b(x) for x in v))
+        pa, pb, ta, tb = base + 0x40, base + 0x50, base + 0x60, base + 0x70
+        for a in (pa, pb, ta, tb):
+            uc.mem_write(a, b'\0' * 16)
+        sp = STACK_BASE + STACK_SIZE - 0x2000
+        for i, a in enumerate([addr['a0'], addr['a1'], ta, tb]):
+            uc.mem_write(sp + 4 + i * 4, struct.pack('<I', a))
+        uc.mem_write(sp, struct.pack('<I', MAGIC_RET))
+        uc.reg_write(UC_X86_REG_ESP, sp)
+        uc.reg_write(UC_X86_REG_EDX, addr['b1'])
+        uc.reg_write(UC_X86_REG_ECX, addr['b0'])
+        uc.reg_write(UC_X86_REG_ESI, pb)
+        uc.reg_write(UC_X86_REG_EDI, pa)
+        uc.emu_start(F_FCE0, MAGIC_RET, count=200000)
+        try:
+            import unicorn.x86_const as xc
+            dist = struct.unpack('<f', bytes(uc.reg_read(xc.UC_X86_REG_XMM0)
+                                             .to_bytes(16, 'little')[:4]))[0]
+        except Exception:
+            dist = None
+        return dict(dist=dist,
+                    pa=read_vec(uc, pa, 2), pb=read_vec(uc, pb, 2),
+                    ta=read_vec(uc, ta, 1)[0], tb=read_vec(uc, tb, 1)[0])
+
+    def resolve_traffic(self):
+        """FUN_00112E70(param_1 = the collision world, param_2 = the pair)."""
+        self._pair()
+        self.crashed_vehs = []
+        self.slams = []
+        self.promotions = []
+        self._run(F_112E70, {}, [0, PAIR])
+        out = self._pair_out()
+        out['promote'] = int(OBJ_B in self.promotions)
+        return out
 
     def dump(self, slot):
         uc = self.uc

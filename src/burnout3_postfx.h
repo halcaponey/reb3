@@ -1,5 +1,7 @@
 #ifndef BURNOUT3_POSTFX_H
 #define BURNOUT3_POSTFX_H
+
+#include <stddef.h>
 /* World post FX: the sky rendering and the speed/boost blur post-effect —
  * RE'd from the retail XBE against the xemu reference captures.
  *
@@ -312,12 +314,20 @@
 
 /* One dome vertex. MUST be 32 bytes — the game's stride, pushed as 0x20 at
  * 0x00032633 (SetStreamSource) and implied by 0x41C0 / 2 / 0x20 = 263. */
-typedef struct {
-    float        pos[3];   /* +0x00 unit dome position                       */
-    unsigned int color;    /* +0x0C 0x0000FF00                               */
-    float        tc0[2];   /* +0x10 (azimuth/2pi, gradient-LUT v)            */
-    float        tc1[2];   /* +0x18 (azimuth/pi, 1 - yhat/0.85) — sky only   */
+typedef struct __attribute__((packed)) B3SkyVertex {
+    // ---- RETAIL WINDOW 0x0000..0x001C: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    float                pos[3];  /* +0x00 unit dome position                       */
+    unsigned int         color;  /* +0x0C 0x0000FF00                               */
+    float                tc0[2];  /* +0x10 (azimuth/2pi, gradient-LUT v)            */
+    float                tc1[2];  /* +0x18 (azimuth/pi, 1 - yhat/0.85) — sky only   */
 } B3SkyVertex;
+
+#define B3SKYVERTEX_RETAIL_SPAN 0x001Cu
+_Static_assert(offsetof(B3SkyVertex, pos) == 0x0000, "pos off retail");
+_Static_assert(offsetof(B3SkyVertex, color) == 0x000C, "color off retail");
+_Static_assert(offsetof(B3SkyVertex, tc0) == 0x0010, "tc0 off retail");
+_Static_assert(offsetof(B3SkyVertex, tc1) == 0x0018, "tc1 off retail");
 
 /* Build one dome exactly as FUN_00032020 does.
  *   sky != 0 -> param_1 == 1 (upper hemisphere, s = +1, writes tc1)
@@ -406,15 +416,45 @@ void b3_sky_lut_set_blit(float f);
  * blurState+0x54, whose useful range is 0..2), and the conversion from s to
  * the combiner constant C0.a is the recovered law b3_postfx_present_alpha().
  * Only the speed -> s mapping is invented now; the composite around it is not. */
+/* RETUNED 2026-08-24, all GLUE, in answer to "I don't see any blur effects on
+ * PC". The headline defect was structural and is fixed in the composite (see
+ * AFX_FS_COMPOSITE), but these numbers were the second half of it: measured on
+ * a pinned frame against a blur-off reference, the OLD ramp moved the picture
+ * by a mean 1.3 levels of 255 at 60 mph and 5.2 at 90 mph. Roughly 1.5 levels
+ * is the floor of what a viewer notices at all, so the old curve was at the
+ * threshold of visibility at 60 and barely over it at 90 -- against a stated
+ * standard of "perceptible by ~90 mph, dramatic under boost".
+ *
+ * Three things were wrong and all three are GLUE:
+ *
+ *   * THE SHAPE. `t` was SQUARED, which is a fine way to keep a cruise quiet
+ *     but throws away the whole middle of the range: at 90 mph -- two thirds
+ *     of the way up the ramp -- a square is only 44% of the way up the curve.
+ *     B3_BLUR_SHAPE makes the exponent explicit and drops it to 1.35, which
+ *     still leaves 60 mph at a quarter strength and lifts 90 mph to 58%.
+ *   * THE PEAK. 0.85 of the game's 0..2 range meant C0.a topped out at 0.425
+ *     unboosted -- under half the recovered ceiling on a scale whose ceiling
+ *     the recovered clamp says is reachable.
+ *   * THE MASK. r0 0.25 with a 1.5 exponent zeroed the effect across the whole
+ *     middle of the frame and still only reached 0.48 at the screen edge, so
+ *     the strongest thing the ramp could ask for was halved again everywhere
+ *     a driver actually looks. 0.10 / 1.10 keeps the car and the HUD centre
+ *     sharp -- which is the point of having a mask -- while letting the smear
+ *     reach 0.65 at the edge and 1.0 in the corners.
+ *
+ * The ONSET (30) and the SATURATION SPEED (120) are deliberately unchanged:
+ * they are what the reference captures pin (0 mph sharp, 42/52 faint, 85/103
+ * strong), and validate_postfx C6 asserts both endpoints. */
 #define B3_BLUR_MPH_ON      30.0f   /* GLUE onset                            */
 #define B3_BLUR_MPH_FULL   120.0f   /* GLUE saturation                       */
-#define B3_BLUR_S_MAX       0.85f   /* GLUE peak s at top speed (of 2.0 max)  */
-#define B3_BLUR_BOOST_GAIN  0.45f   /* GLUE extra from the recovered ramp     */
+#define B3_BLUR_SHAPE       1.35f   /* GLUE ramp exponent (was a hard square) */
+#define B3_BLUR_S_MAX       1.15f   /* GLUE peak s at top speed (of 2.0 max)  */
+#define B3_BLUR_BOOST_GAIN  0.50f   /* GLUE extra from the recovered ramp     */
 #define B3_BLUR_TAPS       16       /* GLUE tap count -- 0.99^16 = 0.851, i.e. a */
                                     /* 15% edge displacement, which is what   */
                                     /* the 85/103 mph captures show           */
-#define B3_BLUR_MASK_R0     0.25f   /* GLUE mask inner radius (sharp centre)  */
-#define B3_BLUR_MASK_POW    1.5f    /* GLUE mask falloff exponent             */
+#define B3_BLUR_MASK_R0     0.10f   /* GLUE mask inner radius (sharp centre)  */
+#define B3_BLUR_MASK_POW    1.10f   /* GLUE mask falloff exponent             */
 
 /* ------------------------------------------------------------------- API */
 

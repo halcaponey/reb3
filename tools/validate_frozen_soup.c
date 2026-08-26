@@ -14,13 +14,21 @@ typedef struct SoupRayContext {
     int hits;
 } SoupRayContext;
 
+/* `wheel_gate` is retail's split between the surface-GATED per-wheel ray
+ * (FUN_001239C0 @0x00123CEF -> FUN_00123790) and the UNGATED under-body
+ * clearance ray (@0x00123EC6..0x00123F97).  This test's soup is all
+ * drivable surface, so both arms answer the same; the parameter is taken so
+ * the hook keeps matching B3VehicleFull.soup_ground_ray. */
 static int soup_ground_ray(void* user, const float start[3], const float end[3],
-                           float* hit_t, float normal[3]) {
+                           float* hit_t, float normal[3], int wheel_gate) {
     SoupRayContext* context = user;
     context->calls++;
-    int surface = b3_collision_ray_polys_game_space(context->polys,
-                                                     context->count, start, end,
-                                                     hit_t, normal);
+    int surface = wheel_gate
+        ? b3_collision_ray_polys_game_space_wheel(context->polys,
+                                                  context->count, start, end,
+                                                  hit_t, normal, 0)
+        : b3_collision_ray_polys_game_space(context->polys, context->count,
+                                            start, end, hit_t, normal);
     if (surface >= 0) context->hits++;
     return surface;
 }

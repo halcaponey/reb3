@@ -1,5 +1,7 @@
 #ifndef BURNOUT3_PARTICLEFX_H
 #define BURNOUT3_PARTICLEFX_H
+
+#include <stddef.h>
 /* THE PARTICLE FX ENGINE -- crash dust/smoke/debris, wall-grind sparks,
  * tyre smoke and the offroad dust roostertail.
  *
@@ -211,8 +213,8 @@
  * tuning values, not a runtime-loaded copy.
  *
  * ART: run `python3 tools/extract_particlefx_art.py` first (it writes
- * build/particlefx/*.png out of Data/Global.txd).  With it missing every
- * entry point degrades to a no-op.
+ * the PNGs under build/particlefx/ out of Data/Global.txd).  Without them
+ * every entry point degrades to a no-op.
  */
 
 #include <GL/gl.h>
@@ -234,21 +236,51 @@ extern "C" {
 #define B3_PFX_MAX      9216
 
 /* One FX descriptor; the comments carry the record's own offsets.   [C] */
-typedef struct {
+/* packed pins the retail offsets; aligned(4) pins only the struct BASE.
+ * No member moves (the offsetof asserts below prove it) -- but with a
+ * 4-aligned base the 4-byte fields ARE 4-aligned, so taking their address
+ * is no longer undefined and -Waddress-of-packed-member goes quiet on the
+ * fields that really are aligned (and still fires on any that are not). */
+typedef struct __attribute__((packed, aligned(4))) B3PfxDesc {
+    // ---- RETAIL WINDOW 0x0000..0x0074: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    unsigned char _pad00[0x8];
+    int                  kind;  /* +0x08 render-kind class 0..5               */
+    int                  blend;  /* +0x0C 0 alpha, 1 SUBTRACTIVE, 2 additive   */
+    float                life;  /* +0x10 seconds                              */
+    float                mid_t;  /* +0x14 mid-key time fraction                */
+    unsigned             col[3];  /* +0x18/1C/20  0xAABBGGRR keys (R = low byte)*/
+    unsigned char _pad01[0x4];
+    float                size[3];  /* +0x28/2C/30  size keys, world units        */
+    unsigned char _pad02[0x10];
+    float                grav;  /* +0x44 gravity y (pos = p + v*t + g*t*t)    */
+    unsigned char _pad03[0x4];
+    float                cone;  /* +0x4C cos(cone half-angle)                 */
+    unsigned char _pad04[0x10];
+    int                  cap_a;  /* +0x60 ring-A capacity                      */
+    int                  cap_b;  /* +0x64 ring-B capacity                      */
+    unsigned char _pad05[0x4];
+    float                max_px;  /* +0x6C max screen size, used x0.435         */
+    float                min_px;  /* +0x70 min screen size cull                 */
+
+    // ---- HARNESS SIDE, past the retail window: no recovered
+    // offset in THIS object, so it must not squat on retail's bytes.
     const char *tex;      /* +0x00 texture name in Data/Global.txd      */
-    int         kind;     /* +0x08 render-kind class 0..5               */
-    int         blend;    /* +0x0C 0 alpha, 1 SUBTRACTIVE, 2 additive   */
-    float       life;     /* +0x10 seconds                              */
-    float       mid_t;    /* +0x14 mid-key time fraction                */
-    unsigned    col[3];   /* +0x18/1C/20  0xAABBGGRR keys (R = low byte)*/
-    float       size[3];  /* +0x28/2C/30  size keys, world units        */
-    float       grav;     /* +0x44 gravity y (pos = p + v*t + g*t*t)    */
-    float       cone;     /* +0x4C cos(cone half-angle)                 */
-    int         cap_a;    /* +0x60 ring-A capacity                      */
-    int         cap_b;    /* +0x64 ring-B capacity                      */
-    float       max_px;   /* +0x6C max screen size, used x0.435         */
-    float       min_px;   /* +0x70 min screen size cull                 */
 } B3PfxDesc;
+
+#define B3PFXDESC_RETAIL_SPAN 0x0074u
+_Static_assert(offsetof(B3PfxDesc, kind) == 0x0008, "kind off retail");
+_Static_assert(offsetof(B3PfxDesc, blend) == 0x000C, "blend off retail");
+_Static_assert(offsetof(B3PfxDesc, life) == 0x0010, "life off retail");
+_Static_assert(offsetof(B3PfxDesc, mid_t) == 0x0014, "mid_t off retail");
+_Static_assert(offsetof(B3PfxDesc, col) == 0x0018, "col off retail");
+_Static_assert(offsetof(B3PfxDesc, size) == 0x0028, "size off retail");
+_Static_assert(offsetof(B3PfxDesc, grav) == 0x0044, "grav off retail");
+_Static_assert(offsetof(B3PfxDesc, cone) == 0x004C, "cone off retail");
+_Static_assert(offsetof(B3PfxDesc, cap_a) == 0x0060, "cap_a off retail");
+_Static_assert(offsetof(B3PfxDesc, cap_b) == 0x0064, "cap_b off retail");
+_Static_assert(offsetof(B3PfxDesc, max_px) == 0x006C, "max_px off retail");
+_Static_assert(offsetof(B3PfxDesc, min_px) == 0x0070, "min_px off retail");
 
 /* One emitter type.  The ADDRESSES of `v[]` are [C] (they are built into
  * two float4 min/max boxes at 0x00181BC5..0x00181E05); the
@@ -263,13 +295,25 @@ typedef struct {
 } B3PfxEmitter;
 
 /* One surface row.  `emit` is the wheel-FX emitter id, or B3_PFX_NONE. */
-typedef struct {
-    float scale;          /* +0x00 emit-strength scale              [C] */
-    float skid;           /* +0x04 skid / darkening                 [S] */
-    float gravelness;     /* +0x08                                  [S] */
-    signed char emit;     /* +0x0C emitter id, 0x1A = none          [C] */
-    signed char decal;    /* lays the fxscrape decal (surf 4/11/14) [C] */
+typedef struct __attribute__((packed)) B3PfxSurface {
+    // ---- RETAIL WINDOW 0x0000..0x0010: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    float                scale;  /* +0x00 emit-strength scale              [C] */
+    float                skid;  /* +0x04 skid / darkening                 [S] */
+    float                gravelness;  /* +0x08                                  [S] */
+    signed char          emit;  /* +0x0C emitter id, 0x1A = none          [C] */
+    unsigned char _pad00[0x3];
+
+    // ---- HARNESS SIDE, past the retail window: no recovered
+    // offset in THIS object, so it must not squat on retail's bytes.
+    signed char          decal;  /* lays the fxscrape decal (surf 4/11/14) [C] */
 } B3PfxSurface;
+
+#define B3PFXSURFACE_RETAIL_SPAN 0x0010u
+_Static_assert(offsetof(B3PfxSurface, scale) == 0x0000, "scale off retail");
+_Static_assert(offsetof(B3PfxSurface, skid) == 0x0004, "skid off retail");
+_Static_assert(offsetof(B3PfxSurface, gravelness) == 0x0008, "gravelness off retail");
+_Static_assert(offsetof(B3PfxSurface, emit) == 0x000C, "emit off retail");
 
 /* Read-only access to the three recovered tables (tools/validate_pfx.py
  * walks these against build/burnout3.elf). */

@@ -1,5 +1,24 @@
 # Burnout 3 opponent AI — drivers, parameters, rubber-banding
 
+> **Status (2026-08-22).** This is an append-only evidence record: later
+> sections supersede earlier ones, and several early "not ported" / "GLUE"
+> verdicts have since been closed by work recorded further down this same file
+> or in the tree. Known-stale statements above their own corrections:
+> `FUN_001714F0` **is** ported (as `nav_replace_car`); the traffic speed cap is
+> the recovered `22.352` m/s, not the old `13.0` GLUE; the corner
+> angle→speed shape is recovered and ported (`b3_ai_corner_speed`,
+> `FUN_00172E80`), so it is no longer GLUE; and `src/burnout3_ai_pace.h` no
+> longer exists — the pace table is loaded at startup from
+> `build/tracks/<track>/pace.bin` by `src/burnout3_ai_pace_runtime.h`, because
+> no game-derived data is compiled into `src/` any more. Where a passage names
+> `tools/extract_*.py` / `tools/gen_*.py` as the producer of an artefact, the
+> live producer is the corresponding `tools/cextract/` stage; those Python
+> paths are forwarding shims onto the immutable archive and the bytes are
+> identical by gate.
+>
+> The AI follow-up ledger in this file is still the live list of open AI work.
+> Addresses, parameters and measurements stand as recorded.
+
 Recovered 2026-08-10 from the analyzed `burnout3.elf` (VAs as elsewhere;
 `.text` = flat + 0x10000). Markers as in the other docs: **[C]** =
 execution-verified (green differential case in `tools/validate_gameplay.py`,
@@ -495,8 +514,23 @@ The **aim point** `AI+0x200` / `AI+0x180` and its corner speed `AI+0x298` →
   nodes `n..n+3`: `sum(pair[n+2], pair[n+3]) - sum(pair[n], pair[n+1])`,
   with explicit end-of-section wrap cases;
 * `FUN_00176150` then produces `AI+0x1D0` as
-  `"Dist to brake speed factor big=>fast" x (dist - corner_speed) + base`
-  when target mode is 0, else the corner speed directly, capped by `AI+0xA08`.
+  `"Dist to brake speed factor big=>fast" x (X - D) + AI+0x298`
+  when target mode is 0, else `AI+0x298` directly, capped by `AI+0xA08`.
+  **Both terms under the factor are distances.** `X` is `FUN_00174A90`
+  (@`0x001761C4`), the arc length from the car's own navigator node
+  `AI+0x1D8` to the planner's corner node `AI+0x214`, off the index row's
+  cumulative `edge[]` table (`x1 - x2`, or `edge[count-1] - x2 + x1` when
+  `from > to`); `D` is `FUN_00174AF0` (@`0x00176204`), the projection inside
+  that same node. An earlier reading here had `(dist - corner_speed)`, and
+  the port had `(cs - D)` -- neither depends on the distance to the corner.
+  Executed side by side the correct form and the port's old one disagree on
+  7 of `tools/validate_ai.py`'s 12 cases; the oracle had agreed only because
+  it stubbed `FUN_00174A90` with a bare `RET`, which leaves XMM0 carrying
+  `AI+0x298` from @`0x00176169`. Note also that `AI+0x298` is
+  `(float)plan_record.u16@+6`, a corner RADIUS in metres (the same field the
+  lane law divides by `DAT_0047A1DC`, "Corner radius to give max offset
+  pos" = 300), so after the `min` with `AI+0xA08` this ceiling sits at the
+  hard cap on 96.6-98.8% of shipped plan nodes. [C-disasm]
 
 `FUN_00158DE0` proves that every index row is relocated from three
 row-relative offsets; `FUN_0018B250` publishes those rows directly in the
@@ -976,11 +1010,12 @@ AI reads are aliases of it:
 
 | avoid | AI | racecar | meaning |
 |---|---|---|---|
-| +0x040[256] | +0x2F0 | +0x1CF0 | per-strip **type** (2..4 = a vehicle, 6 = road no-go) |
+| +0x040[256] | +0x2F0 | +0x1CF0 | per-strip **type**: 1/2 soft no-go, 3 physics-vehicle list, 4 proximity list, 5 WRECKED racecar, 6 LIVE racecar, 7 HARD no-go (corrected 2026-08-20 at each stamper's call site) |
 | +0x140[256] | +0x3F0 | +0x1DF0 | per-strip **time to occupancy**, `u8 x 8/255` → 0..8 s |
 | +0x240[256] | +0x4F0 | +0x1EF0 | per-strip **range**, `s16 x 1000/65536` → ±500 m |
-| +0x440/+0x441/+0x442 | +0x6F0.. | | window width / high index / low index |
-| +0x444 / +0x44C | | | road half-width / offset at the node (world→strip map) |
+| +0x440/+0x441/+0x442 | +0x6F0.. | | the CAR'S OWN FOOTPRINT: strip count / high / low. `FUN_00170100` sets them to `128 +- 5*half_extent` — this is **not** a road-wide band, and every aggregate in `FUN_0016C4B0` is taken over it (corrected 2026-08-20) |
+| +0x000 / +0x010 / +0x020 / +0x030 | | | LEFT edge point / RIGHT edge point (the frame ORIGIN) / the car's world position / the unit right→left axis with y forced to 0 (`FUN_00170260`) |
+| +0x444 / +0x448 / +0x44C | | | road **width** (not half-width) / the car's distance from the LEFT edge / from the RIGHT edge. `strip(p) = (int)((dot(p - right, axis) - lat_right) * 5) + 128`, proved by executing `FUN_0016F400`; the origin cancels, so only the AXIS and the WIDTH are load-bearing |
 | +0x460 | +0x710 | +0x1E10... | the avoidance **aim point** (world) |
 | **+0x470** | **+0x720** | +0x2120 | the avoidance **direction** — what `FUN_0016ADF0` commits |
 | **+0x484** | **+0x734** | +0x2134 | time-to-target for that direction |
@@ -1024,7 +1059,7 @@ Called in order at `0x0016D3E9`..`0x0016D407`, all gated by
 | `FUN_0016F6C0` | **road / no-go edges** | walks route nodes ahead; node 0 uses `Hard No Go offset {distance,time}` (200 m / 0 s), node k uses `Soft No Go offset {distance,time}` + k × `Extra softNoGo offset {dist,time} for future` (101 + 5k m, 2.5 + 0.08k s) |
 | `FUN_0016EA40` | **the other RACECARS** | the `DAT_0073A1A8[]` table, `DAT_0073A19C` entries; gated on `racecar+0x134C != 0`; skips wrecked (`+0x18FA`), the aggression target (`+0x1BB8`), and cars in a takedown cinematic (`+0x27D8`) |
 | `FUN_0016EB60` | **TRAFFIC** | per-slot proximity list: counts `byte[0x649B36 + slot]`, indices `byte[0x6499F8 + slot*0x19 + i]`, records `0x625FB0 + idx*0x180` |
-| `FUN_0016EC70` | the physics-vehicle list `DAT_00731E90[]` (`DAT_00731F9C` entries) | uses `v+0xBC` speed and `v+0x204` frame — a swept forecast |
+| `FUN_0016EC70` | **TRAFFIC and every other physics vehicle**: the global list `DAT_00731E90[]` (`DAT_00731F9C` entries) | uses `v+0xBC` speed and `v+0x204` frame — a swept forecast. **No distance discard**: the only cuts are `abs(dy) <= "Vert dist to discard"` (5 m), `dot(road_fwd, delta) >= -(nav+0x2448)` and `eta` outside `[0, 8 s]`. The 100 m "Distance to discard fatally colliding racecar" belongs to `FUN_0016E5E0`'s RACECAR leg, not to this walk |
 
 The write itself is `FUN_0016E3D0`'s loop (`0x0016E3D3`..`0x0016E41C`): the
 obstacle's two lateral extents become strip indices `edi`..`esi`, and over
@@ -1042,7 +1077,7 @@ forecast time, so a crossing car stamps the whole band it sweeps.
 ### 15.4 The chooser — `FUN_0016C4B0` [C]
 
 ```
-tmin = min(time[i]) over [lo,hi]
+tmin = min(time[i]) over the CAR'S OWN FOOTPRINT [avoid+0x442, avoid+0x441]
 if tmin >= 4.0 (DAT_003B1690):            # nothing to dodge
     aim  = FUN_0016F000() + road_fwd*...  # straight on
     +0x488 = AI+0x1D0                     # corner-brake ceiling, no cut
@@ -1065,8 +1100,9 @@ else:
 `dmin` is the minimum `dist[i]` over the **middle half** of the band
 (`q = (hi-lo)/4`, `0x0016CC79`). The strip filter at `0x0016CCB0` is
 `if (50.0 > avoid+0x48C || type[i] != 6) include` — i.e. every strip counts
-while `avoid+0x48C < 50`, and only once it reaches 50 do the road no-go
-strips drop out. The speed then falls out of the registered ladder:
+while `avoid+0x48C < 50`, and only once it reaches 50 do the **RACECAR**
+strips drop out. (Type 6 is a live racecar, not the road no-go; the earlier
+reading of this line was inverted. Corrected 2026-08-20.) The speed then falls out of the registered ladder:
 
 ```
 dmin < 10 -> "Speed when car is <10m away"  = 26.2 m/s   @0x0016CCFC
@@ -1134,7 +1170,7 @@ machine (§14.1) it **replaces the aim point**, and every downstream stage
 | 9 | corner speed law | `FUN_00172E80` | the `Min speed + t*S` shape | ported §9.3 [C] |
 | 10 | target speed | `FUN_001724F0` | `AI+0x9C4` (m/s) | ported §9.4 [C] |
 | 10a | aggression speed | `FUN_00172FA0` | speed match / boost arm | ported §14.6 [C] |
-| 10b | catch-up | `FUN_001734C0` | `AI+0x9DC` | documented `[S]`, not ported |
+| 10b | catch-up | `FUN_001734C0` | `AI+0x9DC` + the `+45` demand release | **PORTED, section 17** `[C]`, validate_rubberband 43/43 |
 | 11 | boost latch | `FUN_00171D90` | `AI+0xA19` | ported §14.1 [C] |
 | 12 | **the driver** | `FUN_00105340` (vtable `0x003B1240+0x24` ← `FUN_00104D30`) | throttle / brake / steer / boost inputs | ported §3/§9.5 [C], 28 driver cases |
 | 12a | traffic-class driver | `FUN_00105150` | the reduced band | ported §11 [C] |
@@ -1161,9 +1197,296 @@ same bytes as `AI+0x9C0` / `AI+0x9C4`.
 * `FUN_0016C4B0`'s five-term side-select predicate at `0x0016CB33` is read but
   the port uses the simpler "steer to the lower-risk side"; the two agree
   whenever one side is clear.
-* `avoid+0x48C` (the `50.0` gate that drops type-6 strips out of `dmin`) and
-  `avoid+0x450` (the range lerp factor at `0x0016E329`) — read, not modelled.
-  The port takes the `>= 50` branch unconditionally (road no-go strips never
-  enter `dmin`).
+* `avoid+0x48C` (the `50.0` gate that drops type-6 = RACECAR strips out of
+  `dmin`) and `avoid+0x450` (the range lerp factor at `0x0016E329`) — read,
+  not modelled. `src/burnout3_ai_avoid.c` feeds `avoid+0x48C` the car's own
+  speed `[S]`.
+* `FUN_0016F6C0`'s per-node no-go FLAGS (`node+3 & 7`: 5 soft, 4 hard) are
+  not present in the port's extracted `route.bin` — `B3RtNavSection` carries
+  a per-SECTION flag word only — so the road no-go stamper is still not
+  portable 1:1. `tools/extract_bgd_paths.py` would have to carry the node
+  flag byte through. `[?]`
 * `FUN_0016EB60`'s per-slot traffic list (`0x649B36` / `0x6499F8` /
   `0x625FB0`) is the retail proximity cache; the port rescans `g_traffic`.
+
+---
+
+## The driver DISPATCHER, FUN_00104D30 — and four parity defects it exposed
+
+`FUN_00105340` is not retail's per-frame driver entry. Its only caller is
+`FUN_00104D30` @0x00104D8D, and that dispatcher is where most of the
+per-frame contract lives:
+
+```
+FUN_00104D30(ECX = vehicle)
+  v[0x1552] = 0                                   stop flag, cleared first
+  gate = racecar[0x19A8] && !(racecar[0x16D8]==2 && FUN_00017310())
+  if (!gate)  v[0x1414] = v[0x1400] = v[0x1408] = 0
+  else        racecar[0x134C] == 0 -> FUN_00105150   (traffic driver)
+              racecar[0x179C] == 1 -> FUN_00105340   (racer driver)
+              else                 -> FUN_00104E20   (third arm, not ported;
+                                                      0x179C reads 1 in game)
+              if (v[0xBC] < 0.1) v[0x1408] = 0
+              v[0x1438] = 0
+  if (racecar[0x134C] != 0)                       RACER throttle is DERIVED
+      v[0x1400] = min(1, v[0x1414] * v[0x13BC])   (v[0x13BC] reads 4.0)
+  FUN_0011ECF0()                                  the physics input stage
+```
+
+The port already owned the tail — `b3_vehicle_step_full` implements the
+input glue, and `emulate_pipeline.frame()` does the same on the retail side —
+so `b3_ai_dispatch` covers only the head and the class dispatch, and the
+callers hand the physics stage the RAW throttle at v+0x1414. Handing it the
+derived v+0x1400 scales by v[0x13BC] twice.
+
+Four defects this uncovered, all now fixed:
+
+1. **Inverted traffic-class test.** `FUN_001724F0` caps the speed demand to
+   `DAT_005A9770` (22.352 m/s = 50 mph) when `racecar[0x134C] == 0`; the port
+   tested non-zero. `0x134C == 0` IS the traffic class — retail's dispatcher
+   sends 0 to `FUN_00105150`, the traffic driver. `FUN_00105340`'s own test at
+   @0x001058AB takes the racer side on non-zero and was flipped to match.
+   `validate_ai` missed it because its probe was passed an is-traffic BOOLEAN
+   while the emulator got the raw field, so the two sides saw opposite values;
+   the byte at 0x134C is transferred verbatim, so in-game they disagreed.
+
+2. **`racecar+0x134C` never initialised.** The harness `memset` the AI car and
+   set `race_mode`, leaving the class at 0 — every car, the player's included,
+   was classified as traffic: pinned to 50 mph and denied the derivation.
+   Every `Vehicle` in the harness is a racer (traffic lives in `g_traffic`),
+   so it is 1, matching the aggression path's `car_class`.
+
+3. **The driver ran TWICE per frame.** The harness ran the whole chain and then
+   re-drove after the aggression leg replaced the speed demand. `FUN_00105340`'s
+   launch dither @0x00105982 is stateful across calls — it inverts the throttle
+   whenever `v[0x1400] != v[0x156C]`, then stores 0x1400 into 0x156C — so the
+   second call reliably undid the first and pinned the throttle at zero.
+   `b3_ai_plan` now splits the decision from the drive, and retail's one call
+   per frame is preserved.
+
+4. **The AI session's clock never advanced.** The same dither parks a DEADLINE
+   of `clock + 2.0` in v+0x1574 and holds the throttle down until
+   `DAT_0060EA20` passes it. `DAT_0060EA20`/`DAT_0060EA1C` are runtime globals,
+   so the scatter transfer cannot carry them, and `ea.Session()` left the clock
+   frozen at its seed value — the deadline was never reached and the throttle
+   was cut forever. The `ai` line now carries clock and dt. This is why
+   `ai=retail` only ever drove when `physics=retail`: the combined path runs the
+   driver inside the physics session, whose clock ticks.
+
+Measured after the fixes (170 s autodrive runs, mph over the run):
+
+| ai | physics | n | median | p75 | p90 | max |
+|----|---------|---|--------|-----|-----|-----|
+| re | re | 43 | 60 | 103 | 116 | 134 |
+| retail | re | 42 | 60 | 100 | 115 | 134 |
+| re | retail | 43 | 78 | 117 | 123 | 131 |
+| retail | retail | 50 | 86 | 99 | 111 | 121 |
+
+The two AI backends agree within each physics backend. `FUN_00104E20` remains
+unported; `racecar+0x179C` reads 1 for every car the harness drives, so the
+dispatcher never selects it.
+
+
+---
+
+## 17. THE RUBBER BAND — retail's player-relative AI, recovered `[C-disasm]`
+
+Reported symptom: *"it feels too easy to win the race once I am ahead"*. The
+cause was that **none** of retail's player-relative laws were in the port. The
+call site read
+
+```c
+b3_ai_plan(&v->ai, &ac, tp, ceiling, 0.0f);   /* burnout3_full.c:4370 */
+```
+
+— the catch-up argument was the literal `0.0f` — and `b3_ai_plan` pinned
+`AI+0xA08` to `Top speed mps` unconditionally. Nothing an AI car did depended
+on where the player was.
+
+Every constant below is read out of the retail image; addresses are the
+`.rdata` slots the functions load. `tools/validate_rubberband.py` executes all
+three functions under Unicorn and diffs them against `src/burnout3_ai.c`:
+**43/43**.
+
+### 17.1 The per-vehicle block — `FUN_00106370` `[C-disasm]`
+
+Refreshed at the TOP of every car's update: `FUN_00104A90` calls
+`FUN_00105BD0` (@`0x00104AA1`) then `FUN_00106370` (@`0x00104AA6`).
+
+```
+if racecar+0x1920 == 0:                       # the human car itself
+    v+0x1558 = 1                              # @0x00106388
+    v+0x155C = 0.0                            # @0x00106392
+    v+0x1554 = (s8) racecar+0x27D0
+    return
+v+0x1554 = (DAT_0073A1C0 == 1) ? 0 : (grid_slot & 1)     # @0x001063C1
+                                          # SPLIT-SCREEN player pairing;
+                                          # the `and 0x80000001`/dec/or/inc
+                                          # idiom is the signed remainder
+tgt   = DAT_0073A1D0 + v+0x1554 * 0x27E0                 # @0x001063EA
+ahead = FUN_00194200(me+0x10D0, tgt+0x10D0)              # @0x00106407
+v+0x1558 = ahead ? 2 : 3                      # @0x00106415 / @0x00173621
+v+0x155C = clamp((v+0x1560[v+0x1554] - 1600.0) * 5.5555556e-5, 0, 1)
+                                              # @0x0010642E..0x00106493
+v+0x153E = (v+0x1558 == 3)
+```
+
+* `v+0x1560[k]` is `FUN_00105BD0`'s **squared** distance from this car to
+  racecar `k` (the scan at `0x00105C58`; the slots are seeded to `FLT_MAX` at
+  `0x001049B9`).
+* `1600.0` = `0x0039A858`, `5.5555556e-05` = `0x003B1A58` = **1/18000**. So
+  `v+0x155C` is **0 at 40 m from the player and 1 at 140 m**.
+* `FUN_00194200` is the ordering comparator: laps (`+0x350`), checkpoints
+  (`+0x34C`), along-track distance (`+0x348`), grid-slot tiebreak (`+0x19BC`).
+
+So `v+0x1558` is literally **"1 = I am the player, 2 = I am AHEAD of my
+player, 3 = I am BEHIND my player"**, and `v+0x155C` is the normalised gap.
+
+### 17.2 The catch-up — `FUN_001734C0` `[C-disasm]`
+
+Called from `FUN_001724F0` @`0x001726EE` with the aggression-matched speed,
+behind two gates at `0x001726CF` / `0x001726E6`:
+`AI+0xA31 == 0 && racecar+0x10DC > AI+0xA0C` (the expiry latch clear, and the
+race clock past the `-1.0` `AI+0xA0C` is initialised to — i.e. always).
+
+```
+AI+0x9DC = 0                                            # @0x001734E1
+frac = (racecar+0x135C == -1.0 || racecar+0x1394 < 1) ? 0
+     : (FUN_00194380(racecar+0x10D0) - racecar+0x135C)
+       / (racecar+0x1394 * DAT_0073A184[DAT_0073A188-1])  # @0x00173538
+                                        # = distance travelled / (laps * lap)
+if frac >= AI+0x9E8:                                    # @0x00173541
+    AI+0xA04 = 0 ; AI+0xA31 = 1 ; return spd            # ONE-SHOT EXPIRY
+hit = 0
+if racecar+0x2450 == 0:
+    if racecar+0x2440 -> v+0x1558 == 3:                 # I am BEHIND
+        N = (DAT_0073BB50 == 8) ? 2 : DAT_003A29EC[DAT_0073BB50]
+        for car in DAT_0073A1A8[0 .. DAT_0073A19C):     # @0x001735E0
+            if (i16)racecar+0x10D0 - N <= (i16)car+0x10D0 < (i16)racecar+0x10D0
+               and car+0x1920 == 0:                     # the HUMAN
+                hit = 1
+elif racecar+0x2450 == 1:
+    if racecar+0x2440 -> v+0x1558 == 3: hit = 1         # @0x00173585
+if !hit: return spd                                     # @0x00173609
+if v+0x1550 == 0:  return "Top speed mps" + 45.0        # @0x00173671
+AI+0x9DC = v+0x155C * 17.8816 + 17.8816                 # @0x00173659
+return spd + 45.0                                       # @0x0017364F
+```
+
+* `45.0` = `0x003B1770`, `17.8816` = `0x003B1B68` = **exactly 40 mph**.
+* `racecar+0x10D0` is the **1-based race place** — the HUD indexes
+  `word[car+0x10D0]-1` for its ordinal (`RE_FRONTEND` 1239) and the leader
+  scan at `0x00058FD1` walks the table for the car whose `+0x10D0` equals
+  `i+1`.
+* **`DAT_0073BB50` is a dead global.** A byte scan of every `PT_LOAD` byte
+  finds the address `0x0073BB50` in exactly ONE place in the whole image —
+  the `mov 0x73bb50,%eax` at `0x001735AC` — and the slot is in BSS. Nothing
+  ever writes it, so the index is always 0 and `N` is always
+  `DAT_003A29EC[0] = 1`. The difficulty selector was never wired up. **A
+  rival is on catch-up only while its player is exactly ONE place ahead of
+  it.** `[C]`
+* `AI+0x9DC` is consumed only in `FUN_00104A90` @`0x00104BF8`, which advances
+  the car by `AI+0x9DC * dt` along its aim while the attack flag
+  `racecar+0x2188` is up — the off-camera closing warp, **40 mph of free
+  closing speed at 40 m from the player rising to 80 mph at 140 m**.
+* The `+45.0` on the demand is the on-camera half. `FUN_00105340` floors the
+  throttle whenever the demand is more than 1 m/s above the current speed, so
+  `+45` means "full throttle, ignore the corner-brake law, until you are back
+  on terms".
+* The explicit null test on `racecar+0x2440` at `0x0017362D` is **dead code**:
+  both paths that reach it have already dereferenced the pointer
+  (`[ECX+0x1558]` @`0x0017358B`, `[EDI+0x1558]` @`0x0017359F`). Confirmed by
+  emulation — the null case faults before the test. Every racecar has a
+  vehicle.
+
+### 17.3 The hard speed cap — `FUN_00173690` `[C-disasm]`
+
+```
+A = FUN_00172BC0()   # per-section MIN speed; no section table -> "Min speed
+                     #   mps" (@0x00172D05)
+B = FUN_00172D20()   # per-section MAX speed; no section table -> "Top speed
+                     #   mps" (@0x00172E65)
+v = racecar+0x2440
+if v && v+0x1550:                          # fully simulated (on camera)
+    if AI+0xA31:                           # catch-up EXPIRED
+        p = DAT_0073A1D0[(s8) v+0x1554]    # my paired player's racecar
+        AI+0xA08 = max(A, p+0x2440 -> +0xBC - 4.4704)   # @0x00173713
+    else:
+        AI+0xA08 = "Top speed mps"                      # @0x00173748
+else:                                      # OFF CAMERA
+    AI+0xA08 = (v+0x1558 == 2) ? A : B                  # @0x0017375F
+```
+
+`4.4704` = `0x003B1B64` = **exactly 10 mph**. So the race has two phases,
+switched by the same one-shot latch:
+
+| phase | on camera | off camera |
+|---|---|---|
+| catch-up armed (`AI+0xA31 == 0`) | cap = Top speed mps (88) | ahead of player → Min speed (20); behind → Top speed (88) |
+| expired (`AI+0xA31 == 1`) | cap = **max(Min speed, player speed − 10 mph)** | same as above |
+
+The expired arm is the governor that keeps the field on the player's pace:
+when the player slows, the rivals' ceiling comes down with them. Measured on
+both backends (`validate_rubberband.py`):
+
+```
+player   0.0 m/s -> rival ceiling  20.0 m/s
+player  30.0 m/s -> rival ceiling  25.5 m/s
+player  60.0 m/s -> rival ceiling  55.5 m/s
+player  80.0 m/s -> rival ceiling  75.5 m/s
+```
+
+### 17.4 How long catch-up lasts — the .bgd pace record `[C]`
+
+`AI+0x9E8` is `FUN_00172870`'s job (@`0x00172937`):
+
+```
+rec = DAT_0073A170 + (s8)racecar+0x19BC * 0x98      # grid slot
+AI+0x9E4 = rec[0x97] * 0.01     AI+0x9E8 = rec[0x93] * 0.01   <-- the window
+AI+0x9EC = rec[0x90] * 0.01     AI+0x9F0 = rec[0x92] * 0.01
+AI+0x9F4 = rec[0x91] * 0.01     AI+0x9F8 = (s8) rec[0x95]
+AI+0xA12 = rec[0x96] & 1        AI+0x9E0 = AI+0x9EC
+```
+
+and `DAT_0073A170` is the **.bgd event param record**, installed by the loader
+at `0x0018B478` with the opponent count `param[0x3B4]` at `0x0018B48A`. The
+per-opponent records therefore tile `param[0 .. 0x390)` at stride `0x98`,
+which lands exactly on `RE_BGD` §3's first documented field (`+0x3A0`, the
+gold threshold) — and `0x10 + 16*4 + 16*4 + 8 == 0x98` exactly, matching
+`RE_BGD`'s "+0x10.. per-opponent/AI factor tables". That closes `RE_BGD`'s
+`[?]` on those tables.
+
+**With no record `AI+0x9E8` defaults to 0** (@`0x001728F0`), which expires
+catch-up on the very first frame — exactly what this port did before.
+
+`tools/gen_ai_pace.py` extracts all 311 records over the 36 shipped tracks
+into `src/burnout3_ai_pace.h`. The window rises monotonically with the grid
+slot in every standard race — the shipped `FCRGSFFO` on `US_C3_V1`:
+
+| grid | aggression | catch-up window |
+|---|---|---|
+| 0 (player) | 0.00 | 0.00 |
+| 1 | 1.00 | 0.20 |
+| 2 | 1.00 | 0.40 |
+| 3 | 1.00 | 0.56 |
+| 4 | 1.00 | 0.65 |
+| 5 | 1.00 | 0.78 |
+
+The car starting last keeps its licence for 78% of the race; across all 36
+tracks the last-place window ranges 0.47..0.97. Road Rage (`FEGRRFFO`) pins
+slot 1 — and on several tracks every slot — to 1.00: catch-up for the whole
+event.
+
+### 17.5 What the port now does
+
+`src/burnout3_ai.c` gains `b3_ai_player_rel` (17.1), `b3_ai_catchup` (17.2)
+and `b3_ai_speed_cap` (17.3); `b3_ai_plan_ex` takes the cap instead of pinning
+it. `burnout3_full.c` builds the place table and the per-car block once per
+frame in `rubberband_world_build()` and runs the two laws at the call site.
+`B3_RUBBERBAND=0` restores the old behaviour for A/B measurement, and
+`B3_RB_DBG=1` traces place / rank / gap / fraction / cap / bonus per car.
+
+Not ported: the off-camera positional warp that consumes `AI+0x9DC`
+(`FUN_00104A90` @`0x00104BF8`) needs the out-of-range mover `FUN_00170B30`,
+which is still row 13 of §15.6. `AI+0x9DC` is computed and validated; nothing
+reads it yet.

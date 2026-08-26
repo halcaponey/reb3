@@ -1,5 +1,17 @@
 # Control-path audit — input to wheel forces
 
+> **Status (2026-08-22): the audit's action list has been carried out.** All six
+> items in §4 "What the harness should change" landed — the plan/dispatch split
+> (`b3_ai_plan` / `b3_ai_plan_rb` / `b3_ai_dispatch`), the governor turned off,
+> the traffic speed cap corrected to the recovered `22.352` m/s (the `13.0`
+> GLUE value quoted below is gone), the `+0x27D8` autopilot flag routed through
+> the AI wheel, and the off-world path. Two `[?]` verdicts also moved: **THE
+> WALL** is no longer a wall — the harness loads and walks the retail nav graph
+> from `route.bin` + `nav_edges.bin` — and stage 37 **avoidance is ported**
+> (`src/burnout3_ai_avoid.c`, gated by `tools/validate_ai_avoid.py`). The
+> referenced `scratchpad/ai/integration_ai.md` no longer exists; the hunks are
+> in the tree. The stage-by-stage analysis itself stands as recorded.
+
 Scope: every stage that converts a control intent (key, pad, AI decision,
 cinematic handover, rescue) into the forces the vehicle pipeline applies, as
 the harness runs it today (`src/burnout3_full.c` + `src/burnout3_vehicle_sim.c`

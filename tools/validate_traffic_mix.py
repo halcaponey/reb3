@@ -13,6 +13,13 @@ model, then the model is replayed over the shipped .bgd tables:
     FUN_0019E640 @0x0019E640   the same search forward, i.e. the section end
     FUN_001A6070 @0x001A6183   the population law (checked as a model replay,
                                the function itself needs the whole manager)
+    FUN_001A3470 @0x001A34AC   the STAMP/UNSTAMP dispatch: a request's
+                               direction byte and the manager's +0x363BC
+                               travel-sense flag decide whether the request
+                               SPAWNS or RETIRES.  Executed here for all eight
+                               (direction, flag) pairs, then applied to the
+                               shipped table so the population figures below
+                               are the ones retail's spawn arm really produces.
 
 The population law needs no emulation to be pinned: its four constants are
 read straight out of the image here (0.44704, 1/60, 0.5, 0.30, 0.15, 1/2^32).
@@ -338,6 +345,87 @@ def test_row_search(mix):
     return checks
 
 
+F_STAMP_DISPATCH = 0x001A34AC      # FUN_001A3470, just past the row min/max
+A_STAMP_ARM = 0x001A34EC           # the request populates
+A_UNSTAMP_ARM = 0x001A3611         # the request retires
+MGR_FORWARD = 0x363BC              # manager+0x363BC, FUN_001A3EA0 @0x001A3F1F
+
+
+def test_dispatch(mix):
+    """Run FUN_001A3470's dispatch for every (direction, +0x363BC) pair.
+
+    The block is straight-line from 0x001A34AC to whichever arm it picks, so a
+    code hook stopping at 0x001A34EC (STAMP) or 0x001A3611 (UNSTAMP) reads the
+    verdict straight out of retail without needing the manager's tables.
+    """
+    from unicorn import UcError, UC_PROT_ALL, UC_HOOK_CODE
+    from unicorn.x86_const import (UC_X86_REG_EAX, UC_X86_REG_EBX,
+                                   UC_X86_REG_ESP)
+    session = mix.session
+    uc = session.uc
+    BASE = 0x80000000
+    try:
+        uc.mem_map(BASE, 0x80000, UC_PROT_ALL)
+    except UcError:
+        pass                                   # already mapped by a rerun
+    request, descriptor, manager, stack = (BASE + 0x100, BASE + 0x200,
+                                           BASE + 0x1000, BASE + 0x70000)
+    exits = []
+
+    def on_code(u, address, size, user):
+        if address in (A_STAMP_ARM, A_UNSTAMP_ARM):
+            exits.append(address)
+            u.emu_stop()
+
+    handle = uc.hook_add(UC_HOOK_CODE, on_code)
+    uc.mem_write(descriptor + 4, struct.pack('<H', 0))
+    checks = 0
+    # retail's own truth table: forwards (the constructor's value) direction 0
+    # spawns and 1/2 retire; backwards it is the other way round; anything
+    # outside {0,1,2} always retires (@0x001A34D4).
+    for forward in (0, 1):
+        for direction in (0, 1, 2, 3, 7):
+            uc.mem_write(manager + MGR_FORWARD, bytes([forward]))
+            uc.mem_write(request, struct.pack('<HHBB', 10, 40, 0, direction))
+            uc.mem_write(stack + 0x28, struct.pack('<I', manager))
+            uc.mem_write(stack + 0x34, struct.pack('<I', 0))
+            uc.reg_write(UC_X86_REG_EAX, request)
+            uc.reg_write(UC_X86_REG_EBX, descriptor)
+            uc.reg_write(UC_X86_REG_ESP, stack)
+            del exits[:]
+            try:
+                uc.emu_start(F_STAMP_DISPATCH, 0, count=4000)
+            except UcError as exc:
+                raise AssertionError('dispatch dir=%d fwd=%d: %s'
+                                     % (direction, forward, exc))
+            assert len(exits) == 1, (
+                'dispatch dir=%d fwd=%d reached %r'
+                % (direction, forward, [hex(e) for e in exits]))
+            got = exits[0] == A_STAMP_ARM
+            if direction == 0:
+                wantv = forward != 0
+            elif direction in (1, 2):
+                wantv = forward == 0
+            else:
+                wantv = False
+            assert got == wantv, (
+                'dispatch dir=%d fwd=%d: retail %s, model %s'
+                % (direction, forward, 'STAMP' if got else 'UNSTAMP',
+                   'STAMP' if wantv else 'UNSTAMP'))
+            checks += 1
+    uc.hook_del(handle)
+    return checks
+
+
+def request_stamps(direction, forward):
+    """The recovered model of the above."""
+    if direction == 0:
+        return forward != 0
+    if direction in (1, 2):
+        return forward == 0
+    return False
+
+
 def test_constants():
     """The population/placement constants, read out of the image."""
     import extract_bgd_paths                                   # noqa: F401
@@ -465,11 +553,22 @@ def test_asset():
         rows = struct.unpack_from('<%df' % (count * 2), data, offset)
         distances.append(rows[0::2])
         offset += count * 8 + count * 0x12
+    # THE DIRECTION SPLIT.  FUN_001A3EA0 @0x001A3F1F starts the manager's
+    # +0x363BC at 1 and FUN_001A3110 only ever writes `old_window < new_window`
+    # into it, so a racer driving an event forwards holds it at 1 throughout.
+    # Under that flag FUN_001A3470 sends direction 0 to the STAMP arm and
+    # directions 1 and 2 to the UNSTAMP arm -- so only direction-0 requests
+    # populate, and the population below is re-derived on that basis rather
+    # than over every request as it used to be.
+    FORWARD = 1
     per_window = []
+    per_window_all = []
     for first, last, base, count, _refresh, _pad in windows:
         total = 0
+        total_all = 0
         for index in range(count):
             first_row, last_row, path_id, _direction = requests[base + index]
+            spawns = request_stamps(_direction, FORWARD)
             low, high = min(first_row, last_row), max(first_row, last_row)
             row = low
             while True:
@@ -484,19 +583,42 @@ def test_asset():
                     if road:
                         span = abs(distances[path_id][end]
                                    - distances[path_id][row])
-                        total += population(span, road[0], road[1])[0]
+                        cars = population(span, road[0], road[1])[0]
+                        total_all += cars
+                        if spawns:
+                            total += cars
                 if end >= high:
                     break
                 row = end + 1
         per_window.append(total)
+        per_window_all.append(total_all)
     live = [per_window[i] + per_window[i - 1] + per_window[i - 2]
             for i in range(len(per_window))]
+    live_all = [per_window_all[i] + per_window_all[i - 1] + per_window_all[i - 2]
+                for i in range(len(per_window_all))]
     assert min(live) > 0, 'some window group spawns no traffic at all'
     assert max(live) < 254, 'a window group exceeds the 254-body pool'
+    # the split must actually bite -- if it did not, the two figures would be
+    # identical and the STAMP/UNSTAMP arms would be doing nothing
+    assert min(live) < min(live_all) or max(live) < max(live_all), (
+        'the direction split changed nothing: %r vs %r'
+        % ((min(live), max(live)), (min(live_all), max(live_all))))
+    # and it must not halve the road to nothing: retail's own retire arm is
+    # what removes these cars again, a median of four windows later
+    assert min(live) >= 3, 'a window group spawns almost nothing (%d)' % min(live)
+    spawn_n = sum(1 for r in requests if request_stamps(r[3], FORWARD))
+    retire_n = len(requests) - spawn_n
+    assert spawn_n > 0 and retire_n > 0, (
+        'the split leaves one arm empty: %d spawn, %d retire'
+        % (spawn_n, retire_n))
     print('  spawn policy: %d classes / %d models, %d bindings, %d roads; '
-          'population per 3-window group min %d max %d mean %.1f'
-          % (classes_n, entries_n, bindings_n, roads_n, min(live), max(live),
-             sum(live) / float(len(live))))
+          '%d of %d requests STAMP (the rest UNSTAMP); population per '
+          '3-window group min %d max %d mean %.1f '
+          '(pre-split, every request spawning: min %d max %d mean %.1f)'
+          % (classes_n, entries_n, bindings_n, roads_n, spawn_n, len(requests),
+             min(live), max(live), sum(live) / float(len(live)),
+             min(live_all), max(live_all),
+             sum(live_all) / float(len(live_all))))
     return classes_n + entries_n + bindings_n + roads_n
 
 
@@ -508,9 +630,10 @@ def main():
     checks += test_model(mix)
     checks += test_paint(mix)
     checks += test_row_search(mix)
+    checks += test_dispatch(mix)
     checks += test_asset()
     print('traffic spawn policy (RNG, class, model, paint, row owner, '
-          'population): OK (%d checks)' % checks)
+          'stamp/unstamp dispatch, population): OK (%d checks)' % checks)
 
 
 if __name__ == '__main__':

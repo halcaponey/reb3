@@ -361,6 +361,70 @@ def _fv(*v):
     return struct.pack('<%df' % len(v), *v)
 
 
+# ----------------------------------------------------------------------
+# Cached session.
+#
+# follow_update used to build a fresh Uc and reload the whole 4.28 MB ELF on
+# EVERY call, and the game calls it once per rendered frame.  Measured:
+# Uc()+load_elf alone 3.14 ms, the whole call 7.3 ms standalone / 11.2 ms in
+# situ -- 11.2 ms of a 16.7 ms frame budget, the second-largest cost in the
+# sidecar.  It also leaked a Unicorn instance per frame (collected only every
+# 64 calls), and the resulting GC pauses landed on whatever command happened
+# to be running: ccol's max was 40.9 ms and hudtick's 59.7 ms against sub-
+# millisecond medians.
+#
+# Reusing the session is exact here, and that is measured, not assumed: a
+# UC_HOOK_MEM_WRITE probe over randomised inputs recorded ZERO writes outside
+# the scratch regions below (scratchpad/probe_cam.py).  FUN_0015E550 touches
+# nothing but these pages, so zeroing them reproduces a fresh instance's state
+# byte for byte.  tools/validate_takedown.py is the acceptance test.
+_CAM_MAPS = ((_STATE, PAGE), (_RC, 0x8000), (_VEH2, 0x1000), (_MAT, PAGE),
+             (_CFG3, PAGE), (_MODE2, PAGE), (STACK, STACK_SZ),
+             (_RET & ~(PAGE - 1), PAGE))
+
+_CAM = {"uc": None, "extra": None}
+_ZERO = b'\0' * STACK_SZ            # allocated once; sliced for smaller wipes
+
+
+def _cam_session():
+    """The warmed Unicorn for FUN_0015E550, built at most once."""
+    c = _CAM
+    if c["uc"] is not None:
+        return c["uc"]
+    uc = Uc(UC_ARCH_X86, UC_MODE_32)
+    ev.load_elf(uc, ev.ELF)
+    for base, size in _CAM_MAPS:
+        uc.mem_map(base, size, UC_PROT_ALL)
+    c["extra"] = set()
+
+    def on_unmapped(mu, access, address, size, value, user):
+        page = address & ~(PAGE - 1)
+        try:
+            mu.mem_map(page, PAGE, UC_PROT_ALL)
+        except UcError:
+            return False
+        c["extra"].add(page)        # wiped with the rest on the next call
+        return True
+    uc.hook_add(UC_HOOK_MEM_UNMAPPED, on_unmapped)
+
+    # skip the low-speed camera-collision probe (needs the world)
+    def on_code(mu, address, size, user):
+        if address == 0x0015EEEF:
+            mu.reg_write(UC_X86_REG_EIP, 0x0015EEF4)
+    uc.hook_add(UC_HOOK_CODE, on_code, begin=0x0015EEEF, end=0x0015EEEF)
+
+    c["uc"] = uc
+    return uc
+
+
+def _cam_reset(uc):
+    """Put the session back to the state a freshly built one would have."""
+    for base, size in _CAM_MAPS:
+        uc.mem_write(base, _ZERO[:size])
+    for page in _CAM["extra"]:
+        uc.mem_write(page, _ZERO[:PAGE])
+
+
 def follow_update(car_rows, speed_ms, dt, yaw_deg, pitch_deg,
                   boost_ramp=0.0, look_back=0, yaw_gate=1,
                   cam_offset=(0.0, 0.95, -6.8),
@@ -372,26 +436,8 @@ def follow_update(car_rows, speed_ms, dt, yaw_deg, pitch_deg,
     own matrix at *(veh+0x204), RE_NOTES section 16).
     Returns dict(eye, basis(3x3 rows), fov, pitch, yaw).
     """
-    uc = Uc(UC_ARCH_X86, UC_MODE_32)
-    ev.load_elf(uc, ev.ELF)
-    for base, size in ((_STATE, PAGE), (_RC, 0x8000), (_VEH2, 0x1000),
-                       (_MAT, PAGE), (_CFG3, PAGE), (_MODE2, PAGE),
-                       (STACK, STACK_SZ), (_RET & ~(PAGE - 1), PAGE)):
-        uc.mem_map(base, size, UC_PROT_ALL)
-
-    def on_unmapped(mu, access, address, size, value, user):
-        try:
-            mu.mem_map(address & ~(PAGE - 1), PAGE, UC_PROT_ALL)
-        except UcError:
-            return False
-        return True
-    uc.hook_add(UC_HOOK_MEM_UNMAPPED, on_unmapped)
-
-    # skip the low-speed camera-collision probe (needs the world)
-    def on_code(mu, address, size, user):
-        if address == 0x0015EEEF:
-            mu.reg_write(UC_X86_REG_EIP, 0x0015EEF4)
-    uc.hook_add(UC_HOOK_CODE, on_code, begin=0x0015EEEF, end=0x0015EEEF)
+    uc = _cam_session()
+    _cam_reset(uc)
 
     uc.mem_write(RACECAR_TABLE + 4 * slot, struct.pack('<I', _RC))
     uc.mem_write(VEHICLE_TABLE + 0x30 * slot, struct.pack('<I', _VEH2))

@@ -43,6 +43,11 @@ Run:  python3 tools/validate_sfx.py
 """
 import importlib.util
 import os
+
+# The driver links burnout3_backend.c; pin it to the RE path so a flipped
+# build/backends.cfg cannot change what this suite measures.
+os.environ['B3_BACKENDS'] = '/dev/null'
+
 import re
 import struct
 import subprocess
@@ -125,7 +130,13 @@ def load_table():
     os.makedirs(os.path.join(ROOT, "build"), exist_ok=True)
     r = subprocess.run(["gcc", "-Wall", "-Wextra", "-std=c11", "-O2",
                         "-I" + os.path.join(ROOT, "src"),
-                        "-DB3_SFX_TEST_MAIN", "-o", DRIVER, SRC, "-lm"],
+                        # burnout3_sfx.c carries the sfx=retail switch, so
+                        # the driver links the selector and the bridge.
+                        # B3_BACKENDS is pinned to /dev/null below, so this
+                        # always measures the RE path.
+                        "-DB3_SFX_TEST_MAIN", "-o", DRIVER, SRC,
+                        os.path.join(ROOT, "src", "burnout3_backend.c"),
+                        os.path.join(ROOT, "src", "burnout3_emu.c"), "-lm"],
                        capture_output=True, text=True)
     if r.returncode:
         print(r.stderr)

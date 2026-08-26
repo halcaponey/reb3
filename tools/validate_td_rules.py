@@ -14,6 +14,11 @@ The C side is driven by a small command-line harness compiled from the module
 Usage:  python3 tools/validate_td_rules.py [section]
 """
 import os
+
+# The driver links burnout3_backend.c; pin it to the RE path so this
+# differential test is unaffected by whatever build/backends.cfg says.
+os.environ['B3_BACKENDS'] = '/dev/null'
+
 import subprocess
 import struct
 import sys
@@ -296,10 +301,8 @@ int main(void) {
 }
 '''
 
-SCRATCH = os.environ.get(
-    'B3_TDR_SCRATCH',
-    '/tmp/claude-1000/-home-lolz0r-burnout3/'
-    'df62ed7e-f72a-446d-bebd-33653e64dd3d/scratchpad/tdrules')
+SCRATCH = os.environ.get('B3_TDR_SCRATCH',
+                         os.path.join(tempfile.gettempdir(), 'b3_tdrules'))
 
 
 class CDriver:
@@ -311,6 +314,12 @@ class CDriver:
             f.write(DRIVER)
         cmd = ['gcc', '-O1', '-std=c99', '-Wall', '-I', os.path.join(_root, 'src'),
                src, os.path.join(_root, 'src', 'burnout3_td_rules.c'),
+           # burnout3_td_rules.c consults build/backends.cfg (and the
+           # emulation bridge when td_rules=retail), so the driver needs
+           # both objects. The driver never selects retail, so this only
+           # satisfies the linker.
+           os.path.join(_root, 'src', 'burnout3_backend.c'),
+           os.path.join(_root, 'src', 'burnout3_emu.c'),
                # section 9's wall trigger calls straight into the ported
                # FUN_0011AEF0 tail
                os.path.join(_root, 'src', 'burnout3_crash.c'),

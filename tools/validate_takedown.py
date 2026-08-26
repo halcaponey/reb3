@@ -25,12 +25,17 @@ Sections
 
 Usage: python3 tools/validate_takedown.py [-v]
 """
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-from b3_paths import game_path, game_root  # noqa: E402
 import importlib.util
 import json
 import os
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from b3_paths import game_path, game_root  # noqa: E402
+
+# Links objects that consult build/backends.cfg; pin to the RE path so
+# this differential test is unaffected by the live backend selection.
+os.environ['B3_BACKENDS'] = '/dev/null'
+
 import struct
 import subprocess
 import sys
@@ -431,7 +436,11 @@ def build_driver():
         f.write(DRIVER_C)
     cmd = ["gcc", "-Wall", "-Wextra", "-std=c11", "-O2",
            "-I" + os.path.join(_root, "src"), "-o", DRIVER_BIN, DRIVER_SRC,
-           os.path.join(_root, "src", "burnout3_takedown.c"), "-lm"]
+           os.path.join(_root, "src", "burnout3_takedown.c"),
+           # burnout3_takedown.c consults the backend selector; the driver
+           # is pinned to the RE path above, this satisfies the linker.
+           os.path.join(_root, 'src', 'burnout3_backend.c'),
+           os.path.join(_root, 'src', 'burnout3_emu.c'), "-lm"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         print(r.stdout)
@@ -752,7 +761,7 @@ MSG_TABLE = 0x00389160          # 206 x {u8 id, u8 kind, u16 stringIndex}
 MSG_TABLE_N = 206
 DESC_TABLE = 0x003895E8         # 17 x 16 bytes
 KIND_JUMP = 0x00054ACC          # FUN_00054700's kind-3 dispatch
-GLOBALUS = (game_path('Data/Globalus.bin'))
+GLOBALUS = game_path('Data/Globalus.bin')
 
 # what the C module carries, mirrored here; every row is checked against
 # the image and against the retail string table

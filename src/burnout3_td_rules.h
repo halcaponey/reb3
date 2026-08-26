@@ -1,5 +1,7 @@
 #ifndef BURNOUT3_TD_RULES_H
 #define BURNOUT3_TD_RULES_H
+
+#include <stddef.h>
 /* ===========================================================================
  * Takedown TRIGGER rules -- the retail
  *
@@ -42,7 +44,12 @@ extern "C" {
  *    (Deliberately module-scoped names: burnout3_gameplay.h carries the same
  *    numbers for the harness's other systems and both must stay in step.)
  * ------------------------------------------------------------------------- */
-#define B3_TDR_MAX_CARS              8
+/* SIX, matching retail. The attribution arrays sit at racecar+0x15A8,
+ * +0x15C0 and +0x15C6 -- six apart, because the grid is six cars. Carrying
+ * eight made `claim` alone span 0x15A8..0x15C8 and swallow the two arrays
+ * after it, so no field past them could be at its own offset. The harness
+ * headroom was a divergence from retail, which is what this exercise removes. */
+#define B3_TDR_MAX_CARS              6
 
 #define B3_TDR_MAX_CRASH_WAIT_S      2.0f   /* 0x003F7404 "Maximum Crash Wait Time"      */
 #define B3_TDR_MIN_COLLIDE_TD_S      0.1f   /* 0x003F740C "Min Collide Time to enable TD"*/
@@ -62,6 +69,97 @@ extern "C" {
 /* Double Takedown BP[4] @0x003F7508, Takedown Spree BP[4] @0x003F7518 */
 extern const int B3_TDR_BP_DOUBLE[4];
 extern const int B3_TDR_BP_SPREE[4];
+
+/* ---------------------------------------------------------------------------
+ * 1b. THE SLAM SCORER -- FUN_001989A0's own BP / boost / stat consequences.
+ *
+ * Every number below is executed retail, not transcribed: the differential
+ * tools/validate_takedown_score.py runs the real FUN_001989A0 (with
+ * FUN_0019A050, the callout poster, LIVE) over a seeded world and diffs this
+ * module's post-state against it.  Addresses are burnout3.elf VAs.
+ *
+ * THE TYPE TAXONOMY [C, FUN_00197F90 @0x00197F90 executed]
+ *   The type is pure geometry between the two cars' world matrices
+ *   (pv+0x204).  `h` is the angle between the two AT axes (row 2):
+ *
+ *     h <  45   and angle(victim_pos - attacker_pos, attacker_at) <  30
+ *                                                      -> 1  REAR
+ *     h <  45   otherwise                               -> 0  GLANCE
+ *     45 <= h <  135 and acos(dot(attacker_right, victim_at)) < 25 or > 155
+ *          -> 2 or 3, split by whether sign(dot(sep_hat, victim_right))
+ *             matches sign(dot(attacker_right, victim_at))   SIDE A / SIDE B
+ *     otherwise                                         -> 0  GLANCE
+ *
+ *   Constants: 45 @0x003B1770, 30 @0x003A7964, 135 @0x003B1DA4,
+ *   25 @0x0041A798, 180 @0x003B1A04, pi/2 @0x0039A25C, rad2deg @0x00395D78.
+ *   Type 1 is the only one that also fires an SFX (FUN_00141700 @0x00198004).
+ *
+ * THE "SUPER SLAM" (cheap) SELECTOR [C, @0x00198AC6..0x00198B15]
+ *   cheap = victim.respawning(+0x18FB)
+ *         || clock < victim.crash_stamp(+0x1410) + 3.0     [0x003B1698]
+ *         || victim.speed_ms * 2.2369363 < 70.0            [0x003A2938]
+ *   Both boundaries are STRICT: at exactly 70 mph, and at exactly
+ *   crash_stamp + 3.0, the slam is NOT cheap.  Executed both sides.
+ *
+ * WHAT THE ATTACKER GETS [C]
+ *   +0x11F4 = type, +0x11F8 = cheap, +0x11F9 = its own +0x11EE (boosting)
+ *   bp = (cheap ? SuperSlamTypeBP : SlamTypeBP)[type] + (burning ? 15 : 0)
+ *        -> +0x111C AND +0x1180 (never +0x117C: that is takedown-only BP)
+ *   +0x1174 slams made += 1, +0x1588 += SlamBoost, +0x158C = clock
+ *   boost, ONLY when FUN_00017310 (crash party) is false:
+ *        g = BoostQuantum / (tier+1) * (mult + bonus) * ctx_vtable[0xAC]
+ *        +0x11D8 += g ; +0x11D4 = min(+0x11D4 + g, +0x11D0)
+ *   +0x15A0 = type, +0x16BC/+0x16C0 = victim/clock
+ *   +0x1B94 = 1 when the ATTACKER is class 0 (a human did it)
+ *
+ * WHAT THE VICTIM GETS [C]
+ *   +0x1590 times slammed += 1, +0x1594 += SlamBoost, +0x1598 = clock
+ *        (+0x1598 is THE out-of-control stamp), +0x159C = the kind byte
+ *   boost drain, skipped entirely when either peg flag (+0x11EC/+0x11ED):
+ *        d = BoostQuantum / (tier+1) * mult      <- NO bonus, NO ctx scale
+ *        +0x11D4 -= d ; if <= 0 -> 0 and, when +0x11EE && !+0x11F1,
+ *        +0x11EF = 1 (the forced min-burn stop)
+ *   +0x15A0 = type, +0x16BC/+0x16C0 = attacker/clock
+ *   when victim is class 1 and attacker is class 0:
+ *        +0x23E0 = min(+0x23E0 + (+0x23F0) * strength, +0x23F4)
+ *        -- the ONLY consumer of the slam strength in the whole scorer.
+ *
+ * NOT AFFECTED [C]: the victim already being wrecked (+0x18FA) changes
+ * nothing here.  A wrecked victim is dedup'd at the COMMIT (+0x15D6), not
+ * at the slam.
+ * ------------------------------------------------------------------------- */
+#define B3_TDR_SLAM_GLANCE   0
+#define B3_TDR_SLAM_REAR     1
+#define B3_TDR_SLAM_SIDE_A   2
+#define B3_TDR_SLAM_SIDE_B   3
+
+#define B3_TDR_CHEAP_MPH          70.0f  /* 0x003A2938 */
+#define B3_TDR_CHEAP_CRASH_S       3.0f  /* 0x003B1698 */
+#define B3_TDR_TYPE_HEADING_LO    45.0f  /* 0x003B1770 */
+#define B3_TDR_TYPE_HEADING_HI   135.0f  /* 0x003B1DA4 */
+#define B3_TDR_TYPE_REAR_CONE     30.0f  /* 0x003A7964 */
+#define B3_TDR_TYPE_SIDE_CONE     25.0f  /* 0x0041A798 */
+
+/* The "Score/..." parameters the slam scorer consumes.  Defaults are the
+ * COMPILED-IN image values; b3_td_slam_params is writable so the differential
+ * can drive both sides from one seeding. */
+typedef struct B3TdSlamParams {
+    int   slam_bp[4];     /* 0x003F7448 "Slam Type BP"            {20,20,20,20} */
+    int   super_bp[4];    /* 0x003F7458 "Super Slam Type BP"      {30,30,30,30} */
+    int   burning_bp;     /* 0x003F7444 "Burning Slam Extra BP"   15            */
+    float slam_energy;    /* 0x003F73EC                           360           */
+    float boost_quantum;  /* 0x003F72E4                           240           */
+    float boost_scale;    /* game-mode vtable +0xAC; 1.0 in a normal race       */
+    int   crash_party;    /* FUN_00017310; 1 suppresses the attacker's boost    */
+} B3TdSlamParams;
+
+extern B3TdSlamParams b3_td_slam_params;
+void b3_td_slam_params_defaults(B3TdSlamParams* p);
+
+/* FUN_00197F90 verbatim.  `am`/`vm` are the attacker's and victim's world
+ * matrices as retail stores them at pv+0x204: rows 0/1/2 = right/up/at,
+ * row 3 = translation.  Returns B3_TDR_SLAM_*. */
+int b3_td_slam_type(const float am[4][4], const float vm[4][4]);
 
 /* attribution radius: FUN_00197430 compares squared distance against
  * 25600.0 (0x003B1944) == 160 m [C-disasm 0x00197439] */
@@ -132,14 +230,30 @@ extern const int B3_TDR_BP_SPREE[4];
  * FUN_0011BE50 @0x0011C27F, FUN_00197260 @0x00197396) -> no record -> the
  * plain TAKEDOWN! message.
  * ------------------------------------------------------------------------- */
-typedef struct B3TdCause {
-    int present;        /* the record pointer was non-NULL                   */
-    int wall;           /* +0x00                                             */
-    int has_obj;        /* +0x01                                             */
-    int surface;        /* +0x04                                             */
-    int obj_class;      /* obj+0x173 through +0x08 (0 = none)                */
-    int by_wreck;       /* +0x0C as a grid slot, -1 = none                   */
+typedef struct __attribute__((packed)) B3TdCause {
+    // ---- RETAIL WINDOW 0x0000..0x0178: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    unsigned char        wall;  /* +0x00                                             */
+    unsigned char        has_obj;  /* +0x01                                             */
+    unsigned char _pad00[0x2];
+    int                  surface;  /* +0x04                                             */
+    unsigned char _pad01[0x4];
+    int                  by_wreck;  /* +0x0C as a grid slot, -1 = none                   */
+    unsigned char _pad02[0x163];
+    int                  obj_class;  /* obj+0x173 through +0x08 (0 = none)                */
+    unsigned char _pad03[0x1];
+
+    // ---- HARNESS SIDE, past the retail window: no recovered
+    // offset in THIS object, so it must not squat on retail's bytes.
+    int                  present;  /* the record pointer was non-NULL                   */
 } B3TdCause;
+
+#define B3TDCAUSE_RETAIL_SPAN 0x0178u
+_Static_assert(offsetof(B3TdCause, wall) == 0x0000, "wall off retail");
+_Static_assert(offsetof(B3TdCause, has_obj) == 0x0001, "has_obj off retail");
+_Static_assert(offsetof(B3TdCause, surface) == 0x0004, "surface off retail");
+_Static_assert(offsetof(B3TdCause, by_wreck) == 0x000C, "by_wreck off retail");
+_Static_assert(offsetof(B3TdCause, obj_class) == 0x0173, "obj_class off retail");
 
 void b3_td_cause_none(B3TdCause* c);
 void b3_td_cause_wall(B3TdCause* c, int surface);      /* FUN_0011AEF0    */
@@ -151,67 +265,177 @@ void b3_td_cause_wreck(B3TdCause* c, int wreck_slot);  /* FUN_00113960    */
  *    score object is racecar+0x10D0 and the callout slot is score+0x124, so
  *    e.g. score+0x4D8[i] == racecar+0x15A8[i] and slot+0x148 == racecar.
  * ------------------------------------------------------------------------- */
-typedef struct B3TdCar {
-    int   cls;                  /* +0x1920  0 human, 1 AI racer, 2 other     */
-    int   grid;                 /* +0x19BC                                   */
-    int   race_state;           /* +0x134C  (3 = finished)                   */
-    int   crashed;              /* +0x18FA                                   */
-    float crash_time;           /* +0x140C  clock the crash started          */
-    float speed_ms;             /* physics vehicle +0xBC (wall-shunt gate)   */
+typedef struct __attribute__((packed)) B3TdCar {
+    // ---- RETAIL WINDOW 0x0000..0x2410: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    unsigned char _pad00[0xBC];
+    float                speed_ms;  /* physics vehicle +0xBC (wall-shunt gate)   */
+    unsigned char _pad01[0x50];
+    float                dbl_window;  /* +0x110, -1 = closed                       */
+    int                  dbl_count;  /* +0x114                                    */
+    float                spree_window;  /* +0x118, -1 = closed                       */
+    int                  spree_count;  /* +0x11C                                    */
+    unsigned char _pad02[0x8];
+    int                  aftertouch_count;  /* +0x128                                    */
+    unsigned char _pad03[0xFF0];
+    int                  bp;  /* racecar+0x111C running BP total           */
+    unsigned char _pad04[0x54];
+    int                  slams_made;  /* +0x1174                                   */
+    unsigned char _pad05[0x4];
+    int                  bp_takedown;  /* racecar+0x117C  takedown-only BP subtotal */
+    int                  bp_aggressive;  /* racecar+0x1180  slam/combo BP subtotal    */
+    unsigned char _pad06[0x8];
+    int                  aftertouch_td;  /* racecar+0x118C                            */
+    unsigned char _pad07[0x4];
+    int                  td_made;  /* racecar+0x1194                            */
+    unsigned char _pad08[0x34];
+    int                  boost_tier;  /* +0x11CC  bar tier, boost quantum divisor  */
+    float                boost_size;  /* +0x11D0  bar size (the meter clamp)       */
+    float                boost_meter;  /* +0x11D4  units in the bar                 */
+    float                boost_earned;  /* +0x11D8  lifetime units earned            */
+    unsigned char _pad09[0x8];
+    float                boost_mult;  /* +0x11E4  earning multiplier               */
+    float                boost_bonus;  /* +0x11E8  event bonus multiplier           */
+    unsigned char        boost_peg_a;  /* +0x11EC  peg flag: the drain is skipped   */
+    unsigned char        boost_peg_b;  /* +0x11ED  peg flag: the drain is skipped   */
+    unsigned char        boosting;  /* +0x11EE  burning right now                */
+    unsigned char        boost_forcestop;  /* +0x11EF  forced min-burn stop             */
+    unsigned char _pad0A[0x1];
+    unsigned char        boost_ramp_done;  /* +0x11F1                                   */
+    unsigned char _pad0B[0x2];
+    int                  slam_kind;  /* +0x11F4  FUN_00197F90's type 0..3         */
+    unsigned char        slam_cheap;  /* +0x11F8  the Super-Slam table selector     */
+    unsigned char        slam_burning;  /* +0x11F9  attacker was boosting at impact  */
+    unsigned char _pad0C[0x152];
+    int                  race_state;  /* +0x134C  (3 = finished)                   */
+    unsigned char _pad0D[0xBC];
+    float                crash_time;  /* +0x140C  clock the crash started          */
+    float                crash_stamp;  /* +0x1410  score+0x340, the cheap-slam gate */
+    unsigned char _pad0E[0x174];
+    float                slam_energy;  /* +0x1588  slams DEALT, energy accumulator  */
+    float                last_slam_time;  /* +0x158C  attacker-side slam rate limit     */
+    int                  times_slammed;  /* +0x1590                                   */
+    float                slammed_energy;  /* +0x1594  slams TAKEN, energy accumulator  */
+    float                slam_time;  /* +0x1598  set ONLY by FUN_001989A0         */
+    int                  slam_type;  /* +0x159C                                   */
+    int                  last_slam_kind;  /* +0x15A0  FUN_00197F90's type, both cars   */
+    int                  last_victim;  /* +0x15A4 (score+0x4D4)                     */
+    float                claim[B3_TDR_MAX_CARS];  /* +0x15A8[]  -1 = idle             */
+    unsigned char        claim_aftertouch[B3_TDR_MAX_CARS];  /* +0x15C0[]                   */
+    unsigned char        claim_psyche[B3_TDR_MAX_CARS];  /* +0x15C6[]                   */
+    unsigned char _pad0F[0xA];
+    unsigned char        td_credited;  /* +0x15D6 dedup: I have been taken down     */
+    unsigned char        td_credited_fx;  /* +0x15D7 the FX one-shot beside it         */
+    unsigned char _pad10[0x4];
+    int                  td_by;  /* +0x15DC slot of the credited attacker     */
+    unsigned char _pad11[0xA4];
+    int                  psyche_target;  /* +0x1684  the slot this car is stalking    */
+    unsigned char        psyche_armed;  /* +0x1688  (score+0x5B8)                    */
+    unsigned char        taken_down_by[B3_TDR_MAX_CARS];  /* +0x1689[]                     */
+    unsigned char        revenge_flag;  /* +0x168F                                   */
+    unsigned char _pad12[0x20];
+    float                shunt_victim_time;  /* +0x16B0/+0x16B4 (FUN_00197EA0 bookkeeping)*/
+    unsigned char _pad13[0x8];
+    int                  aggressor;  /* +0x16BC  slot, -1 = none                  */
+    float                aggressor_time;  /* +0x16C0, -1 = none                        */
+    unsigned char _pad14[0x236];
+    unsigned char        crashed;  /* +0x18FA                                   */
+    unsigned char        respawning;  /* +0x18FB  the cheap-slam gate              */
+    unsigned char _pad15[0x24];
+    int                  cls;  /* +0x1920  0 human, 1 AI racer, 2 other     */
+    unsigned char _pad16[0x98];
+    int                  grid;  /* +0x19BC                                   */
+    unsigned char _pad17[0x1D4];
+    unsigned char        human_slam;  /* +0x1B94  set when a HUMAN did the slam    */
+    unsigned char _pad18[0x84B];
+    float                ai_aggression;  /* +0x23E0  the AI's grudge accumulator      */
+    unsigned char _pad19[0xC];
+    float                ai_aggr_step;  /* +0x23F0  per-slam increment (x strength)  */
+    float                ai_aggr_cap;  /* +0x23F4  its ceiling                      */
+    unsigned char _pad1A[0x14];
+    float                recover_at;  /* +0x240C  AI recovery = clock + 5.0        */
 
-    /* aggression / out-of-control */
-    float slam_time;            /* +0x1598  set ONLY by FUN_001989A0         */
-    int   slam_type;            /* +0x159C                                   */
-    int   aggressor;            /* +0x16BC  slot, -1 = none                  */
-    float aggressor_time;       /* +0x16C0, -1 = none                        */
-    int   slams_made;           /* +0x1174                                   */
-    float last_slam_time;       /* +0x158C  attacker-side slam rate limit     */
-    int   times_slammed;        /* +0x1590                                   */
-    int   psyche_target;        /* +0x1684  the slot this car is stalking    */
-    int   psyche_armed;         /* +0x1688  (score+0x5B8)                    */
-    float shunt_victim_time;    /* +0x16B0/+0x16B4 (FUN_00197EA0 bookkeeping)*/
-
-    /* attribution (score+0x4D8/+0x4F0/+0x4F6 == racecar+0x15A8/+0x15C0/+0x15C6) */
-    float claim[B3_TDR_MAX_CARS];        /* +0x15A8[]  -1 = idle             */
-    int   claim_aftertouch[B3_TDR_MAX_CARS];  /* +0x15C0[]                   */
-    int   claim_psyche[B3_TDR_MAX_CARS];      /* +0x15C6[]                   */
-    int   claim_force[B3_TDR_MAX_CARS];       /* score+0x4F0 force byte      */
-    float contact_time[B3_TDR_MAX_CARS];      /* score+0x528[] contact timer */
-    float contact_stamp[B3_TDR_MAX_CARS];     /* score+0x510[] last touched  */
-
-    /* commit bookkeeping */
-    int   td_credited;          /* +0x15D6 dedup: I have been taken down     */
-    int   td_by;                /* +0x15DC slot of the credited attacker     */
-    int   last_victim;          /* +0x15A4 (score+0x4D4)                     */
-    float last_td_time;         /* score+0x500                               */
-    int   td_count;             /* score+0x68                                */
-    int   taken_down_by[B3_TDR_MAX_CARS];   /* +0x1689[]                     */
-    int   revenge_flag;         /* +0x168F                                   */
-    float recover_at;           /* +0x240C  AI recovery = clock + 5.0        */
-
-    /* callout-slot counters (score+0x124 + ...) */
-    float dbl_window;           /* +0x110, -1 = closed                       */
-    int   dbl_count;            /* +0x114                                    */
-    float spree_window;         /* +0x118, -1 = closed                       */
-    int   spree_count;          /* +0x11C                                    */
-    int   aftertouch_count;     /* +0x128                                    */
-    int   aftertouch_td;        /* racecar+0x118C                            */
-    int   td_made;              /* racecar+0x1194                            */
-
-    /* DENIED / LUCKY ESCAPE (score+0x5E5/+0x5E6/+0x5E8) */
-    int   denied_pending;
-    int   lucky_pending;
-    float denied_time;
-
-    int   bp;                   /* racecar+0x111C running BP total           */
+    // ---- HARNESS SIDE, past the retail window: no recovered
+    // offset in THIS object, so it must not squat on retail's bytes.
+    int                  claim_force[B3_TDR_MAX_CARS];  /* score+0x4F0 force byte      */
+    float                contact_time[B3_TDR_MAX_CARS];  /* score+0x528[] contact timer */
+    float                contact_stamp[B3_TDR_MAX_CARS];  /* score+0x510[] last touched  */
+    float                last_td_time;  /* score+0x500                               */
+    int                  td_count;  /* score+0x68                                */
+    int                  denied_pending;  
+    int                  lucky_pending;  
+    float                denied_time;  
+    float                view_dist2;  
+    int                  view_radius_alt;  /* veh+0x1550: use the 19600 base instead    */
+    /* GLUE: retail reads the world matrix through pv+0x204, an object this
+     * harness does not carry.  The caller drops the frame in here so the slam
+     * scorer can run FUN_00197F90's geometry; with no frame set the type is
+     * GLANCE, which is what a zero separation would degenerate to anyway. */
+    float                frame[4][4];
+    int                  frame_valid;
     B3TdCause cause;            /* +0x13D8 stored crash cause                */
-
-    /* input to the view-distance authority ladder (section 8a): the squared
-     * distance to the nearest VIEWED racecar.  -1 = unknown, which takes the
-     * ladder's in-range/full-authority path. */
-    float view_dist2;
-    int   view_radius_alt;      /* veh+0x1550: use the 19600 base instead    */
 } B3TdCar;
+
+#define B3TDCAR_RETAIL_SPAN 0x2410u
+_Static_assert(offsetof(B3TdCar, speed_ms) == 0x00BC, "speed_ms off retail");
+_Static_assert(offsetof(B3TdCar, dbl_window) == 0x0110, "dbl_window off retail");
+_Static_assert(offsetof(B3TdCar, dbl_count) == 0x0114, "dbl_count off retail");
+_Static_assert(offsetof(B3TdCar, spree_window) == 0x0118, "spree_window off retail");
+_Static_assert(offsetof(B3TdCar, spree_count) == 0x011C, "spree_count off retail");
+_Static_assert(offsetof(B3TdCar, aftertouch_count) == 0x0128, "aftertouch_count off retail");
+_Static_assert(offsetof(B3TdCar, bp) == 0x111C, "bp off retail");
+_Static_assert(offsetof(B3TdCar, slams_made) == 0x1174, "slams_made off retail");
+_Static_assert(offsetof(B3TdCar, bp_takedown) == 0x117C, "bp_takedown off retail");
+_Static_assert(offsetof(B3TdCar, bp_aggressive) == 0x1180, "bp_aggressive off retail");
+_Static_assert(offsetof(B3TdCar, aftertouch_td) == 0x118C, "aftertouch_td off retail");
+_Static_assert(offsetof(B3TdCar, td_made) == 0x1194, "td_made off retail");
+_Static_assert(offsetof(B3TdCar, boost_tier) == 0x11CC, "boost_tier off retail");
+_Static_assert(offsetof(B3TdCar, boost_size) == 0x11D0, "boost_size off retail");
+_Static_assert(offsetof(B3TdCar, boost_meter) == 0x11D4, "boost_meter off retail");
+_Static_assert(offsetof(B3TdCar, boost_earned) == 0x11D8, "boost_earned off retail");
+_Static_assert(offsetof(B3TdCar, boost_mult) == 0x11E4, "boost_mult off retail");
+_Static_assert(offsetof(B3TdCar, boost_bonus) == 0x11E8, "boost_bonus off retail");
+_Static_assert(offsetof(B3TdCar, boost_peg_a) == 0x11EC, "boost_peg_a off retail");
+_Static_assert(offsetof(B3TdCar, boost_peg_b) == 0x11ED, "boost_peg_b off retail");
+_Static_assert(offsetof(B3TdCar, boosting) == 0x11EE, "boosting off retail");
+_Static_assert(offsetof(B3TdCar, boost_forcestop) == 0x11EF, "boost_forcestop off retail");
+_Static_assert(offsetof(B3TdCar, boost_ramp_done) == 0x11F1, "boost_ramp_done off retail");
+_Static_assert(offsetof(B3TdCar, slam_kind) == 0x11F4, "slam_kind off retail");
+_Static_assert(offsetof(B3TdCar, slam_cheap) == 0x11F8, "slam_cheap off retail");
+_Static_assert(offsetof(B3TdCar, slam_burning) == 0x11F9, "slam_burning off retail");
+_Static_assert(offsetof(B3TdCar, race_state) == 0x134C, "race_state off retail");
+_Static_assert(offsetof(B3TdCar, crash_time) == 0x140C, "crash_time off retail");
+_Static_assert(offsetof(B3TdCar, crash_stamp) == 0x1410, "crash_stamp off retail");
+_Static_assert(offsetof(B3TdCar, slam_energy) == 0x1588, "slam_energy off retail");
+_Static_assert(offsetof(B3TdCar, last_slam_time) == 0x158C, "last_slam_time off retail");
+_Static_assert(offsetof(B3TdCar, times_slammed) == 0x1590, "times_slammed off retail");
+_Static_assert(offsetof(B3TdCar, slammed_energy) == 0x1594, "slammed_energy off retail");
+_Static_assert(offsetof(B3TdCar, slam_time) == 0x1598, "slam_time off retail");
+_Static_assert(offsetof(B3TdCar, slam_type) == 0x159C, "slam_type off retail");
+_Static_assert(offsetof(B3TdCar, last_slam_kind) == 0x15A0, "last_slam_kind off retail");
+_Static_assert(offsetof(B3TdCar, last_victim) == 0x15A4, "last_victim off retail");
+_Static_assert(offsetof(B3TdCar, claim) == 0x15A8, "claim off retail");
+_Static_assert(offsetof(B3TdCar, claim_aftertouch) == 0x15C0, "claim_aftertouch off retail");
+_Static_assert(offsetof(B3TdCar, claim_psyche) == 0x15C6, "claim_psyche off retail");
+_Static_assert(offsetof(B3TdCar, td_credited) == 0x15D6, "td_credited off retail");
+_Static_assert(offsetof(B3TdCar, td_credited_fx) == 0x15D7, "td_credited_fx off retail");
+_Static_assert(offsetof(B3TdCar, td_by) == 0x15DC, "td_by off retail");
+_Static_assert(offsetof(B3TdCar, psyche_target) == 0x1684, "psyche_target off retail");
+_Static_assert(offsetof(B3TdCar, psyche_armed) == 0x1688, "psyche_armed off retail");
+_Static_assert(offsetof(B3TdCar, taken_down_by) == 0x1689, "taken_down_by off retail");
+_Static_assert(offsetof(B3TdCar, revenge_flag) == 0x168F, "revenge_flag off retail");
+_Static_assert(offsetof(B3TdCar, shunt_victim_time) == 0x16B0, "shunt_victim_time off retail");
+_Static_assert(offsetof(B3TdCar, aggressor) == 0x16BC, "aggressor off retail");
+_Static_assert(offsetof(B3TdCar, aggressor_time) == 0x16C0, "aggressor_time off retail");
+_Static_assert(offsetof(B3TdCar, crashed) == 0x18FA, "crashed off retail");
+_Static_assert(offsetof(B3TdCar, respawning) == 0x18FB, "respawning off retail");
+_Static_assert(offsetof(B3TdCar, cls) == 0x1920, "cls off retail");
+_Static_assert(offsetof(B3TdCar, grid) == 0x19BC, "grid off retail");
+_Static_assert(offsetof(B3TdCar, human_slam) == 0x1B94, "human_slam off retail");
+_Static_assert(offsetof(B3TdCar, ai_aggression) == 0x23E0, "ai_aggression off retail");
+_Static_assert(offsetof(B3TdCar, ai_aggr_step) == 0x23F0, "ai_aggr_step off retail");
+_Static_assert(offsetof(B3TdCar, ai_aggr_cap) == 0x23F4, "ai_aggr_cap off retail");
+_Static_assert(offsetof(B3TdCar, recover_at) == 0x240C, "recover_at off retail");
 
 /* One world contact, scored by FUN_0011AEF0's own wall test -- see section 9
  * below for how it is fed and taken. */
@@ -314,6 +538,18 @@ int  b3_td_out_of_control(const B3TdRules* R, int slot, float clock);
 /* FUN_001994D0's message chooser, exposed for the validator. */
 int  b3_td_select_message(const B3TdRules* R, int attacker, int victim,
                           int aftertouch, int psyche);
+
+/* The world matrix retail reads through pv+0x204.  Set it before a slam and
+ * b3_td_slam_report runs FUN_00197F90's geometry for the type; leave it unset
+ * and every slam is B3_TDR_SLAM_GLANCE. */
+void b3_td_set_frame(B3TdRules* R, int slot, const float m[4][4]);
+
+/* FUN_001989A0's "Super Slam" table selector, exposed for the validator. */
+int  b3_td_slam_cheap(const B3TdRules* R, float clock, int victim);
+
+/* The BP FUN_001989A0 pays for one slam, given the type/cheap/burning triple.
+ * Exposed so the validator can diff the table lookup on its own. */
+int  b3_td_slam_bp(int type, int cheap, int burning);
 
 /* ---------------------------------------------------------------------------
  * 8. THE CRASH-THRESHOLD AUTHORITY  veh+0x1534  [C-disasm]
@@ -485,16 +721,30 @@ int  b3_td_wall_take(B3TdRules* R, int slot, B3TdWallHit* out);
  * normal + the impact magnitude, b3_crash_apply_impulse for step 7's
  * routing); nothing on `cv` is modified.
  * ------------------------------------------------------------------------- */
-typedef struct B3TdWallResponse {
-    int   valid;         /* the contact resolved (non-degenerate normal)   */
-    float nh[4];         /* the flattened + normalised contact normal      */
-    float vel[4];        /* veh+0xB0 AFTER steps 2 and 3                   */
-    float scrub;         /* the product of the two scrub factors           */
-    float impact;        /* veh+0x194                                      */
-    float imp[4];        /* veh+0x110 delta -- divide by mass for dv       */
-    float ang_imp[4];    /* veh+0x120 delta -- add to angular momentum     */
-    int   at_point;      /* 1 = step 7 took the torque path                */
+typedef struct __attribute__((packed)) B3TdWallResponse {
+    // ---- RETAIL WINDOW 0x0000..0x0198: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    unsigned char _pad00[0xB0];
+    float                vel[4];  /* veh+0xB0 AFTER steps 2 and 3                   */
+    unsigned char _pad01[0x50];
+    float                imp[4];  /* veh+0x110 delta -- divide by mass for dv       */
+    float                ang_imp[4];  /* veh+0x120 delta -- add to angular momentum     */
+    unsigned char _pad02[0x64];
+    float                impact;  /* veh+0x194                                      */
+
+    // ---- HARNESS SIDE, past the retail window: no recovered
+    // offset in THIS object, so it must not squat on retail's bytes.
+    int                  valid;  /* the contact resolved (non-degenerate normal)   */
+    float                nh[4];  /* the flattened + normalised contact normal      */
+    float                scrub;  /* the product of the two scrub factors           */
+    int                  at_point;  /* 1 = step 7 took the torque path                */
 } B3TdWallResponse;
+
+#define B3TDWALLRESPONSE_RETAIL_SPAN 0x0198u
+_Static_assert(offsetof(B3TdWallResponse, vel) == 0x00B0, "vel off retail");
+_Static_assert(offsetof(B3TdWallResponse, imp) == 0x0110, "imp off retail");
+_Static_assert(offsetof(B3TdWallResponse, ang_imp) == 0x0120, "ang_imp off retail");
+_Static_assert(offsetof(B3TdWallResponse, impact) == 0x0194, "impact off retail");
 
 int b3_td_wall_response(const struct B3CrashVehicle* cv, const float pt[4],
                         const float n[4], B3TdWallResponse* out);

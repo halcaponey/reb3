@@ -1,8 +1,16 @@
 # Audio extraction notes (Burnout 3: Takedown, Xbox)
 
-Tools: `tools/extract_xwb.py`, `tools/extract_awd.py`, `tools/extract_rws.py`
-(Python 3 stdlib only; `extract_xwb.py` optionally shells out to system
-`ffmpeg` to convert WMA entries to PCM `.wav`).
+Tools: the `xwb`, `awd` and `rws` stages of `tools/cextract/`
+(`cx_audio_xwb.c`, `cx_audio_awd.c`, `cx_audio_rws.c`). The `xwb` stage shells
+out to system `ffmpeg` to convert WMA entries to PCM `.wav`.
+
+> **Status (2026-08-22).** The format record below (§§1–4, §6) is accurate and
+> is the evidence; the tooling frame around it changed. The Python extractors
+> this document was written against — `tools/extract_xwb.py`,
+> `extract_awd.py`, `extract_rws.py` — are now forwarding shims onto the
+> immutable archive in `tools/py_extract_archive/`, kept as the byte-identity
+> oracle for the C stages above. There is also no longer a required
+> pre-extracted `<game dir>`: the game reads the XISO directly. See §5.
 
 Output: `build/audio/<bankname>/NNN.wav|.wma` (XWB),
 `build/audio/awd_<dict>/<wave>.wav` (AWD),
@@ -78,10 +86,20 @@ correct one for v3.
   {s16 predictor, u8 stepIndex, u8 pad} header per channel then 4-byte
   nibble groups round-robin per channel) is implemented **but unexercised
   by real data** [community, untested].
-- WMA cannot be decoded with the Python stdlib. Each entry is dumped
-  verbatim as `NNN.wma` (a standalone ASF file); when `ffmpeg` is on PATH it
-  is also decoded to `NNN.wav` and validated (rate/channel match vs the
-  format dword, duration vs the ASF File Properties object, RMS non-silence).
+- **The profile, read off the entries' own ASF headers** (the `WAVEFORMATEX`
+  in each Stream Properties object — the XWB format dword only says "tag 2 =
+  WMA"): every one of the 885 is `wFormatTag 0x0161`, **WMA v2 standard**,
+  2 ch, **160 kb/s CBR**, `cbSize 10`, `flags2 0x000F`. Block align 7431 B
+  @44.1 kHz / 6827 B @48 kHz — one superframe, ~0.37 s. Nothing on the disc
+  is WMA Pro (0x162), Lossless (0x163) or Voice (0x00A).
+- **Decoding is in process now** (`tools/cextract/wma/`, Rockbox `libwma`
+  vendored by `tools/fetch_wma.sh`). Each entry is still dumped verbatim as
+  `NNN.wma` — a standalone ASF file, byte-identical to the Python's and still
+  gated as such — and is also decoded to `NNN.wav` and validated
+  (rate/channel match vs the format dword, duration vs the ASF File Properties
+  object, RMS non-silence). No `ffmpeg` on PATH is required, which is what let
+  these two stages join the game link and reach the web. `B3_FFMPEG=1` runs
+  the old subprocess as the A/B oracle; see docs/RE_MUSIC.md §2.1.
 - Extraction result: **876/885 entries valid** (ASF magic, ffmpeg decode,
   rate/channels/duration agreement, RMS 1600-13100). The 9 rejects are all
   in `movie.xwb`: 0.03–0.46 s entries that decode to pure digital silence
@@ -153,6 +171,43 @@ per-track object hits (`woodenboxh22`, `trafficone33`, `signpostht22`...);
 engine loops live in the per-vehicle `pveh` banks (e.g.
 `awd_pveh_COMP_Car1_high/eng_2873.wav`).
 
+### 2.1 The rpm labels are PER CAR — the example above is not a template
+
+The line above is an example and was once read as a rule: `load_real_audio()`
+in `src/burnout3_full.c` hard-coded `{2873, 4317, 5279, 6234}` and looked for
+exactly those four files in whichever car's bank the player had chosen.
+**Measured over all 67 `_high` banks: only nine carry that set**, and there are
+**79 distinct rpm labels** across the fleet —
+
+| bank | labels |
+|---|---|
+| `awd_pveh_COMP_Car1_high` | `eng_2873` `eng_4317` `eng_5279` `eng_6234` |
+| `awd_pveh_COMP_Car2_high` | `eng_2489` `eng_4487` `eng_5483` `eng_6475` |
+| `awd_pveh_COMP_Car3_high` | `eng_2933` `eng_3914` `eng_4877` `eng_5870` |
+| `awd_pveh_CUPE_Car1_high` | `eng_3530` `eng_4946` `eng_5975` `eng_7060` |
+| `awd_pveh_HEVY_Car1_high` | `eng_1473` `eng_2453` `eng_3437` `eng_4421` |
+| `awd_pveh_HEVY_Car10_high` | `eng_580` `eng_992` `eng_1400` (three) |
+
+— so any car but those nine scored four misses and the harness printed
+`REAL audio: 0 engine loops`. The loader now **scans the bank** instead.
+
+The names themselves are retail's: both extractors copy the AWD record's
+`name` field verbatim (`tools/cextract/cx_audio_awd.c:149`, the archived
+`tools/py_extract_archive/extract_awd.py:146`), so the rpm really is in the
+name and nothing has to be inferred. Two families do not use the `eng_` stem:
+
+* `COMP_Car4` / `COMP_Car9` — `c9_eng_<rpm>` against `c9_x_<rpm>`. Same stem
+  behind a bank-local prefix.
+* `MSCL_Car1` / `MSCL_Car6` — `mtr<rpm>` / `m6r<rpm>` against `mtx<rpm>` /
+  `m6x<rpm>`. **[?]** Reading the `x` as this doc's `ex_` (exhaust) and the
+  `r` as the engine is an inference from those two banks, not a recovered
+  table; the loader fences it behind "no `eng_` wave was found at all" so it
+  can never touch the other 65.
+
+Counting per `_high` bank after the scan: **60 banks yield four loops, 7 yield
+three, none yields zero.** The `_low` banks are not a usable fallback — 41 of
+67 hold a single `eng_` wave.
+
 ## 3. RWS — RenderWare Audio streams (111 files, 75 real + 36 dummies)
 
 Files: `Tracks/**/CRASH1-3.RWS` (crash-mode music), `Tracks/crash1-20.rws`
@@ -205,6 +260,39 @@ rate/channel sanity, exact byte counts, RMS 1800–15800).
   `ovid/movie.xwb`).
 
 ## 5. Reproduce
+
+**You do not have to.** Every audio stage — `awd`, `rws`, `xwb` and `eatrax` —
+is linked into the game and runs in process against the disc on a cache miss,
+so engine loops, SFX, crash beds *and music* simply appear. `xwb` and `eatrax`
+used to be the exception, because they forked `ffmpeg` for WMA; they decode in
+process now (§1, and docs/RE_MUSIC.md §2.1), which is what removed the
+"EA TRAX music unavailable until extracted" notice and the manual step behind
+it.
+
+`build/music/track_NN.wav` materialises **one song at a time**, keyed on the
+song index — the whole family is 722 MB and 22.7 s of decode, and the shuffle
+only ever needs the song it is about to play (docs/RE_MUSIC.md §2.2).
+
+The batch form is still there, and is the only thing that writes the
+`eatrax.txt` manifest:
+
+```
+cxtract --only eatrax          # and --only xwb
+```
+
+It needs the vendored decoder, once per checkout:
+
+```
+sh tools/fetch_wma.sh          # third_party/, gitignored, pinned + sha256
+python3 tools/validate_wma.py  # the SNR gate vs a fresh ffmpeg oracle
+```
+
+Build `cxtract` with `tools/cextract/build.sh`; `--all-global` runs the whole
+car / art / audio / generator set.
+
+The archived Python oracles take a pre-extracted game directory and remain the
+reference implementation — they are what `tools/cextract/verify_cextract.py`
+diffs the C output against, byte for byte:
 
 ```
 python3 tools/extract_awd.py "<game dir>" -o build/audio

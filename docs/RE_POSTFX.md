@@ -1,5 +1,26 @@
 # World post-FX — the sky and the speed blur
 
+> **Status (2026-08-24): there is now a second, modern chain.**
+> `src/burnout3_aftereffects.c` renders the scene into a texture-backed FBO
+> and runs the whole composite as shader passes — no frame grab, no readback,
+> two full-canvas copies per frame removed. It is **on by default on the
+> desktop and off by default on the web** (`B3_AFX=1`/`0`); when it is off,
+> everything below still describes what runs. Its effect set is speed/boost
+> radial blur, a highlight bloom, and a crash/aftertouch treatment, with the
+> recovered ×2 composite and ^0.95 ramp unchanged at the end of it.
+> **Read §4d first if you are citing anything about the blur**: the retail
+> "radial" pass turns out not to be radial, and the `radialblurmask` is never
+> bound — so the port's radial construction is INSPIRED, not recovered.
+
+> **Status (2026-08-22): the ×2 present composite is ON by default.** The
+> blocker this document names as "the top item" — getting the port into
+> render-target space — is closed (`B3_SKY_RT_GAIN` plus the trackmesh lift).
+> **The knob is inverted from what is written below:** `B3_POSTFX_PRESENT=0`
+> now turns the composite *off* for A/B work; it is no longer `=1` to turn it
+> on. Still genuinely open, as recorded: LUT passes 2 and 3, and
+> `radialblurmask`'s texture dictionary, which this port does not extract.
+> (On Android the composite remains off — see `docs/ANDROID_PORT.md`.)
+
 Two world-level features the harness lacked, recovered from the retail Xbox
 executable and checked against the xemu reference captures in
 `REFERENCE IMAGES/` (real Silver Lake gameplay, `US/C3_V1`).
@@ -165,8 +186,31 @@ position `DAT_004D67D0/D4/D8`, row 3 w = 1.0, with
 S = DAT_004D67E0 - 1000.0            0x000325AB..0x000325BB, literal at 0x003B16CC
 ```
 
-`DAT_004D67E0` is the view far clip **[S]** — `FUN_0002ECC0` stamps `10000.0`
-as the far plane at `0x0002ED??`, so the dome sits 1000 units inside it.
+`DAT_004D67E0` is the view far clip **[S]**, and the value it holds is now
+**[C]**: `FUN_0002ECC0` — the renderer init, reached from `FUN_0002EF90` —
+builds three view objects (`arg+0x90`, `arg+0x130`, `arg+0x310`) and gives
+every one of them the same near/far pair as immediate pushes into the
+viewport setters `FUN_001D92A0` (near → `view+0x80`) and `FUN_001D9360`
+(far → `view+0x84`, both of which then rebuild the depth-range scale/bias at
+`+0x8C`/`+0x90` from `DAT_007592B8..BC`):
+
+```
+0002eda6  MOVSS XMM0,[0x003b1684]      ; 0x3F000000 = 0.5
+0002edae  PUSH 0x3f000000              ; near := 0.5
+0002edb3  PUSH ECX / CALL 0x001d92a0
+0002edc4  MOVSS XMM0,[0x003a340c]      ; 0x461C4000 = 10000.0
+0002edcc  PUSH 0x461c4000              ; far  := 10000.0
+0002edd1  PUSH EDX / CALL 0x001d9360
+   repeated verbatim at 0002ede6/0002edee and 0002ee22/0002ee2a (near),
+                        0002ee04/0002ee0c and 0002ee40/0002ee48 (far)
+```
+
+so the dome's `S = 10000 - 1000 = 9000` and it sits 1000 units inside the far
+plane. **The port shipped 0.1 / 5000** — half retail's draw distance, which
+clipped the distant skylines off the big worlds (`US_M1_V1` / `US_P2_V1`
+`track.obj` spans 30 km × 21 km); `src/burnout3_full.c`'s
+`B3_VIEW_NEAR_RETAIL` / `B3_VIEW_FAR_RETAIL` carry the retail pair and
+`tools/validate_draw_distance.py` gates it.
 
 Render state around the draw, from `FUN_000323D0` / `FUN_000324A0`
 (the deferred shadow scheme of RE_FRONTEND 6.7.1):
@@ -502,6 +546,11 @@ final EFG      = 0x00001C80   out.a = R0.a, CLAMP_SUM
    out.rgb = 2 * ( scene.rgb  +  C0.a * blur.rgb )
 ```
 
+> **The port no longer uses this blend operator by default — see §4d.5.** The
+> `×2` and `C0.a` below are recovered and are still used exactly as recovered;
+> the `+` is not, because an add cannot blur. `B3_AFX_PRESENT_ADD=1` runs the
+> equation as written here.
+
 **The presented frame is twice the render target, even when the blur is
 idle.** The OP field is the same field, read the same way, that TRACK-LIGHT
 and WORLD-SPEC independently settled as ×2 on the six world defs
@@ -524,6 +573,239 @@ at 1.2×–1.7× of retail's render target rather than 1.0×, so switching the �
 on today clips 21% of the frame at 255 where the retail captures clip 0.11%.
 The excess is concentrated in the sky (57% of the sky band clips; the near-road
 band only 4.7%). `B3_POSTFX_PRESENT=1` enables it for A/B work.
+
+---
+
+## 4d. CORRECTION (2026-08-24) — the "radial" pass is not radial, and the
+## mask is never bound
+
+Everything in this section is **[C]**, read out of `build/burnout3.elf` with
+capstone (the Ghidra bridge was down). It **supersedes** §4.2's framing and
+§4b.2's item 3, and it retires two of §6's open items by answering them
+negatively.
+
+### 4d.1 `FUN_0003E520`'s third pass is a 3-tap HORIZONTAL blur
+
+The `D3DPIXELSHADERDEF` at **`0x003EA248`** decodes — same field layout, same
+OP-field reading as §4b.3 — to
+
+| field | value |
+|---|---|
+| `PSTextureModes` | `0x00000421` — three PROJECT2D samplers, T0/T1/T2 |
+| `PSCombinerCount` | `0x00011102` — **two** stages |
+| `PSRGBInputs[0]` | `0xC8C1C9C2` → A=T0, B=C0, C=T1, D=C1 |
+| `PSRGBOutputs[0]` | `0x00000C00` — SUM → R0, **OP = 0, no shift** |
+| `PSRGBInputs[1]` | `0xCAC120CC` → A=T2, B=C0, C=1, D=R0 |
+| `PSRGBOutputs[1]` | `0x00000C00` — SUM → R0 |
+| final ABCD / EFG | `0x00000C00` / `0x00000080` — out.rgb = R0, **out.a = 0** |
+| `PSC0Mapping` | `0xFFFFFF42` — stage0 C0 = c2, stage1 C0 = c4 |
+| `PSC1Mapping` | `0xFFFFFFF3` — stage0 C1 = c3 |
+
+```
+out.rgb = c2*T0 + c3*T1 + c4*T2
+```
+
+and at `0x0003F4D3` all three constants are set to the **same** value,
+`0.39999601` (`0x003B1EE4`), pushed as four registers from `c2` by
+`SetPixelShaderConstant` at `0x0003F520`. `0x003B1EE4` has **exactly one**
+reference in the whole image. So the tap set is **3 taps × 0.4 = a deliberate
+×1.2 gain.**
+
+The three samplers are all bound to the *same* surface, `renderer+0x8C0` (the
+160×120 reduction 2): `0x0003F3B5`, `0x0003F3BC`, `0x0003F3C4`, with sampler 3
+explicitly NULLed at `0x0003F3CC`. `EDI` is loaded once at
+`0x0003ED93 lea edi,[esi+0x8c0]` and is callee-saved across the intervening
+calls.
+
+The primitive is **one oversized screen triangle** (`0x0003F545` writes
+`NV097_SET_BEGIN_END` = 5, TRIANGLES; three vertices at `0x0003F62A`,
+`0x0003F71B`, `0x0003F811`) whose three texcoord sets differ **only in x**:
+
+| vertex | tex0 | tex1 | tex2 |
+|---|---|---|---|
+| 1 | (−1.3333334, 0) | (0, 0) | (+1.3333334, 0) |
+| 2 | (638.66669, 0) | (640, 0) | (641.33331, 0) |
+| 3 | (−1.3333334, 480) | (0, 480) | (+1.3333334, 480) |
+
+`tex1` is the position exactly; `tex0`/`tex2` are ∓4/3 units in x. **There is
+no centre, no radial term, and no zoom.**
+
+### 4d.2 Three negatives that matter to any port
+
+* **`radialblurmask` is never bound.** Sampler 3 is NULLed; the mask handle
+  lives at `blurState+0x40`, *below* the `+0x50` sub-struct that is the only
+  thing either postfx function receives (`0x001AE5CC`, `0x001AE601`). It is
+  structurally out of reach of both passes. §6 item 1b is answered: the mask's
+  shape does not matter, because the recovered path does not sample it.
+* **The 0.99 / 0.9998999834 "zoom layers" are read by nothing.** A whole-`.text`
+  operand xref of `0x003B1758` and `0x003B18B4` finds one hit each —
+  `0x0002EBFE` and `0x0002EC65`, both inside the constructor `FUN_0002EBE0`
+  that writes them. Neither literal appears anywhere in the 1937 instructions
+  of `FUN_0003DA90` + `FUN_0003E520`. §4.1's "two zoom layers" is a true
+  statement about the *constructed state* and a false one about the *renderer*.
+* **There are two strength scalars, not one.** `blurState+0x54` feeds the
+  present composite's `C0.a` (`0x0003DC3A`, the only `[ebp+8]` access in
+  `FUN_0003DA90`); `blurState+0x58` feeds pass 3's **constant-alpha blend**,
+  `alpha = ftol(blurState+0x58 × 244.0)` at `0x0003F491`..`0x0003F4C4` with
+  `RS SRCBLEND := 0x8003` (`GL_CONSTANT_ALPHA`) at `0x0003F487`. Both
+  producers remain **[?]** — §6 item 1 stands, but it is now looking for a
+  writer of **two adjacent floats** through a pointer to the `+0x50`
+  sub-struct.
+
+### 4d.3 No crash coupling, no takedown flash [C, negative]
+
+An operand scan over the renderer/postfx range `0x00028000..0x00045000` and
+the world draw `0x001AE340..0x001AEB00` finds **zero** reads of the dilation
+globals `DAT_0060EA18` / `DAT_0060EA24` or the audio rate scale
+`DAT_003EBFD0`. `FUN_0003DA90` and `FUN_0003E520` have exactly two callers
+each, both unconditional, both handed the same `DAT_004D6524+0x50` — there is
+no alternate cinematic state path into either. The crash entry `FUN_00025CC0`,
+the impact machine `FUN_00026050` and the aftertouch shaper `FUN_00118410`
+touch nothing on the blur/present path (`FUN_00118410`: zero hits anywhere in
+the renderer object). Both pixel-shader defs carry all-zero
+`PSConstant0`/`PSConstant1`.
+
+**Retail changes no post-processing during a crash, during time dilation, or
+at a takedown.** Any such effect in this port is an addition and must be
+labelled INSPIRED, never [C].
+
+### 4d.4 What the port does with this
+
+`src/burnout3_aftereffects.c` keeps retail's **architecture** (render to
+texture, reduce, composite, gamma) and deliberately does **not** keep its
+3-tap horizontal smear: it runs a radial blur instead, because the 2026-08-24
+mandate is to be inspired by Burnout 3 rather than to reproduce it. That
+choice is marked INSPIRED at its definition and in the module header. The
+over-unity tap gain is the one piece of pass 3's character that carries over.
+
+### 4d.5 CORRECTION (2026-08-24, later the same day) — the composite's blend operator is INSPIRED too
+
+A user reported "I don't see any blur effects on PC". The chain was live and
+building correctly; the output genuinely had no blur in it, at any speed and
+at any setting, and the reason is in the recovered equation itself.
+
+**An add cannot blur.** The recovered present composite is
+
+```
+out.rgb = 2 * ( scene.rgb + C0.a * blur.rgb )          [C], §4b.3
+```
+
+The scene term is composited at **unit weight** no matter what `C0.a` is, so
+the sharp image is always fully present in the output. Raising `C0.a` adds a
+soft copy on top — it adds *light*, never removing detail. Measured on a
+pinned frame (`tools/afx_sweep.py`, same world, only the effect inputs
+overridden, against a blur-off reference):
+
+| `C0.a` driven to | mean radial gradient energy | reads as |
+|---|---|---|
+| 0.19 (the shipped 90 mph value) | 1.002 | nothing |
+| 1.00 (the recovered ceiling) | 1.005 | a slight overall brightening |
+
+Radial gradient energy *rising above 1.0* is the tell: the frame got very
+slightly harder-edged, because everything got brighter. Six sweep frames from
+60 mph to 150 mph + boost were visually indistinguishable.
+
+Retail could live with this because retail's blur surface is a 3-tap
+horizontal smear at 1.2 total gain (§4d.1) — a soft glow was the entire
+intent, and an add delivers a soft glow faithfully. This port's stated
+standard is different: motion blur must be **visible** — perceptible by
+~90 mph, dramatic under boost. No value of `s` reaches that through an add,
+so the GLUE strength ramp was never the bug.
+
+**What the port does now.** A cross-fade, with the radial mask as the
+per-pixel weight:
+
+```
+out.rgb = 2 * mix( scene.rgb, blur.rgb, C0.a * mask )   INSPIRED
+```
+
+What is preserved, exactly:
+
+* `C0.a = min(s,2)*0.5` — the recovered alpha law, untouched, still gated by
+  `validate_postfx` C7.
+* the `×2` SHIFTLEFTBY1 — untouched.
+* **both recovered endpoints.** At `C0.a == 0` the expression is `2*scene`,
+  the recovered equation bit for bit; verified by rendering the two paths at
+  `s = 0` and comparing arrays for exact equality.
+
+What changed is the **blend operator between those two recovered endpoints**,
+and that is now listed under INSPIRED in the module header rather than under
+RECOVERED, where this document and that header both used to put it.
+
+`B3_AFX_PRESENT_ADD=1` restores the literal recovered add, so the `[C]`
+equation stays *runnable* rather than merely written down — which also makes
+the defect reproducible on the shipped binary. Sweeping both composites over
+the same pinned frames with the **same retuned ramp**, so the blend operator
+is the only variable:
+
+| leg | ADD: mean Δ | ADD: radial | cross-fade: mean Δ | cross-fade: radial |
+|---|---|---|---|---|
+| 60 mph | 5.72 | 1.001 | 0.95 | 0.947 |
+| 90 mph | 14.48 | 1.001 | 2.53 | 0.863 |
+| 120 mph | 24.74 | 1.001 | 4.41 | 0.763 |
+| 150 mph | 24.74 | 1.001 | 4.41 | 0.763 |
+| 150 mph + boost | 36.25 | 0.993 | 6.63 | 0.645 |
+
+The add's radial gradient energy is **pinned at 1.001 all the way to full
+boost** while it moves four to six times as many levels as the cross-fade
+does. That is the defect in one table: it changes a great deal of the picture
+and removes none of its detail.
+
+Note also that the *smaller* mean delta is the one that actually blurs. A
+cross-fade preserves exposure, so it changes fewer levels while changing far
+more of what a viewer sees. Mean-delta is the wrong metric for this effect;
+the gradient-energy ratio is the right one, and a sweep reported only in
+mean-delta would have ranked the broken composite first.
+
+**A measurement hazard, recorded because it produced two rounds of confidently
+wrong numbers.** `B3_SHOT_FRAME` pins a *rendered frame number*, and the
+frames spent loading before the green light are not a fixed count — under CPU
+contention (two game runs launched in parallel, or a validator running
+alongside) a run spends more of them, so frame 400 lands at a different race
+time and the "pinned" frame is a photograph of somewhere else. The sim itself
+is perfectly deterministic: two sequential runs of identical env produce
+bit-identical frames. `tools/afx_sweep.py` now proves the pin on every leg
+instead of assuming it, using the effect under measurement as the instrument
+— the radial mask holds the mix weight at exactly 0 inside `B3_BLUR_MASK_R0`,
+so the centre of the frame is bit-identical across legs if and only if the
+world is. Every table above was taken with that check reading 0 on every leg.
+
+One consequence inside the chain: the radial mask used to be multiplied into
+the blur surface's **rgb**, which is correct for an add (a masked-to-black
+smear adds nothing at screen centre) and catastrophic for a cross-fade (it
+would fade the middle of the screen to black). The mask now travels in the
+blur surface's **alpha** and is applied as the mix weight, which is what it
+always meant. Verified across the crash/dilation ladder: centre luma holds at
+92.0 / 92.1 / 92.1 / 92.1 for divisors 1 / 3 / 6 against a blur-off reference
+of 92.0.
+
+### 4d.6 The GLUE ramp retune (2026-08-24)
+
+Secondary to the above, but real: measured against a blur-off reference the
+old ramp moved the picture by a mean **1.3 levels at 60 mph and 5.2 at 90** —
+around and just above the threshold of noticing. Three GLUE numbers were
+responsible and all three changed. The onset (30 mph) and saturation speed
+(120 mph) did **not** change: they are what the reference captures pin, and
+`validate_postfx` C6 asserts both.
+
+| constant | before | after | why |
+|---|---|---|---|
+| ramp exponent | `t*t` (hard square) | `B3_BLUR_SHAPE` = 1.35 | a square puts 90 mph — two thirds up the ramp — at 44% of the curve |
+| `B3_BLUR_S_MAX` | 0.85 | 1.15 | `C0.a` topped out at 0.425, under half the recovered ceiling |
+| `B3_BLUR_BOOST_GAIN` | 0.45 | 0.50 | — |
+| `B3_BLUR_MASK_R0` | 0.25 | 0.10 | the mask zeroed the effect across the whole middle of the frame |
+| `B3_BLUR_MASK_POW` | 1.5 | 1.10 | and still only reached 0.48 at the screen edge; now 0.65 |
+
+Resulting `C0.a`: 0.13 at 60 mph, 0.33 at 90, 0.58 at 120, 0.86 at 120 + full
+boost.
+
+`B3_AFX_TAPS` stayed at 16, and that is a measured decision rather than an
+omission. The taps are a zoom trail, so the count sets the trail's *length*
+(`0.99^n`); a 16 / 24 / 32 / 48 sweep on a pinned 120 mph frame moved radial
+gradient energy by 0.004 in total (0.763 → 0.759) for three times the
+samples. The trail length is not the lever — the mix weight is, because the
+surface being smeared is already a quarter-resolution image and its high
+frequencies are gone before the first tap.
 
 ---
 
@@ -624,10 +906,15 @@ Before this module the harness cleared to flat `(0.3, 0.5, 0.8)`.
    `+0x50` sub-struct whose owner was not identified. Suggested attack: the
    `Graphics/*.bum` bundles, or a Unicorn trace with the renderer
    instrumented.
-1b. **The mask sampling** — `radialblurmask` lives in the global texture
-   dictionary (`FUN_0002DDF0`), which no extractor touches yet. Its shape is
-   what decides whether the additive blur brightens the whole screen or only
-   the edges; the port assumes the latter (a radial ramp, GLUE).
+1b. ~~**The mask sampling**~~ — **CLOSED 2026-08-24, negatively (§4d.2).**
+   `radialblurmask` is never bound by the recovered pass and cannot be reached
+   from the sub-struct either postfx function receives. Its shape decides
+   nothing. For the record, `FUN_0002DDF0` turns out to be a linear strcmp
+   scan over an in-memory registry at `DAT_004D1FE0` keyed on a name at
+   `record+0x48` — it names no file, so the container is still **[?]**, and
+   the string sits between `WaterFresnel` and `blobbyshadow` just after the
+   `"Graphics/%d.bum"` format string, which is **[S]** for the shader bundles
+   being its home. Not worth chasing now.
 1c. **`FUN_0003C810`** saves the current render target and re-points it at
    `renderer+0x87C + i*4`, and the in-race renderer calls it with `i = 1`.
    Those four surfaces are 256/128/64/32 square `R5G6B5` textures created by

@@ -100,6 +100,12 @@ def build_driver():
         ["gcc", "-Wall", "-Wextra", "-std=c11", "-O2",
          "-I" + os.path.join(ROOT, "src"), "-I/usr/include/SDL2", "-D_REENTRANT",
          "-DB3_BOOSTFX_TEST_MAIN", "-o", DRIVER, SRC,
+         # burnout3_boostfx.c reads the frame camera from the retained
+         # renderer (b3r_view) and draws through its batcher, so the module
+         # comes along even though this driver never draws.  burnout3_render.c
+         # in turn needs the track-mesh material decode.
+         os.path.join(ROOT, "src", "burnout3_render.c"),
+         os.path.join(ROOT, "src", "burnout3_trackmesh.c"),
          "-lSDL2", "-lSDL2_image", "-lGL", "-lm"],
         capture_output=True, text=True, cwd=ROOT)
     if r.returncode:

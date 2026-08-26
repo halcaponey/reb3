@@ -14,10 +14,23 @@ asserts the two agree field for field.
   racer vs racer    FUN_001121F0                   full response + slam class
   car vs wreck      FUN_00113960                   response + crash threshold
 
+The last section ("consume") is not differential: it is the drive-through
+regression guard.  It asserts the invariant the two above leave implicit --
+that a resolved contact reaches a body somebody actually INTEGRATES.  On the
+wreck path FUN_00113960 deliberately gives the alive car nothing (kind 2,
+@0x00113B75), so the wreck is the only body holding the response; if the
+harness does not integrate it, the contact is silently discarded and the car
+is driven through while still being drawn.
+
 Usage: python3 tools/validate_carcol.py [section]
 """
 import math
 import os
+
+# The driver links burnout3_backend.c; pin it to the RE path so this
+# differential test is unaffected by whatever build/backends.cfg says.
+os.environ['B3_BACKENDS'] = '/dev/null'
+
 import struct
 import subprocess
 import sys
@@ -44,7 +57,17 @@ DRIVER = r'''
 #include <math.h>
 #include "burnout3_carcol.h"
 
+/* burnout3_vehicle_sim.c is linked in for b3_rigid_body_integrate; its wheel
+ * ray never runs here, so the world probe is a stub. */
+int b3_ground_probe(float x, float y, float z, float* h, float n[3]) {
+    (void)x; (void)y; (void)z; (void)h; (void)n; return -1;
+}
+
 static B3RigidBody rbs[2];
+/* The 4x4 is not inline in B3RigidBody any more (retail keeps it in its
+ * own object behind the pointer at +0x204), so the driver must give each
+ * body storage before a row is written. */
+static float rbs__frame_store[2][4][4];
 static B3CarBody   bodies[2];
 static B3CarHull   hulls[2];
 
@@ -61,6 +84,7 @@ static void read_body(int i) {
     B3CarBody* b = &bodies[i];
     memset(b, 0, sizeof(*b));
     memset(&rbs[i], 0, sizeof(rbs[i]));
+    b3_rigid_body_bind_frame(&rbs[i], rbs__frame_store[i]);  /* AFTER the memset */
     b->rb = &rbs[i];
     for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) rbs[i].frame[r][c] = rf();
     for (int c = 0; c < 4; c++) b->bbmax[c] = rf();
@@ -79,6 +103,15 @@ static void read_body(int i) {
     b->asleep      = (unsigned char)ri();
     b->drift_state = ri();
     b->yaw_input   = rf();
+    /* the type-3 arm's inputs (FUN_00112E70); every other mode leaves them
+     * at the values body_payload's defaults supply. */
+    b->speed       = rf();
+    b->authority   = rf();
+    b->flags_1353  = (unsigned char)ri();
+    b->immune      = (unsigned char)ri();
+    b->crash_mode  = (unsigned char)ri();
+    b->no_crash    = (unsigned char)ri();
+    b->designated  = (unsigned char)ri();
     if (scanf("%511s", path) != 1) exit(2);
     if (!b3_carcol_hull_load(path, &hulls[i])) { fprintf(stderr, "hull %s\n", path); exit(3); }
     b->hull = &hulls[i];
@@ -94,6 +127,18 @@ static void read_body(int i) {
             p[c] = m[3][0]*m[0][c] + m[3][1]*m[1][c] + m[3][2]*m[2][c];
         for (int c = 0; c < 4; c++) m[3][c] = -p[c];
     }
+}
+
+/* The contact boundary hands its result to the INTEGRATOR, and a contact
+ * nobody integrates is a contact nobody feels.  `parked` is the harness's
+ * parked-wreck model (carcol_pass): no drive servo, gravity cancelled, the
+ * body height pinned -- a wreck may be shoved along the road, never through
+ * it. */
+static void integrate_one(int i, float dt, int parked) {
+    float keep_y = rbs[i].frame[3][1];
+    if (parked) rbs[i].force_acc[1] += 20.0f * bodies[i].mass;
+    b3_rigid_body_integrate(&rbs[i], bodies[i].mass, 0.0f, 0, 0, dt);
+    if (parked) rbs[i].frame[3][1] = keep_y;
 }
 
 static void dump_body(const char* tag, int i) {
@@ -134,6 +179,19 @@ int main(void) {
         dump_body("a", 0);
         return 0;
     }
+    if (mode == 8) {                       /* FUN_0010FCE0, no bodies */
+        float a0[2], a1[2], b0[2], b1[2], pa[2], pb[2], ta, tb, o[4];
+        for (int c = 0; c < 2; c++) a0[c] = rf();
+        for (int c = 0; c < 2; c++) a1[c] = rf();
+        for (int c = 0; c < 2; c++) b0[c] = rf();
+        for (int c = 0; c < 2; c++) b1[c] = rf();
+        float d = b3_carcol_seg_closest2d(a0, a1, b0, b1, pa, pb, &ta, &tb);
+        pf("dist", d);
+        o[0] = pa[0]; o[1] = pa[1]; o[2] = 0; o[3] = 0; pv("pa", o);
+        o[0] = pb[0]; o[1] = pb[1];           pv("pb", o);
+        pf("ta", ta); pf("tb", tb);
+        return 0;
+    }
     read_body(0); read_body(1);
     if (mode == 5) {                       /* FUN_00114270 world AABB */
         float lo[3], hi[3], l4[4], h4[4];
@@ -141,6 +199,101 @@ int main(void) {
         for (int c = 0; c < 3; c++) { l4[c] = lo[c]; h4[c] = hi[c]; }
         l4[3] = h4[3] = 0.0f;
         pv("lo", l4); pv("hi", h4);
+        return 0;
+    }
+    if (mode == 6) {                       /* resolve + ONE integrator frame */
+        float dt = rf();
+        float p0[2][3], v0[2][3];
+        for (int i = 0; i < 2; i++)
+            for (int k = 0; k < 3; k++) {
+                p0[i][k] = rbs[i].frame[3][k];
+                v0[i][k] = rbs[i].vel[k];
+            }
+        int hit = b3_carcol_resolve(&bodies[0], &bodies[1], &ct);
+        printf("hit %d\n", hit);
+        pf("impact", ct.impact);
+        pv("a.imp_force", rbs[0].imp_force);
+        pv("a.force", rbs[0].force_acc);
+        pv("a.deflection", rbs[0].deflection);
+        pv("b.imp_force", rbs[1].imp_force);
+        pv("b.force", rbs[1].force_acc);
+        pv("b.deflection", rbs[1].deflection);
+        for (int i = 0; i < 2; i++)
+            integrate_one(i, dt, bodies[i].crashed);
+        for (int i = 0; i < 2; i++) {
+            char k[32]; float d[4];
+            for (int c = 0; c < 3; c++) d[c] = rbs[i].frame[3][c] - p0[i][c];
+            d[3] = 0.0f;
+            snprintf(k, sizeof k, "%c.dpos", 'a' + i); pv(k, d);
+            for (int c = 0; c < 3; c++) d[c] = rbs[i].vel[c] - v0[i][c];
+            d[3] = 0.0f;
+            snprintf(k, sizeof k, "%c.dvel", 'a' + i); pv(k, d);
+        }
+        return 0;
+    }
+    if (mode == 9) {
+        /* Drive the SAME pair for N frames, rebuilding the traffic car's
+         * pose from its lane cursor every frame exactly as traffic_update()
+         * does, and report the frame on which the contact finally clears.
+         * arm 0 = retail's type-3 arm; arm 1 = the OLD routing (the
+         * racer-vs-racer response, whose mass split hands the traffic body
+         * a share that the lane rebuild then throws away). */
+        int party = ri();
+        float dt = rf();
+        int nframes = ri();
+        int arm = ri();
+        B3CarContact c9;
+        float bframe[4][4], bvel[4], p0[3];
+        int cleared = -1, f;
+        memcpy(bframe, rbs[1].frame, sizeof bframe);
+        memcpy(bvel, rbs[1].vel, sizeof bvel);
+        for (int k = 0; k < 3; k++) p0[k] = rbs[0].frame[3][k];
+        if (arm) bodies[1].type = B3_COL_TYPE_TRAFFIC;
+        for (f = 0; f < nframes; f++) {
+            int hit;
+            for (int i = 0; i < 2; i++) {
+                memset(rbs[i].force_acc,  0, sizeof rbs[i].force_acc);
+                memset(rbs[i].torque_acc, 0, sizeof rbs[i].torque_acc);
+                memset(rbs[i].imp_force,  0, sizeof rbs[i].imp_force);
+                memset(rbs[i].imp_torque, 0, sizeof rbs[i].imp_torque);
+                memset(rbs[i].deflection, 0, sizeof rbs[i].deflection);
+            }
+            memcpy(rbs[1].frame, bframe, sizeof bframe);
+            memcpy(rbs[1].vel, bvel, sizeof bvel);
+            memset(&c9, 0, sizeof c9);
+            hit = arm ? b3_carcol_resolve(&bodies[0], &bodies[1], &c9)
+                      : b3_carcol_resolve_traffic(&bodies[0], &bodies[1],
+                                                  party, &c9);
+            if (f == 0) {
+                printf("hit %d\n", hit);
+                printf("push %d\n", c9.push);
+                pf("pen", c9.pen);
+                pv("a.deflection", rbs[0].deflection);
+                pv("b.deflection", rbs[1].deflection);
+            }
+            if (!hit) { cleared = f; break; }
+            integrate_one(0, dt, 0);
+        }
+        printf("cleared %d\n", cleared);
+        {   float d[4];
+            for (int k = 0; k < 3; k++) d[k] = rbs[0].frame[3][k] - p0[k];
+            d[3] = 0.0f; pv("a.dpos", d); }
+        return 0;
+    }
+    if (mode == 7) {                       /* FUN_00112E70, live traffic */
+        int party = ri();
+        int hit = b3_carcol_resolve_traffic(&bodies[0], &bodies[1], party, &ct);
+        printf("hit %d\n", hit);
+        printf("push %d\n", ct.push);
+        printf("promote %d\n", ct.promote);
+        printf("crash_a %d\n", ct.crash_a);
+        pf("impact", ct.impact);
+        pf("vn_mph", ct.vn_mph);
+        pf("pen", ct.pen);
+        pf("metric_mph", ct.metric_mph);
+        pf("thresh_mph", ct.thresh_mph);
+        pv("point", ct.point); pv("normal", ct.normal);
+        dump_body("a", 0); dump_body("b", 1);
         return 0;
     }
     if (mode == 0) {
@@ -181,6 +334,15 @@ def build_driver():
     exe = os.path.join(d, "carcol_drv")
     cmd = ["gcc", "-std=c11", "-O2", "-I", os.path.join(ROOT, "src"),
            "-o", exe, src, os.path.join(ROOT, "src", "burnout3_carcol.c"),
+           # burnout3_carcol.c consults build/backends.cfg (and the emulation
+           # bridge when carcol=retail), so the driver needs both objects.
+           # The driver never sets carcol=retail, so this only satisfies the
+           # linker -- the RE path is what is under test here.
+           os.path.join(ROOT, "src", "burnout3_backend.c"),
+           os.path.join(ROOT, "src", "burnout3_emu.c"),
+           # b3_rigid_body_integrate, for the "somebody must actually be
+           # moved by this contact" section (mode 6).
+           os.path.join(ROOT, "src", "burnout3_vehicle_sim.c"),
            "-lm"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
@@ -214,10 +376,13 @@ def body_payload(st, hullpath):
     for row in ii:
         v += list(row)
     s = " ".join("%.9g" % x for x in v)
-    s += " %d %d %d %d %d %.9g %s" % (
+    s += " %d %d %d %d %d %.9g" % (
         st.get('type', 0), st.get('crashed', 0), st.get('grounded', 0),
-        st.get('asleep', 0), st.get('drift', 0), st.get('yaw_input', 0.0),
-        hullpath)
+        st.get('asleep', 0), st.get('drift', 0), st.get('yaw_input', 0.0))
+    s += " %.9g %.9g %d %d %d %d %d %s" % (
+        st.get('speed', 0.0), st.get('authority', 1.0),
+        st.get('flags_1353', 0), st.get('immune', 0), st.get('crash_mode', 0),
+        st.get('no_crash', 0), st.get('designated', 0), hullpath)
     return s
 
 
@@ -568,6 +733,140 @@ def wreck_setup(A, B):
 
 
 # ---------------------------------------------------------------------------
+# THE DRIVE-THROUGH REGRESSION.
+#
+# "resolved" is not "felt".  FUN_00113960 (b3_carcol_resolve_wreck) forces the
+# UN-crashed car to kind 2 -- IMMOVABLE -- at 0x00113B75, so a racer that hits
+# a WRECK gets nothing at all: 100% of the contact impulse (+0x110) and 100%
+# of the separation (+0x130) go to the wreck's body.  That is retail, and the
+# `wreck` section above already diffs it field for field.
+#
+# What it leaves implicit is the CONSUMER.  In retail a crashed car keeps
+# running its own solver, so its integrator drains +0x110/+0x130 and the wreck
+# is shoved aside.  carcol_pass() used to skip the integrate for any traffic
+# car with `crashed_until > g_race_time`, and traffic_update() skips a parked
+# wreck entirely -- so on the wreck path NOTHING in the pair was ever
+# integrated.  The racer got zero, the wreck never moved, and the player drove
+# clean through a car that was still being drawn.
+#
+# These cases pin the whole chain: what each body RECEIVES from the solve, and
+# what one frame of the real integrator then DOES with it.  Any arrangement in
+# which a contact leaves both bodies unmoved fails here.
+# ---------------------------------------------------------------------------
+CONSUME_CASES = [
+    # name, racer spec, traffic spec, traffic model, who must move
+    ("racer-into-alive-traffic",
+     dict(pos=(0, 0, 0),    yaw=0.0, mass=1200.0, vel=[0, 0, 45.0]),
+     dict(pos=(0, 0, 4.35), yaw=0.0, mass=2000.0, vel=[0, 0, 20.0], type=2),
+     ("HEVY", "Car11"), "both"),
+    ("racer-into-wrecked-traffic",
+     dict(pos=(0, 0, 0),    yaw=0.0, mass=1200.0, vel=[0, 0, 45.0]),
+     dict(pos=(0, 0, 4.35), yaw=0.0, mass=2000.0, vel=[0, 0, 0.0],
+          type=2, crashed=1),
+     ("HEVY", "Car11"), "wreck-only"),
+    ("racer-into-wrecked-traffic-slow",   # below the 2500 crash threshold
+     dict(pos=(0, 0, 0),    yaw=0.0, mass=1200.0, vel=[0, 0, 12.0]),
+     dict(pos=(0, 0, 4.35), yaw=0.0, mass=2000.0, vel=[0, 0, 0.0],
+          type=2, crashed=1),
+     ("HEVY", "Car11"), "wreck-only"),
+]
+
+
+def _len3(v):
+    return math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+
+
+def chk_gt(name, got, floor):
+    """got must be strictly greater than floor."""
+    global PASS, FAIL
+    if got > floor:
+        PASS += 1
+        return True
+    FAIL += 1
+    print("  FAIL %-40s got=%.6g want > %.6g" % (name, got, floor))
+    return False
+
+
+def run_consume():
+    section("a resolved contact must MOVE somebody "
+            "(carcol_pass drive-through regression)")
+    dt = 1.0 / 60.0
+    for name, sa, sb, tcar, who in CONSUME_CASES:
+        A = make_state(sa, "COMP", "Car1")
+        B = make_state(sb, *tcar)
+        payload = ("6\n%s\n%s\n%.9g\n"
+                   % (body_payload(A, hull_path(A['_cls'], A['_car'])),
+                      body_payload(B, hull_path(B['_cls'], B['_car'])), dt))
+        c = run_driver(payload)
+        chk_eq(name + ".hit", int(c['hit']), 1)
+        if not c['hit']:
+            continue
+        # what each body RECEIVED (a velocity-equivalent, m/s)
+        a_got = _len3(c['a.imp_force']) / A['mass'] + _len3(c['a.deflection'])
+        b_got = _len3(c['b.imp_force']) / B['mass'] + _len3(c['b.deflection'])
+        # what the integrator then DID with it, on top of free travel:
+        #   response displacement = ((imp + force*dt)/m)*dt + deflection
+        # The integrator is imp += force*dt; vel += imp/m; pos += vel*dt;
+        # pos += deflection -- so this is exact, not an approximation.
+        # (Only the horizontal axes: gravity lives in the y lane.)
+        def response_dpos(tag, v0):
+            return [c[tag + '.dpos'][k] - v0[k] * dt for k in (0, 2)]
+
+        def predicted(tag, mass):
+            return [((c[tag + '.imp_force'][k] + c[tag + '.force'][k] * dt)
+                     / mass) * dt + c[tag + '.deflection'][k] for k in (0, 2)]
+
+        a_v0 = list(sa.get('vel', [0, 0, 0]))
+        b_v0 = list(sb.get('vel', [0, 0, 0]))
+        a_resp = response_dpos('a', a_v0)
+        b_resp = response_dpos('b', b_v0)
+        a_moved = math.hypot(*a_resp)
+        b_moved = math.hypot(*b_resp)
+        print("  %-32s impact=%9.1f | racer got %.4f pushed %.4f m | "
+              "traffic got %.4f pushed %.4f m"
+              % (name, c['impact'], a_got, a_moved, b_got, b_moved))
+
+        # (1) SOMEBODY has to receive the contact.  A resolve that writes
+        #     nothing to either body is a phantom collision.
+        chk_gt(name + ".pair receives a response", a_got + b_got, 1e-4)
+
+        if who == "both":
+            # An ALIVE traffic car is a two-way contact: FUN_001121F0 splits
+            # the separation by mass and gives both bodies the impulse.
+            chk_gt(name + ".racer feels the alive traffic car", a_got, 1e-3)
+            chk_gt(name + ".traffic feels the racer", b_got, 1e-3)
+        else:
+            # FUN_00113960 @0x00113B75: the alive car is kind 2, IMMOVABLE.
+            # The racer is meant to get exactly nothing here -- which is
+            # precisely why the WRECK must be integrated by the harness.
+            chk(name + ".racer gets nothing from a wreck (kind 2)",
+                a_got, 0.0, tol=1e-6, rel=0.0)
+            chk_gt(name + ".the wreck receives the whole contact", b_got, 1e-3)
+
+        # (2) ...and one frame of the REAL integrator must turn that into
+        #     motion.  This is the assertion carcol_pass() was failing: it
+        #     skipped b3_rigid_body_integrate for `crashed_until > g_race_time`
+        #     traffic, so the only body holding the response never consumed
+        #     it, the wreck stood still, and the racer -- which FUN_00113960
+        #     deliberately gives nothing -- drove straight through it.
+        chk_gt(name + ".the contact actually pushes a body",
+               a_moved + b_moved, 1e-3)
+        # the push must be EXACTLY what the solve wrote: no accumulator may
+        # be left unconsumed, and none may be applied twice.
+        chk(name + ".racer push == what the solve gave it",
+            a_resp, predicted('a', A['mass']), tol=1e-5, rel=1e-4)
+        chk(name + ".traffic push == what the solve gave it",
+            b_resp, predicted('b', B['mass']), tol=1e-5, rel=1e-4)
+        if who == "wreck-only":
+            chk_gt(name + ".the wreck is shoved out of the way", b_moved, 1e-3)
+            # a parked wreck may be pushed ALONG the road, never through it:
+            # FUN_001121F0 flattens the separation's Y for an alive pair,
+            # FUN_00113960 does not, so the harness pins the wreck's height.
+            chk(name + ".the wreck stays at road height",
+                c['b.dpos'][1], 0.0, tol=1e-6, rel=0.0)
+
+
+# ---------------------------------------------------------------------------
 # THE RACING GATHER'S TWO RUNTIME FILTERS -- FUN_0011BBE0, over the REAL
 # build/collision.bin.  Not car-vs-car, but the same collision boundary:
 # b3_sweep_sphere_ex is what feeds FUN_0011AEF0's wall trigger and
@@ -789,6 +1088,262 @@ def run_gather():
                % (len(res), len(down)), len(hits), 0)
 
 
+# ---------------------------------------------------------------------------
+# FUN_0010FCE0 -- the 2-D segment/segment closest points the type-3 response
+# uses instead of the convex hull.
+# ---------------------------------------------------------------------------
+SEG_CASES = [
+    ("parallel-offset",  (0, 0), (0, 4),   (2, 1),  (2, 5)),
+    ("crossing",         (-2, 0), (2, 0),  (0, -2), (0.3, 2)),
+    ("skew-near",        (0, 0), (0, 4),   (1.2, 1.0), (2.4, 3.4)),
+    ("endpoint-nearest", (0, 0), (0, 4),   (0.5, 6), (3.0, 8)),
+    ("nose-to-tail",     (0, -2), (0, 2),  (0.1, 2.6), (0.1, 6.6)),
+    ("angled-45",        (0, 0), (3, 3),   (2, 0),  (5, 3.2)),
+    ("orthogonal",       (0, 0), (0, 4),   (-2, 2), (2, 2)),   # the sentinel
+    ("far-apart",        (0, 0), (0, 4),   (50, 50), (52, 54)),
+]
+
+
+def run_seg2d():
+    section("2-D capsule axis closest points (FUN_0010FCE0)")
+    s = ec.Session()
+    for name, a0, a1, b0, b1 in SEG_CASES:
+        g = s.seg_closest2d(a0, a1, b0, b1)
+        payload = "8\n%s\n" % " ".join(
+            "%.9g" % x for x in list(a0) + list(a1) + list(b0) + list(b1))
+        c = run_driver(payload)
+        chk(name + ".dist", c['dist'], g['dist'], tol=1e-5, rel=1e-6)
+        if abs(g['dist'] - 1000.0) < 1e-6:
+            print("  %-18s ORTHOGONAL -> sentinel 1000.0 [0x003B16CC]" % name)
+            continue
+        chk(name + ".pa", c['pa'][:2], g['pa'], tol=1e-5)
+        chk(name + ".pb", c['pb'][:2], g['pb'], tol=1e-5)
+        chk(name + ".ta", c['ta'], g['ta'], tol=1e-6)
+        chk(name + ".tb", c['tb'], g['tb'], tol=1e-6)
+        print("  %-18s dist=%8.4f ta=%.3f tb=%.3f" % (name, g['dist'],
+                                                      g['ta'], g['tb']))
+
+
+# ---------------------------------------------------------------------------
+# FUN_00112E70 -- a car against a LIVE traffic car (a type-3 object).
+#
+# The retail contract these cases pin down:
+#   * the RESPONSE is a 2-D capsule test, not the convex hull;
+#   * 100 % of the penetration and the whole 100.0 * min(mass, 2000) shove go
+#     to the CAR (veh+0x130 / FUN_001205E0) -- the traffic car has no rigid
+#     body and receives NOTHING;
+#   * above `authority * 75` mph of normal closing (or `* 20` in a crash
+#     party) the car crashes and FUN_00114910 PROMOTES the traffic object
+#     into a real vehicle, which FUN_00113960 then launches.
+# ---------------------------------------------------------------------------
+TRAFFIC_CASES = [
+    #  name                car(pos,yaw,speed,vel)         traffic(pos,yaw,spd)
+    ("side-rub",      (0, 0, 0), 0.0, 20.0, (1.9, 0, 0.4), 0.0, 18.0, {}),
+    ("side-rub-deep", (0, 0, 0), 0.0, 20.0, (1.4, 0, 0.2), 0.0, 18.0, {}),
+    ("closing-slow",  (0, 0, 0), 0.0, 12.0, (0.6, 0, 4.0), 0.0, 10.0, {}),
+    ("closing-hard",  (0, 0, 0), 0.0, 60.0, (0.6, 0, 4.0), 0.0, 10.0, {}),
+    ("head-on",       (0, 0, 0), 0.0, 30.0, (0.4, 0, 3.0), 3.14159265, 12.0, {}),
+    ("oblique",       (0, 0, 0), 0.25, 34.0, (1.7, 0, 2.0), -0.2, 16.0, {}),
+    ("stationary-traffic",
+                      (0, 0, 0), 0.0, 25.0, (0.3, 0, 4.1), 0.0, 0.0, {}),
+    ("miss",          (0, 0, 0), 0.0, 25.0, (6.0, 0, 4.0), 0.0, 18.0, {}),
+    ("y-gate-above",  (0, 3.5, 0), 0.0, 25.0, (0.4, 0, 4.0), 0.0, 10.0, {}),
+    ("y-gate-inside", (0, 1.5, 0), 0.0, 25.0, (0.4, 0, 4.0), 0.0, 10.0, {}),
+    ("crash-party",   (0, 0, 0), 0.0, 30.0, (0.6, 0, 4.0), 0.0, 10.0,
+                      dict(party=(6, 0))),
+    ("slammed-authority",
+                      (0, 0, 0), 0.0, 20.0, (0.6, 0, 4.0), 0.0, 10.0,
+                      dict(authority=0.1)),
+    ("no-crash-flag", (0, 0, 0), 0.0, 60.0, (0.6, 0, 4.0), 0.0, 10.0,
+                      dict(flags_174=8)),
+    ("crash-veto-1353",
+                      (0, 0, 0), 0.0, 60.0, (0.6, 0, 4.0), 0.0, 10.0,
+                      dict(flags_1353=0x10)),
+    ("muted-1353",    (0, 0, 0), 0.0, 60.0, (0.6, 0, 4.0), 0.0, 10.0,
+                      dict(flags_1353=0x02)),
+    ("spawn-immune",  (0, 0, 0), 0.0, 60.0, (0.6, 0, 4.0), 0.0, 10.0,
+                      dict(immune=1)),
+    ("car-already-crashed",
+                      (0, 0, 0), 0.0, 60.0, (0.6, 0, 4.0), 0.0, 10.0,
+                      dict(crashed=1)),
+    ("truck-side",    (0, 0, 0), 0.0, 40.0, (2.3, 0, 1.0), 0.05, 14.0,
+                      dict(tcar=("HEVY", "Car23"))),
+    ("heavy-head-on", (0, 0, 0), 0.0, 55.0, (0.2, 0, 3.4), 3.14159265, 14.0,
+                      dict(tcar=("HEVY", "Car11"))),
+]
+
+TRAFFIC_MASS = 1500.0
+CAR_MASS = 1200.0
+
+
+def _traffic_states(spec):
+    (name, apos, ayaw, aspd, bpos, byaw, bspd, opt) = spec
+    acar = opt.get('car', ("COMP", "Car1"))
+    tcar = opt.get('tcar', ("HEVY", "Car11"))
+    A = make_state(dict(pos=apos, yaw=ayaw, mass=CAR_MASS,
+                        vel=[math.sin(ayaw) * aspd, 0.0,
+                             math.cos(ayaw) * aspd],
+                        type=0, crashed=opt.get('crashed', 0)), *acar)
+    A['speed'] = aspd
+    A['authority'] = opt.get('authority', 1.0)
+    A['flags_1353'] = opt.get('flags_1353', 0)
+    A['immune'] = opt.get('immune', 0)
+    B = make_state(dict(pos=bpos, yaw=byaw, mass=TRAFFIC_MASS,
+                        vel=[math.sin(byaw) * bspd, 0.0,
+                             math.cos(byaw) * bspd],
+                        type=3), *tcar)
+    B['speed'] = bspd
+    B['no_crash'] = 1 if opt.get('flags_174', 0) & 8 else 0
+    B['designated'] = 1          # FUN_00120BA0 always stamps DAT_0073BB8C
+    return name, A, B, opt
+
+
+def run_traffic():
+    section("car vs a LIVE traffic car -- the type-3 arm (FUN_00112E70)")
+    for spec in TRAFFIC_CASES:
+        name, A, B, opt = _traffic_states(spec)
+        party = opt.get('party', (0, 0))
+        s = ec.Session()
+        s.set_game_mode(*party)
+        s.seed(0, A)
+        s.uc.mem_write(ec.VEH_A + 0xBC, ec.f2b(A['speed']))
+        s.uc.mem_write(ec.VEH_A + 0x1534, ec.f2b(A['authority']))
+        s.uc.mem_write(ec.VEH_A + 0x152C,
+                       ec.f2b(1.0 if A['immune'] else -1.0))
+        s.uc.mem_write(ec.VEH_A + 0x1353, bytes([A['flags_1353']]))
+        tst = dict(frame=B['frame'], bbmax=B['bbmax'], bbmin=B['bbmin'],
+                   mass=TRAFFIC_MASS, speed=B['speed'],
+                   flags_174=opt.get('flags_174', 0),
+                   hull=ec.load_hull(B['_cls'], B['_car']))
+        s.seed_traffic(tst)
+        g = s.resolve_traffic()
+
+        # The port's traffic body only becomes a rigid body when it is
+        # promoted, and FUN_00120BA0 seeds that body's velocity as
+        # frame.at * speed (@0x00120DE3) -- which is exactly what the
+        # harness's traffic_update already leaves in t->rb.
+        Bp = dict(B)
+        Bp['vel'] = [B['frame'][2][k] * B['speed'] for k in range(3)]
+        Bp['omega'] = [0.0, 0.0, 0.0]
+        payload = ("7\n%s\n%s\n%d\n"
+                   % (body_payload(A, hull_path(A['_cls'], A['_car'])),
+                      body_payload(Bp, hull_path(B['_cls'], B['_car'])),
+                      1 if (party[0] == 6 or party[1] in (3, 4, 5)) else 0))
+        c = run_driver(payload)
+
+        chk_eq(name + ".hit", int(c['hit']), int(g['hit']))
+        chk_eq(name + ".promote", int(c['promote']), int(g['promote']))
+        chk_eq(name + ".crash_a", int(c['crash_a']), int(g['crash_a']))
+        print("  %-22s hit=%d push=%d promote=%d impact=%9.1f "
+              "car_defl=%.4f m  traffic_imp=%.0f"
+              % (name, int(c['hit']), int(c['push']), int(c['promote']),
+                 c['impact'], _len3(c['a.deflection']),
+                 _len3(c['b.imp_force'])))
+        if not g['hit']:
+            continue
+        chk(name + ".impact", c['impact'], g['impact'], tol=1e-2, rel=1e-5)
+        chk(name + ".normal", c['normal'], g['normal'], tol=1e-4)
+        # the car's half of the response
+        chk(name + ".car.deflection", c['a.deflection'],
+            g['a']['deflection'], tol=1e-4)
+        chk(name + ".car.force", c['a.force'], g['a']['force'],
+            tol=1e-2, rel=1e-5)
+        chk(name + ".car.torque", c['a.torque'], g['a']['torque'],
+            tol=1e-2, rel=1e-5)
+        if int(c['push']):
+            chk(name + ".point", c['point'], g['point'], tol=1e-4)
+            # THE CONTRACT: a sub-threshold traffic contact writes NOTHING
+            # to the traffic car -- it has no rigid body to write to.
+            chk_eq(name + ".traffic-untouched",
+                   (_len3(g['b']['deflection']) + _len3(g['b']['imp_force'])
+                    + _len3(g['b']['force'])) == 0.0, True)
+            chk_eq(name + ".port-traffic-untouched",
+                   (_len3(c['b.deflection']) + _len3(c['b.imp_force'])
+                    + _len3(c['b.force'])) == 0.0, True)
+        if int(g['promote']):
+            # the promoted car is the ONLY body that moves: FUN_00113960
+            # forces the still-un-crashed racer to kind 2 (immovable).
+            chk(name + ".promoted.imp_force", c['b.imp_force'],
+                g['b']['imp_force'], tol=1e-1, rel=1e-4)
+            chk(name + ".promoted.imp_torque", c['b.imp_torque'],
+                g['b']['imp_torque'], tol=1e-1, rel=1e-4)
+            chk(name + ".promoted.deflection", c['b.deflection'],
+                g['b']['deflection'], tol=1e-4)
+            chk_gt(name + ".promoted actually moves",
+                   _len3(c['b.imp_force']) / TRAFFIC_MASS
+                   + _len3(c['b.deflection']), 0.05)
+
+
+# ---------------------------------------------------------------------------
+# THE RE-CONTACT REGRESSION.
+#
+# The measured cost of the old routing (racer-vs-traffic through
+# FUN_001121F0) was that 78 % of broadphase pairs resolved every frame:
+# the mass split gave the racer only ~55 % of the penetration and handed the
+# rest to a traffic body whose pose traffic_update() rebuilt from the lane
+# cursor, so the same pair re-contacted forever.  Retail's type-3 arm gives
+# the CAR the whole penetration, so one frame clears the overlap even though
+# the traffic car never moves.
+# ---------------------------------------------------------------------------
+RECONTACT_CASES = [
+    ("side-rub",       (0, 0, 0), 0.0, 20.0, (1.9, 0, 0.4), 0.0, 18.0, {}),
+    ("side-rub-deep",  (0, 0, 0), 0.0, 20.0, (1.4, 0, 0.2), 0.0, 18.0, {}),
+    ("nose-in",        (0, 0, 0), 0.0, 12.0, (0.6, 0, 4.0), 0.0, 11.0, {}),
+    ("oblique",        (0, 0, 0), 0.25, 20.0, (1.7, 0, 2.0), -0.2, 18.0, {}),
+]
+
+
+def run_recontact():
+    section("the same pair must not re-contact forever "
+            "(the 78 %-of-pairs regression)")
+    dt = 1.0 / 60.0
+    N = 40
+    for spec in RECONTACT_CASES:
+        name, A, B, opt = _traffic_states(spec)
+        Bp = dict(B)
+        Bp['vel'] = [B['frame'][2][k] * B['speed'] for k in range(3)]
+        Bp['omega'] = [0.0, 0.0, 0.0]
+        got = {}
+        for arm in (0, 1):
+            payload = ("9\n%s\n%s\n0\n%.9g\n%d\n%d\n"
+                       % (body_payload(A, hull_path(A['_cls'], A['_car'])),
+                          body_payload(Bp, hull_path(B['_cls'], B['_car'])),
+                          dt, N, arm))
+            got[arm] = run_driver(payload)
+        t3, old = got[0], got[1]
+        chk_eq(name + ".frame1.hit", int(t3['hit']), 1)
+        chk_eq(name + ".frame1.push", int(t3['push']), 1)
+        # THE CONTRACT: 100 % of the penetration to the CAR, nothing to the
+        # traffic car (FUN_00112E70 @0x00113431 -- no mass split at all).
+        chk(name + ".car takes the WHOLE penetration",
+            _len3(t3['a.deflection']), t3['pen'], tol=1e-5, rel=1e-5)
+        chk_eq(name + ".traffic takes none",
+               _len3(t3['b.deflection']) == 0.0, True)
+        # and the old routing did NOT: the racer got a mass-split share and
+        # the rest went to a body the lane rebuild overwrites.
+        chk_gt(name + ".old routing under-separated the car",
+               t3['pen'] - _len3(old['a.deflection']), 1e-3)
+        chk_gt(name + ".the car is actually pushed out", t3['pen'], 1e-3)
+        # the pair must actually come apart, and sooner than the old arm
+        chk_eq(name + ".type-3 arm clears within %d frames" % N,
+               int(t3['cleared']) >= 0, True)
+        # `old cleared == 0` means the racer-vs-racer arm never saw the
+        # contact AT ALL -- the convex hull misses what the capsule catches.
+        # That is a drive-through, not an improvement, so score it as such.
+        drive_through = int(old['cleared']) == 0
+        chk_eq(name + ".sooner than the old routing",
+               drive_through
+               or (int(t3['cleared']) >= 0
+                   and (int(old['cleared']) < 0
+                        or int(t3['cleared']) <= int(old['cleared']))), True)
+        print("  %-18s pen=%.4f m | type-3: car takes %.4f, clears on frame "
+              "%s | old routing: car takes %.4f, %s"
+              % (name, t3['pen'], _len3(t3['a.deflection']),
+                 int(t3['cleared']), _len3(old['a.deflection']),
+                 "NEVER SAW THE CONTACT (drive-through)" if drive_through
+                 else "clears on frame %d" % int(old['cleared'])))
+
+
 def main():
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     build_driver()
@@ -800,6 +1355,10 @@ def main():
     if which in ("all", "alive"):    run_response(1, "racer vs racer (FUN_001121F0)")
     if which in ("all", "wreck"):    run_response(2, "car vs wreck (FUN_00113960)",
                                                   wreck_setup)
+    if which in ("all", "consume"):  run_consume()
+    if which in ("all", "seg2d"):    run_seg2d()
+    if which in ("all", "traffic"):  run_traffic()
+    if which in ("all", "recontact"): run_recontact()
     print("\n%d/%d passed" % (PASS, PASS + FAIL))
     return 1 if FAIL else 0
 

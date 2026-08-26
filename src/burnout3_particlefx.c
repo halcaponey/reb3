@@ -7,6 +7,9 @@
  * mixer/renderer around them is original harness code, not decompiled.
  */
 #include "burnout3_particlefx.h"
+/* the retained renderer publishes the frame camera, so the billboard passes
+ * do not have to read it back out of the driver */
+#include "burnout3_render.h"
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_image.h>
@@ -24,30 +27,30 @@
 static const B3PfxDesc B3_PFX_DESC[B3_PFX_DESCS] = {
 /*  tex                 kind bl  life  midT   col0        col1        col2        size0 size1 size2  grav  cone capA capB maxpx minpx
  *  colours are 0xAABBGGRR -- RED IS THE LOW BYTE (see the header)   [C] */
-{ "fxdebris1",          3, 0,  2.50f, 0.800f, {0xff606060, 0xff606060, 0x40606060}, {0.35f,0.35f,0.35f}, -12.00f, 0.1f, 100, 200,  32.f, 1.5f },
-{ "fxdebris2",          5, 0,  2.50f, 0.800f, {0xff606060, 0xff606060, 0x40606060}, {0.35f,0.35f,0.35f}, -12.00f, 0.1f, 100, 200,  32.f, 1.5f },
-{ "fxgravel",           1, 0,  0.50f, 0.010f, {0x0090b0c0, 0xff90b0c0, 0x4090b0c0}, {0.60f,0.60f,0.60f}, -25.00f, 0.1f,  60,   0, 112.f, 1.5f },
-{ "fxsnow",             3, 0,  0.50f, 0.020f, {0x10ffffff, 0x80ffffff, 0x00ffffff}, {0.40f,0.80f,2.50f},  -4.90f, 0.1f, 100,   0, 112.f, 2.0f },
-{ "fxglass",            5, 0,  3.50f, 0.900f, {0xc0ffffff, 0xc0ffffff, 0x00ffffff}, {0.22f,0.22f,0.22f},  -9.80f, 0.1f, 180, 540, 112.f, 1.5f },
-{ "fxglass",            5, 0,  3.50f, 0.900f, {0x961964ff, 0x961964ff, 0x001964ff}, {0.16f,0.16f,0.16f},  -9.80f, 0.1f,  80, 160, 112.f, 1.5f },
-{ "fxsmoke",            4, 0,  4.00f, 0.100f, {0x00e0e0e0, 0x70e4e4e4, 0x00ffffff}, {0.60f,1.00f,3.00f},  +0.40f, 0.1f, 120, 150, 112.f, 2.0f },
-{ "fxsmoke",            4, 0,  0.50f, 0.080f, {0x00ffffff, 0xe0ffffff, 0x00ffffff}, {0.40f,0.40f,1.00f},  +0.10f, 0.0f, 200,   0,  96.f, 4.0f },
-{ "fxsmoke",            4, 0,  3.00f, 0.020f, {0x00c0c0c0, 0xe0c0c0c0, 0x00ffffff}, {0.35f,0.75f,3.50f},  +0.10f, 0.0f, 240, 240, 112.f, 4.0f },
-{ "fxsmoke",            4, 0,  0.80f, 0.200f, {0x00ffffff, 0xa0ffffff, 0x00ffffff}, {1.50f,2.80f,4.00f},  +0.10f, 0.0f,   0, 240, 128.f, 4.0f },
-{ "fxsmoke",            4, 0,  5.00f, 0.100f, {0x0ac8d7dc, 0xb4c8d7dc, 0x00f0ffff}, {0.55f,4.00f,9.00f},  +0.05f, 0.0f, 180, 220, 125.f, 2.0f },
-{ "fxsmoke",            4, 0,  1.25f, 0.025f, {0x604b7d8c, 0xc0648c96, 0x0082b4d2}, {0.65f,2.50f,4.00f},  -1.50f, 0.0f, 240,   0, 112.f, 4.0f },
-{ "fxsmoke",            4, 0,  2.50f, 0.030f, {0x00a0aac0, 0xe0a0a0c0, 0x00a0a0c0}, {0.75f,1.20f,4.00f},  +0.10f, 0.0f, 240,   0, 112.f, 4.0f },
-{ "fxsmoke",            4, 0,  1.20f, 0.120f, {0x00b8b0a8, 0x60b8b0a8, 0x00b8b0a8}, {0.10f,0.20f,0.30f},  +0.28f, 0.0f, 240,   0, 112.f, 4.0f },
-{ "fxexplosionsmoke",   1, 1,  1.80f, 0.050f, {0x10ffffff, 0xffffffff, 0x00ffffff}, {1.00f,3.00f,3.50f},  +0.90f, 0.0f,   0, 120, 128.f, 4.0f },
-{ "fxexplosionsmoke",   1, 0,  3.00f, 0.250f, {0xffc0ffff, 0x80183060, 0x00000000}, {0.25f,1.75f,3.50f},  +0.60f, 0.0f,   0, 200, 160.f, 4.0f },
-{ "fxfire",             1, 2,  1.20f, 0.140f, {0xffffffff, 0xff4080c0, 0x00081080}, {0.08f,0.90f,0.80f},  +2.80f, 0.0f,   0, 150,  96.f, 4.0f },
-{ "fxexplosionsmoke",   1, 0,  1.80f, 0.500f, {0xff000000, 0xa0ffffff, 0x00ffffff}, {0.20f,1.50f,3.00f},  +0.90f, 0.0f,   0, 120, 112.f, 4.0f },
-{ "fxexplosionsmoke",   1, 0,  0.80f, 0.250f, {0xffc0ffff, 0x80183060, 0x00000000}, {0.25f,1.75f,3.50f},  +0.90f, 0.0f,   0, 200, 160.f, 4.0f },
-{ "fxfire",             1, 2,  0.50f, 0.080f, {0xffffffff, 0xff4070c0, 0x00081080}, {0.20f,2.40f,2.00f},  +4.20f, 0.0f,   0, 240,  96.f, 4.0f },
-{ "fxexplosionsmoke",   1, 0,  0.70f, 0.200f, {0xff000000, 0xa0ffffff, 0x00ffffff}, {0.50f,2.50f,3.50f},  +0.90f, 0.0f,   0, 120, 112.f, 4.0f },
-{ "fxexplosionfire",    1, 0,  1.50f, 0.250f, {0x80ffffff, 0xff90f0ff, 0x00001060}, {3.50f,4.00f,3.50f},  +2.00f, 0.0f,   0, 200, 192.f, 4.0f },
-{ "fxexplosionsmoke",   4, 0,  3.00f, 0.060f, {0xff70b0ff, 0x80203040, 0x00606060}, {4.00f,0.40f,4.00f},  +1.00f, 0.0f,   0, 200, 160.f, 4.0f },
-{ "fxexplosionflash",   0, 2,  0.12f, 0.200f, {0xffffffff, 0x40ffffff, 0x0080ffff}, {8.00f,3.00f,1.00f},  +1.50f, 0.0f,   0,  50, 256.f, 4.0f }
+{ .tex = "fxdebris1", .kind = 3, .blend = 0, .life = 2.50f, .mid_t = 0.800f, .col = {0xff606060, 0xff606060, 0x40606060}, .size = {0.35f,0.35f,0.35f}, .grav = -12.00f, .cone = 0.1f, .cap_a = 100, .cap_b = 200, .max_px = 32.f, .min_px = 1.5f },
+{ .tex = "fxdebris2", .kind = 5, .blend = 0, .life = 2.50f, .mid_t = 0.800f, .col = {0xff606060, 0xff606060, 0x40606060}, .size = {0.35f,0.35f,0.35f}, .grav = -12.00f, .cone = 0.1f, .cap_a = 100, .cap_b = 200, .max_px = 32.f, .min_px = 1.5f },
+{ .tex = "fxgravel", .kind = 1, .blend = 0, .life = 0.50f, .mid_t = 0.010f, .col = {0x0090b0c0, 0xff90b0c0, 0x4090b0c0}, .size = {0.60f,0.60f,0.60f}, .grav = -25.00f, .cone = 0.1f, .cap_a = 60, .cap_b = 0, .max_px = 112.f, .min_px = 1.5f },
+{ .tex = "fxsnow", .kind = 3, .blend = 0, .life = 0.50f, .mid_t = 0.020f, .col = {0x10ffffff, 0x80ffffff, 0x00ffffff}, .size = {0.40f,0.80f,2.50f}, .grav = -4.90f, .cone = 0.1f, .cap_a = 100, .cap_b = 0, .max_px = 112.f, .min_px = 2.0f },
+{ .tex = "fxglass", .kind = 5, .blend = 0, .life = 3.50f, .mid_t = 0.900f, .col = {0xc0ffffff, 0xc0ffffff, 0x00ffffff}, .size = {0.22f,0.22f,0.22f}, .grav = -9.80f, .cone = 0.1f, .cap_a = 180, .cap_b = 540, .max_px = 112.f, .min_px = 1.5f },
+{ .tex = "fxglass", .kind = 5, .blend = 0, .life = 3.50f, .mid_t = 0.900f, .col = {0x961964ff, 0x961964ff, 0x001964ff}, .size = {0.16f,0.16f,0.16f}, .grav = -9.80f, .cone = 0.1f, .cap_a = 80, .cap_b = 160, .max_px = 112.f, .min_px = 1.5f },
+{ .tex = "fxsmoke", .kind = 4, .blend = 0, .life = 4.00f, .mid_t = 0.100f, .col = {0x00e0e0e0, 0x70e4e4e4, 0x00ffffff}, .size = {0.60f,1.00f,3.00f}, .grav = +0.40f, .cone = 0.1f, .cap_a = 120, .cap_b = 150, .max_px = 112.f, .min_px = 2.0f },
+{ .tex = "fxsmoke", .kind = 4, .blend = 0, .life = 0.50f, .mid_t = 0.080f, .col = {0x00ffffff, 0xe0ffffff, 0x00ffffff}, .size = {0.40f,0.40f,1.00f}, .grav = +0.10f, .cone = 0.0f, .cap_a = 200, .cap_b = 0, .max_px = 96.f, .min_px = 4.0f },
+{ .tex = "fxsmoke", .kind = 4, .blend = 0, .life = 3.00f, .mid_t = 0.020f, .col = {0x00c0c0c0, 0xe0c0c0c0, 0x00ffffff}, .size = {0.35f,0.75f,3.50f}, .grav = +0.10f, .cone = 0.0f, .cap_a = 240, .cap_b = 240, .max_px = 112.f, .min_px = 4.0f },
+{ .tex = "fxsmoke", .kind = 4, .blend = 0, .life = 0.80f, .mid_t = 0.200f, .col = {0x00ffffff, 0xa0ffffff, 0x00ffffff}, .size = {1.50f,2.80f,4.00f}, .grav = +0.10f, .cone = 0.0f, .cap_a = 0, .cap_b = 240, .max_px = 128.f, .min_px = 4.0f },
+{ .tex = "fxsmoke", .kind = 4, .blend = 0, .life = 5.00f, .mid_t = 0.100f, .col = {0x0ac8d7dc, 0xb4c8d7dc, 0x00f0ffff}, .size = {0.55f,4.00f,9.00f}, .grav = +0.05f, .cone = 0.0f, .cap_a = 180, .cap_b = 220, .max_px = 125.f, .min_px = 2.0f },
+{ .tex = "fxsmoke", .kind = 4, .blend = 0, .life = 1.25f, .mid_t = 0.025f, .col = {0x604b7d8c, 0xc0648c96, 0x0082b4d2}, .size = {0.65f,2.50f,4.00f}, .grav = -1.50f, .cone = 0.0f, .cap_a = 240, .cap_b = 0, .max_px = 112.f, .min_px = 4.0f },
+{ .tex = "fxsmoke", .kind = 4, .blend = 0, .life = 2.50f, .mid_t = 0.030f, .col = {0x00a0aac0, 0xe0a0a0c0, 0x00a0a0c0}, .size = {0.75f,1.20f,4.00f}, .grav = +0.10f, .cone = 0.0f, .cap_a = 240, .cap_b = 0, .max_px = 112.f, .min_px = 4.0f },
+{ .tex = "fxsmoke", .kind = 4, .blend = 0, .life = 1.20f, .mid_t = 0.120f, .col = {0x00b8b0a8, 0x60b8b0a8, 0x00b8b0a8}, .size = {0.10f,0.20f,0.30f}, .grav = +0.28f, .cone = 0.0f, .cap_a = 240, .cap_b = 0, .max_px = 112.f, .min_px = 4.0f },
+{ .tex = "fxexplosionsmoke", .kind = 1, .blend = 1, .life = 1.80f, .mid_t = 0.050f, .col = {0x10ffffff, 0xffffffff, 0x00ffffff}, .size = {1.00f,3.00f,3.50f}, .grav = +0.90f, .cone = 0.0f, .cap_a = 0, .cap_b = 120, .max_px = 128.f, .min_px = 4.0f },
+{ .tex = "fxexplosionsmoke", .kind = 1, .blend = 0, .life = 3.00f, .mid_t = 0.250f, .col = {0xffc0ffff, 0x80183060, 0x00000000}, .size = {0.25f,1.75f,3.50f}, .grav = +0.60f, .cone = 0.0f, .cap_a = 0, .cap_b = 200, .max_px = 160.f, .min_px = 4.0f },
+{ .tex = "fxfire", .kind = 1, .blend = 2, .life = 1.20f, .mid_t = 0.140f, .col = {0xffffffff, 0xff4080c0, 0x00081080}, .size = {0.08f,0.90f,0.80f}, .grav = +2.80f, .cone = 0.0f, .cap_a = 0, .cap_b = 150, .max_px = 96.f, .min_px = 4.0f },
+{ .tex = "fxexplosionsmoke", .kind = 1, .blend = 0, .life = 1.80f, .mid_t = 0.500f, .col = {0xff000000, 0xa0ffffff, 0x00ffffff}, .size = {0.20f,1.50f,3.00f}, .grav = +0.90f, .cone = 0.0f, .cap_a = 0, .cap_b = 120, .max_px = 112.f, .min_px = 4.0f },
+{ .tex = "fxexplosionsmoke", .kind = 1, .blend = 0, .life = 0.80f, .mid_t = 0.250f, .col = {0xffc0ffff, 0x80183060, 0x00000000}, .size = {0.25f,1.75f,3.50f}, .grav = +0.90f, .cone = 0.0f, .cap_a = 0, .cap_b = 200, .max_px = 160.f, .min_px = 4.0f },
+{ .tex = "fxfire", .kind = 1, .blend = 2, .life = 0.50f, .mid_t = 0.080f, .col = {0xffffffff, 0xff4070c0, 0x00081080}, .size = {0.20f,2.40f,2.00f}, .grav = +4.20f, .cone = 0.0f, .cap_a = 0, .cap_b = 240, .max_px = 96.f, .min_px = 4.0f },
+{ .tex = "fxexplosionsmoke", .kind = 1, .blend = 0, .life = 0.70f, .mid_t = 0.200f, .col = {0xff000000, 0xa0ffffff, 0x00ffffff}, .size = {0.50f,2.50f,3.50f}, .grav = +0.90f, .cone = 0.0f, .cap_a = 0, .cap_b = 120, .max_px = 112.f, .min_px = 4.0f },
+{ .tex = "fxexplosionfire", .kind = 1, .blend = 0, .life = 1.50f, .mid_t = 0.250f, .col = {0x80ffffff, 0xff90f0ff, 0x00001060}, .size = {3.50f,4.00f,3.50f}, .grav = +2.00f, .cone = 0.0f, .cap_a = 0, .cap_b = 200, .max_px = 192.f, .min_px = 4.0f },
+{ .tex = "fxexplosionsmoke", .kind = 4, .blend = 0, .life = 3.00f, .mid_t = 0.060f, .col = {0xff70b0ff, 0x80203040, 0x00606060}, .size = {4.00f,0.40f,4.00f}, .grav = +1.00f, .cone = 0.0f, .cap_a = 0, .cap_b = 200, .max_px = 160.f, .min_px = 4.0f },
+{ .tex = "fxexplosionflash", .kind = 0, .blend = 2, .life = 0.12f, .mid_t = 0.200f, .col = {0xffffffff, 0x40ffffff, 0x0080ffff}, .size = {8.00f,3.00f,1.00f}, .grav = +1.50f, .cone = 0.0f, .cap_a = 0, .cap_b = 50, .max_px = 256.f, .min_px = 4.0f }
 };
 /* B3PFX-DESC-END */
 
@@ -96,46 +99,46 @@ static const B3PfxEmitter B3_PFX_EMIT[B3_PFX_EMITTERS] = {
  * ===================================================================== */
 #define N B3_PFX_NONE
 static const B3PfxSurface B3_PFX_SURF[B3_PFX_SURFACES] = {
-/*  0 */ {    1.0f,    0.0f,    0.0f,  N, 0 },
-/*  1 */ {    1.0f,    0.0f,    0.0f,  N, 0 },
-/*  2 */ {    1.0f,    0.0f,    0.0f,  N, 0 },
-/*  3 */ {    1.0f,    0.1f,    0.0f,  N, 0 },
-/*  4 */ {    0.5f,    0.1f,    1.0f,  7, 1 },
-/*  5 */ {    0.0f,    0.1f,    1.0f,  7, 0 },
-/*  6 */ {    1.0f,    0.0f,    0.0f,  N, 0 },
-/*  7 */ {    0.5f,    0.0f,    0.0f,  6, 0 },
-/*  8 */ {    1.0f,    0.0f,    0.0f,  N, 0 },
-/*  9 */ {    1.0f,    0.0f,    0.0f,  N, 0 },
-/* 10 */ {    1.0f,    0.0f,    0.0f,  N, 0 },
-/* 11 */ {    0.2f,    0.0f,    0.0f,  6, 1 },
-/* 12 */ {    0.8f,    0.2f,    0.0f,  N, 0 },
-/* 13 */ {    0.8f,    0.3f,    0.0f,  N, 0 },
-/* 14 */ {    0.0f,    0.0f,    1.0f,  7, 1 },
-/* 15 */ {    0.0f,    0.1f,    0.8f,  7, 0 },
-/* 16 */ {    0.0f,    0.3f,    1.0f,  7, 0 },
-/* 17 */ {    0.8f,    0.2f,    0.0f,  N, 0 },
-/* 18 */ {    0.0f,    0.5f,    0.5f,  N, 0 },
-/* 19 */ {    0.2f,    0.0f,    0.0f,  6, 0 },
-/* 20 */ {    0.8f,    0.2f,    0.0f,  N, 0 },
-/* 21 */ {    0.0f,    0.0f,    0.0f,  N, 0 },
-/* 22 */ {    0.0f,    0.0f,    0.0f,  N, 0 },
-/* 23 */ {    0.0f,    0.0f,    0.0f,  N, 0 },
-/* 24 */ {    0.0f,    0.0f,    0.0f,  N, 0 },
-/* 25 */ {    0.0f,    0.0f,    0.0f,  N, 0 },
-/* 26 */ {    0.0f,    0.0f,    0.0f,  N, 0 },
-/* 27 */ {    0.0f,    0.0f,    0.0f,  N, 0 },
-/* 28 */ {    0.0f,    0.0f,    0.0f,  N, 0 },
-/* 29 */ {    0.0f,    0.0f,    0.0f,  N, 0 },
-/* 30 */ {    0.0f,    0.0f,    0.0f,  N, 0 },
-/* 31 */ {    0.0f,    0.0f,    0.0f,  N, 0 },
-/* 32 */ {    0.0f,    0.0f,    0.0f,  N, 0 },
-/* 33 */ {    0.0f,    0.0f,    0.0f,  N, 0 },
-/* 34 */ {    0.0f,    0.0f,    0.0f,  N, 0 },
-/* 35 */ {    0.0f,    0.0f,    0.0f,  N, 0 },
-/* 36 */ {    0.0f,    0.0f,    0.0f,  N, 0 },
-/* 37 */ {    0.0f,    0.0f,    0.0f,  N, 0 },
-/* 38 */ {    0.5f,    0.5f,    0.0f,  N, 0 },
-/* 39 */ {    0.0f,    0.0f,    0.0f,  N, 0 }
+/*  0 */ { .scale = 1.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/*  1 */ { .scale = 1.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/*  2 */ { .scale = 1.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/*  3 */ { .scale = 1.0f, .skid = 0.1f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/*  4 */ { .scale = 0.5f, .skid = 0.1f, .gravelness = 1.0f, .emit = 7, .decal = 1 },
+/*  5 */ { .scale = 0.0f, .skid = 0.1f, .gravelness = 1.0f, .emit = 7, .decal = 0 },
+/*  6 */ { .scale = 1.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/*  7 */ { .scale = 0.5f, .skid = 0.0f, .gravelness = 0.0f, .emit = 6, .decal = 0 },
+/*  8 */ { .scale = 1.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/*  9 */ { .scale = 1.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 10 */ { .scale = 1.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 11 */ { .scale = 0.2f, .skid = 0.0f, .gravelness = 0.0f, .emit = 6, .decal = 1 },
+/* 12 */ { .scale = 0.8f, .skid = 0.2f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 13 */ { .scale = 0.8f, .skid = 0.3f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 14 */ { .scale = 0.0f, .skid = 0.0f, .gravelness = 1.0f, .emit = 7, .decal = 1 },
+/* 15 */ { .scale = 0.0f, .skid = 0.1f, .gravelness = 0.8f, .emit = 7, .decal = 0 },
+/* 16 */ { .scale = 0.0f, .skid = 0.3f, .gravelness = 1.0f, .emit = 7, .decal = 0 },
+/* 17 */ { .scale = 0.8f, .skid = 0.2f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 18 */ { .scale = 0.0f, .skid = 0.5f, .gravelness = 0.5f, .emit = N, .decal = 0 },
+/* 19 */ { .scale = 0.2f, .skid = 0.0f, .gravelness = 0.0f, .emit = 6, .decal = 0 },
+/* 20 */ { .scale = 0.8f, .skid = 0.2f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 21 */ { .scale = 0.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 22 */ { .scale = 0.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 23 */ { .scale = 0.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 24 */ { .scale = 0.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 25 */ { .scale = 0.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 26 */ { .scale = 0.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 27 */ { .scale = 0.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 28 */ { .scale = 0.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 29 */ { .scale = 0.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 30 */ { .scale = 0.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 31 */ { .scale = 0.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 32 */ { .scale = 0.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 33 */ { .scale = 0.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 34 */ { .scale = 0.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 35 */ { .scale = 0.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 36 */ { .scale = 0.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 37 */ { .scale = 0.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 38 */ { .scale = 0.5f, .skid = 0.5f, .gravelness = 0.0f, .emit = N, .decal = 0 },
+/* 39 */ { .scale = 0.0f, .skid = 0.0f, .gravelness = 0.0f, .emit = N, .decal = 0 }
 };
 #undef N
 /* B3PFX-SURF-END */
@@ -181,7 +184,9 @@ static const int B3_PFX_SLIDE_IDS[3] = { 20, 21, 22 };
  *   wheel+0xA0 -> 0 (@0x00180CDF, and 1 @0x00180D44 when veh+0x215==1)
  *   wheel+0xA1 -> 3 (@0x00180DDF)
  *   wheel+0xA2 -> 4 (@0x00180E7A)                                   [C] */
-static const int B3_PFX_WHEEL_IDS[4] = { 0, 1, 3, 4 };
+/* Kept as the recovered fact even though the emitter loop walks the gate ids
+ * and the +0x215 companion separately below -- this is the whole set. */
+static const int B3_PFX_WHEEL_IDS[4] __attribute__((unused)) = { 0, 1, 3, 4 };
 static const int B3_PFX_GATE_IDS[3]  = { 0, 3, 4 };
 #define B3_PFX_WHEEL_EXTRA_ID   1      /* the veh+0x215==1 companion   */
 /* FUN_001805B0, the gate-byte slew. */
@@ -277,11 +282,18 @@ static GLuint load_png(const char *path) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
                     GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_GENERATE_MIPMAP, GL_TRUE);
+    b3r_tex_mipmap_pre();
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rgba->w, rgba->h, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, rgba->pixels);
+    b3r_gen_mipmap();
+    /* GL_GENERATE_MIPMAP is GL 1.4 / GLES1: it does not exist in GLES2, and
+     * therefore not in WebGL either.  Asking for it there is INVALID_ENUM,
+     * the chain never gets built, and a GL_LINEAR_MIPMAP_LINEAR minifier on
+     * a texture with no chain is MIPMAP-INCOMPLETE -- which samples black.
+     * glGenerateMipmap() after the upload is the GL 3.0 / GLES2 spelling of
+     * the same thing, and it is what every target here uses now. */
     SDL_FreeSurface(rgba);
-    glBindTexture(GL_TEXTURE_2D, 0);
+    /* no unbind -- see the note by b3_hud_load_texture() in burnout3_hud.c */
     return t;
 }
 
@@ -756,20 +768,25 @@ int b3_pfx_live_of_desc(int desc) {
  * (0x800B is only written on the subtractive path -- everything else
  * restores 0x8006 -- which is why b3_pfx_draw restores GL_FUNC_ADD.)
  *                                                                  [C] */
-static void set_blend(int blend) {
+/* The blend EQUATION is not part of B3RState -- the retained batcher has no
+ * field for it -- so it stays a raw GL call and the caller flushes the batch
+ * in front of it, which is what keeps the previous group's quads on the
+ * equation they were built under.  The blend FUNC travels in the returned
+ * preset instead: B3R_BLEND_SA_ONE IS glBlendFunc(SRC_ALPHA, ONE) and
+ * B3R_BLEND_ALPHA IS glBlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
+ * (burnout3_render.c b3r_state), so the three rows below are the same three
+ * GL pairs the fixed-function pass issued. */
+static int set_blend(int blend) {
     switch (blend) {
     case 1:      /* SRC_ALPHA / ONE, REVSUBTRACT -- it DARKENS      [C] */
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
         glBlendEquation(GL_FUNC_REVERSE_SUBTRACT);
-        break;
+        return B3R_BLEND_SA_ONE;
     case 2:      /* SRC_ALPHA / ONE, ADD                            [C] */
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
         glBlendEquation(GL_FUNC_ADD);
-        break;
+        return B3R_BLEND_SA_ONE;
     default:     /* SRC_ALPHA / INV_SRC_ALPHA, ADD                  [C] */
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glBlendEquation(GL_FUNC_ADD);
-        break;
+        return B3R_BLEND_ALPHA;
     }
 }
 
@@ -819,8 +836,11 @@ void b3_pfx_draw(void) {
     int pass, i;
     if (!g.ready) return;
 
-    glGetFloatv(GL_MODELVIEW_MATRIX, mv);
-    glGetFloatv(GL_PROJECTION_MATRIX, pr);
+    /* the camera, from the retained renderer's published copy rather than two
+     * synchronous glGetFloatv readbacks -- b3r_proj() carries the harness'
+     * display mirror exactly as GL_PROJECTION_MATRIX did */
+    memcpy(mv, b3r_view(), 16 * sizeof(float));
+    memcpy(pr, b3r_proj(), 16 * sizeof(float));
     glGetIntegerv(GL_VIEWPORT, vp);
     /* max_px / min_px are absolute pixels on RETAIL's 640-wide render
      * target (FUN_00034130 scales by the viewport ints cam+0x78/0x7C
@@ -835,24 +855,39 @@ void b3_pfx_draw(void) {
     /* pixels per world unit at unit view depth: P[1][1] * height/2 */
     px_k = pr[5] * (float)vp[3] * 0.5f;
 
-    glPushAttrib(GL_ENABLE_BIT | GL_DEPTH_BUFFER_BIT | GL_COLOR_BUFFER_BIT
-                 | GL_TEXTURE_BIT | GL_CURRENT_BIT);
-    glEnable(GL_TEXTURE_2D);
-    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-    glEnable(GL_BLEND);
+    /* The attrib push stays: it is what hands the frame back the depth /
+     * blend / enable state this pass moves.  It no longer protects the
+     * GEOMETRY, though -- the quads below are buffered, so the batch has to be
+     * flushed before the pop (and before every raw GL call in between) or it
+     * would be drawn under the state the pop restored. */
+    b3r_state_push();
+    /* GL_TEXTURE_2D / the MODULATE texture env / GL_ALPHA_TEST / GL_FOG /
+     * GL_LIGHTING are all gone: the retained program does the modulate itself
+     * and b3r_begin() turns the fixed-function features off (leaving one of
+     * them live makes gl4es compile a variant of the shader).  The blend, the
+     * depth pair and the cull travel in the B3RState below. */
+    b3r2d_begin();
+    B3RState st;
+    st.tex        = 0;
+    st.mode       = B3R_TEX_MODULATE;     /* the pass' GL_MODULATE            */
+    st.blend      = B3R_BLEND_ALPHA;      /* per group, from set_blend()      */
+    st.alpha_ref  = -1.0f;                /* GL_ALPHA_TEST was off           */
     /* depth-TEST but do not WRITE -- the particle pass never occludes
      * itself or anything drawn after it. */
-    glEnable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
-    glDisable(GL_FOG);
-    glDisable(GL_LIGHTING);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_ALPHA_TEST);
+    st.depth_mask = 0;
+    st.depth_test = 1;
+    st.depth_func = 0;                    /* the pass never set glDepthFunc  */
+    st.cull       = 0;
 
     for (pass = 0; pass < 3; pass++) {
         GLuint bound = 0;
         int open = 0;
-        set_blend(pass);
+        /* The equation is raw GL, so the previous group must be drawn first --
+         * and it must be drawn even when the two groups share a blend FUNC
+         * (groups 1 and 2 are both SRC_ALPHA/ONE), which b3r_batch_state alone
+         * would not notice. */
+        b3r2d_flush();
+        st.blend = set_blend(pass);
         for (i = 0; i < B3_PFX_MAX; i++) {
             const B3PfxP *q = &g.p[i];
             const B3PfxDesc *d;
@@ -930,11 +965,12 @@ void b3_pfx_draw(void) {
             if (d && d->kind == 1) size *= 1.0f / B3_PFX_SQRT2;
 
             if (tex != bound) {
-                if (open) { glEnd(); open = 0; }
-                glBindTexture(GL_TEXTURE_2D, tex);
+                if (open) { b3r2d_prim_end(); open = 0; }
+                st.tex = tex;
+                b3r_batch_state(&st);    /* flushes on the texture change */
                 bound = tex;
             }
-            if (!open) { glBegin(GL_QUADS); open = 1; }
+            if (!open) { b3r2d_prim(B3R2D_QUADS); open = 1; }
 
             h = size * 0.5f;
             c = cosf(q->spin); s = sinf(q->spin);
@@ -944,19 +980,23 @@ void b3_pfx_draw(void) {
             ay[0] = (up[0]*c - rt[0]*s) * h;
             ay[1] = (up[1]*c - rt[1]*s) * h;
             ay[2] = (up[2]*c - rt[2]*s) * h;
-            glColor4f(rgba[0], rgba[1], rgba[2], rgba[3]);
-            glTexCoord2f(0.f, 0.f);
-            glVertex3f(pp[0]-ax[0]+ay[0], pp[1]-ax[1]+ay[1], pp[2]-ax[2]+ay[2]);
-            glTexCoord2f(1.f, 0.f);
-            glVertex3f(pp[0]+ax[0]+ay[0], pp[1]+ax[1]+ay[1], pp[2]+ax[2]+ay[2]);
-            glTexCoord2f(1.f, 1.f);
-            glVertex3f(pp[0]+ax[0]-ay[0], pp[1]+ax[1]-ay[1], pp[2]+ax[2]-ay[2]);
-            glTexCoord2f(0.f, 1.f);
-            glVertex3f(pp[0]-ax[0]-ay[0], pp[1]-ax[1]-ay[1], pp[2]-ax[2]-ay[2]);
+            b3r2d_color(rgba[0], rgba[1], rgba[2], rgba[3]);
+            b3r2d_uv(0.f, 0.f);
+            b3r2d_vertex3(pp[0]-ax[0]+ay[0], pp[1]-ax[1]+ay[1], pp[2]-ax[2]+ay[2]);
+            b3r2d_uv(1.f, 0.f);
+            b3r2d_vertex3(pp[0]+ax[0]+ay[0], pp[1]+ax[1]+ay[1], pp[2]+ax[2]+ay[2]);
+            b3r2d_uv(1.f, 1.f);
+            b3r2d_vertex3(pp[0]+ax[0]-ay[0], pp[1]+ax[1]-ay[1], pp[2]+ax[2]-ay[2]);
+            b3r2d_uv(0.f, 1.f);
+            b3r2d_vertex3(pp[0]-ax[0]-ay[0], pp[1]-ax[1]-ay[1], pp[2]-ax[2]-ay[2]);
         }
-        if (open) glEnd();
+        if (open) b3r2d_prim_end();
     }
+    b3r2d_end();                 /* draws what is left, under the last group's
+                                  * equation, BEFORE the two raw calls below */
     glBlendEquation(GL_FUNC_ADD);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glPopAttrib();
+    /* No unbind: glPopAttrib does not restore texture BINDINGS (that is
+     * GL_TEXTURE_BIT, which this pass does not push), so the bind was never
+     * balancing anything -- and see the note by b3_hud_load_texture(). */
+    b3r_state_pop();
 }

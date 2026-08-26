@@ -7,6 +7,8 @@
 #ifndef BURNOUT3_TRACKMESH_H
 #define BURNOUT3_TRACKMESH_H
 
+#include <stddef.h>
+
 #define TRACKMESH_MAX_GROUPS 4096
 #define TRACKMESH_NAME_LEN   64
 
@@ -46,7 +48,7 @@ typedef struct {
     // AS_C2_V1, 0.90 on EU_C3_V1. This value is vertex-shader constant
     // c[120].z, loaded from the same fog record field as FOGSTART/FOGEND
     // (0x00038D8D -> 0x00038DD8, uploaded at 0x00038F59, the only writer of
-    // slot 0x78 in the image). trackmesh_fog_begin() reproduces the clamp.
+    // slot 0x78 in the image). b3r_fog() reproduces the clamp.
     float fog_far;
     int fog_enabled;
 } TrackScene;
@@ -83,19 +85,31 @@ typedef struct {
 // Uniformly numbered sets (`water`..`water17`, `Chgo_Flag`..`Chgo_Flag10`)
 // collapse to a flat one-period flipbook, which is what makes the numbering
 // look like nothing more than an ordinal.                                 [C]
-typedef struct {
-    int count;                  // +0x11, >= 2
-    float period;               // +0x14
-    float hold;                 // +0x18, live -- seconds the current frame runs
-    float last;                 // +0x1C, live -- clock at the last swap
-    int label;                  // +0x12, live -- current keyframe time
-    int index;                  // +0x10, live -- current frame
-    int step;                   // +0x13, live -- +1 / -1, ping-pong only
-    int pingpong;               // flag bit 0x100; unset on every shipped material
-    int frame_label[TRACKMESH_MAX_FRAMES];      // the atol'd keyframe times
-    char frame_texture[TRACKMESH_MAX_FRAMES][256];
-    unsigned frame_gl[TRACKMESH_MAX_FRAMES];    // filled by the renderer
+typedef struct __attribute__((packed)) TrackMeshAnim {
+    // ---- RETAIL WINDOW 0x0000..0x0020: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    unsigned char _pad00[0x10];
+    int                  index;  // +0x10, live -- current frame
+    float                period;  // +0x14
+    float                hold;  // +0x18, live -- seconds the current frame runs
+    float                last;  // +0x1C, live -- clock at the last swap
+
+    // ---- HARNESS SIDE, past the retail window: no recovered
+    // offset in THIS object, so it must not squat on retail's bytes.
+    int                  pingpong;  // flag bit 0x100; unset on every shipped material
+    int                  frame_label[TRACKMESH_MAX_FRAMES];  // the atol'd keyframe times
+    char                 frame_texture[TRACKMESH_MAX_FRAMES][256];  
+    unsigned             frame_gl[TRACKMESH_MAX_FRAMES];  // filled by the renderer
+    int                  count;  // +0x11, >= 2
+    int                  label;  // +0x12, live -- current keyframe time
+    int                  step;  // +0x13, live -- +1 / -1, ping-pong only
 } TrackMeshAnim;
+
+#define TRACKMESHANIM_RETAIL_SPAN 0x0020u
+_Static_assert(offsetof(TrackMeshAnim, index) == 0x0010, "index off retail");
+_Static_assert(offsetof(TrackMeshAnim, period) == 0x0014, "period off retail");
+_Static_assert(offsetof(TrackMeshAnim, hold) == 0x0018, "hold off retail");
+_Static_assert(offsetof(TrackMeshAnim, last) == 0x001C, "last off retail");
 
 // A run of consecutive triangles sharing one material (one usemtl span).
 typedef struct {
@@ -242,12 +256,9 @@ typedef struct {
     // How many groups the ticker touches -- a moving UV scroll (rate > 0) OR a
     // frame cycle. These are exactly the groups that cannot be baked into a
     // display list, because their texture coordinates or their texture BINDING
-    // change every frame; trackmesh_draw_scroll() draws them all.
+    // change every frame; b3r_track_draw_scroll() draws them all.
     int anim_groups;
 
-    // Scratch colour buffer for trackmesh_draw_shine(), grown on demand.
-    float* shine_scratch;
-    int shine_scratch_verts;
 } TrackMesh;
 
 // Load an OBJ produced by tools/extract_track.py. Returns 0 on success.
@@ -269,19 +280,42 @@ typedef struct {
 int trackmesh_load(TrackMesh* m, const char* path);
 void trackmesh_free(TrackMesh* m);
 
+// ---- THE LOAD PUMP -----------------------------------------------------------
+// trackmesh_load() is one long synchronous parse -- 386k lines for US_C3_V1 and
+// 1.8M for AS_M1_V1 -- and while it runs, nothing else does. On the desktop
+// that is a fraction of a second; on the web port it is seconds, and the
+// loading screen sits frozen for every one of them.
+//
+// So the parse calls back, every few thousand lines, with how far through the
+// file it is (0..1). Install b3_loadscreen_frame()'s wrapper here and the bar
+// keeps moving through the parse; install nothing and the callback costs one
+// null test per chunk. Same contract as b3_iso_set_progress(): MAIN THREAD, and
+// the callback must not re-enter the loader.
+typedef void (*TrackMeshPumpFn)(float frac, void* user);
+void trackmesh_set_pump(TrackMeshPumpFn fn, void* user);
+
 // Hand the shine pass the GL texture the renderer already uploaded for this
 // group (it needs the same image, for its ALPHA channel).
 void trackmesh_set_group_texture(TrackMesh* m, int group, unsigned gl_texture);
 
-// ---- per-group render state -------------------------------------------------
-// Issue the GL state one world group is drawn with: depth mask, blend,
-// alpha test and the texture bind. This is the harness spelling of what the
-// streamed material apply FUN_000393C0 queues per material -- see the .c for
-// the state-by-state citations. `cutout_fallback` is the caller's texel
-// heuristic, used ONLY for groups the OBJ carries no material record for.
-// Safe to call while compiling a display list.
-void trackmesh_group_state(const TrackMesh* m, int group, unsigned gl_texture,
-                           int cutout_fallback);
+// ---- per-group material state -----------------------------------------------
+// DECODE the render state one world group is drawn with -- depth mask, alpha
+// blend, alpha test -- without touching GL.  This is the harness reading of
+// what the streamed material apply FUN_000393C0 queues per material; see the
+// .c for the state-by-state citations.  `cutout_fallback` is the caller's
+// texel heuristic, used ONLY for groups the OBJ carries no material record
+// for (which is none of them on any shipped track).
+//
+// It is a QUERY and not an emitter because the renderer batches: one merged
+// draw covers many groups, so the state has to be a comparable KEY rather
+// than a stream of glEnable calls.  src/burnout3_render.c group_key() is the
+// only caller.
+//
+// `*out_test` is 1 for the world's GREATER 64/255 test, 0 for none, and -1
+// for the B3_TRACK_ONLYMAT diagnostic's "reference 1.0, nothing passes".
+void trackmesh_group_material(const TrackMesh* m, int group,
+                              unsigned gl_texture, int cutout_fallback,
+                              int* out_decal, int* out_blend, int* out_test);
 
 // The vertex colour to hand glColor4fv for vertex `v` of group `group`:
 // rgb = the doubled baked diffuse (or white for the classes with no D3DCOLOR
@@ -316,40 +350,11 @@ typedef unsigned (*TrackMeshTexLoader)(const char* path, void* user);
 int trackmesh_load_frame_textures(TrackMesh* m, TrackMeshTexLoader fn,
                                   void* user);
 
-// Draw the scrolling groups with the current UV offset. They must be EXCLUDED
-// from any baked display list, because their texture coordinates change every
-// frame. Returns the number of triangles drawn.
-int trackmesh_draw_scroll(const TrackMesh* m);
-
-// ---- fog ---------------------------------------------------------------------
-// Turn the recovered world fog on/off around the track draw. The world setup
-// FUN_00038D10 enables D3DRS_FOGENABLE and the world teardown FUN_00039140
-// (@0x000391C5) disables it again, so retail fogs the WORLD ONLY -- not cars,
-// traffic or HUD. B3_TRACK_NOFOG=1 disables it here.
-//
-// fog_begin also binds a one-line GLSL VERTEX program (no fragment program, so
-// the whole fixed-function fragment stage including the linear fog table stays
-// in charge) whose only job is `gl_FogFragCoord = min(|z_eye|, fog_far)` --
-// the microcode's `MIN oFog, r12.z, c[120].z`, which fixed-function GL cannot
-// express. fog_end unbinds it. B3_TRACK_NOFOGFLOOR=1, or a GL without the 2.0
-// entry points, falls back to the old unclamped fog. See the .c for why no
-// arrangement of GL_FOG_START/END/COLOR reproduces the floor.
-void trackmesh_fog_begin(const TrackMesh* m);
-void trackmesh_fog_end(void);
-
-// Draw the class-1/7/10 additive specular pass for one frame. `eye` is the
-// camera position and `light_dir` the game's vertex-shader constant c[0x61] --
-// both in the SAME space as TrackMesh.positions, i.e. after the loader's Z
-// negation. Pass light_dir = NULL to use TrackMesh.scene.light_dir, which is
-// the track's own enviro.dat value; the pass then also tints the additive term
-// by scene.light_rgb, which is what the material apply hands the pixel shader
-// as combiner factor C0.rgb. Returns the number
-// of triangles drawn (0 when the mesh carries no shine groups, no vertex
-// colours, or B3_TRACK_NOSHINE is set).
-//
-// Call it after the opaque world and before the transparent/car passes; it
-// leaves GL blending, depth-mask and texture-env state as it found them.
-int trackmesh_draw_shine(TrackMesh* m, const float eye[3],
-                         const float light_dir[3]);
+// ---- what moved to the renderer ---------------------------------------------
+// trackmesh_draw_scroll(), trackmesh_fog_begin/end() and
+// trackmesh_draw_shine() used to live here.  They are b3r_track_draw_scroll(),
+// b3r_fog() and b3r_track_draw_shine() now -- same arithmetic, same order,
+// same citations, drawn from static VBOs through one program instead of from
+// fixed-function state.  See src/burnout3_render.h.
 
 #endif // BURNOUT3_TRACKMESH_H

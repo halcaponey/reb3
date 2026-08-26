@@ -852,7 +852,75 @@ def run_prepass_case():
     else:
         print("  airborne x4                  OK   flags cleared, contact "
               "pt/normal synthesised from frame up")
+    fails += run_prepass_asym_case()
     return fails
+
+
+def run_prepass_asym_case():
+    """FUN_001239C0 over a GROUND HIT with front_len != rear_len.
+
+    FUN_00123790's tail (0x00123952..0x0012399D: `SUBPS start,end; MULPS;
+    SQRTSS; MULSS [ECX]`) turns the parametric hit into a distance with THAT
+    WHEEL'S OWN ray length; FUN_001239C0 then divides by the length of the
+    COMMON `rayv` it built from wheels 1 and 3 (SQRTSS @0x00123D9A, DIVSS
+    @0x00123DB1) for the contact point, and subtracts the raw distance for
+    cur_len (@0x00123DF7).  The two lengths are equal only when every wheel
+    spans the same ray -- 24 of the 100 VDB cars have front/rear spring
+    length or attach height that differ (COMPCAR2 0.20/0.19, CUPECAR3
+    0.11/0.14, HEVYCAR10 0.50/0.35), and scaling by the common length
+    instead put the short-ray axle 6..80 mm under the road.  Mirrors
+    b3_prepass in src/burnout3_vehicle_sim.c.
+    """
+    _pspec = importlib.util.spec_from_file_location(
+        "ep", "tools/emulate_pipeline.py")
+    ep = importlib.util.module_from_spec(_pspec)
+    _pspec.loader.exec_module(ep)
+
+    ATT, FLEN, RLEN, Y = 0.10, 0.22, 0.25, 0.30
+    R = ep.CAR['radius']
+    p = ep.Pipeline()
+    base = ep.VEHICLE
+    p.wf(base + 0xCA0, ATT); p.wf(base + 0xCAC, FLEN)
+    p.wf(base + 0xCB0, ATT); p.wf(base + 0xCBC, RLEN)
+    for i in range(4):
+        w = base + 0x820 + 0xC0 * i
+        ln = FLEN if i < 2 else RLEN
+        p.wf(w + 0x74, ATT)
+        p.wf(w + 0x60, ATT - 0.75 * ln)
+        p.wf(w + 0x64, ATT - 0.75 * ln)
+    p._write_matrix(ep.CTX0, [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0],
+                              [0, Y, 0, 0]])
+    p.call(ep.F_239C0, stack_args=[ep.VEHICLE])
+
+    # model: identity frame, flat plane at y = 0 (the seeded soup)
+    start_ly = [f32(R + ATT)] * 4
+    end_ly = [f32(f32(ATT - 0.75 * (FLEN if i < 2 else RLEN)) - R)
+              for i in range(4)]
+    span = f32(max(start_ly[1], start_ly[3]) - min(end_ly[1], end_ly[3]))
+    raylen = span                      # |up * -span|, up = (0,1,0)
+    bad = []
+    for i in range(4):
+        seg = f32(start_ly[i] - end_ly[i])          # |start_w - end_w|
+        hit_t = f32(f32(Y + start_ly[i]) / seg)     # plane at y = 0
+        dist = f32(hit_t * seg)                     # 0x00123997
+        cur = f32(f32(start_ly[i] - dist) + R)      # 0x00123DF7
+        cpt_y = f32(f32(Y + start_ly[i]) - f32(span * f32(dist / raylen)))
+        w = base + 0x820 + 0xC0 * i
+        if abs(p.rf(w + 0x64) - cur) > 1e-5:
+            bad.append(("w%d.cur" % i, cur, p.rf(w + 0x64)))
+        if abs(p.rf(w + 0x14) - cpt_y) > 1e-4:
+            bad.append(("w%d.cpt.y" % i, cpt_y, p.rf(w + 0x14)))
+        if p.rb(w + 0xB3) != 1:
+            bad.append(("w%d.contact" % i, 1, p.rb(w + 0xB3)))
+    if bad:
+        print("  asym ray length (ground)     FAIL")
+        for tag, mv, evv in bad[:8]:
+            print("      %-14s model %r  emu %r" % (tag, mv, evv))
+        return 1
+    print("  asym ray length (ground)     OK   front %.2f / rear %.2f: "
+          "dist scales by the PER-WHEEL ray, cur=%.4f on all four"
+          % (FLEN, RLEN, p.rf(base + 0x820 + 0x64)))
+    return 0
 
 
 # ===========================================================================
@@ -2052,7 +2120,12 @@ def run_pipeline_cases():
         r = subprocess.run(['cc', '-O2', '-Isrc', '-o', 'build/dump_traj',
                             'tools/dump_traj.c',
                             'src/burnout3_vehicle_sim.c',
-                            'src/burnout3_panels.c', '-lm'])
+                            'src/burnout3_panels.c',
+                            # burnout3_crash.c carries the crash=retail
+                            # switch; B3_BACKENDS is pinned to /dev/null
+                            # above so this always measures the RE path.
+                            'src/burnout3_backend.c',
+                            'src/burnout3_emu.c', '-lm'])
         if r.returncode != 0:
             print("\nfull pipeline: cannot build build/dump_traj")
             return len(PIPELINE_WINDOWS)
@@ -2188,7 +2261,12 @@ def run_adversarial_cases():
         r = subprocess.run(['cc', '-O2', '-Isrc', '-o', 'build/dump_traj',
                             'tools/dump_traj.c',
                             'src/burnout3_vehicle_sim.c',
-                            'src/burnout3_panels.c', '-lm'])
+                            'src/burnout3_panels.c',
+                            # burnout3_crash.c carries the crash=retail
+                            # switch; B3_BACKENDS is pinned to /dev/null
+                            # above so this always measures the RE path.
+                            'src/burnout3_backend.c',
+                            'src/burnout3_emu.c', '-lm'])
         if r.returncode != 0:
             print("\nadversarial: cannot build build/dump_traj")
             return len(ADVERSARIAL)
@@ -2271,6 +2349,11 @@ def run_adversarial_cases():
 
 
 import os
+
+# dump_traj links burnout3_backend.c; pin it to the RE path so a flipped
+# build/backends.cfg cannot change what this suite measures.
+os.environ['B3_BACKENDS'] = '/dev/null'
+
 
 
 
@@ -3229,7 +3312,9 @@ def run_relocation_cases():
     exe = 'build/dump_traj'
     r = subprocess.run(['cc', '-O2', '-Isrc', '-o', exe, 'tools/dump_traj.c',
                         'src/burnout3_vehicle_sim.c',
-                            'src/burnout3_panels.c', '-lm'])
+                        'src/burnout3_panels.c',
+                        'src/burnout3_backend.c',
+                        'src/burnout3_emu.c', '-lm'])
     if r.returncode != 0:
         print("\nsubstep relocation: cannot build %s" % exe)
         return len(RELOC_CASES)
@@ -3383,14 +3468,14 @@ def main():
               + rlfails + psfails)
 
     total = (len(CASES) + 5 + len(ENGINE_CASES) + len(WHEEL_CASES)
-             + len(ENGAGE_CASES) + len(SUSP_CASES) + 1
+             + len(ENGAGE_CASES) + len(SUSP_CASES) + 2
              + len(TYRE_CASES) + 1 + len(INTEG_CASES) + len(STEER_CASES)
              + len(STEER_AWAY_CASES) + len(PIPELINE_WINDOWS)
              + len(ADVERSARIAL) + len(WC_CASES) + len(C7_CASES)
              + len(RELOC_CASES) + len(PS_CASES))
     print("\n%d/%d cases match the real code "
           "(%d resistance, 5 vertical, %d engine/transmission, %d wheel, "
-          "%d engage, %d suspension, 1 pre-pass, %d tyre/airborne (+1 LSDM), "
+          "%d engage, %d suspension, 2 pre-pass, %d tyre/airborne (+1 LSDM), "
           "%d integrator, %d steering, %d steer-away, "
           "%d full-pipeline trajectories, %d adversarial trajectories, "
           "%d world-contact resolves, %d class-7 updates, "

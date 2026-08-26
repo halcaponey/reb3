@@ -22,6 +22,11 @@ Acceptance test for the CRASH CINEMA wave (2026-08-13):
 Usage: python3 tools/validate_crashcinema.py
 """
 import os
+
+# Links objects that consult build/backends.cfg; pin to the RE path so
+# this differential test is unaffected by the live backend selection.
+os.environ['B3_BACKENDS'] = '/dev/null'
+
 import re
 import struct
 import subprocess
@@ -514,6 +519,10 @@ def sec45(ck):
         ["cc", "-O2", "-I" + os.path.join(_root, "src"), "-o", exe, src,
          os.path.join(_root, "src", "burnout3_crash.c"),
          os.path.join(_root, "src", "burnout3_td_rules.c"),
+         # burnout3_td_rules.c consults the backend selector; the driver
+         # is pinned to the RE path above, this satisfies the linker.
+         os.path.join(_root, "src", "burnout3_backend.c"),
+         os.path.join(_root, "src", "burnout3_emu.c"),
          os.path.join(_root, "src", "burnout3_vehicle_sim.c"), "-lm"],
         capture_output=True, text=True, cwd=_root)
     if r.returncode:

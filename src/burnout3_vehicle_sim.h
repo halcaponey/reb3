@@ -23,6 +23,8 @@
 //   equation any more; where something is still a stand-in it is marked GLUE
 //   at the site and carries a ledger row.
 
+#include <stddef.h>
+
 #ifndef BURNOUT3_VEHICLE_SIM_H
 #define BURNOUT3_VEHICLE_SIM_H
 
@@ -202,7 +204,7 @@ void b3_physics_defaults(B3PhysicsConfig* cfg);
 
 // Set the config field owning a given 0x1D0-struct offset (the offsets from
 // burnout3_physics_params.h). Used both by b3_physics_defaults() and to apply
-// the per-car VDB overrides from burnout3_car_physics.h.
+// the per-car VDB overrides from build/cars/car_physics.bin.
 void b3_config_set_by_offset(B3PhysicsConfig* cfg, unsigned offset,
                              float value);
 
@@ -368,9 +370,26 @@ float b3_steer_slew(float prev, float raw, float steer_response);
 //   accumulators, +0x130 deflection, +0x10 BODY inverse inertia rows,
 //   +0x40 world inverse inertia rows, +0x70 inverse frame transform.
 // ---------------------------------------------------------------------------
-typedef struct B3RigidBody {   // named: burnout3_crash.h forward-declares it
-    float frame[4][4];            // rows: right, up, at, pos
-    float vel[4];                 // xyz velocity; [3] = speed (+0xBC)
+// The dynamics window of the live vehicle, at RETAIL's own offsets: this
+// struct sits at vehicle+0 and every field below +0x140 lands exactly where
+// the game puts it. Declared in OFFSET order and packed, so the compiler adds
+// no padding of its own.
+//
+// `frame` IS THE EXCEPTION, and deliberately so. Retail does not inline the
+// transform in the vehicle: v+0x204 holds a POINTER to a separate frame object
+// (4x4 + file ptr, aliased again at v+0xCC0 -- see CTX0 in
+// tools/emulate_pipeline.py). The port inlines it instead, which is a genuine
+// data-model divergence, not just a layout one: matching retail means the
+// vehicle stores a pointer and the matrix lives in its own allocation. Until
+// that separation is done, the matrix is parked past the parity window at
+// +0x140 where it collides with nothing, and is marked here so it cannot be
+// mistaken for a recovered offset.
+typedef struct B3RigidBody {
+    unsigned char _pad00[0x10];
+    float inv_inertia_body[3][4]; // +0x10
+    float inv_inertia_world[3][4];// +0x40   (rebuilt as Rt*I0*R)
+    float inv_frame[4][4];        // +0x70   (rebuilt)
+    float vel[4];                 // +0xB0 xyz velocity; [3] = speed (+0xBC)
     float dir[4];                 // +0xC0 unit travel direction
     float omega[4];               // +0xD0
     float angmom[4];              // +0xE0
@@ -379,10 +398,46 @@ typedef struct B3RigidBody {   // named: burnout3_crash.h forward-declares it
     float imp_force[4];           // +0x110  (cleared)
     float imp_torque[4];          // +0x120  (cleared)
     float deflection[4];          // +0x130  (added to pos, cleared)
-    float inv_inertia_body[3][4]; // +0x10
-    float inv_inertia_world[3][4];// +0x40   (rebuilt as Rt*I0*R)
-    float inv_frame[4][4];        // +0x70   (rebuilt)
+    // Retail stores a POINTER to the frame object here, not the matrix:
+    // v+0x204 -> {4x4 + file ptr}, aliased again at v+0xCC0 (CTX0 in
+    // tools/emulate_pipeline.py). Pointer-to-row keeps every `frame[r][c]`
+    // site indexing identically while the 64-byte matrix leaves the retail
+    // window -- inlined it collided with contact_pt_160 at +0x160 whatever
+    // offset it was parked at, which is what blocked B3VehicleFull parity.
+    //
+    // EVERY body must be bound to storage before a row is touched, and AFTER
+    // any memset that would zero the pointer. b3_rigid_body_bind_frame does
+    // it; B3_RIGID_BODY_LOCAL declares a local body already bound.
+    //
+    // THE SLOT IS PINNED TO 8 BYTES, and that is load-bearing rather than
+    // decorative: this pointer is the LAST member, so sizeof(B3RigidBody) --
+    // and therefore every retail offset in B3VehicleFull after it, which
+    // reaches contact_pt_160 through `_pad00[0x18]` -- would otherwise be a
+    // function of the target's POINTER WIDTH.  On a 32-bit target (the wasm
+    // build, web/) the struct would end at 0x144 instead of 0x148 and slide
+    // the whole 0x160..0x1A00 window down by 4.  The union costs nothing on
+    // 64-bit, where the pointer already fills it.
+    union {
+        float (*frame)[4];        // GLUE +0x140 (retail: pointer at +0x204)
+        unsigned char _frame_slot[8];
+    };
 } B3RigidBody;
+
+_Static_assert(sizeof(B3RigidBody) == 0x148, "B3RigidBody span (see _frame_slot)");
+
+_Static_assert(offsetof(B3RigidBody, inv_inertia_body)  == 0x010, "rb I0");
+_Static_assert(offsetof(B3RigidBody, inv_inertia_world) == 0x040, "rb Iw");
+_Static_assert(offsetof(B3RigidBody, inv_frame)         == 0x070, "rb invF");
+_Static_assert(offsetof(B3RigidBody, vel)               == 0x0B0, "rb vel");
+_Static_assert(offsetof(B3RigidBody, dir)               == 0x0C0, "rb dir");
+_Static_assert(offsetof(B3RigidBody, omega)             == 0x0D0, "rb omega");
+_Static_assert(offsetof(B3RigidBody, angmom)            == 0x0E0, "rb angmom");
+_Static_assert(offsetof(B3RigidBody, force_acc)         == 0x0F0, "rb force");
+_Static_assert(offsetof(B3RigidBody, torque_acc)        == 0x100, "rb torque");
+_Static_assert(offsetof(B3RigidBody, imp_force)         == 0x110, "rb impF");
+_Static_assert(offsetof(B3RigidBody, imp_torque)        == 0x120, "rb impT");
+_Static_assert(offsetof(B3RigidBody, deflection)        == 0x130, "rb defl");
+_Static_assert(offsetof(B3RigidBody, frame)             == 0x140, "rb frame slot");
 
 // One integration step. in_race = byte +0x210, state6 = (+0x215 == 6),
 // com_height = +0x1F4 (gravity torque application height while in race).
@@ -469,6 +524,32 @@ int b3_rigid_body_obb_plane_contact(const B3RigidBody* rb,
                                     const float plane_n[3],
                                     B3WorldContact* out);
 
+// One polygon of the world soup the narrow phase walks: retail's record is
+// 0x40 bytes with the three vertices at +0x00/+0x10/+0x20 and the normal at
+// +0x30 (FUN_00107950 reads them at exactly those offsets).
+typedef struct {
+    float v[3][3];     // the three vertices, WORLD
+    float n[3];        // the unit face normal, WORLD
+} B3WorldPoly;
+
+// FUN_00107950 [C] over the WHOLE soup, which is what retail actually runs:
+// every polygon's real vertices are clipped against the box, the surviving
+// faces' normals are SUMMED and their clipped centroids AVERAGED, and the
+// result is ONE contact -- the single B3WorldContact its caller FUN_00109EA0
+// consumes once per frame.
+//
+// Prefer this to b3_rigid_body_obb_plane_contact whenever the caller has the
+// real polygons.  The plane form fabricates a square of half-size
+// |box dims| + 1 around `plane_pt`, so it only agrees with retail while that
+// point lies under the body; handed a triangle vertex it misses every face
+// larger than ~6 m (78.7% of the near-vertical faces on US_C3_V1).  And
+// resolving the plane form once PER POLYGON is not the same thing at all:
+// that applies N impulses and N push-outs where retail applies one.
+int b3_rigid_body_obb_soup_contact(const B3RigidBody* rb,
+                                   const float bbmin[3], const float bbmax[3],
+                                   const B3WorldPoly* polys, int npoly,
+                                   B3WorldContact* out);
+
 // cls = body +0x215 (1/2/3 = the racecar states, 6 knocked prop, 7
 // panel/debris piece; anything else takes the 0.875 arm),
 // attach_mode = +0x2BA (class 7 only), restitution = +0x1F8.
@@ -517,27 +598,51 @@ int b3_ground_probe(float x, float y, float z,
 extern int (*b3_ground_probe_hook)(float x, float y, float z,
                                    float* out_height, float out_normal[3]);
 
-// Per-wheel record, mirroring the live wheel struct (v+0x820 stride 0xC0).
+// The live wheel record at RETAIL's own layout: vehicle+0x820, stride 0xC0,
+// every field at the offset the game puts it.
+//
+// Declared in OFFSET order with explicit padding, and packed so the compiler
+// adds none of its own -- the previous logical ordering put `spin` at 0x60
+// instead of retail's 0x58 and made the whole record 0x80 instead of 0xC0, so
+// no retail code could have walked this array.
+//
+// local_x / local_z / frame_y used to live here. They are HARNESS state with
+// no retail offset, so they would have been squatting on bytes the game owns;
+// they now live in B3VehicleFull's wheel_local_x/_z/wheel_frame_y arrays.
 typedef struct {
-    float local_x, local_z;   // wheel frame row3 x/z (.bgv +0xB80 attach)
-    float radius;             // +0x50
     float world_pos[4];       // +0x00 (written by FUN_00123FD0)
     float contact_pt[4];      // +0x10
     float normal[4];          // +0x20 contact normal
     float prev_pos[4];        // +0x30 prev-frame world pos (BE50 restore)
     float prev_contact[4];    // +0x40
+    float radius;             // +0x50
     float torque;             // +0x54
     float spin;               // +0x58
     float omega;              // +0x5C
     float prev_len;           // +0x60
     float cur_len;            // +0x64 (pre-pass output)
+    unsigned char _pad68[0x0C];
     float attach;             // +0x74
-    float frame_y;            // wheel frame row3.y (visual drop)
+    unsigned char _pad78[0x38];
     unsigned short surface;   // +0xB0
     unsigned char bump;       // +0xB2
     unsigned char contact;    // +0xB3
     unsigned char force_flag; // +0xB4
+    unsigned char _padB5[0x0B];
 } B3WheelSim;
+
+#define B3_WHEEL_RETAIL_STRIDE 0xC0u
+_Static_assert(sizeof(B3WheelSim) == B3_WHEEL_RETAIL_STRIDE,
+               "wheel stride must match retail's 0xC0");
+_Static_assert(offsetof(B3WheelSim, radius)   == 0x50, "wheel radius");
+_Static_assert(offsetof(B3WheelSim, torque)   == 0x54, "wheel torque");
+_Static_assert(offsetof(B3WheelSim, spin)     == 0x58, "wheel spin");
+_Static_assert(offsetof(B3WheelSim, omega)    == 0x5C, "wheel omega");
+_Static_assert(offsetof(B3WheelSim, prev_len) == 0x60, "wheel prev_len");
+_Static_assert(offsetof(B3WheelSim, cur_len)  == 0x64, "wheel cur_len");
+_Static_assert(offsetof(B3WheelSim, attach)   == 0x74, "wheel attach");
+_Static_assert(offsetof(B3WheelSim, surface)  == 0xB0, "wheel surface");
+_Static_assert(offsetof(B3WheelSim, contact)  == 0xB3, "wheel contact");
 
 // ---------------------------------------------------------------------------
 // FUN_0011AEF0's WORLD -- the chassis polygon soup, live vehicle +0x200.
@@ -569,134 +674,301 @@ typedef struct {
 // The full vehicle: rigid body + wheels + drivetrain + the live config
 // copies FUN_00134710 installs (named by their live offsets).
 typedef struct B3VehicleFull {
-    B3RigidBody rb;           // +0x204 frame, +0xB0.. dynamics, +0x10 inertia
-    float mass;               // +0x1F0
-    float com_height;         // +0x1F4 = (half_ext.y - center_off.y) * 0.1
-    float half_ext[4];        // +0x1D0 (.bgv +0xE80)
-    float center_off[4];      // +0x1E0 (.bgv +0xE90)
-    B3WheelSim wheel[4];
-    int wheel_count;          // +0x1169
+    // ---- RETAIL WINDOW 0x0000..0x1A00: every field where the game puts
+    // it, packed with explicit padding, asserted below the struct.
+    B3RigidBody rb;            // +0x0000  dynamics (see B3RigidBody)
+    unsigned char _pad00[0x18];
+    float                  contact_pt_160[4];  // +0x160 world contact point
+    float                  contact_n_170[4];  // +0x170 contact normal (wall: flattened)
+    unsigned char _pad01[0x10];
+    unsigned short         surface_190;  // +0x190 surface flags of the contact
+    unsigned char _pad02[0x2];
+    float                  impact_194;  // +0x194 impact magnitude
+    int                    contact_state_198;  // +0x198 0 none / 1 wall / 2 ground
+    unsigned char _pad03[0x34];
+    float                  half_ext[4];  // +0x1D0 (.bgv +0xE80)
+    float                  center_off[4];  // +0x1E0 (.bgv +0xE90)
+    float                  mass;  // +0x1F0
+    float                  com_height;  // +0x1F4 = (half_ext.y - center_off.y) * 0.1
+    unsigned char _pad04[0x16];
+    // The sleep flag FUN_0011AEF0 and the suspension pass both consult. It
+    // lived only in B3CrashVehicle, the fourth partial view of this object.
+    unsigned char          asleep_020E;  // +0x20E (FUN_00125100 clears it)
+    unsigned char _pad04b[0x2];
+    unsigned char          landed_211;  // +0x211 "landed on a car" (tail unported)
+    unsigned char          contact_212;  // +0x0212
+    unsigned char          contact_213;  // +0x0213
+    unsigned char _pad05[0x1];
+    unsigned char          class_215;  // +0x0215
+    unsigned char _pad06[0x10E];
+    float                  grip_scalar;  // ctx+0x324
+    unsigned char _pad07[0x174];
+    float                  ground_clear;  // ctx+0x49C
+    unsigned char _pad08[0x380];
+    B3WheelSim             wheel[4];  // +0x0820
+    unsigned char _pad09[0x640];
+    unsigned short         surface_1160;  // +0x1160
+    unsigned char _pad0A[0x2];
+    float                  steer_deg_1164;  // +0x1164
+    unsigned char _pad0B[0x1];
+    unsigned char          wheel_count;  // +0x1169  BYTE in retail, not int:
+                                         // an int here is unaligned at 0x1169
+    unsigned char _pad0C[0x1E9];
+    unsigned char          flags_1353;  // +0x1353 bit0|bit2 disable, bit3 blocks crash
+    unsigned char _pad0D[0xC];
+    float                  resist_1360;  // +0x1360
+    float                  downforce_1364;  // +0x1364
+    float                  brake_h_1368;  // +0x1368
+    float                  accel_h_136C;  // +0x136C
+    float                  steer_h_1370;  // +0x1370
+    float                  drift_h_1374;  // +0x1374
+    float                  steer_min_1378;  // +0x1378
+    float                  steer_max_137C;  // +0x137C
+    float                  steer_v0_1380;  // +0x1380
+    float                  steer_base_1384;  // +0x1384
+    float                  steer_resp_1388;  // +0x1388
+    float                  brakef_138C;  // +0x138C
+    float                  slide_max_1390;  // +0x1390
+    float                  slide_min_1394;  // +0x1394
+    float                  turn_slow_1398;  // +0x1398
+    float                  turn_fast_139C;  // +0x139C
+    float                  autodrift_13A0;  // +0x13A0
+    float                  turn_rate_13A4;  // +0x13A4
+    float                  surface_grip_13A8;  // +0x13A8 class-0 velocity scrub factor
+    float                  lsdm_limit_13AC;  // +0x13AC
+    float                  lsdm_angle_13B0;  // +0x13B0
+    float                  lsdm_t1_13B4;  // +0x13B4
+    float                  lsdm_t2_13B8;  // +0x13B8
+    float                  accel_mult_13BC;  // +0x13BC
+    float                  kquad_13C0;  // +0x13C0
+    float                  mindrift_13C4;  // +0x13C4
+    float                  maxpress_13C8;  // +0x13C8
+    float                  engbrake_13CC;  // +0x13CC
+    float                  cos_maxdrift_13D0;  // +0x13D0
+    float                  maxboost_13D4;  // +0x13D4
+    float                  corkscrew_13D8;  // +0x13D8
+    float                  cos90_mindrift_air_13DC;  // +0x13DC
+    float                  aggr_time_13E0;  // Steer Away Time (s)
+    float                  aggr_total_13E4;  // Total Out-Of-Control Time (s)
+    float                  aggr_angle_13E8;  // Aggressive Steering Max Angle (deg)
+    float                  aggr_vel_13EC;  // Aggressive Steering Max Velocity
+    float                  aggr_drag_13F0;  // Aggressive Steering Drag Coef
+    unsigned char _pad0E[0x8];
+    unsigned char          input_bits_13FC;  // +0x13FC
+    unsigned char _pad0F[0x3];
+    float                  throttle_1400;  // +0x1400
+    float                  brake_1404;  // +0x1404
+    float                  steer_1408;  // +0x1408
+    unsigned char _pad10[0x8];
+    float                  throttle_raw_1414;  // +0x1414
+    unsigned char _pad11[0x4];
+    float                  thr_prev_141C;  // +0x141C
+    float                  brake_prev_1420;  // +0x1420
+    float                  steer_prev_1424;  // +0x1424
+    unsigned char _pad12[0x4];
+    float                  drift_time_142C;  // +0x142C
+    float                  slide_prev_1430;  // +0x1430
+    float                  drift_dir_1434;  // +0x1434 flipped when gear == -1
+    float                  drift_timer_1438;  // +0x1438
+    float                  airtime_143C;  // +0x143C
+    float                  slide_1440;  // +0x1440
+    unsigned char          boost_1444;  // +0x1444
+    unsigned char _pad13[0x1];
+    unsigned char          flag_b_1446;  // +0x1446
+    unsigned char _pad14[0x1];
+    B3EngineTransmission   trans;  // +0x1448..+0x14D4
+    unsigned char _pad15[0x48];
+    float                  drive_torque_1520;  // +0x1520
+    int                    drift_state_1524;  // +0x1524
+    unsigned char _pad16[0x4];
+    float                  timer_152C;  // +0x152C
+    unsigned char _pad17[0x4];
+    float                  authority_1534;  // +0x1534 driver authority (crash thresholds)
+    unsigned char _pad18[0x4];
+    unsigned char          hit_side_153C;  // +0x153C
+    unsigned char          byte_153D;  // +0x153D
+    unsigned char          no_scrub_153E;  // +0x153E non-class-0: skip the 0.99 scrub
+    unsigned char _pad19[0x11];
+    // The AI driver's LSDM gate. A BYTE: validate_ai.py seeds it with wb()
+    // (s.wb(VEH+0x1550, 0/1)), and B3AiCar carried it as an int -- the same
+    // type defect found 14 times elsewhere. Modelled here because it is the
+    // vehicle's byte, not the racecar's.
+    unsigned char          lsdm_active_1550;  // +0x1550 LSDM engaged
+    unsigned char _pad19c[0x1];
+    // The driver's stop flag. Also a BYTE -- validate_ai.py reads it back
+    // with rb(VEH+0x1552) -- and it too was an int in the struct the port
+    // invented for the driver's outputs.
+    unsigned char          stop_flag_1552;  // +0x1552 driver stop
+    unsigned char _pad19d[0x19];
+    // The AI driver's per-car scratch. These lived in B3AiState, which is a
+    // view of the AI OBJECT at racecar+0x1A00 -- so they sat at vehicle
+    // offsets inside an AI-shaped struct, the same conflation B3AiCar had,
+    // and it blocked the AI object from being transferred at all.
+    float                  prev_throttle_156C;  // +0x156C throttle carried across frames
+    float                  brake_hold_1570;     // +0x1570 brake hold timer
+    float                  dither_1574;         // +0x1574 throttle-dither cycle
+    float                  stuck_arm_1578;      // +0x1578 stuck arm (-1 = disarmed)
+    float                  reverse_timer_157C;  // +0x157C reverse burst (-1 = idle)
+    unsigned char _pad19b[0x110];
+    float                  ooc_wall_1690;  // ... +0x1690 second (wall/spin) stamp
+    unsigned char _pad1A[0x36C];
 
-    // suspension config copies (+0xCA0..+0xCBC)
-    float front_attach, front_damp, front_k, front_len;
-    float rear_attach, rear_damp, rear_k, rear_len;
-
-    // live 0x1360..0x13F0 block
-    float resist_1360, downforce_1364;
-    float brake_h_1368, accel_h_136C, steer_h_1370, drift_h_1374;
-    float steer_min_1378, steer_max_137C, steer_v0_1380, steer_base_1384;
-    float steer_resp_1388, brakef_138C;
-    float slide_max_1390, slide_min_1394;
-    float turn_slow_1398, turn_fast_139C;
-    float autodrift_13A0, turn_rate_13A4;
-    float lsdm_limit_13AC, lsdm_angle_13B0, lsdm_t1_13B4, lsdm_t2_13B8;
-    float accel_mult_13BC, kquad_13C0, mindrift_13C4, maxpress_13C8;
-    float engbrake_13CC, cos_maxdrift_13D0, maxboost_13D4;
-    float corkscrew_13D8, cos90_mindrift_air_13DC;
-
-    // input + drift state
-    float throttle_1400, brake_1404, steer_1408, throttle_raw_1414;
-    unsigned char input_bits_13FC;
-    float thr_prev_141C, brake_prev_1420, steer_prev_1424;
-    float drift_time_142C, slide_prev_1430, drift_timer_1438;
-    float airtime_143C, slide_1440;
-    float steer_deg_1164;
-    int drift_state_1524;
-    unsigned char boost_1444, flag_b_1446, byte_153D, f1168;
-    float timer_152C;
-    float drive_torque_1520;
-    B3EngineTransmission trans;   // +0x1448..+0x14D4
-
-    // ---- control-state bytes the update branches on --------------------
-    // +0x215 VEHICLE CLASS (the constructors: FUN_00117730 leaves 1 on the
-    // two player bodies, FUN_00110280 stamps 2 and 3 on the two AI racer
-    // pools and 4 on the 64 traffic bodies; FUN_00119F40 = 6 and
-    // FUN_001068A0 = 7 are the non-car physics bodies). Only 3 SKIPS the
-    // aggressive-driving-reaction envelope in FUN_0011ECF0, the rollover
-    // handler in FUN_0011BE50 and the countdown launch block; {1,2,3} are
-    // the "is a car" set FUN_00123FD0 tests. Default 1 (player).
-    unsigned char class_215;
-    // +0x212 a chassis contact was resolved this substep (FUN_0011AEF0
-    // sets it, FUN_0011BE50 clears it after every force pass, and the
-    // per-frame FUN_00104840 clears it before the driver stage). It gates
-    // the steer-away envelope OFF.
-    unsigned char contact_212;
-    // +0x153C "which side was I hit on" (the slam classifier FUN_00112AC0 /
-    // FUN_00112DE0 writes it, the two cars getting opposite values). It
-    // picks the SIGN of the forced steer-away lock.
-    unsigned char hit_side_153C;
-
-    // ---- aggressive driving reaction (out-of-control) ------------------
-    // live copies FUN_00134710 installs from config +0x1BC..+0x1CC, plus
-    // the config values behind +0x13F8 the non-OOC path restores and the
-    // owner-object clocks the envelope is measured against.
-    float aggr_time_13E0;      // Steer Away Time (s)
-    float aggr_total_13E4;     // Total Out-Of-Control Time (s)
-    float aggr_angle_13E8;     // Aggressive Steering Max Angle (deg)
-    float aggr_vel_13EC;       // Aggressive Steering Max Velocity
-    float aggr_drag_13F0;      // Aggressive Steering Drag Coef
-    float cfg_steer_max_14C;   // config +0x14C  Steering Max Angle
-    float cfg_steer_maxvel_154;// config +0x154  Steering Max Velocity
-    float cfg_steer_drag_190;  // config +0x190  Steering Drag Coef
-    float ooc_slam_1598;       // owner(+0x13F4)+0x1198 -> +0x1598 slam stamp
-    float ooc_wall_1690;       // ... +0x1690 second (wall/spin) stamp
-    float launch_time_1350;    // owner +0x1350 (the flag_b 3 s clear)
-
-    // ---- FUN_0011AEF0: the chassis-vs-world resolve, IN the substep -----
-    // Retail runs it @0x0011C0B7, between the tyre force pass
-    // (FUN_0011D460 @0x0011C0A2) and the suspension pre-pass
-    // (FUN_001239C0 @0x0011C0E7), so the impulse it pushes into
-    // +0x110/+0x120 and the deflection it pushes into +0x130 are consumed
-    // by THAT substep's FUN_00109560 @0x0011C160.  The response itself is
-    // `b3_crash_response` in burnout3_crash.c; the two files are joined by
-    // this hook rather than a link-time call so every existing build of
-    // burnout3_vehicle_sim.c keeps its dependency set.
+    // ---- HARNESS SIDE, past the retail window. Nothing here carries a
+    // recovered VEHICLE offset (annotations naming config/owner/racecar
+    // belong to other objects), so none of it squats on the game's bytes.
+    // Which emulator pipeline session this car maps to, so a retail backend
+    // reached through a hook (chassis_resolve gets only the vehicle) can name
+    // the session whose veh+0x200 soup belongs to THIS car. -1 = unassigned.
+    int                    emu_slot;
+    /* harness-side: 1 while the RETAIL EMULATOR owns this car's physics step
+     * (b3_emu_slot_of assigned it a live slot), 0 while the port steps it.
+     * Ownership is PER CAR -- B3_EMU_CARS caps how many ride the emulator
+     * (default 1, the player) -- so any "physics is retail" decision taken
+     * per FEATURE instead of per car is wrong for everyone past the cap. */
+    int                    emu_owned;
+    float                  rb_frame_store[4][4];  // HARNESS backing for rb.frame; retail
+    float                  wheel_local_x[4];  // wheel frame row3 x (.bgv +0xB80 attach)
+    float                  wheel_local_z[4];  // wheel frame row3 z
+    float                  wheel_frame_y[4];  // wheel frame row3 y (visual drop)
+    float                  front_attach;  
+    float                  front_damp;  
+    float                  front_k;  
+    float                  front_len;  
+    float                  rear_attach;  
+    float                  rear_damp;  
+    float                  rear_k;  
+    float                  rear_len;  
+    unsigned char          f1168;  
+    float                  cfg_steer_max_14C;  // config +0x14C  Steering Max Angle
+    float                  cfg_steer_maxvel_154;  // config +0x154  Steering Max Velocity
+    float                  cfg_steer_drag_190;  // config +0x190  Steering Drag Coef
+    float                  ooc_slam_1598;  // owner(+0x13F4)+0x1198 -> +0x1598 slam stamp
+    float                  launch_time_1350;  // owner +0x1350 (the flag_b 3 s clear)
+    int                    racecar_class_1920;  // racecar+0x1920 (2 never wall-crashes)
+    int                    is_class0;  // racecar class == 0 -> the second poly set
+    int                    party_mode;  // FUN_00017310 (crash-party thresholds)
+    int                    crash_fired;  // the FUN_0010DCA0 call retail makes
+    float                  crash_dv;  
+    float                  crash_dv_thr;  
+    float                  crash_headon;  
+    float                  crash_headon_thr;  
+    unsigned char          surf_bit15_15CC;  // racecar+0x15CC := surface >> 15
+    float                  clock;  // DAT_0060EA20 mirror
+    float                  boost_elapsed;  
+    int                    boost_ramp_done;  
+    // shapes the generator does not model (function pointers etc.):
     B3ChassisSoup soup;                       // veh+0x200
     void* soup_user;                          // harness cookie
     int (*soup_freeze)(void* user, struct B3VehicleFull* v);  // FUN_0011BC60
     int (*chassis_resolve)(struct B3VehicleFull* v);          // FUN_0011AEF0
     void* soup_ground_user;
+    /* `wheel_gate` distinguishes retail's TWO rays into the same veh+0x200
+     * soup, which are NOT filtered alike:
+     *   1  the per-wheel ray, FUN_001239C0 @0x00123CEF -> FUN_00123790.  That
+     *      one applies the SURFACE GATE @0x00123799..0x0012383E [C]: a
+     *      racing car (veh+0x215 in {1,2,3}, veh+0x210 == 0) skips every
+     *      polygon whose surface low byte is > 0x14 and != 0x26.
+     *   0  the under-body 30 m clearance ray, FUN_001239C0
+     *      @0x00123EC6..0x00123F97 [C], which walks the same soup but calls
+     *      FUN_001B2230 directly @0x00123F00 with NO gate at all.
+     * Passing the flag is what keeps the port from gating both or neither. */
     int (*soup_ground_ray)(void* user, const float start[3],
                            const float end[3], float* hit_t,
-                           float normal[3]);
-
-    // The B3CrashVehicle inputs FUN_0011AEF0 reads that are not on the
-    // rigid body (all named by their live offsets; see burnout3_crash.h).
-    float surface_grip_13A8;  // +0x13A8 class-0 velocity scrub factor
-    float drift_dir_1434;     // +0x1434 flipped when gear == -1
-    float authority_1534;     // +0x1534 driver authority (crash thresholds)
-    unsigned char flags_1353; // +0x1353 bit0|bit2 disable, bit3 blocks crash
-    unsigned char no_scrub_153E;   // +0x153E non-class-0: skip the 0.99 scrub
-    unsigned char landed_211;      // +0x211 "landed on a car" (tail unported)
-    int racecar_class_1920;   // racecar+0x1920 (2 never wall-crashes)
-    int is_class0;            // racecar class == 0 -> the second poly set
-    int party_mode;           // FUN_00017310 (crash-party thresholds)
-
-    // ...and its outputs.  +0x213 is cleared beside +0x212 @0x0011C0B0.
-    unsigned char contact_213;
-    float contact_pt_160[4];  // +0x160 world contact point
-    float contact_n_170[4];   // +0x170 contact normal (wall: flattened)
-    unsigned short surface_190;   // +0x190 surface flags of the contact
-    float impact_194;             // +0x194 impact magnitude
-    int contact_state_198;        // +0x198 0 none / 1 wall / 2 ground
-    int crash_fired;              // the FUN_0010DCA0 call retail makes
-    // ...and, for REPORTING only, the four numbers FUN_0011AEF0's gate
-    // @0x0011B909..0x0011B9A3 tested on the substep that raised it.  Nothing
-    // in the port reads them; they exist because the td_rules wall record is
-    // empty on a crash_fired frame (the two arms never see the same contact),
-    // so the crash printf had nothing true to say.
-    float crash_dv, crash_dv_thr, crash_headon, crash_headon_thr;
-    unsigned char surf_bit15_15CC;// racecar+0x15CC := surface >> 15
-
-    // env exports (damage ctx)
-    float grip_scalar;        // ctx+0x324
-    float ground_clear;       // ctx+0x49C
-    unsigned short surface_1160;
-    float clock;              // DAT_0060EA20 mirror
-    // boost clock plumbing (racecar +0x10DC - +0x11C0 / byte +0x11F1)
-    float boost_elapsed;
-    int   boost_ramp_done;
+                           float normal[3], int wheel_gate);
 } B3VehicleFull;
+
+#define B3_VEHICLE_RETAIL_SPAN 0x1A00u
+_Static_assert(offsetof(B3VehicleFull, rb) == 0, "rb at vehicle+0");
+_Static_assert(offsetof(B3VehicleFull, contact_pt_160) == 0x0160, "contact_pt_160 off retail");
+_Static_assert(offsetof(B3VehicleFull, contact_n_170) == 0x0170, "contact_n_170 off retail");
+_Static_assert(offsetof(B3VehicleFull, surface_190) == 0x0190, "surface_190 off retail");
+_Static_assert(offsetof(B3VehicleFull, impact_194) == 0x0194, "impact_194 off retail");
+_Static_assert(offsetof(B3VehicleFull, contact_state_198) == 0x0198, "contact_state_198 off retail");
+_Static_assert(offsetof(B3VehicleFull, half_ext) == 0x01D0, "half_ext off retail");
+_Static_assert(offsetof(B3VehicleFull, center_off) == 0x01E0, "center_off off retail");
+_Static_assert(offsetof(B3VehicleFull, mass) == 0x01F0, "mass off retail");
+_Static_assert(offsetof(B3VehicleFull, com_height) == 0x01F4, "com_height off retail");
+_Static_assert(offsetof(B3VehicleFull, asleep_020E) == 0x020E, "asleep_020E off retail");
+_Static_assert(offsetof(B3VehicleFull, landed_211) == 0x0211, "landed_211 off retail");
+_Static_assert(offsetof(B3VehicleFull, contact_212) == 0x0212, "contact_212 off retail");
+_Static_assert(offsetof(B3VehicleFull, contact_213) == 0x0213, "contact_213 off retail");
+_Static_assert(offsetof(B3VehicleFull, class_215) == 0x0215, "class_215 off retail");
+_Static_assert(offsetof(B3VehicleFull, grip_scalar) == 0x0324, "grip_scalar off retail");
+_Static_assert(offsetof(B3VehicleFull, ground_clear) == 0x049C, "ground_clear off retail");
+_Static_assert(offsetof(B3VehicleFull, wheel) == 0x0820, "wheel off retail");
+_Static_assert(offsetof(B3VehicleFull, surface_1160) == 0x1160, "surface_1160 off retail");
+_Static_assert(offsetof(B3VehicleFull, steer_deg_1164) == 0x1164, "steer_deg_1164 off retail");
+_Static_assert(offsetof(B3VehicleFull, wheel_count) == 0x1169, "wheel_count off retail");
+_Static_assert(offsetof(B3VehicleFull, flags_1353) == 0x1353, "flags_1353 off retail");
+_Static_assert(offsetof(B3VehicleFull, resist_1360) == 0x1360, "resist_1360 off retail");
+_Static_assert(offsetof(B3VehicleFull, downforce_1364) == 0x1364, "downforce_1364 off retail");
+_Static_assert(offsetof(B3VehicleFull, brake_h_1368) == 0x1368, "brake_h_1368 off retail");
+_Static_assert(offsetof(B3VehicleFull, accel_h_136C) == 0x136C, "accel_h_136C off retail");
+_Static_assert(offsetof(B3VehicleFull, steer_h_1370) == 0x1370, "steer_h_1370 off retail");
+_Static_assert(offsetof(B3VehicleFull, drift_h_1374) == 0x1374, "drift_h_1374 off retail");
+_Static_assert(offsetof(B3VehicleFull, steer_min_1378) == 0x1378, "steer_min_1378 off retail");
+_Static_assert(offsetof(B3VehicleFull, steer_max_137C) == 0x137C, "steer_max_137C off retail");
+_Static_assert(offsetof(B3VehicleFull, steer_v0_1380) == 0x1380, "steer_v0_1380 off retail");
+_Static_assert(offsetof(B3VehicleFull, steer_base_1384) == 0x1384, "steer_base_1384 off retail");
+_Static_assert(offsetof(B3VehicleFull, steer_resp_1388) == 0x1388, "steer_resp_1388 off retail");
+_Static_assert(offsetof(B3VehicleFull, brakef_138C) == 0x138C, "brakef_138C off retail");
+_Static_assert(offsetof(B3VehicleFull, slide_max_1390) == 0x1390, "slide_max_1390 off retail");
+_Static_assert(offsetof(B3VehicleFull, slide_min_1394) == 0x1394, "slide_min_1394 off retail");
+_Static_assert(offsetof(B3VehicleFull, turn_slow_1398) == 0x1398, "turn_slow_1398 off retail");
+_Static_assert(offsetof(B3VehicleFull, turn_fast_139C) == 0x139C, "turn_fast_139C off retail");
+_Static_assert(offsetof(B3VehicleFull, autodrift_13A0) == 0x13A0, "autodrift_13A0 off retail");
+_Static_assert(offsetof(B3VehicleFull, turn_rate_13A4) == 0x13A4, "turn_rate_13A4 off retail");
+_Static_assert(offsetof(B3VehicleFull, surface_grip_13A8) == 0x13A8, "surface_grip_13A8 off retail");
+_Static_assert(offsetof(B3VehicleFull, lsdm_limit_13AC) == 0x13AC, "lsdm_limit_13AC off retail");
+_Static_assert(offsetof(B3VehicleFull, lsdm_angle_13B0) == 0x13B0, "lsdm_angle_13B0 off retail");
+_Static_assert(offsetof(B3VehicleFull, lsdm_t1_13B4) == 0x13B4, "lsdm_t1_13B4 off retail");
+_Static_assert(offsetof(B3VehicleFull, lsdm_t2_13B8) == 0x13B8, "lsdm_t2_13B8 off retail");
+_Static_assert(offsetof(B3VehicleFull, accel_mult_13BC) == 0x13BC, "accel_mult_13BC off retail");
+_Static_assert(offsetof(B3VehicleFull, kquad_13C0) == 0x13C0, "kquad_13C0 off retail");
+_Static_assert(offsetof(B3VehicleFull, mindrift_13C4) == 0x13C4, "mindrift_13C4 off retail");
+_Static_assert(offsetof(B3VehicleFull, maxpress_13C8) == 0x13C8, "maxpress_13C8 off retail");
+_Static_assert(offsetof(B3VehicleFull, engbrake_13CC) == 0x13CC, "engbrake_13CC off retail");
+_Static_assert(offsetof(B3VehicleFull, cos_maxdrift_13D0) == 0x13D0, "cos_maxdrift_13D0 off retail");
+_Static_assert(offsetof(B3VehicleFull, maxboost_13D4) == 0x13D4, "maxboost_13D4 off retail");
+_Static_assert(offsetof(B3VehicleFull, corkscrew_13D8) == 0x13D8, "corkscrew_13D8 off retail");
+_Static_assert(offsetof(B3VehicleFull, cos90_mindrift_air_13DC) == 0x13DC, "cos90_mindrift_air_13DC off retail");
+_Static_assert(offsetof(B3VehicleFull, aggr_time_13E0) == 0x13E0, "aggr_time_13E0 off retail");
+_Static_assert(offsetof(B3VehicleFull, aggr_total_13E4) == 0x13E4, "aggr_total_13E4 off retail");
+_Static_assert(offsetof(B3VehicleFull, aggr_angle_13E8) == 0x13E8, "aggr_angle_13E8 off retail");
+_Static_assert(offsetof(B3VehicleFull, aggr_vel_13EC) == 0x13EC, "aggr_vel_13EC off retail");
+_Static_assert(offsetof(B3VehicleFull, aggr_drag_13F0) == 0x13F0, "aggr_drag_13F0 off retail");
+_Static_assert(offsetof(B3VehicleFull, input_bits_13FC) == 0x13FC, "input_bits_13FC off retail");
+_Static_assert(offsetof(B3VehicleFull, throttle_1400) == 0x1400, "throttle_1400 off retail");
+_Static_assert(offsetof(B3VehicleFull, brake_1404) == 0x1404, "brake_1404 off retail");
+_Static_assert(offsetof(B3VehicleFull, steer_1408) == 0x1408, "steer_1408 off retail");
+_Static_assert(offsetof(B3VehicleFull, throttle_raw_1414) == 0x1414, "throttle_raw_1414 off retail");
+_Static_assert(offsetof(B3VehicleFull, thr_prev_141C) == 0x141C, "thr_prev_141C off retail");
+_Static_assert(offsetof(B3VehicleFull, brake_prev_1420) == 0x1420, "brake_prev_1420 off retail");
+_Static_assert(offsetof(B3VehicleFull, steer_prev_1424) == 0x1424, "steer_prev_1424 off retail");
+_Static_assert(offsetof(B3VehicleFull, drift_time_142C) == 0x142C, "drift_time_142C off retail");
+_Static_assert(offsetof(B3VehicleFull, slide_prev_1430) == 0x1430, "slide_prev_1430 off retail");
+_Static_assert(offsetof(B3VehicleFull, drift_dir_1434) == 0x1434, "drift_dir_1434 off retail");
+_Static_assert(offsetof(B3VehicleFull, drift_timer_1438) == 0x1438, "drift_timer_1438 off retail");
+_Static_assert(offsetof(B3VehicleFull, airtime_143C) == 0x143C, "airtime_143C off retail");
+_Static_assert(offsetof(B3VehicleFull, slide_1440) == 0x1440, "slide_1440 off retail");
+_Static_assert(offsetof(B3VehicleFull, boost_1444) == 0x1444, "boost_1444 off retail");
+_Static_assert(offsetof(B3VehicleFull, flag_b_1446) == 0x1446, "flag_b_1446 off retail");
+_Static_assert(offsetof(B3VehicleFull, trans) == 0x1448, "trans off retail");
+_Static_assert(offsetof(B3VehicleFull, drive_torque_1520) == 0x1520, "drive_torque_1520 off retail");
+_Static_assert(offsetof(B3VehicleFull, drift_state_1524) == 0x1524, "drift_state_1524 off retail");
+_Static_assert(offsetof(B3VehicleFull, timer_152C) == 0x152C, "timer_152C off retail");
+_Static_assert(offsetof(B3VehicleFull, authority_1534) == 0x1534, "authority_1534 off retail");
+_Static_assert(offsetof(B3VehicleFull, hit_side_153C) == 0x153C, "hit_side_153C off retail");
+_Static_assert(offsetof(B3VehicleFull, byte_153D) == 0x153D, "byte_153D off retail");
+_Static_assert(offsetof(B3VehicleFull, no_scrub_153E) == 0x153E, "no_scrub_153E off retail");
+_Static_assert(offsetof(B3VehicleFull, prev_throttle_156C) == 0x156C, "prev_throttle_156C off retail");
+_Static_assert(offsetof(B3VehicleFull, brake_hold_1570) == 0x1570, "brake_hold_1570 off retail");
+_Static_assert(offsetof(B3VehicleFull, dither_1574) == 0x1574, "dither_1574 off retail");
+_Static_assert(offsetof(B3VehicleFull, stuck_arm_1578) == 0x1578, "stuck_arm_1578 off retail");
+_Static_assert(offsetof(B3VehicleFull, reverse_timer_157C) == 0x157C, "reverse_timer_157C off retail");
+_Static_assert(offsetof(B3VehicleFull, stop_flag_1552) == 0x1552, "stop_flag_1552 off retail");
+_Static_assert(offsetof(B3VehicleFull, lsdm_active_1550) == 0x1550, "lsdm_active_1550 off retail");
+_Static_assert(offsetof(B3VehicleFull, ooc_wall_1690) == 0x1690, "ooc_wall_1690 off retail");
 
 // ---------------------------------------------------------------------------
 // Aggressive driving reaction / "steer away" -- FUN_0011ECF0's head
@@ -740,5 +1012,27 @@ void b3_lsdm_update(B3VehicleFull* v, float dt);
 // (harness pose placement, collision push-out). The integrator refreshes
 // them every step; this covers state edits between steps.
 void b3_vehicle_full_refresh_derived(B3VehicleFull* v);
+
+// Point a rigid body at its frame storage. Call AFTER any memset of the body.
+//
+// ZEROES the storage as well as binding it, and that is not optional: callers
+// have always relied on `memset(&rb, 0, sizeof rb)` to clear the 4x4 along
+// with everything else. Now that the matrix lives outside the struct, that
+// memset no longer reaches it, so an unzeroed body inherits whatever was on
+// the stack -- which showed up as an intermittent NaN in the physics about one
+// run in three, with every suite still green.
+static inline void b3_rigid_body_bind_frame(B3RigidBody* rb, float (*store)[4])
+{
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) store[r][c] = 0.0f;
+    rb->frame = store;
+}
+
+// Declare a local body with its own storage, already bound. Use this instead
+// of a bare `B3RigidBody x;` -- a bare one has a NULL frame and faults on the
+// first row write.
+#define B3_RIGID_BODY_LOCAL(name) \
+    B3RigidBody name; float name##__frame_store[4][4]; \
+    b3_rigid_body_bind_frame(&(name), name##__frame_store)
 
 #endif // BURNOUT3_VEHICLE_SIM_H

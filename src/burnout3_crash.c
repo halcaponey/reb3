@@ -30,6 +30,8 @@
 #include <string.h>
 
 #include "burnout3_crash.h"
+#include "burnout3_backend.h"
+#include "burnout3_emu.h"
 #include "burnout3_vehicle_sim.h"
 
 /* CRASH-AUDIT instrumentation.  B3_WALLGATE=1 prints one line per APPLIED
@@ -157,41 +159,81 @@ static int sliver_edge(const float a[4], const float c[4]) {
     return 0;
 }
 
-// FUN_0011AC30 [C] (normal race mode -- the crash-party '&'-poly and
-// '&'-wheel skips at its head are gated on FUN_00017310 and are [S]).
-void b3_crash_poly_contact(const B3CrashPoly* poly, unsigned short flags,
-                           B3CrashContactAcc* acc) {
-    // transform the three verts into body space (4-wide MULPS/ADDPS chain)
+// FUN_0011AC30's GEOMETRY ADMISSION, factored out [C].
+//
+// THE TWO GATES THAT DECIDE WHETHER RETAIL SEES A WALL AT ALL.  Everything
+// downstream -- the aggregate normal, the impulse, veh+0x194, the
+// dv > authority*27.5 / headon > authority*0.707 crash trigger -- only ever
+// runs on a polygon that got through here:
+//
+//   1  the near-vertical SLIVER REJECT (|n.y| < 0.2 [0x3A69B4]).  A face with
+//      any edge shorter than 0.5 m vertically [0x3B1684] and 0.447 m
+//      horizontally is dropped by FUN_0011ABB0.  A curb riser triangulated
+//      with a vertical edge is exactly that shape -- 94.8% of the shipped
+//      short near-vertical faces die here.
+//   2  the BOX CLIP against veh+0x1D0 / veh+0x1E0 (FUN_001B0C00), which needs
+//      >= 3 surviving verts.  The chassis box bottom is bbmin.y BELOW the
+//      wheel-hub plane, i.e. 0.1612 m above the road on COMPCAR1, so any curb
+//      whose top is lower than that is clipped away entirely.
+//
+// Returns 1 when the polygon would enter one of the accumulators.  Shared
+// with b3_crash_poly_contact below so the two cannot drift apart.
+static int crash_poly_admit(const B3CrashPoly* poly, const float inv[4][4],
+                            const float bbmax[4], const float bbmin[4],
+                            float clip[9][4], int* out_n, float cent[4]) {
     float v[3][4];
-    frame_point(acc->inv, poly->p0, v[0]);
-    frame_point(acc->inv, poly->p1, v[1]);
-    frame_point(acc->inv, poly->p2, v[2]);
+    frame_point(inv, poly->p0, v[0]);
+    frame_point(inv, poly->p1, v[1]);
+    frame_point(inv, poly->p2, v[2]);
 
     // near-vertical polys: reject slivers (|n.y| < 0.2 [0x3A69B4])
     if (fabsf(poly->n[1]) < 0.2f) {
         float ex = v[0][0] - v[1][0];
         float ey = v[0][1] - v[1][1];
         float ez = v[0][2] - v[1][2];
-        if (fabsf(ey) < 0.5f && ez * ez + ex * ex < 0.2f) return;
-        if (sliver_edge(v[0], v[2])) return;
-        if (sliver_edge(v[1], v[2])) return;
+        if (fabsf(ey) < 0.5f && ez * ez + ex * ex < 0.2f) return 0;
+        if (sliver_edge(v[0], v[2])) return 0;
+        if (sliver_edge(v[1], v[2])) return 0;
     }
 
-    float clip[9][4];
-    int n = b3_crash_box_clip(acc->bbmax, acc->bbmin,
-                              (const float(*)[4])v, clip);
-    if (n < 3) return;
+    int n = b3_crash_box_clip(bbmax, bbmin, (const float(*)[4])v, clip);
+    if (n < 3) return 0;
+    *out_n = n;
 
-    int ground = poly->n[1] > 0.7f;          // [0x3B17D8]
-
-    float cent[4] = {clip[0][0], clip[0][1], clip[0][2], clip[0][3]};
+    cent[0] = clip[0][0]; cent[1] = clip[0][1];
+    cent[2] = clip[0][2]; cent[3] = clip[0][3];
     for (int i = 1; i < n; i++)
         for (int k = 0; k < 4; k++) cent[k] += clip[i][k];
     float invn = 1.0f / (float)n;
     for (int k = 0; k < 4; k++) cent[k] *= invn;
 
+    // ground faces additionally need a low centroid [0x39B2B0]
+    if (poly->n[1] > 0.7f && 0.35f < cent[1]) return 0;
+    return 1;
+}
+
+int b3_crash_poly_admits(const B3CrashPoly* poly, const float inv[4][4],
+                         const float bbmax[4], const float bbmin[4]) {
+    float clip[9][4], cent[4];
+    int n = 0;
+    if (!poly || !inv || !bbmax || !bbmin) return 0;
+    return crash_poly_admit(poly, inv, bbmax, bbmin, clip, &n, cent);
+}
+
+// FUN_0011AC30 [C] (normal race mode -- the crash-party '&'-poly and
+// '&'-wheel skips at its head are gated on FUN_00017310 and are [S]).
+void b3_crash_poly_contact(const B3CrashPoly* poly, unsigned short flags,
+                           B3CrashContactAcc* acc) {
+    float clip[9][4];
+    float cent[4];
+    int n = 0;
+    if (!crash_poly_admit(poly, (const float(*)[4])acc->inv, acc->bbmax,
+                          acc->bbmin, clip, &n, cent))
+        return;
+
+    int ground = poly->n[1] > 0.7f;          // [0x3B17D8]
+
     if (ground) {
-        if (0.35f < cent[1]) return;         // [0x39B2B0]
         for (int k = 0; k < 4; k++) acc->gnd_n[k] += poly->n[k];
         for (int k = 0; k < 4; k++) acc->gnd_cent[k] += cent[k];
         acc->gnd_count++;
@@ -584,6 +626,23 @@ int b3_vehicle_chassis_contact(B3VehicleFull* v) {
     B3CrashVehicle cv;
     int n;
 
+    /* crash=retail: FUN_0011AEF0 over the port's own bytes, at retail's own
+     * call site inside the substep loop. Thiscall, ECX = the vehicle. The 26
+     * fields it touches go over at their retail offsets and come straight
+     * back -- including the four accumulators (+0xF0/+0x110/+0x120/+0x130)
+     * that the integrator consumes and clears at the end of THIS substep, so
+     * a wall response stays a force inside the solve rather than a post-hoc
+     * correction. The veh+0x200 soup it reads is the one the port uploaded.
+     *
+     * B3CrashVehicle is not involved: it is a fourth partial view of the
+     * vehicle, and every field in it is a B3VehicleFull field at the same
+     * offset, so the transfer works off B3VehicleFull directly. */
+    if (b3_backend_get(B3_FEAT_CRASH) == B3_BACKEND_RETAIL) {
+        int wall_n = 0;
+        if (b3_emu_chassis_resolve(v->emu_slot, v, &wall_n))
+            return wall_n;
+    }
+
     memset(&cv, 0, sizeof cv);
     memcpy(cv.frame, rb->frame, sizeof cv.frame);            // +0x204
     memcpy(cv.inv, rb->inv_frame, sizeof cv.inv);            // +0x70
@@ -952,14 +1011,33 @@ static void wreck_world_inertia(const B3WreckState* w, float out[3][4]) {
 }
 
 // world->body inverse (FUN_00040AE0: transpose + pos = -pos*R)
+//
+// THE TRANSPOSE COMES FIRST.  Retail's FUN_00040AE0 swaps the three
+// off-diagonal pairs IN PLACE and only then back-rotates the translation
+// against the ALREADY-TRANSPOSED rows -- which is what the two other ports of
+// the same function in this tree do (b3_mat_invert_rigid,
+// burnout3_vehicle_sim.c, and b3p_build_inv_frame, burnout3_props.c).  This
+// one used to multiply the translation against the ORIGINAL matrix:
+//
+//     inv[3][j] = -(f[3][0]*f[0][j] + f[3][1]*f[1][j] + f[3][2]*f[2][j])
+//
+// which is -(pos . column j) instead of -(pos . row j).  The two agree only
+// when the rotation block is symmetric (an unyawed car) or when pos is the
+// origin -- and the origin is exactly where the crash oracle
+// tools/validate_crash_traj.py seeds its wrecks, which is why the suite never
+// saw it.  A wreck yawed 37 deg at a real track coordinate
+// (5466, 164, -2314) had every world point it transformed land 7.1 km away,
+// so b3_wreck_world_contact's narrow phase could not intersect ANY wall: the
+// wreck's whole world-contact arm was silently dead and wrecks drove through
+// barriers.
 static void wreck_inv_frame(const float f[4][4], float inv[4][4]) {
     for (int i = 0; i < 3; i++)
         for (int j = 0; j < 3; j++)
             inv[i][j] = f[j][i];
     inv[0][3] = inv[1][3] = inv[2][3] = 0.0f;
     for (int j = 0; j < 3; j++)
-        inv[3][j] = -(f[3][0] * f[0][j] + f[3][1] * f[1][j]
-                      + f[3][2] * f[2][j]);
+        inv[3][j] = -(f[3][0] * inv[0][j] + f[3][1] * inv[1][j]
+                      + f[3][2] * inv[2][j]);
     inv[3][3] = 1.0f;
 }
 
@@ -1408,7 +1486,8 @@ void b3_wreck_report_hit(B3WreckState* w, const float n[3],
 // wreck's own box.  What is NOT retail is the single contact plane it is
 // given (row PH-09).
 // ---------------------------------------------------------------------------
-static B3ObbPlaneFn     g_wreck_narrow_phase = NULL;   /* FUN_00107950 */
+static B3ObbPlaneFn     g_wreck_narrow_phase = NULL;   /* FUN_00107950, 1 poly */
+static B3ObbSoupFn      g_wreck_soup_phase    = NULL;   /* FUN_00107950, soup  */
 static B3WorldContactFn g_wreck_resolve       = NULL;   /* FUN_00109EA0 */
 
 void b3_wreck_set_world_resolve(B3ObbPlaneFn narrow_phase,
@@ -1417,38 +1496,115 @@ void b3_wreck_set_world_resolve(B3ObbPlaneFn narrow_phase,
     g_wreck_resolve = resolve;
 }
 
+void b3_wreck_set_world_soup(B3ObbSoupFn soup_phase) {
+    g_wreck_soup_phase = soup_phase;
+}
+
+/* The GAME-space rigid-body view of the wreck the two passes below share:
+ * chirality mirror in, the +0x110/+0x120/+0x130 accumulators carried in so a
+ * second contact in the same frame adds to the first exactly as they do
+ * between the collision manager's passes. */
+static void wreck_rb_load(const B3WreckState* w, B3WreckState* gw,
+                          B3RigidBody* rb, float store[4][4]) {
+    *gw = *w;
+    mirror_frame(gw->frame);
+    mirror_vec(gw->vel);
+    mirror_pseudo(gw->angmom);
+    mirror_pseudo(gw->omega);
+
+    memset(rb, 0, sizeof *rb);
+    /* bind AFTER the memset -- it would zero the frame pointer */
+    b3_rigid_body_bind_frame(rb, store);
+    memcpy(rb->frame, gw->frame, 16 * sizeof(float));
+    memcpy(rb->vel, gw->vel, sizeof rb->vel);
+    memcpy(rb->angmom, gw->angmom, sizeof rb->angmom);
+    memcpy(rb->omega, gw->omega, sizeof rb->omega);
+    memcpy(rb->inv_inertia_body, w->iinv_body, sizeof rb->inv_inertia_body);
+    wreck_world_inertia(gw, rb->inv_inertia_world);
+    wreck_inv_frame((const float(*)[4])gw->frame, rb->inv_frame);
+    for (int i = 0; i < 3; i++)
+        rb->dir[i] = (w->vel[3] > 1e-4f) ? gw->vel[i] / w->vel[3]
+                                         : rb->frame[2][i];
+    memcpy(rb->imp_force, w->pend_imp, sizeof rb->imp_force);
+    memcpy(rb->imp_torque, w->pend_imp_torque, sizeof rb->imp_torque);
+    memcpy(rb->deflection, w->pend_defl, sizeof rb->deflection);
+    mirror_vec(rb->imp_force);
+    mirror_pseudo(rb->imp_torque);
+    mirror_vec(rb->deflection);
+}
+
+/* ...and back out.  The resolve's velocity scrub / damp arm acts in place,
+ * not through an accumulator: FUN_00109EA0 writes +0xB0 directly. */
+static void wreck_rb_store(B3WreckState* w, B3RigidBody* rb,
+                           const B3WorldContactResult* res) {
+    mirror_vec(rb->imp_force);
+    mirror_pseudo(rb->imp_torque);
+    mirror_vec(rb->deflection);
+    memcpy(w->pend_imp, rb->imp_force, sizeof w->pend_imp);
+    memcpy(w->pend_imp_torque, rb->imp_torque, sizeof w->pend_imp_torque);
+    memcpy(w->pend_defl, rb->deflection, sizeof w->pend_defl);
+    mirror_vec(rb->vel);
+    mirror_pseudo(rb->angmom);
+    mirror_pseudo(rb->omega);
+    memcpy(w->vel, rb->vel, sizeof w->vel);
+    memcpy(w->angmom, rb->angmom, sizeof w->angmom);
+    memcpy(w->omega, rb->omega, sizeof w->omega);
+    if (res->sleep) w->asleep = 1;
+}
+
+int b3_wreck_world_contact_soup(B3WreckState* w, const B3WorldPoly* polys,
+                                int npoly) {
+    if (!w->active || !g_wreck_resolve || !g_wreck_soup_phase) return 0;
+
+    B3WreckState gw;
+    B3RigidBody rb; float rb__frame_store[4][4];
+    wreck_rb_load(w, &gw, &rb, rb__frame_store);
+
+    /* Chirality: the soup is handed in HARNESS space, the ported law runs in
+     * GAME space.  A vertex and a face normal are both true vectors, so both
+     * just z-negate (see the note on B3WreckState). */
+    enum { WRECK_SOUP_MAX = 128 };
+    B3WorldPoly gp[WRECK_SOUP_MAX];
+    if (npoly > WRECK_SOUP_MAX) npoly = WRECK_SOUP_MAX;
+    for (int i = 0; i < npoly; i++) {
+        for (int k = 0; k < 3; k++) {
+            gp[i].v[k][0] =  polys[i].v[k][0];
+            gp[i].v[k][1] =  polys[i].v[k][1];
+            gp[i].v[k][2] = -polys[i].v[k][2];
+        }
+        gp[i].n[0] =  polys[i].n[0];
+        gp[i].n[1] =  polys[i].n[1];
+        gp[i].n[2] = -polys[i].n[2];
+    }
+
+    B3WorldContact ct;
+    B3WorldContactResult res;
+    const int hit = g_wreck_soup_phase(&rb, w->bbmin, w->bbmax, gp, npoly,
+                                       &ct);
+    /* ONE resolve per frame, whatever the soup held -- FUN_00122D00's single
+     * FUN_00109EA0 call @0x00122F81.  cls = veh+0x215 (1/2/3 are the racecar
+     * states: gate 1.0, damp 0.95, no gravity add); restitution = the
+     * rigid-body ctor's +0x1F8 [0x003A69C4] = 0.1 @0x001094C5 -- FUN_00122830
+     * does not override it. */
+    g_wreck_resolve(&rb, w->mass, w->state215 ? w->state215 : 1,
+                    0, 0.1f, hit ? &ct : NULL, &res);
+    wreck_rb_store(w, &rb, &res);
+    if (res.impulsed) {
+        /* PANELS: the same channel the suspension pass publishes on.  The
+         * contact normal comes back in game space; mirror it home. */
+        const float n3[3] = { ct.normal[0], ct.normal[1], -ct.normal[2] };
+        b3_wreck_report_hit(w, n3, res.impact, /*collision=*/1);
+    }
+    return hit;
+}
+
 int b3_wreck_world_contact(B3WreckState* w, const float hit_pos[3],
                            const float hit_n[3]) {
     if (!w->active || !g_wreck_resolve) return 0;
 
-    // Chirality: every ported law runs in GAME space (see the note on
-    // B3WreckState).  Vectors z-negate; the plane normal is a true vector.
-    B3WreckState gw = *w;
-    mirror_frame(gw.frame);
-    mirror_vec(gw.vel);
-    mirror_pseudo(gw.angmom);
-    mirror_pseudo(gw.omega);
-
-    B3RigidBody rb;
-    memset(&rb, 0, sizeof rb);
-    memcpy(rb.frame, gw.frame, sizeof rb.frame);
-    memcpy(rb.vel, gw.vel, sizeof rb.vel);
-    memcpy(rb.angmom, gw.angmom, sizeof rb.angmom);
-    memcpy(rb.omega, gw.omega, sizeof rb.omega);
-    memcpy(rb.inv_inertia_body, w->iinv_body, sizeof rb.inv_inertia_body);
-    wreck_world_inertia(&gw, rb.inv_inertia_world);
-    wreck_inv_frame((const float(*)[4])gw.frame, rb.inv_frame);
-    for (int i = 0; i < 3; i++)
-        rb.dir[i] = (w->vel[3] > 1e-4f) ? gw.vel[i] / w->vel[3]
-                                        : rb.frame[2][i];
-    // the accumulators carry: a second contact in the same frame adds to the
-    // first, exactly as +0x110/+0x120/+0x130 do between the manager's passes
-    memcpy(rb.imp_force, w->pend_imp, sizeof rb.imp_force);
-    memcpy(rb.imp_torque, w->pend_imp_torque, sizeof rb.imp_torque);
-    memcpy(rb.deflection, w->pend_defl, sizeof rb.deflection);
-    mirror_vec(rb.imp_force);
-    mirror_pseudo(rb.imp_torque);
-    mirror_vec(rb.deflection);
+    B3WreckState gw;
+    B3RigidBody rb; float rb__frame_store[4][4];
+    wreck_rb_load(w, &gw, &rb, rb__frame_store);
 
     const float ppt[3] = { hit_pos[0], hit_pos[1], -hit_pos[2] };
     const float pn[3]  = { hit_n[0],   hit_n[1],   -hit_n[2] };
@@ -1462,23 +1618,7 @@ int b3_wreck_world_contact(B3WreckState* w, const float hit_pos[3],
     g_wreck_resolve(&rb, w->mass, w->state215 ? w->state215 : 1,
                     0, 0.1f, hit ? &ct : NULL, &res);
 
-    // fold the accumulators back into the wreck's pending channel, mirrored
-    // to harness space (imp is a vector, the angular impulse a pseudovector)
-    mirror_vec(rb.imp_force);
-    mirror_pseudo(rb.imp_torque);
-    mirror_vec(rb.deflection);
-    memcpy(w->pend_imp, rb.imp_force, sizeof w->pend_imp);
-    memcpy(w->pend_imp_torque, rb.imp_torque, sizeof w->pend_imp_torque);
-    memcpy(w->pend_defl, rb.deflection, sizeof w->pend_defl);
-    // the resolve's velocity scrub / damp arm acts in place, not through an
-    // accumulator: FUN_00109EA0 writes +0xB0 directly.
-    mirror_vec(rb.vel);
-    mirror_pseudo(rb.angmom);
-    mirror_pseudo(rb.omega);
-    memcpy(w->vel, rb.vel, sizeof w->vel);
-    memcpy(w->angmom, rb.angmom, sizeof w->angmom);
-    memcpy(w->omega, rb.omega, sizeof w->omega);
-    if (res.sleep) w->asleep = 1;
+    wreck_rb_store(w, &rb, &res);
     if (res.impulsed) {
         // PANELS: the same channel the suspension pass publishes on.
         float n3[3] = { hit_n[0], hit_n[1], hit_n[2] };
@@ -1506,9 +1646,11 @@ void b3_wreck_update(B3WreckState* w, float ground_y, float dt) {
     mirror_pseudo(gw.angmom);
     mirror_pseudo(gw.omega);
 
-    B3RigidBody rb;
+    B3RigidBody rb; float rb__frame_store[4][4];
     memset(&rb, 0, sizeof(rb));
-    memcpy(rb.frame, gw.frame, sizeof(rb.frame));
+    /* bind AFTER the memset -- it would zero the frame pointer */
+    b3_rigid_body_bind_frame(&rb, rb__frame_store);
+    memcpy(rb.frame, gw.frame, 16 * sizeof(float));
     memcpy(rb.vel, gw.vel, sizeof(rb.vel));
     memcpy(rb.angmom, gw.angmom, sizeof(rb.angmom));
     memcpy(rb.omega, gw.omega, sizeof(rb.omega));

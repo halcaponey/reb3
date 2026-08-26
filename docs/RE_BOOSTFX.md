@@ -1,5 +1,11 @@
 # RE_BOOSTFX — the boost exhaust flame, and the boost sound
 
+> **Status (2026-08-22).** The art extraction is C now: where this document says
+> `python3 tools/extract_boostfx_art.py`, the live implementation is the
+> `boostfx_art` stage in `tools/cextract/cx_art_fx.c`. The Python path is a
+> forwarding shim onto the immutable archive and produces identical bytes by
+> gate. Findings unaffected.
+
 Recovered from `build/burnout3.elf` (the correctly-mapped ELF of the retail
 Xbox `default.xbe`). Implemented in `src/burnout3_boostfx.{c,h}` (visual) and
 `src/burnout3_sfx.{c,h}` (audio); asserted by `tools/validate_boostfx.py`

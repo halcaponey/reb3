@@ -1,31 +1,55 @@
 # TODO — Burnout 3: Takedown RE harness
 
-State as of **2026-08-14, master `a88c43f`**. Everything below is open; each
+State as of **2026-08-22, master `332de42`**. Everything below is open; each
 item names its blocker and the retail function to start from. Nothing here is
 waiting on information that is missing from the executable — every physics row
 has been traced far enough to name what unlocks it.
 
 Ground rules that apply to all of it: physics/collision/triggers/control flow
 are strict 1:1 with retail (`[C]`/`[S]`/`[?]` provenance with addresses, GLUE
-marks on harness inventions); rendering LOOK is explicitly relaxed. Keep all
-15 suites green, and build BOTH targets (`make -j4` and `android/`).
+marks on harness inventions); rendering LOOK is explicitly relaxed. Keep the
+suites green — 39 `tools/validate_*.py` plus three C ones — and build **all
+three** targets: `make -j4` (desktop), `make wasm` (web), and `android/`.
+
+Two standing gates that are not optional:
+
+* **`tools/validate_no_baked_data.py`** — no game-derived data may be compiled
+  into `src/`. It asserts both halves: the eight generated headers are gone and
+  unreferenced, *and* the replacements really come off disk.
+* **`tools/cextract/verify_cextract.py`** — any change to the C extraction
+  pipeline must still produce byte-identical artefacts against the immutable
+  Python oracle in `tools/py_extract_archive/`. Never edit the archive to make
+  the gate pass.
 
 ---
 
 ## 1. Physics fidelity — the main goal
 
-Ledger: `docs/PHYSICS_GLUE_LEDGER.md` — **18 recovered / 3 proven-unrecoverable
-/ 6 blocked**, plus 1 decided-but-not-landed.
+Ledger: `docs/PHYSICS_GLUE_LEDGER.md` is authoritative for the row-by-row
+status (recovered / proven-unrecoverable / blocked). As of 2026-08-14 it stood
+at **18 recovered / 3 proven-unrecoverable / 6 blocked**, plus 1
+decided-but-not-landed; **blocker A has since closed two of the six** (PH-10,
+PH-12) and unblocked a third (PH-17), so re-read the ledger rather than this
+tally.
 
-The six blocked rows collapse onto **three root blockers**. Work the blockers,
-not the rows — each one closes two or three rows at once.
+The blocked rows collapse onto **root blockers**. Work the blockers, not the
+rows — each one closes two or three rows at once.
 
-### Blocker A — the `.bgd` nav-node walk *(closes PH-10, PH-12, PH-17)*
+### Blocker A — the `.bgd` nav-node walk — **LARGELY CLOSED (2026-08-22)**
 
-Port `FUN_00175B10` (nav-node walk) and `FUN_00170820` (the route-following
-driver reached from the autopilot flag `racecar+0x27D8`). `FUN_00179760` is
-the navigator reset helper invoked by `FUN_001714F0`, not the walker. Owner:
-the AI-DRIVE lane of work.
+`FUN_00170820` (the route-following driver reached from the autopilot flag
+`racecar+0x27D8`) is ported — `src/burnout3_ai.c` section 16, transcribed
+branch for branch. The nav graph itself is loaded and walked at run time from
+`route.bin` + `nav_edges.bin`, and `FUN_001714F0`'s navigator reset is ported
+as `nav_replace_car`. `FUN_00179760` is the reset helper it invokes, not the
+walker.
+
+Consequently **PH-10 and PH-12 are closed** and **PH-17 is no longer blocked on
+them** — its own watchdog marks (`beach_time`, `stuck_ref`, `unstuck_side`,
+`immune_until`) are still GLUE, which is a different and smaller problem.
+
+What genuinely remains here: the target follower's **mutable route-selection
+state** and **recovery-state timing**. Owner: the AI-DRIVE lane of work.
 
 * The retail graph layout is now recovered: every row is a row-relative
   `{pair, edge, link, node_count|flags}` directory, with two point IDs per
@@ -53,13 +77,15 @@ the AI-DRIVE lane of work.
   (including the open-row clamp and its unusual wrapped mode-zero tail); its
   higher-level state writers are still unmapped.
 
-* **PH-10** crash-recovery placement now uses retail nav-node placement and
-  heading; the surrounding retail reset state remains.
-* **PH-12** AI-wheel handovers (`full.c:130, 1746-1754, 2078, 2205`).
+* **PH-10** — closed. Crash-recovery placement uses retail nav-node placement
+  and heading. The surrounding retail reset state is the residue.
+* **PH-12** — closed. The route driver is ported; AI-wheel handovers go through
+  it.
 * **PH-17** off-world / stuck watchdogs (`full.c`, `FUN_001712E0`) —
-  `beach_time`, `stuck_ref`, wall-grind detector, off-world drop recovery.
-  Retail's 5 mph stuck rule is already known; the rest exists only because the
-  harness road model is two drive lines (`full.c:5645`).
+  **still open, but no longer blocked.** `beach_time`, `stuck_ref`, wall-grind
+  detector, off-world drop recovery. Retail's 5 mph stuck rule is already
+  known; the rest exists only because the harness road model is two drive
+  lines. This is now the AI-DRIVE lane's next item rather than a dependency.
 
 ### Blocker B — the traffic body update *(closes PH-07, PH-13, gap 2)*
 
@@ -216,8 +242,10 @@ Runs and renders on the Pixel (Mali, Android 16). See `docs/ANDROID_PORT.md`.
   aspect — suspect the player car's own geometry against the near plane.
   Reproduce with a device screencap; not seen on desktop.
 * **Pause/resume is untested.** SDL destroys the GL context on background;
-  every display list, texture and gl4es state the harness uploaded at init
-  would need rebuilding. Expect a black screen after a task switch.
+  every VBO, shader program, texture and gl4es state the harness uploaded at
+  init would need rebuilding. Expect a black screen after a task switch.
+  (This used to say "display list" -- there are none left anywhere in the
+  harness; see docs/web/webprof_sweep.md's fourth and fifth waves.)
 * **Tilt/button ergonomics** — awaiting play feedback. Knobs already exist:
   `B3_TILT_LOCK_G` (default 0.42 g ≈ 25° for full lock), `B3_TILT_SIGN=-1` to
   invert. Button geometry is in `b3_touch.c`'s `BTN[]` table.
@@ -226,10 +254,17 @@ Runs and renders on the Pixel (Mali, Android 16). See `docs/ANDROID_PORT.md`.
 
 * **Release signing config** — `assembleRelease` still has no `signingConfigs`;
   the APK is hand-signed with the debug keystore in the build loop.
+* **The packer drops files the runtime now needs.** `pack_assets.sh` omits
+  `route.bin` / `grid.bin` / `traffic.bin` on the grounds that they were baked
+  into `src/burnout3_track_paths.h`, `burnout3_start_grid.h` and
+  `burnout3_traffic_data.h`. **All three headers are gone** and the runtime
+  loaders open those files directly — so the packed build is missing data it
+  will ask for. Fix the packer.
 * **Asset diet** — `build/cars/` is 133 MiB of the 143 MiB payload. Restricting
   it to the roster slots plus the `.bgd` traffic set should drop the APK under
-  60 MiB; the packer needs the tables out of `burnout3_vehicle_data.h` +
-  `burnout3_traffic_data.h`.
+  60 MiB. The packer used to read the tables out of the two generated headers;
+  it now has to read the same data from the runtime sources
+  (`build/cars/roster.bin` and the per-track `traffic.bin`).
 * **Crash audio beds are not packed** (`B3_PACK_CRASH_AUDIO=1`, ~147 MiB), so
   the phone logs "no crash beds" and crashes are quiet.
 * **On-device asset sideload** so another track can be `adb push`ed without a
@@ -244,16 +279,23 @@ Runs and renders on the Pixel (Mali, Android 16). See `docs/ANDROID_PORT.md`.
 
 * **Keep the two source lists in lockstep**: a module added to the Makefile's
   `SRCS` must also be added to `android/app/src/main/cpp/CMakeLists.txt`.
+  **They have drifted (2026-08-22).** CMake has 21 entries, the Makefile 25.
+  Missing from the Android build: `burnout3_ai_avoid.c`, `burnout3_scenery.c`,
+  `burnout3_backend.c`, `burnout3_emu.c`. (`burnout3_isodata.c` is absent by
+  design — Android does not take the ISO path.) The web target does **not** have
+  this failure mode: `make wasm` builds from the same `SRCS` variable, on
+  purpose.
 
 ---
 
 ## 3. Validation & tooling
 
-### `extract_collision.py`'s containment self-check fails `[?]`
+### The archived collision extractor's containment self-check fails `[?]`
 
-The extractor writes a correct `collision.bin` — 60373 triangles, which the
-game loads and drives on, and byte-identical across runs — and then exits 1
-because its own sanity check does not hold:
+`tools/py_extract_archive/extract_collision.py` writes a correct
+`collision.bin` — 60373 triangles, which the game loads and drives on, and
+byte-identical across runs and against the C `collision` stage — and then
+exits 1, because its own sanity check does not hold:
 
 ```
 [extract_collision] route XZ bounds x[4015..5812] z[1285..3137]
@@ -263,28 +305,138 @@ because its own sanity check does not hold:
 So either the check's premise is wrong (the route legitimately leaves the
 collision world's AABB), or the route and the collision world are being taken
 from two different things and it is luck that the game plays. Worth settling,
-because a wrong pairing here would be invisible until something falls through
-the floor. `make content` currently ignores the non-zero exit and says so.
+because a wrong pairing here would be invisible until something fell through
+the floor. The check exists only in the archive — `tools/cextract/cx_collision.c`
+does not carry it — so nothing in the live path notices either way, which is
+the other half of why it is still open.
 
-Related and probably the same thread: `generate_track()` in
-`src/burnout3_full.c` hardcodes the label `"Bangkok (Tracks/AS/C1_V1)"` while
-the runtime track id defaults to `US_C3_V1` and the route points come from the
-generated `burnout3_track_paths.h`. At minimum the label is stale.
-
+Related, and possibly the same thread: `generate_track()` in
+`src/burnout3_full.c` (the synthetic fallback used when no real geometry
+resolves) hardcodes the label `"Bangkok (Tracks/AS/C1_V1)"` while the runtime
+track id defaults to `US_C3_V1`. At minimum the label is stale.
 
 * **`tools/validate_gameplay.py` — green (91/91)**. Its collision-world
   section now compares the shared u16 source grid rather than float32/float64
   decimal expansions, uses valid resident-unit samples, and probes the
   current `US_C3_V1` low-road contact instead of a stale track-specific
   coordinate.
-* The other 15 suites are green and must stay so: port 151, crash_traj 134,
+* The suites below were green at the counts recorded here and must stay green;
+  the counts themselves grow as cases are added, so treat the *names* as the
+  list and each suite's own output as the count: port 151, crash_traj 134,
   crashcinema 115, td_rules 532, takedown 973, props 337, ai 163, carcol 752,
   sfx 399, hud 760, carfx 223, postfx 171, music 100, particlefx 600,
-  boostfx 77.
-* **`.panels` sidecars must be regenerated** after any `tools/extract_bgv.py`
-  change — they now carry the `panelbb` line that seeds the recovered panel
-  OBB. Without it `panel_piece_spawn` silently falls back to the invented
-  `B3_PANEL_HALF` cube (`box_ok[]` records which pieces got a real box).
+  boostfx 77. There are now 39 `tools/validate_*.py` in total, plus three C
+  suites (`validate_frozen_soup.c`, `validate_traffic_pool.c`,
+  `validate_traffic_reservations.c`) with `make test-*` targets.
+* **`.panels` sidecars must be regenerated** after any change to the `.bgv`
+  extractor — now `tools/cextract/cx_cars_bgv.c` (the Python
+  `tools/extract_bgv.py` is a shim onto the archived oracle). They carry the
+  `panelbb` line that seeds the recovered panel OBB. Without it
+  `panel_piece_spawn` silently falls back to the invented `B3_PANEL_HALF` cube
+  (`box_ok[]` records which pieces got a real box).
+* **Any extractor change must re-pass `tools/cextract/verify_cextract.py`**
+  against a fresh oracle run. Byte-identical, pixel-identical for PNGs, and a
+  file on only one side is a failure.
+* **`cx_art_postfx.c` does not emit the `env+0x60` `light_rgb` block** that
+  `tools/py_extract_archive/extract_postfx_art.py:297-302` writes, so all 37
+  `build/postfx/<ID>_env.txt` sidecars and `enviro_manifest.txt` fail the gate
+  (the 107 sky PNGs are all pixel-identical). Pre-existing at HEAD — `git show
+  HEAD:tools/cextract/cx_art_postfx.c | grep -c light_rgb` is 0 — and it is
+  the one open `verify_cextract.py` failure. Detail:
+  `docs/LOAD_PARALLELISM.md` §5.
+* **The extraction stages and the texture load run on a worker pool**
+  (`tools/cextract/cx_pool.h`); `B3_JOBS=1` puts every one of them back on the
+  calling thread, unchanged, which is the first thing to try when a
+  parallelised stage is suspected. Cold ISO boot 17.8 s → 5.4 s desktop,
+  38.8 s → 18.0 s web. The measurement, the rejected candidates and the gate
+  results are `docs/LOAD_PARALLELISM.md`.
+
+---
+
+## 3b. Web (WASM / WebGL — "Reb3")
+
+Design and the measured constraints behind it: `web/README.md`. Build with
+`make wasm`, serve with `make serve`, gate with `make test-web` (headless
+Chromium over CDP — never a visible browser).
+
+* **In-browser audio is deferred.** `SDL_OpenAudioDevice` is answered with `0`
+  because `AudioContext` does not exist on the worker `main()` runs on. The
+  route is an AudioWorklet owned by the main thread, pulling the same 44.1 kHz
+  mono S16 mix `audio_callback()` produces through a ring in the shared heap —
+  the image bridge's trick in the other direction. `web/README.md` §3.
+* **Keep the smoke gate honest.** `tools/web_smoke.py` is the only automated
+  check on this target; it must fail on a crash rather than time out green.
+* Unlike Android, the web target builds from the Makefile's **same `SRCS`**
+  variable — deliberately, so there is no second source list to drift. Keep it
+  that way.
+* **The web renders at the VIEWPORT** (canvas CSS box x devicePixelRatio),
+  capped at a 1080p-class pixel count because the 3090 holds 60 there and
+  manages only 15.7 fps at 4K. `B3_RES=WxH` overrides, `B3_RES=pin` restores
+  the old 640x480. If a future wave makes 4K viable, the cap is one constant
+  (`B3_WEB_MAX_PX` in web/b3_web.c) and the measurement to redo is the table in
+  docs/web/webprof_sweep.md, seventh wave.
+* **Compare the web against the DESKTOP, not against the web.** Four rendering
+  defects survived every web gate this repo has because all of them were
+  web-to-web. Pin the same frame on both at the same resolution and seed --
+  and pick an EARLY frame, because the two sims diverge into different races
+  within a few hundred frames and that reads as a rendering fault.
+* **gl4es is retired on the web** (kept on Android). `<GL/gl.h>` resolves to
+  `web/GL/gl.h` = GLES2; `web/fetch_deps.sh` is a no-op. If a compatibility
+  built-in ever reappears in a shader or a `glBegin` in a pass, the web build
+  breaks at compile time rather than silently — that is intentional.
+* **The GL call count is ~2 400/frame, not the ~800 the phase-2 brief aimed
+  at.** The frame is nonetheless capped at 60 on real hardware with ~6.9 ms
+  idle, so this is headroom work, not a defect. The breakdown names the two
+  jobs: `cars` spends 912 calls on 58 draws (every sub-mesh re-points its
+  vertex format, rebinds its texture and re-uploads its matrices — one shared
+  car vertex format and per-instance uniforms would collapse it), and `track`
+  spends 501 on 206 draws (merge-by-texture is per material-run; a
+  draw-order-preserving global texture sort would cut it). See
+  `docs/web/webprof_sweep.md`, sixth wave.
+* **The aftereffects chain is ON for the web** as of the sixth wave. Both of
+  the reasons it shipped off were gl4es' and both are gone: cost is +0.14 ms of
+  `render_frame` (was +2.3 ms) and the sky survives. Worth knowing: the sky
+  loss was never the depth precision it was attributed to — it survived on a
+  16-bit attachment. *(Superseded in part: the context is WebGL 2 now, with a
+  real WebGL 1 fallback, so the depth attachment is 24-bit where the browser
+  gives it — `web/README.md`, "The context is WebGL 2". The two versions
+  disagree about framebuffer completeness in a way that matters: WebGL 1
+  requires all attachments to share dimensions and answers
+  `INCOMPLETE_DIMENSIONS` `0x8CD9` when they do not; WebGL 2 dropped the rule.
+  That is which status the resize cliff reported.)*
+* **The viewport measure used to be a SYNCHRONOUS main-thread round trip on
+  the frame loop — fixed, the read is pushed now.** `b3_web_defend_pin()`
+  asked the browser how big the canvas was every 30 presents, from the worker
+  the game loop runs on, through *two* calls that are both
+  `__proxy: 'sync'` in emsdk `src/lib/libhtml5.js`:
+  `emscripten_get_element_css_size` **and**
+  `emscripten_get_device_pixel_ratio`. So twice a second the loop *blocked*
+  until the main thread got round to answering, and `g_real_fps` (measured on
+  the worker over a 30-frame window) absorbed whatever the main thread was
+  busy with — a burst of proxied `console.log` (FULL SLAM lines, crash-trace
+  chatter), an OPFS persist (`b3CachePersistOpfs`, main-thread, debounced
+  2 500 ms after a mid-race materialisation), a GC. That is the shape of the
+  transient dips that recover fully. It is **not** crash-trace file I/O:
+  `build/crash_trace_NNN.log` is MEMFS (`/app` and `/app/build` are MEMFS;
+  only `/app/build/.isocache` is mirrored to OPFS) and `b3MemfsWalk` only
+  ever walks the cache root, so traces are never persisted. The main thread
+  now OWNS the measurement — `b3_web_viewport_watch()` installs a
+  `ResizeObserver` plus a re-armed `matchMedia` for dpr and writes the box
+  into a shared-heap slot under a seqlock; the worker reads four int32s out of
+  its own heap and never blocks. `B3_WEB_VP_POLL=1` forces the old path and
+  `B3_WEB_VPPROF=1` times the measurement, so the before/after comes out of
+  one binary: **mean 0.35 ms / max 0.77 ms → mean 0.002 ms / max 0.005 ms**,
+  about 100–150×, and that is measured against a nearly idle headless main
+  thread — the old path's *best* case, since its cost is a queue round trip
+  that grows with whatever else the main thread is doing.
+* **Still open, same area:** the crash-trace *open* probes up to 1 000
+  candidate paths with `fopen(..., "r")` to pick its number
+  (`crash_trace_tick`, `burnout3_full.c`) — one expensive frame per crash, on
+  both targets. A remembered counter would do.
+* **The menu frame loop is 69–135 ms with `sim`/`render` near zero** and is
+  unexplained. It is NOT the frame-limiter defect fixed in the sixth wave — the
+  menu screens use their own throttle (`if (now - last < 16) SDL_Delay(...)`),
+  which cannot inject sleep on a late frame. Needs its own measurement.
 
 ---
 
@@ -302,3 +454,14 @@ generated `burnout3_track_paths.h`. At minimum the label is stale.
   disassembly is the ground truth, not the decompile.
 * Always run the game with `SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy`,
   one instance at a time.
+* **Never add game-derived data to `src/`.** Not a table, not a string, not a
+  "temporary" constant. It goes in a data file the port loads at run time.
+  `tools/validate_no_baked_data.py` will catch it, and the reason the rule is
+  absolute is that a compiled-in copy does not *look* missing — the port used
+  to substitute one track's road and grid on every other track and the symptom
+  read as a physics bug for weeks.
+* **`tools/py_extract_archive/` is immutable.** It is the oracle the C
+  extraction pipeline is gated against. If the gate fails, the C side is wrong.
+* **Retail is runnable.** Before arguing about whether the port matches, flip
+  the feature to `retail` in `build/backends.cfg` (or run `--retail`) and
+  measure. That is what the backend switch is for.

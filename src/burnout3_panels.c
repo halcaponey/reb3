@@ -508,9 +508,11 @@ void b3_panels_pieces_update(B3PanelSet* s,
 
         // ---- into GAME space (b3_mat_orthonormalize is chirality-bound;
         // the same round trip B3WreckState documents) --------------------
-        B3RigidBody rb;
+        B3RigidBody rb; float rb__frame_store[4][4];
         memset(&rb, 0, sizeof(rb));
-        memcpy(rb.frame, p->frame, sizeof(rb.frame));
+        /* bind AFTER the memset -- it would zero the frame pointer */
+        b3_rigid_body_bind_frame(&rb, rb__frame_store);
+        memcpy(rb.frame, p->frame, 16 * sizeof(float));
         memcpy(rb.vel, p->vel, sizeof(rb.vel));
         memcpy(rb.angmom, p->angmom, sizeof(rb.angmom));
         memcpy(rb.omega, p->omega, sizeof(rb.omega));

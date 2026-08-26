@@ -5,7 +5,7 @@
  * ----------
  * Art: the game's own Global.txd panels (tools/extract_txd.py) and the HUD
  * font recovered from the XBE .data section (tools/extract_font.py; glyph
- * metrics in src/burnout3_font.h).  See docs/RE_FRONTEND.md sections 1-6.
+ * metrics in build/frontend/font.bin).  See docs/RE_FRONTEND.md 1-6.
  *
  * The BOOST BAR in this module is no longer eyeballed: its box size, screen
  * anchor, fill/earn/flame state machine, flame-frame sequencing and segment
@@ -22,6 +22,8 @@
  */
 #ifndef BURNOUT3_HUD_H
 #define BURNOUT3_HUD_H
+
+#include <stddef.h>
 
 #include <GL/gl.h>
 
@@ -532,6 +534,29 @@ extern "C" {
 #define B3HUD_AT_GLOSS_B        0.6f       /* @0x003FCF88                  */
 #define B3HUD_AT_GLOSS_A        1.0f       /* @0x003FCF8C                  */
 #define B3HUD_AT_ALPHA_MIN      0.01f      /* @0x003A7ED8 comiss @0x00050168 */
+/* THE UVs.  The callback reads them from the runtime table at 0x0054F680,
+ * indexed by VERTEX INDEX (`mov eax,[ecx+0x54f680]` @0x0005004F with
+ * ecx = idx*8), and FUN_00265D10 fills all seven pairs from FOUR ValueDB
+ * scalars.  Those four were called "not in the image" -- they ARE: each
+ * has a compiled-in default written by a one-instruction C++ dynamic
+ * initialiser, the same shape the boost bar's floats use, so the @bss:
+ * citation below is machine-checked by tools/validate_hud.py.
+ *   u = U_MID at the box's x = 0.5, U_EDGE at x = 0 and x = 1
+ *   v = V_TOP at y = 0, V_BOTTOM at y = 1
+ * and the CENTRE vertex's own v is derived @0x00265CE0 into 0x0054F6BC as
+ * V_TOP + (V_BOTTOM - V_TOP) * 0.45 -- the same 0.45 as the centre
+ * vertex's box y (B3HUD_AT_CENTRE_Y), which proves v is simply linear in
+ * the box's y.  These are half-texel UVs for a 64x64 sheet (0.5/64,
+ * 32.5/64, 63.5/64), so pass 1 samples the sheet's RIGHT HALF only -- the
+ * crisp badge -- and the pass-2 mirror u := 1 - u (0x00050180) lands on
+ * its LEFT HALF, which holds the soft gloss sprite.  Mapping 0..1 instead
+ * crams BOTH sprites into every wedge: the "smudged, doubled" crosshair
+ * of build/debug_dump_081.                                            [C] */
+#define B3HUD_AT_U_EDGE     0.9921875f /* @bss:0x0054F678=0x00265C80 63.5/64 */
+#define B3HUD_AT_U_MID      0.5078125f /* @bss:0x0054F6D4=0x00265C60 32.5/64 */
+#define B3HUD_AT_V_TOP      0.0078125f /* @bss:0x0054F664=0x00265CA0  0.5/64 */
+#define B3HUD_AT_V_BOTTOM   0.9921875f /* @bss:0x0054F6E0=0x00265CC0 63.5/64 */
+#define B3HUD_AT_V_CENTRE_T 0.45f      /* @0x003A2D1C mulss @0x00265CF4      */
 
 /* B3HUD-TABLE-END */
 
@@ -642,14 +667,28 @@ typedef struct B3HudCallout {
 /* Mirror of the game's boost record (racecar+0x119C, RE_GAMEPLAY 3).
  * The HUD derives everything it draws from these five numbers, exactly
  * as FUN_0004C390 does from score+0xFC..+0x11E. */
-typedef struct B3HudBoostIn {
-    int   tier;         /* score+0x0FC  0..3                            */
-    float bar_size;     /* score+0x100  units (240/360/540/720)         */
-    float meter;        /* score+0x104  units                           */
-    float earned;       /* score+0x108  lifetime units, monotone        */
-    float min_units;    /* score+0x110  units                           */
-    int   boosting;     /* score+0x11E                                  */
+typedef struct __attribute__((packed)) B3HudBoostIn {
+    // ---- RETAIL WINDOW 0x0000..0x0124: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    unsigned char _pad00[0xFC];
+    int                  tier;  /* score+0x0FC  0..3                            */
+    float                bar_size;  /* score+0x100  units (240/360/540/720)         */
+    float                meter;  /* score+0x104  units                           */
+    float                earned;  /* score+0x108  lifetime units, monotone        */
+    unsigned char _pad01[0x4];
+    float                min_units;  /* score+0x110  units                           */
+    unsigned char _pad02[0xA];
+    int                  boosting;  /* score+0x11E                                  */
+    unsigned char _pad03[0x2];
 } B3HudBoostIn;
+
+#define B3HUDBOOSTIN_RETAIL_SPAN 0x0124u
+_Static_assert(offsetof(B3HudBoostIn, tier) == 0x00FC, "tier off retail");
+_Static_assert(offsetof(B3HudBoostIn, bar_size) == 0x0100, "bar_size off retail");
+_Static_assert(offsetof(B3HudBoostIn, meter) == 0x0104, "meter off retail");
+_Static_assert(offsetof(B3HudBoostIn, earned) == 0x0108, "earned off retail");
+_Static_assert(offsetof(B3HudBoostIn, min_units) == 0x0110, "min_units off retail");
+_Static_assert(offsetof(B3HudBoostIn, boosting) == 0x011E, "boosting off retail");
 
 /* ---- the EVENT TICKER --------------------------------------------- *
  * Row slots in the element object's order (obj+0x570 + i*0x28); the
@@ -670,16 +709,40 @@ enum {
 /* One category record exactly as FUN_0004D130 reads it -- the 0x1C-byte
  * B3CatRecord of src/burnout3_score_events.h (score+0x358/+0x374/+0x390/
  * +0x418) plus its separate "event open" flag (rec+0x10, mirrored in
- * B3ScoreEvents as air_active / onc_active / drift_active / nm_active). */
-typedef struct B3HudTickIn {
-    int   open;         /* rec+0x10  the *_active flag                  */
-    float value;        /* rec+0x00  metres (near miss: chain links)    */
-    float prev_value;   /* rec+0x08  the closed event's final value     */
-    float clock;        /* rec+0x04  last-update clock (near miss only) */
-    int   tier;         /* rec+0x11  current tier, -1 = none            */
-    int   prev_tier;    /* rec+0x12  the closed event's tier            */
-    int   count;        /* rec+0x13  number of tiers (4)                */
+ * B3ScoreEvents as air.active / onc.active / drift.active / nm.active). */
+typedef struct __attribute__((packed)) B3HudTickIn {
+    // ---- RETAIL WINDOW 0x0000..0x0018: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    float                value;  /* rec+0x00  metres (near miss: chain links)    */
+    float                clock;  /* rec+0x04  last-update clock (near miss only) */
+    float                prev_value;  /* rec+0x08  the closed event's final value     */
+    unsigned char _pad00[0x4];
+    unsigned char        open;  /* rec+0x10  the *_active flag                  */
+    /* SIGNED, all three. This is the same byte range as B3CatRecord in
+     * burnout3_score_events.h, and retail stores -1 there for "no tier"
+     * (validate_score_events reads air/onc/drift tier back as 's'). Declared
+     * unsigned, the -1 the harness copies in becomes 255, tick_probe promotes
+     * it to int, and the row draws `for (i = 0; i < 255; i++)` stars -- a row
+     * of pips marching off the screen edge on a category that has not scored
+     * anything at all.
+     *
+     * Note the parity assertions CANNOT catch this: offsetof and sizeof are
+     * identical either way. A byte at the right offset and the right width can
+     * still be the wrong type. */
+    signed char          tier;  /* rec+0x11  current tier, -1 = none            */
+    signed char          prev_tier;  /* rec+0x12  the closed event's tier            */
+    signed char          count;  /* rec+0x13  number of tiers (4)                */
+    unsigned char _pad01[0x4];
 } B3HudTickIn;
+
+#define B3HUDTICKIN_RETAIL_SPAN 0x0018u
+_Static_assert(offsetof(B3HudTickIn, value) == 0x0000, "value off retail");
+_Static_assert(offsetof(B3HudTickIn, clock) == 0x0004, "clock off retail");
+_Static_assert(offsetof(B3HudTickIn, prev_value) == 0x0008, "prev_value off retail");
+_Static_assert(offsetof(B3HudTickIn, open) == 0x0010, "open off retail");
+_Static_assert(offsetof(B3HudTickIn, tier) == 0x0011, "tier off retail");
+_Static_assert(offsetof(B3HudTickIn, prev_tier) == 0x0012, "prev_tier off retail");
+_Static_assert(offsetof(B3HudTickIn, count) == 0x0013, "count off retail");
 
 /* ---- the EA TRAX now-playing feed ---------------------------------- *
  * Fill this straight from b3_music_now_playing().  The element is a pure
@@ -851,6 +914,20 @@ const char *b3_hud_place_ordinal(int place);
 
 /* Load one PNG as a GL texture (RGBA, linear, clamped). 0 on failure. */
 GLuint b3_hud_load_texture(const char *path);
+
+/* Menu text in GlobalFont (gradient + outline, the tick-row style).
+ * Returns the drawn width in pixels at this scale. */
+float  b3_hud_draw_text(const char *s, float x, float y, float scale,
+                        float r, float g, float b, float a);
+float  b3_hud_text_width(const char *s, float scale);
+/* pixel-space quad in the 640x480 virtual canvas (y down from the top) */
+void   b3_hud_draw_rect_px(float x, float y, float w, float h,
+                           float r, float g, float b, float a);
+void   b3_hud_draw_quad_uv_px(GLuint tex, float x, float y, float w, float h,
+                              float u0, float v0, float u1, float v1,
+                              float alpha);
+void   b3_hud_draw_quad_px(GLuint tex, float x, float y, float w, float h,
+                           float alpha);
 
 /* Load the HUD texture set from <dir> (normally "build/frontend").
  * Returns the number of textures loaded (0 = nothing found / no HUD). */

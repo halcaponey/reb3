@@ -1,5 +1,16 @@
 # Takedown trigger rules — slam → out-of-control → crash → attribution → commit
 
+> **Status (2026-08-22).** Append-only evidence record; later sections supersede
+> earlier ones. Since this was written the **prop system landed**, which closes
+> the passages here that assume the harness has no prop entities:
+> `FUN_00112E70`'s object crash trigger is ported as `b3_td_object_contact`
+> (`src/burnout3_td_rules.c`), every prop contact is handed to it, and the
+> `mesh_collide` structure-band stand-in for class 2 is dead code — the arm it
+> describes has no caller. The **takedown-credit spend** the "harness
+> divergence" note asks for also exists and is wired
+> (`b3_tdfx_takedown_credit`, `FUN_00025A30`), so a player takedown now spends
+> the credit retail spends. Addresses, rules and measurements stand as recorded.
+
 Recovered 2026-08-11 from the analysed `burnout3.elf` (corrected VAs;
 `.text` = old flat address + 0x10000).
 
@@ -788,6 +799,51 @@ sections wire it up. `FUN_001987A0` is **cdecl** (`FUN_00197D20` @`0x00197E38`
 does `add esp,0x10`) while `FUN_001994D0` is stdcall `ret 0x10` — getting
 either wrong unbalances the stack and the caller "returns" into the ELF
 header, the same class of failure RE_GAMEPLAY §9 records.
+
+**Every stub's `argbytes` IS its callee cleanup, and it matters.** Six entries
+in `tools/emulate_td_rules.py`'s `STUB_FUNCS` were `0` for functions that end
+in `RET n`: `FUN_00140610`/`FUN_00140480`/`FUN_00141700` (`RET 0x8`),
+`FUN_00190330`/`FUN_00190380` (`RET 0x4`) and `FUN_0019A050` (`RET 0x14`). A
+stub that pops only the return address leaves those bytes on the caller's
+stack, and the caller then reads every later `[ESP+n]` slot off by that much.
+The symptom was silent and specific: `FUN_00197F90`'s REAR branch calls
+`FUN_00141700` before returning, so with the leak the whole of
+`FUN_001989A0`'s ESP-relative half — the super-slam flag, the type, the BP —
+came out as zero for a rear slam only. Corrected; see
+`tools/validate_takedown_score.py` §2.
+
+## 13b. The joined score path — `tools/validate_takedown_score.py` (**988/988**)
+
+`validate_td_rules.py` proves the takedown TRIGGER; this suite proves what the
+trigger COSTS and PAYS, on both cars, against the same executed retail.
+
+| § | executed | what it pins |
+|---|---|---|
+| 1 | image bytes | the 5 parameter storages + the 7 geometry/gate constants + the port's compiled defaults |
+| 2 | `FUN_00197F90` | 11 seeded frames → the 0/1/2/3 taxonomy, plus the type carried through the whole slam into +0x11F4/+0x15A0 |
+| 3 | `FUN_001989A0` | the super-slam gate: 10 seedings incl. both STRICT boundaries (exactly 70 mph, exactly crash+3.0 s) |
+| 4 | `FUN_0019A050` live | 4 types × cheap × burning = 16 → BP, the +0x1180 subtotal, +0x117C staying 0, and the DAT_003A4B18 message index |
+| 5 | `FUN_001989A0` | the attacker's gain: 4 tiers, mult, bonus, mult+bonus, 2 context scales, 3 clamp cases, crash party |
+| 6 | `FUN_001989A0` | the victim's drain: tiers, multipliers, floor, both peg flags, the forced min-burn stop, 4 exact-zero landings, and 3 cases proving the bonus is NOT used |
+| 7 | `FUN_001989A0` | the whole field split over 4 class pairings + a double slam (accumulators add) |
+| 8 | `FUN_001989A0` | +0x23E0: the class gate both ways, strength scaling, accumulation, the cap |
+| 9 | `FUN_001989A0` + `FUN_00198E60` | a wrecked victim changes NOTHING at the slam; the wreck is deduped at the commit (+0x15D6) |
+| 10 | the whole chain | slam → OOC → wreck → attribution → claim → commit → award, BP totals on both cars |
+| 11 | `FUN_00197920` | a near miss moves no BP, no boost, no counter and opens no claim slot |
+| 12 | `FUN_00029F30` kind 1/2 | a rub and a wall shunt move no BP, no boost, no counter, no OOC stamp |
+| 13 | image bytes | the retail bridge's field WIDTHS (see below) |
+
+**The width defect §13 catches.** `src/burnout3_tdcar_ranges.h` carries each
+`B3TdCar` field into the emulated racecar as `sizeof(field)` bytes at
+`offsetof(field)`. Three flags retail touches with BYTE instructions were
+declared `int`, so with `td_rules=retail` selected each one overwrote a live
+neighbour every call:
+
+| port field | offset | retail width | what the 4-byte write destroyed |
+|---|---|---|---|
+| `crashed` | +0x18FA | byte (`8A 81 FA 18 ..` @0x00024BD9) | +0x18FB respawning **and** +0x18FC, the ONCOMING flag (`88 93 FC 18 ..` @0x0018D89F) |
+| `td_credited` | +0x15D6 | byte (`8A 86 D6 15 ..` @0x0002585C) | +0x15D7, the commit's FX one-shot (`C6 87 D7 15 ..` @0x00198E94) |
+| `revenge_flag` | +0x168F | byte (`C6 87 8F 16 ..` @0x00198F3E) | 3 bytes of +0x1690, the second out-of-control clock, which `FUN_0011ECF0` reads as a FLOAT (`0F 2F A2 90 16 ..` @0x0011EDA3) |
 
 ---
 

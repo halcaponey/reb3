@@ -15,19 +15,19 @@ Usage:
 
 Exit code 0 = all green.
 """
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-from b3_paths import game_path, game_root  # noqa: E402
 import argparse
 import os
 import re
 import struct
 import subprocess
 import sys
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from b3_paths import game_path, game_root  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_ELF = os.path.join(REPO, "build", "burnout3.elf")
-XBE = (game_path('default.xbe'))
+XBE = game_path('default.xbe')
 HDR = os.path.join(REPO, "src", "burnout3_hud.h")
 SRC = os.path.join(REPO, "src", "burnout3_hud.c")
 
@@ -529,16 +529,35 @@ def check_render_state_presets(img, ck):
     for va, i, exp, note in want:
         ck.eq("preset %08x[%d]" % (va, i), exp, img.preset(va, i), note=note)
 
-    # and the C must map them to the matching GL enums
+    # and the C must map them to the matching GL enums.  The two blend presets
+    # are named rather than spelled out since the HUD moved onto the retained
+    # 2D batcher (src/burnout3_render.h): B3R_BLEND_ALPHA and B3R_BLEND_SA_ONE
+    # are what b3r_state() turns into those two glBlendFunc pairs, so accept
+    # either spelling of each.
     src = open(SRC).read()
-    for tag, snippet in (
-            ("plate blend", "glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)"),
-            ("fire blend", "glBlendFunc(GL_SRC_ALPHA, GL_ONE)"),
-            ("blend equation", "glBlendEquation(GL_FUNC_ADD)"),
-            ("colour mask", "glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE)"),
-            ("plate wrap", "GL_TEXTURE_WRAP_S, GL_REPEAT"),
-            ("fire clamp", "GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE")):
-        ck.eq(tag, True, snippet in src, note=snippet)
+    ren = open(os.path.join(REPO, "src", "burnout3_render.c")).read()
+    for tag, snippets in (
+            ("plate blend", ("glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)",
+                             "b3r2d_blend(B3R_BLEND_ALPHA)")),
+            ("fire blend",  ("glBlendFunc(GL_SRC_ALPHA, GL_ONE)",
+                             "b3r2d_blend(B3R_BLEND_SA_ONE)")),
+            ("blend equation", ("glBlendEquation(GL_FUNC_ADD)",)),
+            ("colour mask", ("glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE)",)),
+            ("plate wrap", ("GL_TEXTURE_WRAP_S, GL_REPEAT",)),
+            ("fire clamp", ("GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE",))):
+        ck.eq(tag, True, any(x in src for x in snippets), note=snippets[0])
+    # ...and the batcher's presets must really be those GL enum pairs
+    # b3r_state() no longer calls glBlendFunc by that name: every state call in
+    # the renderer goes through the CPU state shadow that replaced
+    # glPushAttrib/glPopAttrib (GLES2 has no attribute stack), so the preset
+    # spells itself b3r_gl_blend_func(GL_SRC_ALPHA, ...).  The ENUM PAIR is
+    # what this check is about, and it is still exactly the pair.
+    ck.eq("B3R_BLEND_ALPHA is SRC_ALPHA/ONE_MINUS_SRC_ALPHA", True,
+          "(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)" in ren,
+          note="src/burnout3_render.c b3r_state() -> b3r_gl_blend_func()")
+    ck.eq("B3R_BLEND_SA_ONE is SRC_ALPHA/ONE", True,
+          "(GL_SRC_ALPHA, GL_ONE)" in ren,
+          note="src/burnout3_render.c b3r_state() -> b3r_gl_blend_func()")
     ck.eq("draw order plate->earn->tread->core->edge->over", True,
           src.index("boost_plate(x, y") < src.index("boost_earn_flame(x, y")
           < src.index("boost_tread(x, y") < src.index("boost_core(x, y")
@@ -629,12 +648,18 @@ def check_draw_capture(ck):
 # [11] the EVENT TICKER -- who owns it, what drives it, what it says
 # --------------------------------------------------------------------- #
 GLOBALUS = [os.path.join(REPO, "build", "Globalus.bin"),
-            (game_path('Data/Globalus.bin'))]
+            game_path('Data/Globalus.bin')]
 
 TICK_C_RE = re.compile(
     r"B3_TICK\[B3_HUD_TICK_ROWS\]\s*=\s*\{(.*?)\n\};", re.S)
+# The row's English LABEL used to be the first column here.  It was retail
+# Globalus text, so the purge took it out of the C (docs: cx_extract.h "purge
+# 2", src/burnout3_hudstr_runtime.h) and left the recovered INDEX, which is
+# what this gate checks against the constructor's imm32.  The text itself is
+# read from the user's own Globalus.bin below and printed, not compared to a
+# copy of itself.
 TICK_ROW_RE = re.compile(
-    r'\{\s*"([^"]*)",\s*(B3HUD_TICK_STR_[A-Z]+)\s*/\s*4,\s*'
+    r'\{\s*(B3HUD_TICK_STR_[A-Z]+)\s*/\s*4,\s*'
     r'([A-Za-z0-9_.]+),\s*([01]),\s*(0x[0-9A-Fa-f]+)\s*\}')
 
 
@@ -743,7 +768,8 @@ def check_ticker(img, ck):
         if row >= len(crows):
             ck.eq("probe row %d in range" % row, True, False, note="")
             continue
-        label, strname, cth, probed, crec = crows[row]
+        strname, cth, probed, crec = crows[row]
+        label = strname.replace("B3HUD_TICK_STR_", "")
         ck.eq("row %d record" % row, rec, int(crec, 16),
               note="%s <- score+0x%03X" % (label, rec))
         want = cthresh.get(cth, None)
@@ -757,7 +783,7 @@ def check_ticker(img, ck):
           note="slot 3 (AIR) has a slot + a label but is NEVER probed")
     ck.eq("C mirrors the probe order", True,
           "B3_TICK_PROBE[6] = {0, 1, 2, 4, 5, 6}" in src, note="")
-    ck.eq("C marks AIR unprobed", True, crows[3][3] == "0",
+    ck.eq("C marks AIR unprobed", True, crows[3][2] == "0",
           note="row 3 = %s" % crows[3][0])
 
     # -- (d) the labels are Globalus.bin entries ------------------------- #
@@ -767,12 +793,18 @@ def check_ticker(img, ck):
     get, path = globalus_strings()
     for row, va in sites:
         off = img.u32(va)
-        ck.eq("row %d label offset" % row, hdr[crows[row][1]], off,
+        ck.eq("row %d label offset" % row, hdr[crows[row][0]], off,
               note="constructor @%08x -> entry %d" % (va, off // 4))
         if get:
+            # the port no longer carries the text -- it resolves this index
+            # against the user's own file at draw time, so what is checkable
+            # is that the index RESOLVES, and that no copy of the string is
+            # left in the source
             want = get(off // 4)
-            ck.eq("row %d label text" % row, crows[row][0], want,
-                  note="Globalus.bin entry %d" % (off // 4))
+            ck.eq("row %d label resolves" % row, True,
+                  bool(want) and '"%s"' % want not in src,
+                  note="Globalus.bin entry %d = %r, absent from the C"
+                       % (off // 4, want))
     if get:
         print("       (%s)" % path)
     else:
@@ -919,9 +951,18 @@ def check_plates(img, ck):
                               ("mph", hdr["B3HUD_STR_MPH"], "mph")):
             ck.eq("label %s" % nm, want, get(off // 4),
                   note="entry %d of %s" % (off // 4, os.path.basename(path)))
-        ck.eq("C draws \"POS\" not \"POS.\"", True,
-              '"POS"' in src and '"POS."' not in src,
-              note="entry 2002 is POS, no period")
+        # The C used to spell the label out.  It is retail text, so the purge
+        # took it out (cx_extract.h "purge 2"): what the C carries now is the
+        # recovered INDEX, and it resolves the text out of the user's own file
+        # at draw time.  Check exactly that.
+        code = code_only(src)
+        for nm, mac in (("POS", "B3HUD_STR_POS"), ("LAP", "B3HUD_STR_LAP"),
+                        ("mph", "B3HUD_STR_MPH")):
+            txt = get(hdr[mac] // 4)
+            ck.eq("C resolves %s by index, not by literal" % nm, True,
+                  ("b3_hudstr(%s / 4)" % mac) in code
+                  and ('"%s"' % txt) not in code,
+                  note="entry %d = %r" % (hdr[mac] // 4, txt))
 
     # (g) the C really uses the three-slice geometry and the game's art
     ck.eq("C has plate_3slice", True, "plate_3slice" in src, note="")
@@ -950,8 +991,10 @@ def check_opponent_tags(img, ck):
         for i, want in enumerate(("1st", "2nd", "3rd", "4th", "5th", "6th")):
             ck.eq("ordinal[%d]" % i, want, get(base + i),
                   note="entry %d" % (base + i))
-            ck.eq("C ordinal[%d]" % i, True, '"%s"' % want in src,
-                  note="b3_hud_place_ordinal")
+            ck.eq("C ordinal[%d] not a literal" % i, True,
+                  '"%s"' % want not in code_only(src),
+                  note="b3_hud_place_ordinal resolves entry %d at draw time"
+                       % (base + i))
         ck.eq("the run ends at 6", True,
               get(base + 6) not in ("7th",),
               note="entry %d = %r, not an ordinal" % (base + 6, get(base + 6)))
@@ -970,7 +1013,12 @@ def check_opponent_tags(img, ck):
           note="call FUN_001C7C90 @0x0018F757 (3 verts, one colour)")
     ck.eq("vertex count", 3, img.u32(0x0018F3B3),
           note="mov edi,3 @0x0018F3B2, pushed @0x0018F715")
-    ck.eq("C draws GL_TRIANGLES", True, "glBegin(GL_TRIANGLES)" in src,
+    # The C spelling moved from immediate mode to the retained 2D batcher when
+    # the renderer stopped emitting fixed-function geometry; the assertion is
+    # about the PRIMITIVE, so accept either spelling of it.
+    ck.eq("C draws GL_TRIANGLES", True,
+          ("glBegin(GL_TRIANGLES)" in src
+           or "b3r2d_prim(B3R2D_TRIANGLES)" in src),
           note="apex-down, untextured")
 
     # (d) every constant the element runs on, re-read at its own VA
@@ -1184,22 +1232,78 @@ def check_ticker_capture(img, ck):
           note="alpha = timer * 4, and the box shrinks 10%")
 
 
+def code_only(text):
+    """Blank out /* */ and // runs, keeping length and line structure.
+
+    The port's provenance prose NAMES the strings it resolves ("POS"/"LAP":
+    a flat light blue...), and that is the whole point of this codebase -- a
+    comment is documentation, not a shipped data table.  Any check that
+    asserts a literal is ABSENT therefore has to run on code only, the same
+    rule tools/validate_no_baked_data.py applies."""
+    out = list(text)
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in '"\'':
+            q = c
+            i += 1
+            while i < n and text[i] != q:
+                i += 2 if text[i] == "\\" else 1
+            i += 1
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            for k in range(i, j):
+                if text[k] != "\n":
+                    out[k] = " "
+            i = j
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            for k in range(i, j):
+                out[k] = " "
+            i = j
+        else:
+            i += 1
+    return "".join(out)
+
+
 FONT_ROW_RE = re.compile(
     r"\{([-0-9.f, ]+)\},\s*/\* '(\\?.)' \*/")
 
 
 def parse_font_header():
-    """The GlobalFont block of src/burnout3_font.h, as the C sees it."""
-    path = os.path.join(REPO, "src", "burnout3_font.h")
-    txt = open(path).read()
-    blk = txt[txt.index("b3_font_globalfont"):]
-    m = re.search(r'"GlobalFont",\s*(\d+),\s*(\d+),', blk)
-    out = {"tex_w": int(m.group(1)), "tex_h": int(m.group(2))}
-    rows = FONT_ROW_RE.findall(blk)[:95]
-    for i, (vals, ch) in enumerate(rows):
-        v = [float(x.rstrip("f")) for x in vals.split(",")]
-        out[chr(0x20 + i)] = dict(w=v[4], h=v[5], xoff=v[6], yoff=v[7],
-                                  adv=v[8], present=v[9])
+    """The GlobalFont block of build/frontend/font.bin, as the C sees it.
+
+    This used to parse src/burnout3_font.h, which no longer exists: the glyph
+    metrics are the retail typeface's, i.e. game data, and are loaded at run
+    time now (src/burnout3_font_runtime.h).  The numbers are IDENTICAL -- the
+    extractor rounds each one with the header's own "%.6f"/"%.1f" before
+    storing the f32, precisely so this table stays the table the port used to
+    compile in.  Format: tools/cextract/cx_extract.h, 'B3FN' v1.
+    """
+    path = os.environ.get("B3_FONT_BIN",
+                          os.path.join(REPO, "build", "frontend", "font.bin"))
+    with open(path, "rb") as f:
+        d = f.read()
+    if len(d) < 16 or d[:4] != b"B3FN":
+        raise SystemExit("%s is not a B3FN asset -- run "
+                         "tools/cextract/build.sh && cxtract --only font "
+                         "--out ." % path)
+    ver, nfont, nglyph = struct.unpack_from("<III", d, 4)
+    if ver != 1 or nfont < 1 or nglyph != 95:
+        raise SystemExit("%s is B3FN v%d with %d fonts x %d glyphs, expected "
+                         "v1 x 95" % (path, ver, nfont, nglyph))
+    o = 16                                   # font 0 is GlobalFont
+    name = d[o:o + 32].split(b"\0")[0].decode("ascii", "replace")
+    tw, th = struct.unpack_from("<II", d, o + 32)
+    out = {"tex_w": tw, "tex_h": th, "name": name}
+    o += 44                                  # name + tex_w/h + line_h
+    for i in range(95):
+        g = struct.unpack_from("<9f", d, o + i * 40)
+        present = d[o + i * 40 + 36]
+        out[chr(0x20 + i)] = dict(w=g[4], h=g[5], xoff=g[6], yoff=g[7],
+                                  adv=g[8], present=float(present))
     return out
 
 

@@ -1,5 +1,17 @@
 # Gamedata.bgd — track gameplay data (decoded 2026-08-10)
 
+> **Status (2026-08-22).** Two current-state lines below have moved.
+> `src/burnout3_track_paths.h` **no longer exists** — the centreline pool it
+> baked in (`B3_CENTERLINE`) is read at run time from `route.bin` instead,
+> because no game-derived data is compiled into `src/`. And the split
+> pool lifecycle described as "tested but not applied to persistent bodies" **is**
+> applied: `src/burnout3_traffic_pool.c` drives the live traffic array
+> (`b3_traffic_pool_acquire` / `_release`). Where the text names
+> `tools/extract_bgd_paths.py` as the producer, the live producer is
+> `tools/cextract/cx_paths.c`; the Python path is a forwarding shim onto the
+> immutable archive and the bytes are identical by gate. The format decode is
+> unaffected.
+
 Confidence markers as elsewhere in this repo:
 `[C]` confirmed (game code address given, or an invariant that holds on all
 40 shipped Tracks/*/*/Gamedata.bgd files), `[S]` strongly supported

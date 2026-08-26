@@ -46,6 +46,61 @@ static B3ColTri* g_tris = NULL;
 static int g_ntris = 0;
 static float g_min[3], g_max[3];
 
+/* ------------------------------------------------------------------------
+ * RETAIL'S UNIT-RESIDENCY FOOTPRINT.  [C]
+ *
+ * `body+0x216` -- the streamed.dat unit a body is standing in, and the byte
+ * the traffic/articulated-vehicle update FUN_00120F30 turns into the
+ * `body+0x242C` "run the base update" latch -- is NOT the owner of a polygon
+ * under the car.  FUN_0011BC60 @0x0011BD55 writes it from
+ *
+ *     cVar7 = FUN_001AD4A0(&DAT_007397C8 + view*0x73, [[veh+0x204]+0x30]);
+ *     *(char *)(veh + 0x216) = cVar7;
+ *
+ * and FUN_001AD4A0 walks a ten-entry window of units around the streamer's
+ * own cursor (`[tbl+0x4C] - 4 .. +5`, wrapped by the unit count `[tbl+0x0C]`)
+ * asking FUN_0019D7F0 whether the position is inside each one, returning -1
+ * (0xFF) only when none of them claims it.  FUN_0019D7F0 @0x0019D7F0 is
+ *
+ *     for i in 0..3:  0.0 <= a[i]*x + b[i]*z - c[i]
+ *
+ * -- FOUR XZ HALF-PLANES.  The body's Y is never read and no ray is cast:
+ * residency is a 2-D convex footprint test, and the twelve floats that
+ * define it are the `f32[12]` at the unit's LOD block +0x70 that
+ * tools/cextract/cx_collision.c already documents in its format notes.
+ *
+ * The port asked a DIFFERENT question -- "did a downward ray from y+5 to
+ * y-25 hit a polygon?" -- which is false wherever the soup has a hole, a
+ * missing deck or a gap the road bridges.  Measured offline against every
+ * shipped track (tools/validate_traffic_align.py --deck-audit): 5.24%
+ * (US_C1_V1) to 50.15% (AS_C3_V2) of traffic-path cross-sections, median
+ * 21.56%, answer "no polygon", and 85% of those are XZ cells with no
+ * collision triangle at ANY height.  Each one is a traffic car the renderer
+ * draws (it gates on `active` alone) and carcol_pass() refuses (it gates on
+ * `streamed`): a visible, intangible car.  Retail has that state too --
+ * FUN_00114610's pair filter drops any pair whose body has +0x216 == -1,
+ * @0x001146F2 / @0x00114719 -- it just never reaches it in shot, because
+ * its units tile the world the player can see.
+ *
+ * collision.bin does not carry the +0x70 half-planes yet, so the footprint
+ * is reconstructed here from each unit's own triangles as an XZ AABB -- the
+ * closest shape to the real quad the shipped asset allows.  It is not a pure
+ * superset: it OVER-covers where the quad is rotated (safe -- a body over
+ * the road stays resident) and UNDER-covers where a unit carries no geometry
+ * near its own border, because retail's quads TILE the corridor and a
+ * triangle hull does not.  Measured inside retail's 160 m view gate of the
+ * race route, that leaves 6.20% of traffic-path cross-sections claimed by no
+ * unit (down from 11.50% for the ray), and roughly a quarter of that
+ * residual is points outside collision.bin's whole XZ extent -- an
+ * EXTRACTION gap no runtime predicate can close.  Emitting the real twelve
+ * floats from cx_collision.c is the follow-up that makes this exact.
+ * --------------------------------------------------------------------- */
+#define B3C_UNIT_MAX 256
+static float g_unit_min[B3C_UNIT_MAX][2];
+static float g_unit_max[B3C_UNIT_MAX][2];
+static unsigned char g_unit_live[B3C_UNIT_MAX];
+static int g_unit_count = 0;
+
 // XZ grid of triangle indices (triangles registered over their XZ AABB).
 #define B3C_CELL 8.0f
 static int g_gw = 0, g_gh = 0;
@@ -77,13 +132,43 @@ int b3_collision_tri_get(int i, float* v0, float* v1, float* v2,
     return 1;
 }
 
+/* THE REFILL SIZE, and why this file cares.  The record loop below reads 40
+ * bytes at a time out of a 2.4 MB file.  On a desktop that is thousands of
+ * memcpys out of stdio's buffer and a read() every time it empties; in the
+ * browser it is a read() every time it empties AND every one of those is a
+ * BLOCKING round trip to the main thread (-sPROXY_TO_PTHREAD -- the mechanism
+ * is written up at the top of burnout3_trackmesh.c).  musl's buffer is 1 KB,
+ * so US_C3_V1's collision.bin cost ~2 400 of them.
+ *
+ * setvbuf, not a rewrite: the loop keeps its exact fread-per-record shape and
+ * its short-read semantics, and only the refill size changes.  musl's setvbuf
+ * IGNORES a NULL buffer (unlike glibc's, which would allocate), so the block is
+ * owned here -- and it must be installed before the FIRST read, because
+ * swapping buffers mid-stream would throw away whatever is already buffered. */
+#define B3COL_IOBUF (1u << 20)
+
+/* B3_IO_SMALL=1 restores the 1 KB refill, so the cost of this can be measured
+ * out of one binary -- see the note in burnout3_trackmesh.c, which owns the
+ * switch's documentation and the other two loaders it covers. */
+static int b3col_io_small(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char* e = getenv("B3_IO_SMALL");
+        mode = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return mode;
+}
+
 int b3_collision_load(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) return 0;
+    char* iobuf = b3col_io_small() ? NULL : (char*)malloc(B3COL_IOBUF);
+    if (iobuf) setvbuf(f, iobuf, _IOFBF, B3COL_IOBUF);
     unsigned char hdr[0x28];
     if (fread(hdr, 1, sizeof hdr, f) != sizeof hdr ||
         memcmp(hdr, "B3CL", 4) != 0) {
         fclose(f);
+        free(iobuf);
         return 0;
     }
     unsigned version, count;
@@ -91,6 +176,7 @@ int b3_collision_load(const char* path) {
     memcpy(&count, hdr + 8, 4);
     if (version != 1 || count == 0 || count > 4u * 1000 * 1000) {
         fclose(f);
+        free(iobuf);
         return 0;
     }
     g_tris = malloc((size_t)count * sizeof(B3ColTri));
@@ -99,6 +185,8 @@ int b3_collision_load(const char* path) {
     g_ntris = 0;
     g_min[0] = g_min[1] = g_min[2] = 1e30f;
     g_max[0] = g_max[1] = g_max[2] = -1e30f;
+    memset(g_unit_live, 0, sizeof g_unit_live);
+    g_unit_count = 0;
     for (unsigned i = 0; i < count; i++) {
         unsigned char rec[40];
         if (fread(rec, 1, sizeof rec, f) != sizeof rec) break;
@@ -135,8 +223,30 @@ int b3_collision_load(const char* path) {
             if (lo < g_min[k]) g_min[k] = lo;
             if (hi > g_max[k]) g_max[k] = hi;
         }
+        /* the unit's XZ footprint (see B3C_UNIT_MAX above).  Every triangle
+         * counts, EXCLUDED ONES INCLUDED: the +0x70 half-planes bound the
+         * whole unit, not the drivable subset of it. */
+        {
+            int u = t->unit;
+            float lox = fminf(t->v0[0], fminf(t->v1[0], t->v2[0]));
+            float hix = fmaxf(t->v0[0], fmaxf(t->v1[0], t->v2[0]));
+            float loz = fminf(t->v0[2], fminf(t->v1[2], t->v2[2]));
+            float hiz = fmaxf(t->v0[2], fmaxf(t->v1[2], t->v2[2]));
+            if (!g_unit_live[u]) {
+                g_unit_live[u] = 1;
+                g_unit_count++;
+                g_unit_min[u][0] = lox; g_unit_max[u][0] = hix;
+                g_unit_min[u][1] = loz; g_unit_max[u][1] = hiz;
+            } else {
+                if (lox < g_unit_min[u][0]) g_unit_min[u][0] = lox;
+                if (hix > g_unit_max[u][0]) g_unit_max[u][0] = hix;
+                if (loz < g_unit_min[u][1]) g_unit_min[u][1] = loz;
+                if (hiz > g_unit_max[u][1]) g_unit_max[u][1] = hiz;
+            }
+        }
     }
     fclose(f);
+    free(iobuf);
 
     // grid
     g_gw = (int)((g_max[0] - g_min[0]) / B3C_CELL) + 2;
@@ -251,6 +361,35 @@ int b3_ground_probe(float x, float y, float z,
     return b3_ground_probe_unit(x, y, z, out_height, out_normal, NULL);
 }
 
+int b3_collision_unit_at_xz(float x, float z, unsigned char* out_unit) {
+    /* FUN_001AD4A0's loop, minus the streamer: retail scans a ten-unit window
+     * around its own load cursor because only those ten are RESIDENT; this
+     * port loads collision.bin whole, so every unit is a candidate and the
+     * window degenerates to the full table.  The per-unit test is
+     * FUN_0019D7F0's -- XZ only, no Y, no ray -- widened from the convex quad
+     * to its AABB until cx_collision.c emits the LOD block's +0x70 floats.
+     * Ties go to the unit whose footprint centre is nearest, so the reported
+     * identity is stable frame to frame where footprints overlap. */
+    int best = -1;
+    float best_d2 = 0.0f;
+    if (out_unit) *out_unit = 0xff;
+    if (!g_ntris) return 0;
+    for (int u = 0; u < B3C_UNIT_MAX; u++) {
+        if (!g_unit_live[u]) continue;
+        if (x < g_unit_min[u][0] || x > g_unit_max[u][0]) continue;
+        if (z < g_unit_min[u][1] || z > g_unit_max[u][1]) continue;
+        float cx = 0.5f * (g_unit_min[u][0] + g_unit_max[u][0]);
+        float cz = 0.5f * (g_unit_min[u][1] + g_unit_max[u][1]);
+        float d2 = (x - cx) * (x - cx) + (z - cz) * (z - cz);
+        if (best < 0 || d2 < best_d2) { best = u; best_d2 = d2; }
+    }
+    if (best < 0) return 0;
+    if (out_unit) *out_unit = (unsigned char)best;
+    return 1;
+}
+
+int b3_collision_unit_count(void) { return g_unit_count; }
+
 // Closest point on triangle to p (standard Ericson), for the sphere sweep.
 static void closest_on_tri(const B3ColTri* t, const float* p, float* out) {
     const float *a = t->v0, *b = t->v1, *c = t->v2;
@@ -329,10 +468,99 @@ int b3_sweep_sphere(const float* from, const float* to, float radius,
                               hit_pos, hit_normal, NULL);
 }
 
+int b3_nearest_wall_signed(const float* p, float radius, float wall_ny_max,
+                           float* out_signed, float* out_normal) {
+    if (!g_ntris) return 0;
+    int cx0, cz0, cx1, cz1;
+    cell_of(p[0] - radius, p[2] - radius, &cx0, &cz0);
+    cell_of(p[0] + radius, p[2] + radius, &cx1, &cz1);
+    float best = radius * radius;
+    int best_i = -1; float best_s = 0.0f;
+    for (int cz = cz0; cz <= cz1; cz++) for (int cx = cx0; cx <= cx1; cx++) {
+        if (cx < 0 || cz < 0 || cx >= g_gw || cz >= g_gh) continue;
+        int c = cz * g_gw + cx;
+        for (int k = 0; k < g_cell_count[c]; k++) {
+            int i = g_cell_idx[g_cell_start[c] + k];
+            const B3ColTri* t = &g_tris[i];
+            if (t->excl) continue;
+            if (fabsf(t->n[1]) > wall_ny_max) continue;
+            float q[3];
+            closest_on_tri(t, p, q);
+            float dx = p[0]-q[0], dy = p[1]-q[1], dz = p[2]-q[2];
+            float d2 = dx*dx + dy*dy + dz*dz;
+            if (d2 < best) {
+                best = d2; best_i = i;
+                best_s = dx*t->n[0] + dy*t->n[1] + dz*t->n[2];
+            }
+        }
+    }
+    if (best_i < 0) return 0;
+    if (out_signed) *out_signed = best_s;
+    if (out_normal) memcpy(out_normal, g_tris[best_i].n, 12);
+    return 1;
+}
+
+int b3_segment_crosses_wall(const float* a, const float* b, float wall_ny_max,
+                            float* out_hit, float* out_normal) {
+    if (!g_ntris) return 0;
+    float d[3] = { b[0]-a[0], b[1]-a[1], b[2]-a[2] };
+    float lo = fminf(a[0], b[0]), hi = fmaxf(a[0], b[0]);
+    float lz = fminf(a[2], b[2]), hz = fmaxf(a[2], b[2]);
+    int cx0, cz0, cx1, cz1;
+    cell_of(lo, lz, &cx0, &cz0);
+    cell_of(hi, hz, &cx1, &cz1);
+    float best_t = 2.0f; int best_i = -1; float best_p[3] = {0,0,0};
+    for (int cz = cz0; cz <= cz1; cz++) for (int cx = cx0; cx <= cx1; cx++) {
+        if (cx < 0 || cz < 0 || cx >= g_gw || cz >= g_gh) continue;
+        int c = cz * g_gw + cx;
+        for (int k = 0; k < g_cell_count[c]; k++) {
+            int i = g_cell_idx[g_cell_start[c] + k];
+            const B3ColTri* t = &g_tris[i];
+            if (t->excl) continue;
+            if (fabsf(t->n[1]) > wall_ny_max) continue;
+            float dn = d[0]*t->n[0] + d[1]*t->n[1] + d[2]*t->n[2];
+            if (dn >= -1e-6f) continue;             /* front -> back only */
+            float w[3] = { a[0]-t->v0[0], a[1]-t->v0[1], a[2]-t->v0[2] };
+            float sd = w[0]*t->n[0] + w[1]*t->n[1] + w[2]*t->n[2];
+            if (sd < 0.0f) continue;                /* started behind */
+            float tt = -sd / dn;
+            if (tt < 0.0f || tt > 1.0f || tt >= best_t) continue;
+            float p[3] = { a[0]+d[0]*tt, a[1]+d[1]*tt, a[2]+d[2]*tt };
+            float q[3];
+            closest_on_tri(t, p, q);
+            float ex = p[0]-q[0], ey = p[1]-q[1], ez = p[2]-q[2];
+            if (ex*ex + ey*ey + ez*ez > 1e-4f) continue;   /* off the face */
+            best_t = tt; best_i = i; memcpy(best_p, p, 12);
+        }
+    }
+    if (best_i < 0) return 0;
+    if (out_hit) memcpy(out_hit, best_p, 12);
+    if (out_normal) memcpy(out_normal, g_tris[best_i].n, 12);
+    return 1;
+}
+
 int b3_sweep_sphere_ex(const float* from, const float* to, float radius,
                        float wall_ny_max, const float* vel,
                        float* hit_pos, float* hit_normal,
                        unsigned short* hit_type) {
+    return b3_sweep_sphere_tri(from, to, radius, wall_ny_max, vel, hit_pos,
+                               hit_normal, hit_type, NULL);
+}
+
+int b3_sweep_sphere_tri(const float* from, const float* to, float radius,
+                        float wall_ny_max, const float* vel,
+                        float* hit_pos, float* hit_normal,
+                        unsigned short* hit_type, int* hit_tri) {
+    return b3_sweep_sphere_admit(from, to, radius, wall_ny_max, vel, hit_pos,
+                                 hit_normal, hit_type, hit_tri, NULL, NULL);
+}
+
+int b3_sweep_sphere_admit(const float* from, const float* to, float radius,
+                          float wall_ny_max, const float* vel,
+                          float* hit_pos, float* hit_normal,
+                          unsigned short* hit_type, int* hit_tri,
+                          int (*admit)(void* user, int tri), void* user) {
+    if (hit_tri) *hit_tri = -1;
     if (!g_ntris) return 0;
     float d[3] = {to[0]-from[0], to[1]-from[1], to[2]-from[2]};
     float len = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
@@ -355,6 +583,9 @@ int b3_sweep_sphere_ex(const float* from, const float* to, float radius,
                 if (t->excl) continue;
                 if (gather_runtime_skip(t, vel)) continue;    // FUN_0011BBE0
                 if (fabsf(t->n[1]) > wall_ny_max) continue;   // not a wall
+                /* the caller's own admission, applied INSIDE the walk so a
+                 * refused face cannot mask an accepted one behind it */
+                if (admit && !admit(user, i)) continue;
                 float q[3];
                 closest_on_tri(t, p, q);
                 float dx = p[0]-q[0], dy = p[1]-q[1], dz = p[2]-q[2];
@@ -375,6 +606,7 @@ int b3_sweep_sphere_ex(const float* from, const float* to, float radius,
         if (best_i >= 0) {
             if (hit_pos) memcpy(hit_pos, best_q, 12);
             if (hit_type) *hit_type = g_tris[best_i].type;
+            if (hit_tri) *hit_tri = best_i;
             if (hit_normal) {
                 // push direction: from the contact point toward the sphere
                 // centre; degenerate (centre on the surface) falls back to
@@ -438,6 +670,45 @@ int b3_collision_gather_walls(const float center[3], const float half[3],
     return count;
 }
 
+int b3_collision_gather_sphere(const float center[3], float radius,
+                               const float* vel, B3CollisionPoly* out,
+                               int cap) {
+    if (!g_ntris || !g_seen || !out || cap <= 0 || radius <= 0.0f) return 0;
+    int cx0, cz0, cx1, cz1;
+    cell_of(center[0] - radius, center[2] - radius, &cx0, &cz0);
+    cell_of(center[0] + radius, center[2] + radius, &cx1, &cz1);
+    if (++g_seen_stamp == 0) {
+        memset(g_seen, 0, (size_t)g_ntris * sizeof(*g_seen));
+        g_seen_stamp = 1;
+    }
+    const float r2 = radius * radius;
+    int count = 0;
+    for (int cz = cz0; cz <= cz1; cz++) for (int cx = cx0; cx <= cx1; cx++) {
+        if (cx < 0 || cz < 0 || cx >= g_gw || cz >= g_gh) continue;
+        int cell = cz * g_gw + cx;
+        for (int k = 0; k < g_cell_count[cell]; k++) {
+            int index = g_cell_idx[g_cell_start[cell] + k];
+            if (g_seen[index] == g_seen_stamp) continue;
+            g_seen[index] = g_seen_stamp;
+            const B3ColTri* tri = &g_tris[index];
+            if (tri->excl) continue;
+            if (gather_runtime_skip(tri, vel)) continue;   /* FUN_0011BBE0 */
+            float q[3];
+            closest_on_tri(tri, center, q);
+            float dx = center[0] - q[0], dy = center[1] - q[1],
+                  dz = center[2] - q[2];
+            if (dx*dx + dy*dy + dz*dz > r2) continue;
+            memcpy(out[count].v0, tri->v0, 12);
+            memcpy(out[count].v1, tri->v1, 12);
+            memcpy(out[count].v2, tri->v2, 12);
+            memcpy(out[count].normal, tri->n, 12);
+            out[count].type = tri->type;
+            if (++count == cap) return count;
+        }
+    }
+    return count;
+}
+
 int b3_collision_gather(const float center[3], const float half[3],
                         B3CollisionPoly* out, int cap) {
     if (!g_ntris || !g_seen || !out || cap <= 0) return 0;
@@ -496,6 +767,23 @@ int b3_collision_filter_walls(const B3CollisionPoly* input, int input_count,
         float max_y = fmaxf(poly->v0[1], fmaxf(poly->v1[1], poly->v2[1]));
         if (max_y < center[1] - half[1] || min_y > center[1] + half[1])
             continue;
+        /* ...and the SAME test on X and Z.  This used to bound Y only, so the
+         * chassis set inherited the wheel gather's reach -- that gather walks
+         * whole GRID CELLS and never tests a triangle's XZ at all, which put
+         * chassis walls up to 18 m away in the soup when retail's own query is
+         * a sphere of |veh+0x1D0| + speed*dt, i.e. 2.6-3.6 m
+         * [C] FUN_0011BC60 @0x0011BCD9/0x0011BD17.  Retail's wall response is
+         * the MIN/MAX of the plane over every wall record (FUN_0011AC30
+         * @0x0011AE61), so distant faces do not merely cost time -- they steer
+         * the response. */
+        float min_x = fminf(poly->v0[0], fminf(poly->v1[0], poly->v2[0]));
+        float max_x = fmaxf(poly->v0[0], fmaxf(poly->v1[0], poly->v2[0]));
+        if (max_x < center[0] - half[0] || min_x > center[0] + half[0])
+            continue;
+        float min_z = fminf(poly->v0[2], fminf(poly->v1[2], poly->v2[2]));
+        float max_z = fmaxf(poly->v0[2], fmaxf(poly->v1[2], poly->v2[2]));
+        if (max_z < center[2] - half[2] || min_z > center[2] + half[2])
+            continue;
         out[count++] = *poly;
         if (count == cap) break;
     }
@@ -533,6 +821,49 @@ int b3_collision_ray_polys_game_space(const B3CollisionPoly* polys,
     return surface;
 }
 
+// FUN_00123790's per-poly surface gate [C] @0x00123799..0x0012383E -- see the
+// full transcription in burnout3_collision.h.  The whole reason this exists:
+// a WHEEL must roll through the game's non-driving surfaces, and the port
+// had no such rule, so its wheels stood on geometry retail's wheels pass
+// straight through.  Measured effect on a median curb carrying surface
+// 0x0018 (80 such faces on US_C3_V1): the port mounted it and rolled 4.82
+// deg / 72.9 deg-s^-1 where retail stays flat at 0.00 deg -- tools/
+// validate_curb.py, case "median 0x0018 (wheel ray must ignore)".
+int b3_collision_wheel_surface_testable(unsigned short type,
+                                        unsigned char class_215) {
+    // veh+0x215 outside {1,2,3} runs ungated (@0x001237A1..0x001237B7)
+    if (!(class_215 == 1 || class_215 == 2 || class_215 == 3)) return 1;
+    const unsigned lo = (unsigned)(type & 0xFFu);
+    if (lo == 0x26u) return 1;                  // @0x00123822 the wreck plane
+    return lo <= 0x14u;                         // @0x0012382B/@0x00123835
+}
+
+int b3_collision_ray_polys_game_space_wheel(const B3CollisionPoly* polys,
+                                            int count, const float start[3],
+                                            const float end[3], float* hit_t,
+                                            float normal[3],
+                                            unsigned char class_215) {
+    if (!polys || count <= 0 || !start || !end) return -1;
+    float a[3] = {start[0], start[1], -start[2]};
+    float b[3] = {end[0], end[1], -end[2]};
+    float best = 999.0f;                        // [0x003B1A24] @0x001237D3
+    int best_i = -1;
+    for (int i = 0; i < count; i++) {
+        if (!b3_collision_wheel_surface_testable(polys[i].type, class_215))
+            continue;
+        float t = b3c_ray_points(a, b, polys[i].v0, polys[i].v1, polys[i].v2);
+        if (t >= 0.0f && t < best) { best = t; best_i = i; }
+    }
+    if (best_i < 0) return -1;
+    if (hit_t) *hit_t = best;
+    if (normal) {
+        normal[0] = polys[best_i].normal[0];
+        normal[1] = polys[best_i].normal[1];
+        normal[2] = -polys[best_i].normal[2];
+    }
+    return polys[best_i].type;
+}
+
 #ifdef B3_COLLISION_TEST_MAIN
 // Differential test harness for tools/validate_gameplay.py: reads
 // "x y0 y1 z [unit]" probe segments in RAW GAME coordinates from stdin, answers
@@ -540,8 +871,18 @@ int b3_collision_ray_polys_game_space(const B3CollisionPoly* polys,
 // The segment is cast through the same b3c_down_ray core b3_ground_probe
 // wraps; explicit endpoints let the validator match the game's exact ray.
 int main(int argc, char** argv) {
-    if (b3_collision_load(argc > 1 ? argv[1] : "build/collision.bin") <= 0) {
-        fprintf(stderr, "cannot load collision.bin\n");
+    // The path is REQUIRED.  It used to default to the global
+    // build/collision.bin, which is whichever track was extracted LAST, so a
+    // caller that forgot the argument probed a different world and the answers
+    // still looked plausible.  tools/validate_gameplay.py always passes the
+    // per-track file; nothing may fall back to the global one any more.
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s build/tracks/<ID>/collision.bin\n",
+                argv[0]);
+        return 2;
+    }
+    if (b3_collision_load(argv[1]) <= 0) {
+        fprintf(stderr, "cannot load %s\n", argv[1]);
         return 1;
     }
     float x, y0, y1, z;

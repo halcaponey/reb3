@@ -60,20 +60,26 @@ F_DENYAWARD  = 0x00195CE0   # DENIED / LUCKY award
 F_POSTHUD    = 0x00199350   # PostHudCallout
 F_CRASHENTRY = 0x0010DCA0   # the crash-state entry (never called by a slam)
 
-# helpers the above call that this oracle stubs
+# Helpers the above call that this oracle stubs.  The second element is the
+# CALLEE's own stack cleanup: these are all `RET n` functions, so a stub that
+# pops only the return address leaves n bytes of the caller's frame behind and
+# every later ESP-relative slot in the caller reads the wrong bytes.  Each
+# number below is the literal in that function's own RET [C-disasm]; the ones
+# that used to be 0 are marked, because that leak is what made FUN_001989A0
+# mis-score a REAR slam (FUN_00197F90's rear branch calls FUN_00141700).
 STUB_FUNCS = {
     0x00017310: ('crash_party_mode', 0),
     0x00197F90: ('slam_type', 0),
-    0x0019A050: ('combo_helper', 0),
-    0x00140610: ('sfx_a', 0),
-    0x00140480: ('sfx_b', 0),
-    0x00141700: ('sfx_c', 0),
+    0x0019A050: ('combo_helper', 0x14),   # RET 0x14, was 0
+    0x00140610: ('sfx_a', 8),             # RET 0x8,  was 0
+    0x00140480: ('sfx_b', 8),             # RET 0x8,  was 0
+    0x00141700: ('sfx_c', 8),             # RET 0x8,  was 0
     0x00190270: ('stat_a', 0),
     0x001902A0: ('stat_b', 0),
     0x001902D0: ('stat_c', 0),
     0x00190300: ('stat_d', 0),
-    0x00190330: ('stat_e', 0),
-    0x00190380: ('stat_f', 0),
+    0x00190330: ('stat_e', 4),            # RET 0x4,  was 0
+    0x00190380: ('stat_f', 4),            # RET 0x4,  was 0
     0x001903D0: ('stat_g', 0),
     0x00190400: ('stat_h', 0),
     0x00048760: ('rand_f', 0),
@@ -113,6 +119,13 @@ P_SLAM_BP      = 0x003F7448   # Slam Type BP[4]
 P_SUPER_BP     = 0x003F7458   # Super Slam Type BP[4]
 P_SLAM_BOOST   = 0x003F73EC   # 180
 P_BURNING_BP   = 0x003F7444   # 15
+
+# the slam kinds the game-context +0x64 dispatcher switches on
+# (FUN_00029F30's jump table @0x0002A01C)
+B3K_RUB, B3K_WALL = 1, 2
+B3K_WALL_SHUNT = B3K_WALL
+B3K_SIDE_LIGHT, B3K_REAR_LIGHT = 3, 4
+B3K_SIDE, B3K_REAR = 5, 6
 
 RC_STRIDE = 0x27E0
 RC_BASE   = SCRATCH + 0x10000        # racecars live here
@@ -386,6 +399,115 @@ class World(Emu):
             spree_window=self.rf(self.cslot(i) + 0x118),
             spree_count=self.ri(self.cslot(i) + 0x11C),
             at_count=self.ri(self.cslot(i) + 0x128),
+        )
+
+    # ------------------------------------------------------------------
+    # THE SLAM SCORER (tools/validate_takedown_score.py).
+    #
+    # The sections above deliberately stub FUN_00197F90 (the type selector)
+    # and FUN_0019A050 (the callout/BP poster), because they only care about
+    # the TRIGGER stamps.  The joined score path needs both live, plus a
+    # game-mode +0xAC hook that really pushes a float -- the generic ret-0
+    # stub leaves the x87 stack untouched and the slam's boost gain is then
+    # multiplied by whatever ST(0) happened to hold.
+    # ------------------------------------------------------------------
+    SCORE_PARAM_VAS = {
+        'slam_bp':       (P_SLAM_BP, 'i', 4),
+        'super_bp':      (P_SUPER_BP, 'i', 4),
+        'burning_bp':    (P_BURNING_BP, 'i', 1),
+        'slam_energy':   (P_SLAM_BOOST, 'f', 1),
+        'boost_quantum': (0x003F72E4, 'f', 1),
+    }
+
+    def seed_slam_params(self, p):
+        """Write the slam scorer's parameter block at its registrar storage."""
+        for name, (va, ty, n) in self.SCORE_PARAM_VAS.items():
+            v = p[name]
+            vals = v if n > 1 else [v]
+            for k, x in enumerate(vals):
+                if ty == 'i':
+                    self.wi(va + 4 * k, int(x))
+                else:
+                    self.wf(va + 4 * k, float(x))
+
+    def live_scorer(self, slam_type=None, boost_scale=1.0, crash_party=0):
+        """Un-stub FUN_0019A050, and either force or execute FUN_00197F90.
+
+        `slam_type=None` runs the real geometry selector."""
+        self.stubs.pop(0x0019A050, None)
+        if slam_type is None:
+            self.stubs.pop(0x00197F90, None)
+        else:
+            def force(e, args, regs):
+                e.uc.reg_write(UC_X86_REG_EAX, slam_type)
+            self.stub(0x00197F90, 'slam_type', argbytes=0, cb=force)
+        # FLD dword [MISC+0x2000] ; RET  -- a REAL float return for +0xAC
+        code = STUB_BASE + 0x800
+        self.w(code, b'\xD9\x05' + struct.pack('<I', MISC + 0x2000) + b'\xC3')
+        self.wf(MISC + 0x2000, boost_scale)
+        self.wi(MISC + 0x100 + 0xAC, code)
+        self.gamectx(True)
+        if crash_party:
+            self.stub(0x00017310, 'crash_party_mode', argbytes=0,
+                      cb=lambda e, a, r: e.uc.reg_write(UC_X86_REG_EAX, 1))
+        else:
+            self.stub(0x00017310, 'crash_party_mode', argbytes=0, cb=_ret0)
+
+    def set_boost(self, i, tier=0, size=720.0, meter=0.0, earned=0.0,
+                  mult=1.0, bonus=0.0, peg_a=0, peg_b=0, boosting=0,
+                  ramp_done=0):
+        rc = self.rc(i)
+        self.wi(rc + 0x11CC, tier)
+        self.wf(rc + 0x11D0, size)
+        self.wf(rc + 0x11D4, meter)
+        self.wf(rc + 0x11D8, earned)
+        self.wf(rc + 0x11E4, mult)
+        self.wf(rc + 0x11E8, bonus)
+        self.wb(rc + 0x11EC, peg_a)
+        self.wb(rc + 0x11ED, peg_b)
+        self.wb(rc + 0x11EE, boosting)
+        self.wb(rc + 0x11EF, 0)
+        self.wb(rc + 0x11F1, ramp_done)
+
+    def set_frame(self, i, m):
+        """The world matrix retail reads through pv+0x204: rows right/up/at,
+        row 3 = translation.  Stored 16-float row-major, as retail does."""
+        base = MISC + 0x3000 + i * 0x100
+        for r in range(4):
+            for c in range(4):
+                self.wf(base + (r * 4 + c) * 4, float(m[r][c]))
+        self.wi(self.pv(i) + 0x204, base)
+        return base
+
+    def slam_type_call(self, attacker, victim):
+        """FUN_00197F90: EAX = victim pv, ECX = attacker pv, [esp+4] = strength."""
+        return self.call(0x00197F90,
+                         regs={UC_X86_REG_EAX: self.pv(victim),
+                               UC_X86_REG_ECX: self.pv(attacker)},
+                         stack_args=(struct.unpack('<I',
+                                     struct.pack('<f', 1.0))[0],))
+
+    def score_state(self, i):
+        """Every field FUN_001989A0's score half can touch."""
+        rc = self.rc(i)
+        return dict(
+            bp=self.ri(rc + 0x111C), bp_td=self.ri(rc + 0x117C),
+            bp_aggr=self.ri(rc + 0x1180),
+            slams_made=self.ri(rc + 0x1174), times_slammed=self.ri(rc + 0x1590),
+            td_made=self.ri(rc + 0x1194), aftertouch_td=self.ri(rc + 0x118C),
+            boost_tier=self.ri(rc + 0x11CC), boost_size=self.rf(rc + 0x11D0),
+            boost_meter=self.rf(rc + 0x11D4), boost_earned=self.rf(rc + 0x11D8),
+            boost_forcestop=self.rb(rc + 0x11EF),
+            slam_kind=self.ri(rc + 0x11F4), slam_cheap=self.rb(rc + 0x11F8),
+            slam_burning=self.rb(rc + 0x11F9),
+            slam_energy=self.rf(rc + 0x1588),
+            slammed_energy=self.rf(rc + 0x1594),
+            last_slam_time=self.rf(rc + 0x158C), slam_time=self.rf(rc + 0x1598),
+            slam_type=self.rb(rc + 0x159C), last_slam_kind=self.ri(rc + 0x15A0),
+            aggressor=self.ru(rc + 0x16BC), aggressor_time=self.rf(rc + 0x16C0),
+            human_slam=self.rb(rc + 0x1B94),
+            ai_aggression=self.rf(rc + 0x23E0),
+            td_credited=self.rb(rc + 0x15D6), td_count=self.ri(self.score(i) + 0x68),
         )
 
     def cause_record(self, wall=0, has_obj=0, surface=0, obj=0, wreck_rc=0):

@@ -9,7 +9,11 @@
  * file reproduces THAT order, not the mathematically equivalent one.
  */
 #include "burnout3_ai.h"
+#include "burnout3_backend.h"
+#include "burnout3_emu.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 #include <string.h>
 
@@ -36,6 +40,16 @@
 #define B3AI_STOP_MS       0.1f        /* 0x003A69C4 */
 #define B3AI_DITHER_HALF   0.5f        /* 0x0041A4AC */
 #define B3AI_CATCHUP_TOL   0.0010309278732165694f  /* 0x003B1E04 */
+
+/* ---- the rubber band (FUN_00106370 / FUN_001734C0 / FUN_00173690) ------ */
+/* Every one of these is read straight out of the retail image; none is
+ * tuned, scaled or invented.  Addresses are the .rdata slots the three
+ * functions load.  docs/RE_AI.md section 17. */
+#define B3AI_CATCHUP_RELEASE 45.0f     /* 0x003B1770  added to the demand   */
+#define B3AI_CATCHUP_WARP    17.8816f  /* 0x003B1B68  exactly 40 mph        */
+#define B3AI_PACE_MARGIN     4.4704f   /* 0x003B1B64  exactly 10 mph        */
+#define B3AI_GAP_D2_BIAS     1600.0f   /* 0x0039A858  (40 m)^2              */
+#define B3AI_GAP_D2_SCALE    5.5555556e-05f /* 0x003B1A58 = 1/18000         */
 /* DAT_005A9770, the traffic-class AI target-speed cap: 22.352 m/s = exactly
  * 50 mph, installed by the static-init snippet at 0x002C5E80 from .data
  * 0x003B2110 (same copy-snippet pattern as the 13.4112 brake threshold). */
@@ -44,17 +58,19 @@
 /* AI config defaults: compiled-in (FUN_0016AFD0) overridden by the retail
  * Data/vdb.xml column -- docs/RE_AI.md section 1, all [C] hash-mirrored. */
 B3AiParams b3_ai_params = {
-    /* oor_speed_dec_rate  */ 10.0f,
-    /* oor_max_dir_deg     */ 1.0f,
-    /* angle_min_speed_deg */ 90.0f,
-    /* top_speed_mps       */ 88.0f,
-    /* min_speed_mps       */ 20.0f,
-    /* car_at_weight       */ 0.9f,
-    /* drift_start_deg     */ 20.0f,
-    /* max_lock_deg        */ 10.0f,
-    /* drift_max_lock_deg  */ 50.0f,
-    /* avoid 10/20/30 m    */ 26.2f, 40.0f, 60.0f,
-    /* brake_dist_factor   */ 0.6f,
+    .oor_speed_dec_rate = 10.0f,
+    .oor_max_dir_deg = 1.0f,
+    .angle_min_speed_deg = 90.0f,
+    .top_speed_mps = 88.0f,
+    .min_speed_mps = 20.0f,
+    .car_at_weight = 0.9f,
+    .drift_start_deg = 20.0f,
+    .max_lock_deg = 10.0f,
+    .drift_max_lock_deg = 50.0f,
+    .avoid_speed_10m = 26.2f,
+    .avoid_speed_20m = 40.0f,
+    .avoid_speed_30m = 60.0f,
+    .brake_dist_factor = 0.6f,
 };
 
 void b3_ai_init(void) {
@@ -63,7 +79,24 @@ void b3_ai_init(void) {
      * per-difficulty column later (FUN_00172870's 0x98-byte per-slot record). */
 }
 
-void b3_ai_state_init(B3AiState* s) {
+/* The driver's own state inside the VEHICLE, at its idle values.
+ *
+ * These five are vehicle fields (v+0x1534..0x157C) that the port used to keep
+ * in B3AiState. That mattered for more than tidiness: B3AiState survives a
+ * vehicle re-init and the vehicle does not -- b3_vehicle_full_init memsets
+ * the whole object, and the harness re-inits on respawn. Left to the memset
+ * the timers come back as 0.0, which reads as "a reverse burst is running and
+ * has expired" instead of "idle", and the stuck car goes to NEUTRAL rather
+ * than into reverse. Hence a function, called from both places. */
+void b3_ai_vehicle_state_init(B3VehicleFull* veh) {
+    veh->stuck_arm_1578 = -1.0f;
+    veh->reverse_timer_157C = -1.0f;
+    veh->brake_hold_1570 = -1.0f;
+    veh->authority_1534 = 1.0f;
+    veh->drift_state_1524 = 4;
+}
+
+void b3_ai_state_init(B3AiState* s, B3VehicleFull* veh) {
     memset(s, 0, sizeof *s);
     s->des_dir[2] = 1.0f;
     s->des_dir_n[2] = 1.0f;
@@ -71,11 +104,156 @@ void b3_ai_state_init(B3AiState* s) {
     s->t2t_snap = 1.0f;
     s->max_speed = b3_ai_params.top_speed_mps;
     s->speed_cap = b3_ai_params.top_speed_mps;
-    s->stuck_arm = -1.0f;
-    s->reverse_timer = -1.0f;
-    s->brake_hold = -1.0f;
-    s->steer_authority = 1.0f;
-    s->drift_state = 4;
+    /* FUN_001718A0 @0x001719DB/@0x001719E3: the catch-up bonus starts at 0
+     * and the race-clock gate at -1.0, so `rc+0x10DC > AI+0xA0C` is true from
+     * the first frame.  The expiry latch AI+0xA31 starts clear. */
+    s->catchup_bonus   = 0.0f;
+    s->catchup_gate    = -1.0f;
+    s->catchup_expired = 0;
+    /* AI+0x9E8 is FUN_00172870's job.  Its NO-RECORD default (@0x001728F0)
+     * is 0, which expires catch-up on the first frame; the caller overwrites
+     * it from the .bgd pace record. */
+    s->catchup_window  = 0.0f;
+    b3_ai_vehicle_state_init(veh);
+}
+
+/* ======================================================================== */
+/* FUN_00106370 -- "where am I relative to my human player", refreshed at    */
+/* the top of the per-car update FUN_00104A90 (@0x00104AA6).                 */
+/* ======================================================================== */
+void b3_ai_player_rel(int race_mode, int ncars, int grid_slot,
+                      int ahead_of_player, float dist2_to_player,
+                      int* player_slot, int* rank_1558, float* gap_155c) {
+    int slot;
+    float g;
+
+    /* @0x00106376: `if (racecar+0x1920 == 0)` -- the human car itself. */
+    if (race_mode == 0) {
+        if (player_slot) *player_slot = grid_slot;  /* (s8) racecar+0x27D0 */
+        if (rank_1558)   *rank_1558   = B3AI_RANK_IS_PLAYER;   /* @0x00106388 */
+        if (gap_155c)    *gap_155c    = 0.0f;                  /* @0x00106392 */
+        return;
+    }
+
+    /* @0x001063B0: one car in the world -> player 0; otherwise the SPLIT-
+     * SCREEN pairing `grid_slot & 1` (the `and 0x80000001` / dec / or / inc
+     * idiom @0x001063C8 is the signed remainder; grid slots are >= 0 so it
+     * reduces to the low bit). */
+    slot = (ncars == 1) ? 0 : (grid_slot & 1);
+    if (player_slot) *player_slot = slot;
+
+    /* @0x0010640C: FUN_00194200 answers "do I outrank my player?".  Ahead
+     * -> 2, behind (or level) -> 3.  Only rank 3 arms the catch-up. */
+    if (rank_1558)
+        *rank_1558 = ahead_of_player ? B3AI_RANK_AHEAD_OF_PLAYER
+                                     : B3AI_RANK_BEHIND_PLAYER;
+
+    /* @0x0010642E..0x00106493: the SQUARED distance to the player, biased by
+     * (40 m)^2 and scaled by 1/18000, clamped to 0..1.  0 at 40 m, 1 at
+     * 140 m.  The squared distance is FUN_00105BD0's per-car scan result
+     * cached at vehicle+0x1560[slot]. */
+    g = (dist2_to_player - B3AI_GAP_D2_BIAS) * B3AI_GAP_D2_SCALE;
+    if (g < 0.0f) g = 0.0f;          /* maxss 0.0  @0x00106471 */
+    if (g > 1.0f) g = 1.0f;          /* minss 1.0  @0x00106477 */
+    if (gap_155c) *gap_155c = g;
+}
+
+/* ======================================================================== */
+/* FUN_001734C0 -- the CATCH-UP.  Called from FUN_001724F0 @0x001726EE with  */
+/* the aggression-matched speed, behind the two gates at @0x001726CF and     */
+/* @0x001726E6 (`AI+0xA31 == 0 && racecar+0x10DC > AI+0xA0C`).               */
+/* ======================================================================== */
+float b3_ai_catchup(B3AiState* s, const B3AiCatchupIn* in, float spd) {
+    float frac;
+    int i, lo, hit;
+
+    s->catchup_bonus = 0.0f;                        /* @0x001734E1 */
+
+    /* @0x001734E9: with no start distance or no lap count the fraction is 0,
+     * so the window never expires on its own. */
+    frac = in->dist_valid ? in->race_fraction : 0.0f;
+
+    /* @0x00173541: `COMISS frac, AI+0x9E8 / JC` -- expire once the race is
+     * `catchup_window` of the way done.  The compare is unordered-false, so a
+     * NaN fraction does NOT expire; `>=` reproduces that.  The latch is
+     * one-shot: from here on FUN_00173690 switches to the player-tracking
+     * cap instead. */
+    if (frac >= s->catchup_window && s->catchup_expired == 0) {
+        s->pace_a04        = 0.0f;                  /* @0x0017355C */
+        s->catchup_expired = 1;                     /* @0x00173564 */
+        return spd;                                 /* argument unchanged  */
+    }
+
+    /* @0x00173572: is my human player within `place_window` places AHEAD of
+     * me?  Retail walks the whole car table DAT_0073A1A8 looking for a car
+     * with `my_place - N <= place < my_place` and `+0x1920 == 0`; only the
+     * human has mode 0, so this finds the player or nothing.  Both arms first
+     * require rank 3 -- "I am behind my player" (@0x0017358B / @0x0017359F). */
+    hit = 0;
+    if (in->mode_2450 == 0) {
+        if (in->veh_rank == B3AI_RANK_BEHIND_PLAYER) {
+            lo = in->my_place - in->place_window;
+            for (i = 0; i < in->ncars; i++) {
+                if (in->place[i] < lo) continue;            /* @0x001735F1 */
+                if (in->place[i] >= in->my_place) continue; /* @0x001735F5 */
+                if (in->race_mode[i] != 0) continue;        /* @0x001735FA */
+                hit = 1;
+                break;
+            }
+        }
+    } else if (in->mode_2450 == 1) {
+        /* @0x00173585: this mode skips the place window entirely. */
+        if (in->veh_rank == B3AI_RANK_BEHIND_PLAYER) hit = 1;
+    }
+    if (!hit) return spd;                            /* @0x00173609 */
+
+    /* @0x00173625: the car is off-camera (not fully simulated) -- there is no
+     * gap number to scale, so the demand is released to Top speed + 45.
+     * (The null test on racecar+0x2440 at 0x0017362D is dead code: both paths
+     * that reach it have already dereferenced the pointer.  Kept because that
+     * is the instruction stream.) */
+    if (!in->veh_valid || !in->veh_in_range)
+        return b3_ai_params.top_speed_mps + B3AI_CATCHUP_RELEASE; /* @0x00173671 */
+
+    /* @0x00173639: the off-camera warp speed, 40 mph at 40 m from the player
+     * rising to 80 mph at 140 m.  FUN_00104A90 @0x00104BF8 advances the car
+     * by `AI+0x9DC * dt` along its aim while the attack flag is up. */
+    s->catchup_bonus = in->veh_gap_norm * B3AI_CATCHUP_WARP
+                     + B3AI_CATCHUP_WARP;            /* @0x00173659 */
+    /* @0x0017364F: and the on-camera half -- +45 m/s on the speed demand.
+     * FUN_00105340 floors the throttle whenever the demand is more than
+     * 1 m/s above the current speed, so this is "full throttle, ignore the
+     * corner-brake law, until you are back on terms". */
+    return spd + B3AI_CATCHUP_RELEASE;
+}
+
+/* ======================================================================== */
+/* FUN_00173690 -- the hard speed cap AI+0xA08.                             */
+/* ======================================================================== */
+void b3_ai_speed_cap(B3AiState* s, const B3AiCatchupIn* in,
+                     float player_speed, float section_min, float section_max) {
+    /* @0x001736B4/@0x001736C2: a car that is fully simulated gets the
+     * player-relative treatment; an off-camera one gets the section table. */
+    if (in->veh_valid && in->veh_in_range) {
+        if (s->catchup_expired) {
+            /* @0x00173713: `max(section_min, player_speed - 10 mph)`.  Once
+             * catch-up has expired this is the governor that keeps the pack
+             * on the player's pace -- when the player slows, so does the
+             * ceiling, and the field waits. */
+            float f = player_speed - B3AI_PACE_MARGIN;
+            s->speed_cap = (f > section_min) ? f : section_min;
+        } else {
+            s->speed_cap = b3_ai_params.top_speed_mps;   /* @0x00173748 */
+        }
+        return;
+    }
+    /* @0x0017375F: OFF CAMERA.  A car AHEAD of its player is pinned to the
+     * section MINIMUM; a car behind it is allowed the section MAXIMUM.  With
+     * no per-section factor table that is "Min speed mps" vs "Top speed mps"
+     * -- 20 m/s against 88.  This is the half of the rubber band that stops
+     * the field driving away from a slow player. */
+    s->speed_cap = (in->veh_rank == B3AI_RANK_AHEAD_OF_PLAYER)
+                 ? section_min : section_max;
 }
 
 /* --- vector helpers, matching the game's SSE helpers exactly ------------ */
@@ -125,8 +303,8 @@ float b3_ai_commit_target(B3AiState* s, const B3AiCar* c,
     s->des_dir[2] = target_point[2] - c->pos[2];
     s->des_dir[3] = 0.0f;          /* row3.w of the matrix minus 1.0 -> 0 */
     len = b3_norm3_len(s->des_dir);
-    if (c->speed_ms > 1.0f)
-        s->time_to_target = len / c->speed_ms;
+    if (c->veh->rb.vel[3] > 1.0f)
+        s->time_to_target = len / c->veh->rb.vel[3];
     else
         s->time_to_target = len;
     return len;
@@ -152,33 +330,33 @@ void b3_ai_target_angle(B3AiState* s, const B3AiCar* c) {
 
     /* gate: the LSDM/drift path (byte v+0x1550 set AND (below the LSDM speed
      * limit OR already drifting)) uses a yaw-RATE demand instead. */
-    if (c->lsdm_active &&
-        (c->speed_ms * B3AI_MPS2MPH <= c->lsdm_limit_mph ||
-         c->drift_state == 2 || c->drift_state == 1)) {
+    if (c->veh->lsdm_active_1550 &&
+        (c->veh->rb.vel[3] * B3AI_MPS2MPH <= c->veh->lsdm_limit_13AC ||
+         c->veh->drift_state_1524 == 2 || c->veh->drift_state_1524 == 1)) {
         float a[4], cross[4], cxa[4], d, rate, cur, gain, sp;
-        a[0] = c->car_at[0]; a[1] = c->car_at[1]; a[2] = c->car_at[2];
+        a[0] = c->veh->rb.dir[0]; a[1] = c->veh->rb.dir[1]; a[2] = c->veh->rb.dir[2];
         a[3] = 0.0f;
         if (s->target_mode != 1) {
-            a[0] += c->veh_fwd[0];
-            a[1] += c->veh_fwd[1];
-            a[2] += c->veh_fwd[2];
+            a[0] += c->veh->rb.frame[2][0];
+            a[1] += c->veh->rb.frame[2][1];
+            a[2] += c->veh->rb.frame[2][2];
         }
         if (a[0] * a[0] + a[1] * a[1] + a[2] * a[2] >= B3AI_EPS2) {
             b3_norm3(a);
         } else {
-            a[0] = c->veh_fwd[0]; a[1] = c->veh_fwd[1]; a[2] = c->veh_fwd[2];
+            a[0] = c->veh->rb.frame[2][0]; a[1] = c->veh->rb.frame[2][1]; a[2] = c->veh->rb.frame[2][2];
         }
         d = b3_clamp(b3_dot3(s->des_dir_n, a), -1.0f, 1.0f);
         ang = b3_acos_c(d);                       /* radians here */
 
-        cross[0] = a[1] * c->veh_right[2] - a[2] * c->veh_right[1];
-        cross[1] = a[2] * c->veh_right[0] - a[0] * c->veh_right[2];
-        cross[2] = a[0] * c->veh_right[1] - a[1] * c->veh_right[0];
+        cross[0] = a[1] * c->veh->rb.frame[0][2] - a[2] * c->veh->rb.frame[0][1];
+        cross[1] = a[2] * c->veh->rb.frame[0][0] - a[0] * c->veh->rb.frame[0][2];
+        cross[2] = a[0] * c->veh->rb.frame[0][1] - a[1] * c->veh->rb.frame[0][0];
         if (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]
             < B3AI_EPS2) {
-            cross[0] = a[1] * c->veh_fwd[2] - a[2] * c->veh_fwd[1];
-            cross[1] = a[2] * c->veh_fwd[0] - a[0] * c->veh_fwd[2];
-            cross[2] = a[0] * c->veh_fwd[1] - a[1] * c->veh_fwd[0];
+            cross[0] = a[1] * c->veh->rb.frame[2][2] - a[2] * c->veh->rb.frame[2][1];
+            cross[1] = a[2] * c->veh->rb.frame[2][0] - a[0] * c->veh->rb.frame[2][2];
+            cross[2] = a[0] * c->veh->rb.frame[2][1] - a[1] * c->veh->rb.frame[2][0];
         }
         cross[3] = 0.0f;
         b3_norm3(cross);
@@ -188,7 +366,7 @@ void b3_ai_target_angle(B3AiState* s, const B3AiCar* c) {
         if (b3_dot3(cxa, s->des_dir_n) < 0.0f) ang = 0.0f - ang;
 
         rate = ang / s->t2t_snap;                 /* demanded yaw rate */
-        cur = c->yaw_rate;
+        cur = c->veh->rb.omega[1];
         s->steer_err = cur - rate;
         /* gain 0.04 while the error UNWINDS the yaw, 0.01 while it winds up
          * (DAT_0041A50C / DAT_0041A510); the opposite-sign multiplier
@@ -197,7 +375,7 @@ void b3_ai_target_angle(B3AiState* s, const B3AiCar* c) {
             gain = (rate <= cur) ? B3AI_YAW_GAIN_LO : B3AI_YAW_GAIN_HI;
         else
             gain = (rate <= cur) ? B3AI_YAW_GAIN_HI : B3AI_YAW_GAIN_LO;
-        sp = c->speed_ms;
+        sp = c->veh->rb.vel[3];
         s->target_angle = (rate - cur) * sp * sp * gain;
         if (s->target_angle > 90.0f) s->target_angle = 90.0f;
         if (s->target_angle < -90.0f) s->target_angle = -90.0f;
@@ -210,9 +388,9 @@ void b3_ai_target_angle(B3AiState* s, const B3AiCar* c) {
         float k = b3_ai_params.car_at_weight;
         float one_minus = 1.0f - k;
         float blend[4], d;
-        blend[0] = c->car_at[0] * one_minus + c->fwd[0] * k;
-        blend[1] = c->car_at[1] * one_minus + c->fwd[1] * k;
-        blend[2] = c->car_at[2] * one_minus + c->fwd[2] * k;
+        blend[0] = c->veh->rb.dir[0] * one_minus + c->fwd[0] * k;
+        blend[1] = c->veh->rb.dir[1] * one_minus + c->fwd[1] * k;
+        blend[2] = c->veh->rb.dir[2] * one_minus + c->fwd[2] * k;
         blend[3] = 0.0f;
         b3_norm3(blend);
         d = b3_dot3(s->des_dir_n, blend);
@@ -254,7 +432,7 @@ float b3_ai_corner_speed(const B3AiState* s, const B3AiCar* c,
     float t = 1.0f - u;
     float lerped, spd;
     if (0.0f > t) t = 0.0f;                       /* maxss(0, 1-u) */
-    if (c->drift_state == 2 || c->drift_state == 1)
+    if (c->veh->drift_state_1524 == 2 || c->veh->drift_state_1524 == 1)
         lerped = max_speed;
     else
         lerped = t * max_speed;
@@ -268,21 +446,54 @@ float b3_ai_corner_speed(const B3AiState* s, const B3AiCar* c,
 /* ======================================================================== */
 /* FUN_001724F0 -- the target speed (racecar+0x23C4).                       */
 /* ======================================================================== */
+static void b3_ai_target_speed_core(B3AiState* s, const B3AiCar* c,
+                                    float catchup_bonus,
+                                    const B3AiCatchupIn* rb);
+
 void b3_ai_target_speed(B3AiState* s, const B3AiCar* c, float catchup_bonus) {
+    b3_ai_target_speed_core(s, c, catchup_bonus, 0);
+}
+
+void b3_ai_target_speed_rb(B3AiState* s, const B3AiCar* c,
+                           const B3AiCatchupIn* rb) {
+    b3_ai_target_speed_core(s, c, 0.0f, rb);
+}
+
+static void b3_ai_target_speed_core(B3AiState* s, const B3AiCar* c,
+                                    float catchup_bonus,
+                                    const B3AiCatchupIn* rb) {
     float spd = b3_ai_corner_speed(s, c, s->max_speed);
     float err, f;
     s->corner_speed = spd;
     s->target_speed = spd;
 
-    if (c->traffic_class) {
-        /* traffic-class cars are pinned to DAT_005A9770 = 50 mph */
+    if (!c->traffic_class) {
+        /* [C] FUN_001724F0+0x??: `if (racecar[0x134C] == 0)` -- the cap is on
+         * the ZERO side.  racecar+0x134C == 0 IS the traffic class (retail's
+         * driver dispatcher FUN_00104D30 sends 0x134C==0 to FUN_00105150,
+         * the traffic driver), so traffic is pinned to DAT_005A9770 = 50 mph.
+         * This test used to read `if (c->traffic_class)` -- inverted, which
+         * gave every 0x134C==0 car the RACER speed path (uncapped + catch-up)
+         * and every racer the 50 mph pin.  validate_ai never caught it
+         * because every case it drives has 0x134C == 0. */
         float cap = B3AI_TRAFFIC_CAP;
         s->target_speed = (spd < cap) ? spd : cap;
     } else if (c->race_mode == 1) {
         /* FUN_00172FA0 (aggression speed matching) then FUN_001734C0
          * (catch-up).  Both are supplied by the caller as a delta because
          * their state machines are [S] -- see docs/RE_AI.md section 11. */
-        s->target_speed = spd + catchup_bonus;
+        if (rb) {
+            /* [C] FUN_001724F0 @0x001726B9..0x001726F3: the two gates on the
+             * catch-up call are `AI+0xA31 == 0` and
+             * `racecar+0x10DC > AI+0xA0C`; when either fails retail zeroes
+             * AI+0x9DC instead (@0x00172700). */
+            if (s->catchup_expired == 0 && rb->race_clock > s->catchup_gate)
+                s->target_speed = b3_ai_catchup(s, rb, spd);
+            else
+                s->catchup_bonus = 0.0f;
+        } else {
+            s->target_speed = spd + catchup_bonus;
+        }
         if (c->free_speed_floor) {
             if (s->target_speed < 0.0f) s->target_speed = 0.0f;
         } else if (s->target_speed < b3_ai_params.min_speed_mps) {
@@ -304,80 +515,142 @@ void b3_ai_target_speed(B3AiState* s, const B3AiCar* c, float catchup_bonus) {
 /* FUN_00104CA0 -- brake helper.  In reverse (gear -1) the "brake" goes to  */
 /* the THROTTLE input; forward it goes to the brake and throttle is zeroed. */
 /* ======================================================================== */
-void b3_ai_brake(B3AiInputs* in, B3AiState* s, const B3AiCar* c,
+void b3_ai_brake(B3AiState* s, B3AiCar* c,
                  float amount) {
-    if (s->brake_hold != -1.0f && s->brake_hold <= c->clock)
-        s->brake_hold = -1.0f;
-    if (c->gear == -1) {
-        in->brake = 0.0f;
-        in->throttle = amount;
-        in->throttle_raw = 0.0f;
-    } else if (c->gear != 0) {
-        in->brake = amount;
-        in->throttle = 0.0f;
-        in->throttle_raw = 0.0f;
+    /* `s` is FUN_00104CA0's AI-object `this`: retail passes it, the body
+     * only ever touches the racecar, and callers (incl. validate_ai.py) are
+     * written against the retail signature -- so it stays, unread. */
+    (void)s;
+    if (c->veh->brake_hold_1570 != -1.0f && c->veh->brake_hold_1570 <= c->clock)
+        c->veh->brake_hold_1570 = -1.0f;
+    if (c->veh->trans.gear == -1) {
+        c->veh->brake_1404 = 0.0f;
+        c->veh->throttle_1400 = amount;
+        c->veh->throttle_raw_1414 = 0.0f;
+    } else if (c->veh->trans.gear != 0) {
+        c->veh->brake_1404 = amount;
+        c->veh->throttle_1400 = 0.0f;
+        c->veh->throttle_raw_1414 = 0.0f;
     }
 }
 
 /* ======================================================================== */
 /* FUN_00105340 -- the AI racer driver.                                     */
 /* ======================================================================== */
-void b3_ai_drive(B3AiState* s, const B3AiCar* c, B3AiInputs* in,
+void b3_ai_drive(B3AiState* s, B3AiCar* c,
                  float dt, float reverse_aim_dot) {
+    /* ai=retail: FUN_00105340 over the port's own bytes. B3AiCar is a pure
+     * racecar view and points at the physics vehicle the way retail does at
+     * racecar+0x2440, so each object scatters to its own base -- the racecar
+     * ranges to RC, B3_VEHICLE_RANGES to VEH -- and the driver's writes come
+     * back from both. Nothing is converted in either direction.
+     *
+     * This was blocked until the two objects were separated: B3AiCar used to
+     * carry ten VEHICLE fields at their vehicle offsets inside a struct laid
+     * out on the RACECAR, so the transfer put this car's speed at RC+0xBC and
+     * retail's driver read the emulator's default vehicle instead. */
+    if (b3_backend_get(B3_FEAT_AI) == B3_BACKEND_RETAIL) {
+        /* If THIS CAR's physics runs inside the emulator, the driver runs
+         * there too (b3_emu_step_ai) -- calling the separate AI session as
+         * well would drive the car twice and put the two sessions into
+         * contention over v+0x1400..0x157C.  This must be the PER-CAR
+         * ownership flag, not the feature switch: B3_EMU_CARS caps how many
+         * cars ride the emulator (default 1, the player), and the feature
+         * check here left every car past the cap with NO DRIVER AT ALL on
+         * the all-retail build -- five opponents idling backwards down the
+         * start slope to route p~0.99 and 0 mph, which read as "the field
+         * stalls" in every ai=retail+physics=retail run. */
+        if (c->veh->emu_owned)
+            return;
+        if (b3_emu_ai_drive(0, c, s, c->veh, c->clock, dt,
+                            (const float(*)[4])c->veh->rb.frame))
+            return;
+    }
+
     int rev_high;        /* [esp+7]: engine at/above the change-up point   */
     float lock, st, d;
 
-    memset(in, 0, sizeof *in);
-    in->gear_request = 0;
+    /* Retail's driver recomputes its outputs into the VEHICLE each call.
+     * This used to be memset() over an output struct the port invented; the
+     * fields are cleared by name now, and v+0x14C8 is deliberately NOT among
+     * them -- see below. */
+    c->veh->throttle_1400     = 0.0f;
+    c->veh->brake_1404        = 0.0f;
+    c->veh->throttle_raw_1414 = 0.0f;
+    c->veh->input_bits_13FC   = 0;
+    /* v+0x1408 is NOT cleared. It is the steer the driver wrote LAST frame --
+     * the slew limiter's memory -- and retail keeps exactly one value there.
+     * The port modelled that single address twice, as B3AiState.prev_steer
+     * and B3AiInputs.steer, so clearing "the output" silently destroyed "the
+     * memory" once the two collapsed onto the same field. validate_ai's
+     * "ooc mode 1 holds" case is the one that catches it: it reads 0 instead
+     * of the 0.3 retail carries in. */
+    c->veh->stop_flag_1552    = 0;
+    /* v+0x14A4 (the transmission's in-shift latch) is NOT touched. The port
+     * used to set a "shift_kick" here, but the only documented writer of
+     * 0x14A4/0x14A0=0.35 is FUN_0011BE50's CRASHED path at 0011BEB4
+     * (RE_NOTES "The crashed path is NOT the racing pipeline", RE_SFX 329) --
+     * nothing places it in FUN_00105340. It was inert while it landed in the
+     * output struct the port invented; against the real vehicle it would
+     * cancel the transmission's in-flight shift every frame, killing the
+     * mid-shift torque cut. */
+    c->commit_boost           = 0;
+    c->engage_boost           = 0;
+    /* The gear is NOT cleared. Retail leaves v+0x14C8 as it found it and
+     * writes 1 or -1 only on the two swap branches; the port zeroed it and
+     * invented a "0 = leave alone" convention, which the harness and
+     * validate_ai.py both had to undo (`mine_gear = got if got else seeded`).
+     * With the driver writing the real vehicle, retail's behaviour is simply
+     * to not touch it. */
 
-    rev_high = (c->engine_rpm >= c->change_up_rpm);
+    /* v+0x149C is RAD/S in retail, v+0x1470 is rpm; convert at the
+     * comparison so the field can hold the game's own bytes. */
+    rev_high = (c->veh->trans.omega * 9.549296f >= c->veh->trans.change_up_rpm);
 
     /* ---- 1. active reverse burst ------------------------------------- */
-    if (s->reverse_timer != -1.0f) {
-        s->reverse_timer -= dt;
-        if (s->reverse_timer > 0.0f) {
-            in->throttle_raw = 0.0f;
-            in->throttle = 0.0f;
-            in->brake = 1.0f;
+    if (c->veh->reverse_timer_157C != -1.0f) {
+        c->veh->reverse_timer_157C -= dt;
+        if (c->veh->reverse_timer_157C > 0.0f) {
+            c->veh->throttle_raw_1414 = 0.0f;
+            c->veh->throttle_1400 = 0.0f;
+            c->veh->brake_1404 = 1.0f;
             /* steer full lock toward the aim side while backing out */
-            if (reverse_aim_dot < -0.1f)      in->steer = -1.0f;
-            else if (reverse_aim_dot > 0.1f)  in->steer = 1.0f;
-            else                              in->steer = 0.0f;
-            s->prev_steer = in->steer;
+            if (reverse_aim_dot < -0.1f)      c->veh->steer_1408 = -1.0f;
+            else if (reverse_aim_dot > 0.1f)  c->veh->steer_1408 = 1.0f;
+            else                              c->veh->steer_1408 = 0.0f;
+            c->veh->steer_1408 = c->veh->steer_1408;
             return;
         }
-        s->reverse_timer = 0.0f;
-        if (c->speed_ms < B3AI_STOP_MS) {
-            s->reverse_timer = -1.0f;
-            in->gear_request = 1;               /* back into forward */
-            in->shift_kick = 1;
-            in->throttle_raw = 0.0f;
-            in->throttle = 0.0f;
-            in->brake = 0.0f;
+        c->veh->reverse_timer_157C = 0.0f;
+        if (c->veh->rb.vel[3] < B3AI_STOP_MS) {
+            c->veh->reverse_timer_157C = -1.0f;
+            c->veh->trans.gear = 1;               /* back into forward */
+            c->veh->throttle_raw_1414 = 0.0f;
+            c->veh->throttle_1400 = 0.0f;
+            c->veh->brake_1404 = 0.0f;
             return;
         }
-        b3_ai_brake(in, s, c, 1.0f);
-        in->stop_flag = 1;
+        b3_ai_brake(s, c, 1.0f);
+        c->veh->stop_flag_1552 = 1;
         return;
     }
 
     /* ---- 2. stuck detector: below 5 mph with the crash timer clear ----- */
     if (c->crash_timer >= B3AI_CRASH_GATE || s->target_speed <= 0.0f ||
-        c->speed_ms * B3AI_MPS2MPH >= B3AI_STUCK_MPH) {
-        s->stuck_arm = -1.0f;
-    } else if (s->stuck_arm == -1.0f) {
-        s->stuck_arm = B3AI_ARM_S;
+        c->veh->rb.vel[3] * B3AI_MPS2MPH >= B3AI_STUCK_MPH) {
+        c->veh->stuck_arm_1578 = -1.0f;
+    } else if (c->veh->stuck_arm_1578 == -1.0f) {
+        c->veh->stuck_arm_1578 = B3AI_ARM_S;
     } else {
-        s->stuck_arm -= dt;
-        if (s->stuck_arm <= 0.0f) {
-            s->reverse_timer = B3AI_REVERSE_S;
-            s->stuck_arm = -1.0f;
-            in->gear_request = -1;
-            in->shift_kick = 1;
-            in->throttle_raw = 0.0f;
-            in->throttle = 0.0f;
-            in->brake = 0.0f;
-            in->steer = 0.0f;
+        c->veh->stuck_arm_1578 -= dt;
+        if (c->veh->stuck_arm_1578 <= 0.0f) {
+            c->veh->reverse_timer_157C = B3AI_REVERSE_S;
+            c->veh->stuck_arm_1578 = -1.0f;
+            c->veh->trans.gear = -1;
+            c->veh->throttle_raw_1414 = 0.0f;
+            c->veh->throttle_1400 = 0.0f;
+            c->veh->brake_1404 = 0.0f;
+            c->veh->steer_1408 = 0.0f;
             return;
         }
     }
@@ -394,126 +667,230 @@ void b3_ai_drive(B3AiState* s, const B3AiCar* c, B3AiInputs* in,
      * mode 0 the driver throws full OPPOSITE lock. */
     if (c->ooc_window) {
         if (c->ooc_mode == 2) {
-            s->steer_authority = 0.1f;
+            c->veh->authority_1534 = 0.1f;
         } else {
-            s->steer_authority = 0.05f;
+            c->veh->authority_1534 = 0.05f;
             if (c->ooc_mode == 0) {
                 if (c->ooc_countersteer)
                     st = 0.0f - ((st < 0.0f) ? -1.0f : 1.0f);
                 else
-                    st = s->prev_steer;      /* hold the previous input */
+                    st = c->veh->steer_1408;      /* hold the previous input */
             } else if (c->ooc_mode == 1) {
-                st = s->prev_steer;
+                st = c->veh->steer_1408;
             }
         }
     }
-    in->steer = st;
-    s->prev_steer = st;
+    c->veh->steer_1408 = st;
+    c->veh->steer_1408 = st;
 
     /* ---- 4. speed band ------------------------------------------------ */
     if (c->attack_active) {
         if (c->attack_left) {
-            if (c->attack_commit) { s->drift_state = 2; in->steer = 1.0f; }
+            if (c->attack_commit) { c->veh->drift_state_1524 = 2; c->veh->steer_1408 = 1.0f; }
         } else if (c->attack_right && c->attack_commit) {
-            s->drift_state = 1; in->steer = -1.0f;
+            c->veh->drift_state_1524 = 1; c->veh->steer_1408 = -1.0f;
         }
-        d = s->target_speed - c->speed_ms;
+        d = s->target_speed - c->veh->rb.vel[3];
         if (d > 1.0f) {
-            in->brake = 0.0f;
-            in->throttle_raw = 1.0f;
-            in->throttle = 1.0f;
+            c->veh->brake_1404 = 0.0f;
+            c->veh->throttle_raw_1414 = 1.0f;
+            c->veh->throttle_1400 = 1.0f;
         } else if (d >= 0.0f - B3AI_BRAKE_EXCESS) {
-            in->brake = 0.0f;
+            c->veh->brake_1404 = 0.0f;
             if (rev_high) {
-                in->throttle_raw = 1.0f;
-                in->throttle = 1.0f;
+                c->veh->throttle_raw_1414 = 1.0f;
+                c->veh->throttle_1400 = 1.0f;
             } else {
-                in->throttle_raw = 0.0f;
-                in->throttle = 0.0f;
+                c->veh->throttle_raw_1414 = 0.0f;
+                c->veh->throttle_1400 = 0.0f;
             }
         } else {
-            b3_ai_brake(in, s, c, 1.0f);
-            if (s->target_speed < B3AI_STOPFLAG_MS) in->stop_flag = 1;
+            b3_ai_brake(s, c, 1.0f);
+            if (s->target_speed < B3AI_STOPFLAG_MS) c->veh->stop_flag_1552 = 1;
             goto boost_tail;
         }
     } else {
-        if (s->drift_state != 2 && s->drift_state != 1) s->drift_state = 4;
-        d = s->target_speed - c->speed_ms;
+        if (c->veh->drift_state_1524 != 2 && c->veh->drift_state_1524 != 1) c->veh->drift_state_1524 = 4;
+        d = s->target_speed - c->veh->rb.vel[3];
         if (d > 1.0f) {
-            in->throttle_raw = 1.0f;
-            if (!c->traffic_class) {
-                in->brake = 0.0f;
-                in->throttle = 1.0f;
+            c->veh->throttle_raw_1414 = 1.0f;
+            if (c->traffic_class) {
+                /* [C] FUN_00105340+0x??: `if (racecar[0x134C] != 0)` -- the
+                 * RACER side.  Retail writes the brake and skips the dither
+                 * here; v+0x1400 is not written because retail's wrapper
+                 * FUN_00104D30 derives it as min(1, v[0x1414] * v[0x13BC]),
+                 * which with 1414 = 1.0 and 13BC = 4.0 is the 1.0 below.
+                 * Flipped with the b3_ai_target_speed test: 0x134C == 0 is
+                 * traffic, so the racer branch is the NON-zero one. */
+                c->veh->brake_1404 = 0.0f;
+                c->veh->throttle_1400 = 1.0f;
             }
         } else if (!c->brake_suppressed && d < 0.0f - B3AI_BRAKE_EXCESS) {
-            b3_ai_brake(in, s, c, 1.0f);
-            if (s->target_speed < B3AI_STOPFLAG_MS) in->stop_flag = 1;
+            b3_ai_brake(s, c, 1.0f);
+            if (s->target_speed < B3AI_STOPFLAG_MS) c->veh->stop_flag_1552 = 1;
             goto boost_tail;
         } else if (rev_high) {
-            in->brake = 0.0f;
-            in->throttle_raw = 1.0f;
-            in->throttle = 1.0f;
+            c->veh->brake_1404 = 0.0f;
+            c->veh->throttle_raw_1414 = 1.0f;
+            c->veh->throttle_1400 = 1.0f;
         } else {
-            in->throttle_raw = 0.0f;
-            in->throttle = 0.0f;
-            in->brake = 0.0f;
+            c->veh->throttle_raw_1414 = 0.0f;
+            c->veh->throttle_1400 = 0.0f;
+            c->veh->brake_1404 = 0.0f;
         }
     }
 
     /* ---- 5. launch throttle dither ------------------------------------ */
     {
         float duty = 1.0f;
-        if (s->dither_deadline > c->clock)
-            duty = 1.0f - (s->dither_deadline - c->clock) * B3AI_DITHER_HALF;
-        if (in->throttle != s->prev_throttle) {
-            if (in->throttle == 1.0f && c->speed_ms < B3AI_BRAKE_EXCESS)
-                s->dither_deadline = -1.0f;
+        if (c->veh->dither_1574 > c->clock)
+            duty = 1.0f - (c->veh->dither_1574 - c->clock) * B3AI_DITHER_HALF;
+        if (c->veh->throttle_1400 != c->veh->prev_throttle_156C) {
+            if (c->veh->throttle_1400 == 1.0f && c->veh->rb.vel[3] < B3AI_BRAKE_EXCESS)
+                c->veh->dither_1574 = -1.0f;
             else
-                s->dither_deadline = duty * B3AI_REVERSE_S + c->clock;
+                c->veh->dither_1574 = duty * B3AI_REVERSE_S + c->clock;
             duty = 1.0f - duty;
         }
-        s->prev_throttle = in->throttle;
-        if (in->throttle == 1.0f) {
-            in->throttle = duty;
-            in->throttle_raw = duty;
+        c->veh->prev_throttle_156C = c->veh->throttle_1400;
+        if (c->veh->throttle_1400 == 1.0f) {
+            c->veh->throttle_1400 = duty;
+            c->veh->throttle_raw_1414 = duty;
         } else {
-            in->throttle = 1.0f - duty;
-            in->throttle_raw = 1.0f - duty;
+            c->veh->throttle_1400 = 1.0f - duty;
+            c->veh->throttle_raw_1414 = 1.0f - duty;
         }
     }
 
     /* ---- 6. boost request -------------------------------------------- */
-    if (c->wants_boost && c->gear > 0 && !c->boosting)
-        in->engage_boost = 1;
+    if (c->wants_boost && c->veh->trans.gear > 0 && !c->boosting)
+        c->engage_boost = 1;
 
 boost_tail:
     /* the min-burn latch racecar+0x11EF is only set on the paths that did NOT
      * just call the engage gate (the engage branch jumps past it) */
-    if (!in->engage_boost && c->boosting && !c->boost_ramp_done)
-        in->commit_boost = 1;
+    if (!c->engage_boost && c->boosting && !c->boost_ramp_done)
+        c->commit_boost = 1;
     if (c->boosting) {
-        in->bits = 4;                    /* the transmission's boost anchor */
-        in->brake = 0.0f;
+        c->veh->input_bits_13FC = 4;                    /* the transmission's boost anchor */
+        c->veh->brake_1404 = 0.0f;
     } else {
-        in->bits = 0;
+        c->veh->input_bits_13FC = 0;
     }
 }
 
 /* ======================================================================== */
 /* Whole chain, one call.                                                   */
 /* ======================================================================== */
-void b3_ai_update(B3AiState* s, const B3AiCar* c, B3AiInputs* in,
-                  const float target_point[3], float arbitrated_max_speed,
-                  float catchup_bonus, float dt) {
-    /* FUN_00173690: the hard cap is Top speed mps while racing */
-    s->speed_cap = b3_ai_params.top_speed_mps;
+/* Everything FUN_00104D30 needs decided BEFORE the driver runs.  Split out of
+ * b3_ai_update so a caller that overrides the speed demand (the aggression
+ * leg) can do so between the plan and the drive, instead of driving twice.
+ * Retail runs the driver exactly ONCE per frame, and FUN_00105340's launch
+ * dither is stateful across calls -- it inverts the throttle whenever
+ * v+0x1400 differs from v+0x156C and then stores 0x1400 into 0x156C -- so a
+ * second call in the same frame reliably undoes the first.  That is what
+ * pinned the throttle to zero: the driver produced 1.0, the re-drive read
+ * back 1.0 != 0.0 and flipped it to 0.0, every frame. */
+static void b3_ai_plan_core(B3AiState* s, B3AiCar* c,
+                            const float target_point[3],
+                            float arbitrated_max_speed, float speed_cap,
+                            float catchup_bonus, const B3AiCatchupIn* rb);
+
+void b3_ai_plan(B3AiState* s, B3AiCar* c,
+                const float target_point[3], float arbitrated_max_speed,
+                float catchup_bonus) {
+    /* FUN_00173690's catch-up-still-armed arm (@0x00173748).  A caller that
+     * has run b3_ai_speed_cap() for the frame uses b3_ai_plan_ex/_rb. */
+    b3_ai_plan_core(s, c, target_point, arbitrated_max_speed,
+                    b3_ai_params.top_speed_mps, catchup_bonus, 0);
+}
+
+void b3_ai_plan_ex(B3AiState* s, B3AiCar* c,
+                   const float target_point[3], float arbitrated_max_speed,
+                   float catchup_bonus, float speed_cap) {
+    b3_ai_plan_core(s, c, target_point, arbitrated_max_speed, speed_cap,
+                    catchup_bonus, 0);
+}
+
+void b3_ai_plan_rb(B3AiState* s, B3AiCar* c,
+                   const float target_point[3], float arbitrated_max_speed,
+                   float speed_cap, const B3AiCatchupIn* rb) {
+    b3_ai_plan_core(s, c, target_point, arbitrated_max_speed, speed_cap,
+                    0.0f, rb);
+}
+
+static void b3_ai_plan_core(B3AiState* s, B3AiCar* c,
+                            const float target_point[3],
+                            float arbitrated_max_speed, float speed_cap,
+                            float catchup_bonus, const B3AiCatchupIn* rb) {
+    s->speed_cap = speed_cap;
     b3_ai_commit_target(s, c, target_point);
     s->max_speed = (arbitrated_max_speed < s->speed_cap)
                  ? arbitrated_max_speed : s->speed_cap;
     b3_ai_frame_snapshot(s);
+    /* ONE pass.  b3_ai_target_angle's 2.4/8.1 deg-per-frame slew limiter
+     * latches AI+0x9CC, so a second pass in the same frame slews twice --
+     * the same class of bug as the double b3_ai_dispatch the call site's
+     * comment warns about. */
     b3_ai_target_angle(s, c);
-    b3_ai_target_speed(s, c, catchup_bonus);
-    b3_ai_drive(s, c, in, dt, b3_dot3(s->des_dir_n, c->right));
+    b3_ai_target_speed_core(s, c, catchup_bonus, rb);
+}
+
+void b3_ai_update(B3AiState* s, B3AiCar* c,
+                  const float target_point[3], float arbitrated_max_speed,
+                  float catchup_bonus, float dt) {
+    b3_ai_plan(s, c, target_point, arbitrated_max_speed, catchup_bonus);
+    b3_ai_dispatch(s, c, dt, b3_dot3(s->des_dir_n, c->right), 1);
+}
+
+/* ======================================================================== */
+/* FUN_00104D30 -- the driver DISPATCHER.                                   */
+/*                                                                          */
+/* This is retail's real per-frame driver entry; FUN_00105340 (racer) and    */
+/* FUN_00105150 (traffic) are two of its three arms.  The port called        */
+/* FUN_00105340 directly, which skipped ALL of the following: the stop-flag  */
+/* pre-clear, the class dispatch, the low-speed steer drop, the drift-timer  */
+/* clear, and -- the one that mattered -- the throttle DERIVATION.  Retail   */
+/* does not leave v+0x1400 to the racer driver at all: the driver writes the */
+/* RAW throttle at v+0x1414 and the dispatcher scales it here.              */
+/* ======================================================================== */
+void b3_ai_dispatch(B3AiState* s, B3AiCar* c, float dt, float reverse_aim_dot,
+                    int ai_enable) {
+    /* [C] FUN_00104D30 @0x00104D30: `*(char*)(ECX+0x1552) = 0` is the first
+     * instruction -- the stop flag is cleared before either driver runs. */
+    c->veh->stop_flag_1552 = 0;
+
+    if (!ai_enable) {
+        /* [C] @0x00104D6A: the no-driver arm zeroes raw throttle, throttle
+         * and steer.  Retail also reaches it when the FUN_00017310 gate
+         * trips (racecar+0x16D8 == 2 and the streamer is mid-transition);
+         * that gate reads objects the harness does not model, so the caller
+         * passes the enable in. */
+        c->veh->throttle_raw_1414 = 0.0f;
+        c->veh->throttle_1400     = 0.0f;
+        c->veh->steer_1408        = 0.0f;
+    } else {
+        /* [C] @0x00104D8?: racecar+0x134C == 0 -> FUN_00105150 (traffic),
+         * else racecar+0x179C == 1 -> FUN_00105340 (racer), else
+         * FUN_00104E20.  The third arm is NOT ported: racecar+0x179C reads
+         * 1 for every car the harness drives, so it is unreachable here. */
+        if (c->traffic_class == 0)
+            b3_ai_traffic_drive(c, s->target_angle, s->target_speed);
+        else
+            b3_ai_drive(s, c, dt, reverse_aim_dot);
+    }
+
+    /* The REST of FUN_00104D30 -- the low-speed steer drop (@0x00104DA5), the
+     * v+0x1438 clear, the racer throttle derivation
+     *   `if (racecar[0x134C] != 0) v[0x1400] = min(1, v[0x1414]*v[0x13BC])`
+     * (@0x00104DC6) and the FUN_0011ECF0 tail -- is the INPUT GLUE, and the
+     * port already owns it in b3_vehicle_step_full (and, on the retail side,
+     * in emulate_pipeline's frame()).  Doing it here as well would derive the
+     * throttle twice: v+0x13BC reads 4.0, so a raw of 0.3 would come out as
+     * 1.0 instead of 0.3 * 4 clamped once.  What the driver owes the physics
+     * stage is therefore the RAW throttle at v+0x1414 -- exactly what retail
+     * hands FUN_0011ECF0 -- so the callers must pass v+0x1414, not v+0x1400.
+     */
 }
 
 /* ======================================================================== */
@@ -532,18 +909,59 @@ float b3_ai_oor_governor(float speed_ms, float speed_mph,
 /* ======================================================================== */
 /* FUN_00105150 -- the reduced traffic driver.                              */
 /* ======================================================================== */
-void b3_ai_traffic_drive(const B3AiCar* c, B3AiInputs* in,
+void b3_ai_traffic_drive(B3AiCar* c,
                          float target_angle_deg, float target_speed_ms) {
     float d;
-    memset(in, 0, sizeof *in);
-    in->steer = b3_clamp(target_angle_deg * b3_ai_params.max_lock_deg
+
+    /* traffic=retail: FUN_00105150 over the port's own bytes. Thiscall,
+     * ECX = the vehicle; it follows v+0x1568 to the racecar and reads the
+     * target angle/speed at racecar+0x23C0/0x23C4. Those are AI+0x9C0/0x9C4 --
+     * the AI object is embedded at racecar+0x1A00 -- so a B3AiState carrying
+     * them puts them exactly where the function looks. The port takes them as
+     * arguments instead, so they are staged into a local state view here.
+     *
+     * This covers the traffic DRIVER only. The population law FUN_001A6070
+     * stays on the port: it reads the traffic manager object, which this
+     * tree does not map, and validate_traffic_mix.py checks it as a model
+     * replay against constants read from the image rather than by calling it. */
+    if (b3_backend_get(B3_FEAT_TRAFFIC) == B3_BACKEND_RETAIL) {
+        B3AiState ts;
+        memset(&ts, 0, sizeof ts);
+        ts.target_angle = target_angle_deg;
+        ts.target_speed = target_speed_ms;
+        if (b3_emu_ai_drive(1, c, &ts, c->veh, c->clock, 0.0f,
+                            (const float(*)[4])c->veh->rb.frame))
+            return;
+    }
+    /* Retail's driver recomputes its outputs into the VEHICLE each call.
+     * This used to be memset() over an output struct the port invented; the
+     * fields are cleared by name now, and v+0x14C8 is deliberately NOT among
+     * them -- see below. */
+    c->veh->throttle_1400     = 0.0f;
+    c->veh->brake_1404        = 0.0f;
+    /* v+0x1408 is assigned unconditionally two lines down, so clearing it
+     * here was dead -- and it must not read as "retail clears the steer". */
+    c->veh->throttle_raw_1414 = 0.0f;
+    c->veh->input_bits_13FC   = 0;
+    c->veh->stop_flag_1552    = 0;
+    /* v+0x14A4 (the transmission's in-shift latch) is NOT touched. The port
+     * used to set a "shift_kick" here, but the only documented writer of
+     * 0x14A4/0x14A0=0.35 is FUN_0011BE50's CRASHED path at 0011BEB4
+     * (RE_NOTES "The crashed path is NOT the racing pipeline", RE_SFX 329) --
+     * nothing places it in FUN_00105340. It was inert while it landed in the
+     * output struct the port invented; against the real vehicle it would
+     * cancel the transmission's in-flight shift every frame, killing the
+     * mid-shift torque cut. */
+    c->commit_boost           = 0;
+    c->engage_boost           = 0;
+    c->veh->steer_1408 = b3_clamp(target_angle_deg * b3_ai_params.max_lock_deg
                          * B3AI_LOCK_PER_DEG, -1.0f, 1.0f);
-    d = target_speed_ms - c->speed_ms;
+    d = target_speed_ms - c->veh->rb.vel[3];
     if (d > 1.0f) {
-        in->throttle = 1.0f;
-        in->throttle_raw = 1.0f;
+        c->veh->throttle_1400 = 1.0f;
+        c->veh->throttle_raw_1414 = 1.0f;
     } else if (d < -2.2352f) {         /* 5 mph excess */
-        in->brake = 1.0f;
+        c->veh->brake_1404 = 1.0f;
     }
 }
 
@@ -601,32 +1019,32 @@ float b3_ai_avoid_speed_cap(float speed, float dist_ahead_m) {
 float b3_ai_drift_apex_time = 1.0f;
 
 B3AiAggroParams b3_ai_aggro_params = {
-    /* min_aggression  */ 0.002f,
-    /* min_wait_s      */ 0.0f,
-    /* max_wait_s      */ 3.0f,
-    /* dist_ahead_m    */ 40.0f,
-    /* dist_behind_m   */ 150.0f,
-    /* min_target_mph  */ 75.0f,
-    /* slow_factor     */ 0.9f,
-    /* boost_dist_m    */ 15.0f,
-    /* boost_aggro_m   */ -22.5f,
-    /* start_delay_s   */ 3.0f,
-    /* immunity_s      */ 3.0f,
-    /* block_min_s     */ 3.0f,
-    /* block_max_s     */ 15.0f,
-    /* block_dist_m    */ 15.0f,
-    /* separation_m    */ 3.0f,
-    /* position_time_s */ 30.0f,
-    /* ahead_gap_m     */ 3.5f,
-    /* speed_diff_mph  */ 50.0f,
-    /* steer_out_m     */ 5.0f,
-    /* steer_out_s     */ 0.5f,
-    /* slam_s          */ 0.75f,
-    /* max_cos_off_lane*/ 0.8f,
-    /* commit_s        */ 0.075f,
-    /* sticky_dist_m   */ 10.0f,
-    /* sticky_mph      */ 40.0f,
-    /* close_match_m   */ 10.0f,
+    .min_aggression = 0.002f,
+    .min_wait_s = 0.0f,
+    .max_wait_s = 3.0f,
+    .dist_ahead_m = 40.0f,
+    .dist_behind_m = 150.0f,
+    .min_target_mph = 75.0f,
+    .slow_factor = 0.9f,
+    .boost_dist_m = 15.0f,
+    .boost_aggro_m = -22.5f,
+    .start_delay_s = 3.0f,
+    .immunity_s = 3.0f,
+    .block_min_s = 3.0f,
+    .block_max_s = 15.0f,
+    .block_dist_m = 15.0f,
+    .separation_m = 3.0f,
+    .position_time_s = 30.0f,
+    .ahead_gap_m = 3.5f,
+    .speed_diff_mph = 50.0f,
+    .steer_out_m = 5.0f,
+    .steer_out_s = 0.5f,
+    .slam_s = 0.75f,
+    .max_cos_off_lane = 0.8f,
+    .commit_s = 0.075f,
+    .sticky_dist_m = 10.0f,
+    .sticky_mph = 40.0f,
+    .close_match_m = 10.0f,
 };
 
 /* the compiled sign extract `(bits & 0xBF800000) | 0x3F800000` -- note it
@@ -1411,14 +1829,14 @@ int b3_ai_route_alt(B3AiWheel* w, float dt) {
  *   racecar+0x27D8 = on;
  *   if (on)  { racecar+0x19D0..+0x19DC = 0; FUN_00179760(AI); }
  *   else     { v+0x1534 = 1.0; if (v+0x1524 == 4) v+0x1524 = 0; }          */
-int b3_ai_wheel_set(B3AiWheel* w, B3AiState* s, int on) {
+int b3_ai_wheel_set(B3AiWheel* w, B3AiState* s, B3VehicleFull* veh, int on) {
     on = on ? 1 : 0;
     if (on == w->ai_wheel) return B3_AI_WHEEL_NONE;
     w->ai_wheel = on;
     if (on) return B3_AI_WHEEL_TAKE;   /* caller resets the navigator       */
     if (s) {
-        s->steer_authority = 1.0f;     /* MOVSS [v+0x1534], 1.0             */
-        if (s->drift_state == 4) s->drift_state = 0;
+        veh->authority_1534 = 1.0f;     /* MOVSS [v+0x1534], 1.0             */
+        if (veh->drift_state_1524 == 4) veh->drift_state_1524 = 0;
     }
     return B3_AI_WHEEL_GIVE;
 }
@@ -1464,7 +1882,7 @@ int b3_ai_navfail(B3AiWheel* w, int walk_ok) {
 }
 
 /* FUN_00176150 -- see the header for the full transcription. */
-float b3_ai_corner_brake(float corner_speed, float approach_d, int boost_scale,
+float b3_ai_corner_brake(float corner_speed, float brake_dist, int boost_scale,
                          float speed_cap, int target_mode, int mode_1fc) {
     float out;
     if (mode_1fc != 0 || corner_speed <= 0.0f) {          /* 0x003B16E0 = 0 */
@@ -1473,7 +1891,11 @@ float b3_ai_corner_brake(float corner_speed, float approach_d, int boost_scale,
         float cs = corner_speed;
         if (boost_scale) cs *= 1.02f;                     /* 0x003A2C44     */
         if (target_mode == 0)
-            out = b3_ai_params.brake_dist_factor * (cs - approach_d) + cs;
+            /* @0x0017620C..0x00176228: XMM0 = FUN_00174A90's arc length to
+             * the corner node, MINUS FUN_00174AF0's in-node projection,
+             * times DAT_0047A1CC, plus AI+0x298.  `brake_dist` is that
+             * difference -- a DISTANCE, not the corner value. */
+            out = b3_ai_params.brake_dist_factor * brake_dist + cs;
         else
             out = cs;
     }

@@ -1,56 +1,148 @@
-# Extraction reference
+# Where the data comes from
 
-**The step-by-step walkthrough is in the [README](../README.md)** — prerequisites,
-the four commands, what a correct launch prints, and what to do when it does
-not. This file is the reference behind it: why the ELF mapping matters, what
-each generated header holds and where it came from, the exact extractor
-invocations, and what must never be committed.
+**The setup walkthrough is in the [README](../README.md)** — two commands, and
+the game reads your own disc. This file is the reference behind it: what the
+game does with the disc at run time, how to run the extractor out of band, why
+the ELF mapping matters for every RE tool, and what must never be committed.
 
 This repository contains **no game content**. Not the executable, not the
 tracks, cars, textures, audio or music, and not the data tables extracted from
 them. What it contains is the code that reads those files and the recovered
 logic that runs on them.
 
-To build a running program you supply your own copy of *Burnout 3: Takedown*
-for the original Xbox, and the tools here rebuild everything locally.
-
 ---
 
-## 1. What you need
+## 1. Your copy of the game
 
-| | |
-|---|---|
-| **The game** | A dump of a disc you own. The extractors were developed against the NTSC-U (USA) release. |
-| **Python** | 3.8+. `pip install pillow capstone unicorn` — Pillow for texture PNGs, capstone/unicorn for the RE tools and test suites. |
-| **A C toolchain** | `gcc`, `make`, SDL2 and SDL2_image dev packages, and OpenGL. On Debian/Ubuntu: `sudo apt install build-essential libsdl2-dev libsdl2-image-dev libgl1-mesa-dev` |
-| **Disk** | About 8 GB free. Fully extracted, `build/` is ~7 GB, most of it audio. |
+A dump of a disc you own, developed against the NTSC-U (USA) release. Either
+form works and the port detects which:
 
-The game directory is whatever folder holds `default.xbe`:
+* an **XISO image** — `Burnout 3 - Takedown (USA).xiso.iso` or similar;
+* an **expanded directory** — whatever folder holds `default.xbe`:
 
 ```
 Burnout 3 Takedown/
 ├── default.xbe
+├── Data/            Globalus.bin, vdb.xml
 ├── GLOBAL/
-├── pveh/            player + traffic vehicles (.bgv / .btv)
-├── Tracks/          per-event track data (static.dat, streamed.dat, .bgd)
-└── ...
+├── pveh/            player + traffic vehicles (.bgv/.btv, .hwd/.lwd engine audio)
+├── sound/           .awd audio dictionaries
+└── Tracks/          per-track static.dat, streamed.dat, .bgd, .xwb, .rws
 ```
 
-Point the tools at it once:
+Point everything at it once:
 
 ```bash
 export B3_GAME_ROOT="/path/to/Burnout 3 Takedown"
 ```
 
-Every tool reads that variable through `tools/b3_paths.py` and fails with an
-explicit message if it is unset. Nothing here has a path baked in.
+`$B3_GAME_ROOT` is the last step of the game's own image ladder
+(`--iso=<path>` → `$B3_ISO` → `build/iso_path.txt` → `$B3_GAME_ROOT`), and it
+is what every tool in `tools/` resolves through `tools/b3_paths.py`. Those
+tools fail with an explicit message if it is unset, and they match path case
+insensitively — the Xbox filesystem is case-insensitive, so dumps differ on
+`GLOBAL/` vs `global/` and `Tracks/` vs `tracks/`.
+
+**Nothing here has a path baked in.** No retail path is compiled into the C
+either; `src/burnout3_isodata.h` and the `tools/cextract` defaults are all
+empty strings with the environment in front of them.
 
 ---
 
-## 2. The corrected ELF
+## 2. What happens at run time
 
-Everything else depends on this step, and it is the one place people usually
-go wrong.
+`./burnout3` opens the image and materialises assets on demand. The mechanism
+is one seam:
+
+* `src/burnout3_isoshim.h` is force-included into every `src/` translation unit
+  and redirects `fopen`, `access`, `IMG_Load` and `SDL_LoadWAV`.
+* Every loader still opens a literal `build/...` path. `b3_iso_resolve()` maps
+  that to the **ISO cache** (`build/.isocache`, moved by `$B3_ISO_CACHE`).
+* On a cache miss it runs the `tools/cextract` **stage** that produces the file
+  — in process, against the disc — and then returns the cache path.
+
+Not one loader had to be edited, which is the property the design was chosen
+for. The exhaustive list of what the seam covers, and what is deliberately
+outside it, is the comment block at the top of `src/burnout3_isodata.h`. Read
+it before adding a loader.
+
+`--build` selects the old pre-extracted `build/` tree instead. That is the
+debug path; it still works, and section 3 is how to fill it.
+
+### Nothing retail is compiled in
+
+Eight generated headers used to bake retail data into `src/`. All eight are
+gone, replaced by `src/*_runtime.h` loaders:
+
+| gone | replaced by | reads |
+|---|---|---|
+| `burnout3_track_paths.h` | (the nav loader) | `build/tracks/<id>/route.bin` |
+| `burnout3_start_grid.h` | (the grid loader) | `build/tracks/<id>/grid.bin` |
+| `burnout3_ai_pace.h` | `burnout3_ai_pace_runtime.h` | `build/tracks/<id>/pace.bin` |
+| `burnout3_traffic_data.h` | `burnout3_traffic_runtime.h` | `build/tracks/<id>/traffic.bin` |
+| `burnout3_trackselect.h` | `burnout3_trackselect_runtime.h` | your `Globalus.bin` + the ELF |
+| `burnout3_car_physics.h` | `burnout3_car_physics_runtime.h` | `build/cars/car_physics.bin` |
+| `burnout3_vehicle_data.h` | `burnout3_vehicle_data_runtime.h` | `build/cars/roster.bin` |
+| `burnout3_font.h` | `burnout3_font_runtime.h` | `build/frontend/font.bin` |
+
+...plus the in-race HUD's Globalus **labels**, which were typed into
+`src/burnout3_hud.c` as English literals with their recovered index in a
+trailing comment (`burnout3_hudstr_runtime.h` resolves them out of your own
+`Globalus.bin` now).
+
+`tools/validate_no_baked_data.py` is the permanent gate and asserts both
+halves: the headers are absent and nothing references them, **and** the
+replacements really come off disk, proven by the loaders' own log lines on a
+real boot.
+
+What *is* still committed in `src/` is recovered **program structure**, not
+content: `burnout3_physics_params.h` (the ValueDB registrar's parameter names
+and byte offsets), the `*_ranges.h` tables and `burnout3_vehicle_retail.h`
+(retail's own struct offsets, each with a `_Static_assert`). Those are the
+shape of the game's code, which is what this project recovers.
+
+---
+
+## 3. Extracting out of band — `cxtract`
+
+The same stages the game runs on a cache miss are available as a standalone
+driver, which is how you fill a `build/` tree for `--build`, or produce assets
+to look at.
+
+```bash
+tools/cextract/build.sh /tmp/cxtract          # build the driver
+/tmp/cxtract --list                           # the per-track stages
+/tmp/cxtract --list-global                    # the car / art / audio families
+/tmp/cxtract --track US_C3_V1 --out build --game "$B3_GAME_ROOT"
+/tmp/cxtract --all-global     --out build --game "$B3_GAME_ROOT"
+```
+
+14 per-track stages (`CX_STAGE_LIST` in `tools/cextract/cx_extract.h`): `tlist`,
+`track`, `textures`, `collision`, `envmap`, `bgd_paths`, `traffic`,
+`traffic_cars`, `nav_edges`, `start_grid`, `pace`, `props`, `scenery`,
+`light_probes` — plus the dump-global car, art, audio and generator families.
+`$B3_TRACK` picks the circuit when `--track` is not given. Nothing is hardcoded
+per track: the ids come from the shipped track list.
+
+### The Python archive is the oracle
+
+`tools/py_extract_archive/` holds the original Python extractors, **unmodified**
+apart from the `$B3_GAME_ROOT` path resolution every tool here carries.
+`tools/cextract/verify_cextract.py` is the permanent differential gate: it
+demands the C output be **byte-identical** to a fresh run of the archive
+(pixel-identical for PNGs) and fails on a file present on only one side.
+
+Never edit an archived tool to make the gate pass — the archive is the spec.
+`tools/py_extract_archive/README.md` says which tool each `cxtract` stage
+replaced. The old `tools/<name>.py` paths remain as forwarding stubs, because
+several validators import them as parsing libraries.
+
+---
+
+## 4. The corrected ELF
+
+Every RE tool and every differential suite reads `build/burnout3.elf`, not the
+XBE. This is the one place people usually go wrong.
 
 ```bash
 python3 tools/xbe2elf.py "$B3_GAME_ROOT/default.xbe" build/burnout3.elf
@@ -74,135 +166,32 @@ section at its true VA, BSS materialised, `e_entry = 0x001D2807`.
 | Float constants | wrong | correct |
 | Data/string xrefs | meaningless | resolve |
 
+Old→new address translation: `new = old + 0x10000`, **`.text` only**.
+
 If you import it into Ghidra, use the **ELF loader and do not pass an explicit
 language ID** — doing so forces the Binary loader and reproduces the bug.
+`tools/apply_ghidra_types.py` then applies the recovered structs and prototypes
+to the database.
 
 `build/burnout3.elf` is a derived copy of the retail executable. It is
 gitignored. Do not redistribute it.
 
 ---
 
-## 3. The data tables (`make assets`)
-
-Seven headers are compiled into the program. They are game data in C form, so
-they are gitignored and generated locally:
-
-| header | extractor | what it holds |
-|---|---|---|
-| `burnout3_physics_params.h` | `extract_physics_params.py` | the 73-parameter physics model, offsets into the `0x1D0` config struct |
-| `burnout3_vehicle_data.h` | `extract_vehicles.py` | the 107-vehicle roster, cross-checked against `vlist.bin` |
-| `burnout3_car_physics.h` | `extract_car_vdb.py generate` | 4,685 per-car overrides out of `Data/vdb.xml` |
-| `burnout3_font.h` | `extract_font.py` | glyph metrics for the three fonts in the XBE `.data` |
-| `burnout3_track_paths.h` | `extract_bgd_paths.py` | the track's nav/racing lines from its `.bgd` |
-| `burnout3_traffic_data.h` | `extract_traffic.py` | traffic population, class, model and paint tables |
-| `burnout3_start_grid.h` | `extract_start_grid.py` | the real race start grid |
-
-```bash
-make assets      # runs all seven, in dependency order
-```
-
-`make` refuses to build without them and tells you exactly what is missing —
-it will never silently produce a program with invented numbers in it.
-
-**This step alone does not get you a playable game.** It gets you a program
-that *compiles*. The track, sky and cars come from section 4; skip it and you
-build successfully, launch, and drive through an empty void.
-
-### The one manual step
-
-`tools/extract_physics_params.py` walks the ValueDB registrar `FUN_00132D10`
-and reads the compiled-in defaults out of `FUN_00132950`. It does that through
-a **Ghidra bridge on `http://127.0.0.1:8089`** rather than from the ELF
-directly, so that single extractor needs Ghidra open with `build/burnout3.elf`
-loaded and the bridge running. The other six read the game files directly and
-need nothing but Python.
-
-This is the one rough edge in an otherwise self-contained pipeline. Porting it
-to a capstone sweep over the ELF — the pattern is in
-`tools/field_usage_19be.py` — would remove the dependency.
-
----
-
-## 4. The world you drive through (`make content`)
-
-This is the step that puts a track under the car and a sky above it.
-
-```bash
-make content
-```
-
-which runs, in order:
-
-```bash
-python3 tools/extract_track.py           # -> build/track.obj + build/tracks/<ID>/
-python3 tools/extract_textures.py        # -> build/textures/
-python3 tools/extract_collision.py       # -> build/collision.bin
-python3 tools/extract_envmap.py          # -> build/tracks/<ID>/envmap.png  (the sky)
-python3 tools/extract_light_probes.py
-python3 tools/extract_props.py           # -> build/tracks/<ID>/props.bin
-python3 tools/extract_bgv.py build/cars  # -> build/cars/<CLASS>_<CarN>.obj
-python3 tools/extract_bgv_textures.py
-python3 tools/extract_traffic_lights.py
-python3 tools/extract_txd.py             # -> build/frontend/  (HUD art)
-python3 tools/extract_carfx_art.py
-python3 tools/extract_boostfx_art.py
-python3 tools/extract_particlefx_art.py
-python3 tools/extract_postfx_art.py
-```
-
-`B3_TRACK` selects the circuit (default `US_C3_V1`, matching the runtime
-default). Track-scoped extractors also take `--event <ID>`, and several accept
-`--all` to do every shipped track at once. Nothing is hardcoded per track — the
-IDs come from the shipped track list.
-
-A correct run reports, on launch:
-
-```
-[Burnout3] REAL track geometry: 97826 verts, 90246 tris from build/track.obj
-[Burnout3] GAME collision world: 60373 triangles (build/collision.bin)
-[carfx] env map build/tracks/US_C3_V1/envmap.png
-[Burnout3] REAL textures: 122 loaded, 0 groups unresolved (of 990)
-[Burnout3 HUD] 99 textures from build/frontend (edge 41/41, core 30/30, over 20/20)
-```
-
-If you instead see `Generated road mesh` with no `REAL track geometry` line,
-`make content` has not been run.
-
-## 4b. Audio (`make audio`)
-
-~5 GB and by far the slowest step, which is why it is separate. The game runs
-without it — you get silence, not a crash.
-
-```bash
-make audio
-```
-
-```bash
-python3 tools/extract_awd.py "$B3_GAME_ROOT"   # .awd + the per-car .hwd/.lwd banks
-python3 tools/extract_xwb.py "$B3_GAME_ROOT"   # XACT wave banks
-python3 tools/extract_rws.py "$B3_GAME_ROOT"   # crash beds
-python3 tools/extract_eatrax.py -j 8 --globalus "$B3_GAME_ROOT/Data/Globalus.bin"
-```
-
-Pass the **game root as a single directory**, not a list of files. Each of the
-first three walks it recursively and names its output from the dictionary
-inside each file, qualifying with the source path when names collide. Hand them
-individual files and every engine bank is misnamed — `awd_Car1_high` instead of
-`awd_pveh_COMP_Car1_high` — and the game then finds none of them.
-
-Six of 1569 waves fail to decode; that is the shipped data, and `make audio`
-ignores the resulting non-zero exit rather than aborting the chain. A correct
-run ends with 174 dictionaries / 1569 waves and `EA TRAX: 44 tracks`.
-
----
-
 ## 5. Checking it worked
 
 ```bash
-make test-soup-ray test-traffic-pool test-traffic-reservations
-python3 tools/validate_port.py           # the physics differential vs retail
-python3 tools/validate_carcol.py         # car-vs-car collision vs retail
+make test-soup-ray test-traffic-pool test-traffic-reservations test-audio-ring
+python3 tools/validate_port.py            # the physics differential vs retail
+python3 tools/validate_carcol.py          # car-vs-car collision vs retail
+python3 tools/validate_no_baked_data.py   # nothing retail is compiled in
 ```
+
+The `validate_*` suites are differential tests: they execute the *retail* code
+out of `build/burnout3.elf` under Unicorn and compare it against this port,
+function by function. They need the ELF from section 4. If a suite fails after
+you change something, the port diverged from the game — that is the whole point
+of them.
 
 `validate_carcol.py` compares against the real collision hulls, which live in
 the `.bgv`/`.btv` files rather than in any extracted asset. Pull them out once:
@@ -212,12 +201,6 @@ python3 -c "import sys; sys.path.insert(0,'tools'); \
             import emulate_carcol as ec; ec.extract_hulls()"   # -> build/cars/*.hull
 ```
 
-The `validate_*` suites are differential tests: they execute the *retail* code
-out of `build/burnout3.elf` under Unicorn and compare it against this port,
-function by function. They need the ELF from step 2. If a suite fails after you
-change something, the port diverged from the game — that is the whole point of
-them.
-
 ---
 
 ## 6. What must never be committed
@@ -225,9 +208,12 @@ them.
 `.gitignore` already covers all of it, but for the avoidance of doubt:
 
 * `default.xbe`, any disc image, and `build/burnout3.elf`
-* everything under `build/` — geometry, textures, audio, music, collision
-* the seven generated headers in `src/`
-* screenshots or video of the retail game
+* everything under `build/` — geometry, textures, audio, music, collision, the
+  per-track binaries, the ISO cache
+* screenshots or video of the retail game, and any retail display string
 
-Cite a retail frame or an address in the documentation freely. Do not check the
-bytes in.
+Cite a retail frame or an address in the documentation freely — the `docs/`
+here do, by filename. Do not check the bytes in.
+
+Format credits for the two formats first documented by other people are in
+[THIRD_PARTY.md](../THIRD_PARTY.md).

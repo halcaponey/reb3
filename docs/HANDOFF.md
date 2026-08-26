@@ -3,61 +3,71 @@
 Written for whoever picks this up next. Read this before touching anything; it
 will save you days, mostly by telling you which approaches are already dead.
 
+> **Section numbers here are load-bearing.** Six source files and several
+> validators cite "HANDOFF.md section 2" (the flat-load trap) and "HANDOFF
+> section 5" (the methodology rules) by number. Do not renumber the sections.
+
 **Goal:** a faithful recreation of Burnout 3: Takedown driven by data and logic
 recovered from the retail Xbox executable.
 
-**Honest state (updated 2026-08-10, session 2 close):** a playable, faithful
-recreation. You race a 6-car grid of real liveried Burnout 3 cars (closed
-bodies, spinning/steering wheels at real attach points, translucent glass,
-wreck-shell damage states) from the game's REAL start grid around the real
-textured Bangkok circuit, against real oncoming traffic (12 .btv cars on the
-926-pt oncoming line), with the game's engine/transmission/suspension/tyre
-grip/steering physics run as THE GAME'S OWN per-frame pipeline
-(b3_vehicle_step_full: FUN_0011ECF0 + FUN_0011BE50's stage order over a real
-vehicle struct with 4 independent wheels, multi-frame trajectory-verified —
-validate_port.py 76/76 incl. 3 full-pipeline trajectory cases), the game's
-scoring/boost/takedown/out-of-control/damage rules (validate_gameplay.py
-61/61), the real HUD (XBE-embedded fonts + Global.txd art), real engine
-loops + music, mesh-based collision, and AI running the recovered AI-driver
-law + 73 recovered AI params. Every recovered equation cites its address and
-has a differential case; glue is marked GLUE; unrecovered items are [S]/[?]
-in the docs (panel attach matrices, AI target writers, catch-up integration,
-in-race HUD layout initializers, crash-mode aftermath).
+**Honest state (updated 2026-08-22):** it plays. `./burnout3` reads the user's
+own Xbox disc, materialises what it needs out of it, and puts you on the
+recovered track-select globe; you pick one of 36 events and one of 107 cars and
+race it — real geometry, real liveries, real traffic and AI, takedowns, crash
+cinematics with aftertouch, the retail HUD. Nothing game-derived is compiled
+into `src/`. Every recovered equation cites its address and has a differential
+case against the retail x86 executing under Unicorn; harness inventions are
+marked **GLUE**; open items stay `[?]`.
 
-Detailed, evidence-marked findings live in `docs/RE_NOTES.md`. This file is the
-orientation and the war stories.
+Where the current, authoritative status lives — this file is orientation and
+war stories, not a status board:
+
+| Question | Document |
+|---|---|
+| What is recovered, per subsystem | `docs/RE_MASTER.md` → the `docs/RE_*.md` it indexes |
+| What in the physics is still glue, and what is blocked on what | `docs/PHYSICS_GLUE_LEDGER.md` |
+| What is open and who should work it next | `TODO.md` |
+| How to build, run and switch data sources | `README.md` |
 
 ---
 
 ## 1. Setup you need
 
-**Target file** (not in repo — user-supplied game dump):
-```
-$B3_GAME_ROOT/default.xbe
-```
+**Target file** (not in repo — user-supplied game dump). Either a `.xiso.iso`
+image or an expanded dump directory works; the port auto-detects.
 
-**Ghidra + MCP bridge.** A Ghidra instance runs with the `ghidra-mcp` plugin
-exposing an HTTP API on `127.0.0.1:8089`. Nearly every tool here talks to it.
-Check it is alive:
-```bash
-curl -s http://127.0.0.1:8089/analysis_status
-```
-Useful endpoints: `/decompile_function`, `/disassemble_function`,
-`/get_function_by_address`, `/get_xrefs_to`, `/list_functions`,
-`/get_function_callers`, `/get_function_callees`, `/create_struct`,
-`/recreate_struct`, `/set_function_prototype`, `/get_struct_layout`.
+**Build and run — this is the whole thing:**
 
-**Python deps:** `unicorn` (CPU emulation), `Pillow` (texture export). Both
-already installed.
-
-**Build and run:**
 ```bash
 make                                  # -> ./burnout3
-python3 tools/extract_track.py        # -> build/track.obj + track.mtl
-python3 tools/extract_textures.py     # -> build/textures/*.png
-./burnout3                            # renders the real track
-python3 tools/validate_port.py        # physics port vs real x86; must stay green
+./burnout3                            # reads the disc directly
+./burnout3 --iso=<path to image or dump>
 ```
+
+There is **no extraction step to run first**. `src/burnout3_isodata.c` resolves
+every `build/...` path a loader opens to an ISO cache under `build/.isocache`
+and, on a miss, runs the C extraction stage that produces it in process. See
+`src/burnout3_isodata.h` for the path map and the mode switches; `--build` is
+the old pre-extracted tree, kept as the debug path.
+
+**For RE work (not for playing):**
+
+* **Ghidra + MCP bridge.** A Ghidra instance runs with the `ghidra-mcp` plugin
+  exposing an HTTP API on `127.0.0.1:8089`. Check it is alive:
+  ```bash
+  curl -s http://127.0.0.1:8089/analysis_status
+  ```
+  Useful endpoints: `/decompile_function`, `/disassemble_function`,
+  `/get_function_by_address`, `/get_xrefs_to`, `/list_functions`,
+  `/get_function_callers`, `/get_function_callees`, `/create_struct`,
+  `/recreate_struct`, `/set_function_prototype`, `/get_struct_layout`.
+  **Every request must carry `&program=burnout3.elf`** — the default served
+  program is a flat-loaded duplicate and `/switch_program` lies. Capstone or
+  objdump over the raw ELF is the fallback when the bridge is down.
+* **Python deps:** `unicorn` (CPU emulation), `Pillow` (texture export).
+* **The differential suites** are the acceptance bar. `tools/validate_*.py`
+  (plus three C ones) execute the retail functions under Unicorn and diff the
+  port against them. They must stay green; `TODO.md` §3 carries the tallies.
 
 ---
 
@@ -87,12 +97,17 @@ python3 tools/apply_ghidra_types.py   # structs + prototypes, self-verifying
 
 Old flat-load addresses translate as `new = old + 0x10000`, **`.text` only**.
 
+The port carries a C transcription of this conversion (`burnout3_isodata.c`), so
+in ISO mode `build/burnout3.elf` is produced from the disc's `default.xbe`
+automatically — several loaders parse ELF program headers and reject a raw XBE.
+
 ---
 
 ## 3. What is verified
 
 Everything here is either confirmed by two independent derivations or checked
-against executing the real code. `docs/RE_NOTES.md` marks each with `[C]`/`[S]`/`[?]`.
+against executing the real code. Each `docs/RE_*.md` marks its claims
+`[C]`/`[S]`/`[?]`; `docs/RE_MASTER.md` is the index across all of them.
 
 ### Executable
 Image base `0x00010000`, entry `0x001D2807`, 17 sections, RenderWare RW36,
@@ -112,17 +127,24 @@ floats in the community VDB dump (`Sokka06/burnout-data-tool`,
 `float value` + `uint32 hashed key`; the hashing is why no parameter names
 appear in any shipped data file.
 
-Regenerate: `python3 tools/extract_physics_params.py`
+**Per-car tuning** is the retail `Data/vdb.xml`, keyed by
+`"<param><group>/../Export/ValueDB/VehiclePhysics/<VLIST-ID>.cfg"` (param name
+FIRST — the reason cfgpath-first CRC guesses matched nothing), hashed by the
+table-CRC at `0x001AF250` with **SAR** (arithmetic) shift and no final
+inversion. It is loaded at run time now, not compiled in.
 
-### Physics equations — 4 ported and verified against real execution
-`tools/emulate_vehicle.py` runs the actual x86 under Unicorn.
-`tools/validate_port.py` diffs the ported C against it — **49/49 green**.
+### Physics equations
+The port runs `b3_vehicle_step_full()`, a 1:1 C composition of the real
+per-frame pipeline (input stage `FUN_0011ECF0` including engine, then
+`FUN_0011BE50`'s main path over substeps: force pass `FUN_0011D460`, suspension
+pre-pass `FUN_001239C0`, force pass `FUN_00123FD0`, stop-check, integrator
+`FUN_00109560`), on a fixed 60 Hz tick accumulator, in GAME coordinate space.
 
-Recovered so far: longitudinal resistance (incl. its 4th accumulator component),
-vertical force with downforce, gear change-up test, the full
-engine/transmission update, drive-torque-to-wheels, gear engagement, the
-per-wheel suspension spring/damper (with droop, bump flag, wheel spin and the
-pre-pass airborne path — RE_NOTES section 10).
+The acceptance oracle is `tools/emulate_pipeline.py` — the REAL functions
+running multi-frame under one persistent Unicorn session — with
+`tools/dump_traj.c` running the C from identical state and
+`tools/validate_port.py` diffing them, including full multi-hundred-frame
+trajectory runs that keep gear and drift state equal on every frame.
 
 **Two constants no amount of reading would have found:**
 - gravity is **10.0**, not 9.81
@@ -130,29 +152,46 @@ pre-pass airborne path — RE_NOTES section 10).
   and the downforce term converts `speed_ms` with it rather than reading the
   stored mph field
 
-### Assets — track geometry, textures, materials
-- `static.dat` Xbox track format decoded: **14,551 verts / 9,847 tris, 67
-  models, 0 skipped** (`tools/extract_track.py`)
-- **180/180 textures** decoded, DXT1/DXT5 (`tools/extract_textures.py`), with
-  production names (`bk_marketbuilding1b`, `bk_freewaysigns3`, …)
-- Materials wired: **71/71 submeshes textured**, 12/12 references resolve
-- It's the **Bangkok** circuit (Thai signage; `Tracks/AS/` = Asia)
-- `src/burnout3_trackmesh.c` loads the OBJ; the harness renders it
+Row-by-row status — recovered, proven-unrecoverable, blocked — is
+`docs/PHYSICS_GLUE_LEDGER.md`. Do not restate it here; it moves.
 
-### Vehicle roster
-107 vehicles extracted from `pveh/`, cross-validating exactly against
-`vlist.bin`'s declared count (`tools/extract_vehicles.py`).
+### Assets and formats
+- `static.dat` Xbox track format decoded — geometry, textures (DXT1/DXT5,
+  production names), materials, the second prop model/instance tables, scenery,
+  and the streamed-unit layout (`docs/RE_NOTES.md`, `INTEGRATION_NOTE.md`)
+- `.bgv` car geometry decoded from the game's own relinker `FUN_000310f0`
+  (`BGV_EXTRACTION.md`) — the format is read AND written, round-trip
+  byte-exact on all 67 shipped player cars (`tools/validate_bgv.py`)
+- `.bgd` nav graph, route and traffic-path tables (`docs/RE_BGD.md`)
+- `.awd` / `.rws` audio, and the XWB/EA TRAX music banks (`docs/AUDIO_NOTES.md`)
+- 107-vehicle roster from `pveh/`, cross-validating exactly against
+  `vlist.bin`'s declared count
+
+All of it now goes through `tools/cextract/` (C), gated byte-for-byte against
+the archived Python oracle by `tools/cextract/verify_cextract.py`.
+
+### Retail as a runnable backend
+`build/backends.cfg` flips each of ten features (`physics`, `carcol`, `ai`,
+`traffic`, `td_rules`, `score`, `crash`, `camera`, `sfx`, `hud`) between the
+recovered C and the game's own x86 under Unicorn (`tools/b3_emu_server.py`);
+`--re` / `--retail` force all ten for one run. That is the ground truth the
+differential suites measure against, and it is why parity claims here are
+measurements.
 
 ---
 
 ## 4. Dead ends — do not repeat these
 
+> Historical record. `.bgv` was **solved** after this was written (section 3,
+> `BGV_EXTRACTION.md`) — by transcribing the game's own relinker, which is
+> exactly the "get ground truth" lesson of section 5. The five failures below
+> are kept because each one is a heuristic that will look convincing again.
+
 ### `.bgv` vehicle meshes: five failed approaches
 
-The mesh format is **unsolved, including by the Burnout modding community** —
-EdnessP's Noesis plugin loads `.bgv` textures then calls `boSetDummyMdl`, and
-"All vehicle model support" is in its own TODO. This is open research, not a
-lookup.
+At the time, the mesh format was unsolved, including by the Burnout modding
+community — EdnessP's Noesis plugin loads `.bgv` textures then calls
+`boSetDummyMdl`, and "All vehicle model support" is in its own TODO.
 
 1. **Plain float3 scan** — all 576 KB of `Car1.bgv` yields exactly one 38-triple
    region. Not float vertices.
@@ -184,6 +223,8 @@ without the `0x40` bounds prefix, validates nothing.
 
 ### Other dead ends
 - `PrgData.bin` is not a VDB (its header fields don't validate)
+- The per-car VDB is **not** inside each `.bgv` — falsified by full-dump scan.
+  It is the single retail file `Data/vdb.xml` (section 3).
 - Full-game emulation via xemu is impractical here: not installed, not packaged,
   and needs a BIOS/MCPX ROM. Function-level emulation via Unicorn works instead
   and needs none of that.
@@ -204,8 +245,9 @@ Practical rules that follow:
 
 1. **Ground truth beats reading.** The physics work is trustworthy because
    Unicorn executes the real code and says yes or no. The geometry work produced
-   five confident wrong answers because it had no equivalent. Get ground truth
-   before believing anything.
+   five confident wrong answers because it had no equivalent — and was solved
+   the moment one existed (the game's own relinker). Get ground truth before
+   believing anything.
 2. **A green test suite means "what I checked matches", not "correct".** The
    4-component force bug passed 7/7 because nothing compared the 4th component.
    Widen what you assert before trusting a pass.
@@ -220,115 +262,87 @@ Practical rules that follow:
    convention that produced zero typed fields. Always assert on the *result*.
 6. **When you announce a finding, you've already verified it.** Two of the worst
    errors here were reported as breakthroughs and retracted the next step.
+7. **The decompiler is not the disassembly.** Ghidra's decompile of
+   `FUN_00109BB0` silently drops two of three axes. When a claim rests on
+   control flow or on which components are written, read the instructions.
+8. **An oracle you can edit is not an oracle.** `tools/py_extract_archive/` is
+   immutable for this reason: the byte-identity gate only means something if the
+   reference side cannot be adjusted until it agrees.
 
 ---
 
 ## 6. What's left
 
-(A–D from the original list are DONE — textures, drivetrain port, .bgv
-geometry+textures, audio. What remains, by value-per-effort:)
+**This section is deliberately a pointer, not a list.** It went stale twice by
+duplicating the ledgers; the ledgers are updated as part of the work and this
+file is not.
 
-### A. Per-car physics — DONE (2026-08-10, with a correction)
-The per-car VDB is **NOT inside each .bgv** (that assumption is falsified —
-full-dump scan). It is the single retail file **`Data/vdb.xml`**, and the
-registrar emulation recovered the whole key pipeline: key =
-`"<param><group>/../Export/ValueDB/VehiclePhysics/<VLIST-ID>.cfg"` (param
-name FIRST — the reason the earlier cfgpath-first CRC guesses matched
-nothing), hashed by the table-CRC at 0x001AF250 with **SAR** (arithmetic)
-shift and no final inversion; car IDs are base-40 decodes of vlist.bin's
-packed 8-byte IDs (`COMPCAR1`...). `tools/extract_car_vdb.py` (probe /
-scan / generate) emulates `FUN_00132D10` + `FUN_00134AC0`, verifies its
-Python hash mirror against the real code, and emits
-`src/burnout3_car_physics.h`: 100/107 cars (67 player cars x 64 params,
-33 traffic x 9). init_vehicles now gives every grid car its own
-B3PhysicsConfig with its real values; the marked fallback ratios only remain
-for the 7 cars with no VDB overrides. See RE_NOTES section 10.
-
-### A2. The full vehicle pipeline — DONE (2026-08-11)
-The harness no longer runs a scalar speed+drift reconstruction: vehicle_update
-drives `b3_vehicle_step_full()`, the 1:1 C composition of the real per-frame
-pipeline (input stage FUN_0011ECF0 incl. engine, then FUN_0011BE50's main
-path: 2 substeps at dt/2 of force pass FUN_0011D460 [with the LSDM bicycle
-model FUN_0011C7C0 now ported] / crash stub / suspension pre-pass
-FUN_001239C0 [ground-hit path now ported] / force pass FUN_00123FD0 /
-stop-check / integrator FUN_00109560), on a fixed 60 Hz tick accumulator,
-in GAME coordinate space with boundary conversion (RE_NOTES 14). The
-acceptance oracle is `tools/emulate_pipeline.py`: the REAL functions running
-multi-frame under one persistent Unicorn session; `tools/dump_traj.c` runs
-the C from identical state; the differential windows match to 1e-6..1e-3
-(tolerance 1e-2/1e-1) and full 300-390-frame runs keep gear/drift state
-equal on every frame. Ground contact goes through `b3_ground_probe`
-(the collision agent's real kd-tree world; route-height fallback documented).
-
-### B. Suspension/tyre solver (FUN_00123FD0) — suspension half DONE
-The per-wheel spring/damper is ported and verified (validate_port.py
-suspension section, 7 cases + 1 pre-pass case, 49/49 total): clamped
-`F = -(comp-len)k + vel*c` along the contact normal into +0xF0/+0x100,
-droop relax, bump flag, wheel spin decay/wrap, and FUN_001239C0's airborne
-path. The wheel record (+0x820 stride 0xC0) field map is in RE_NOTES 10.
-Still open there: the pre-pass ground-hit path (needs the track poly soup at
-+0x200 — record format documented), the bottom-out impulse solver
-(FUN_001066A0/FUN_00106720), and the body-scrape branch. IMPORTANT: the
-lateral/longitudinal **tyre grip forces are NOT in FUN_00123FD0** — that
-function is suspension + wheel visuals only; grip lives in FUN_0011D460's
-unexplored branches / FUN_00123000, which is now the last big physics block.
-
-### C. Damage panels + wheels in .bgv
-`tools/extract_bgv.py` gets the whole drivable mesh via the relinker layout
-(BGV_EXTRACTION.md). The per-panel sub-structures (the 10-slot table at each
-LOD base, glass records, damage-state masks at record+0x18, wheel matrices at
-+0xB80) are partially mapped in RE_NOTES; rendering panels/wheels separately
-(for damage + spinning wheels) is open. The draw path to study is
-`FUN_000303d0` → `FUN_00031e10` → `FUN_00031ab0`.
-
-### D. Remaining polish
-Real audio IS wired now: the player's own rpm-labelled engine loops
-(pitch-tracked) + front-end music play from build/audio/ (see
-load_real_audio / audio_callback in burnout3_full.c). Still open: crash/DJ
-samples, track collision against actual mesh (currently corridor walls),
-opponent AI beyond line-following, HUD/menus, other tracks (extractors are
-track-agnostic — only C1_V1 is wired up).
-
-(The old note here about matching hashes against .bgv bytes is superseded:
-the registrar emulation was indeed the way, but the VDB the keys match is
-Data/vdb.xml, not anything in the .bgv files — section A above.)
+* **`TODO.md`** — the live open-item board: the physics blockers and the retail
+  function each one starts from, the Android correctness/packaging items, the
+  suite tallies that must stay green, and the process rules for agent waves.
+* **`docs/PHYSICS_GLUE_LEDGER.md`** — the physics rows themselves: recovered,
+  proven-unrecoverable, or blocked, each with its evidence.
+* **`docs/RE_AI.md`** — the AI follow-up ledger; the navigator's mutable
+  route-selection state and recovery-state timing are the standing open end.
+* **`web/README.md` §3** — in-browser audio is DONE (the AudioWorklet reading a
+  shared-heap ring); what is left open there is EA TRAX, which needs a WMA
+  decoder the browser does not have — WebCodecs was probed and refuses every
+  WMA config.
+* **Anything marked `[?]` or GLUE** in a `docs/RE_*.md` file is an open item by
+  construction. That is what the marks are for.
 
 ---
 
 ## 7. File inventory
 
 ```
-tools/xbe2elf.py                XBE -> correctly mapped ELF32   [essential first step]
-tools/xboxkrnl_ordinals.py      kernel ordinal -> name table
-tools/apply_ghidra_types.py     applies structs + prototypes to the DB, self-verifying
-tools/extract_physics_params.py Ghidra -> src/burnout3_physics_params.h
-tools/extract_vehicles.py       pveh/ -> src/burnout3_vehicle_data.h (107 vehicles)
-tools/extract_track.py          static.dat -> OBJ + MTL (real track geometry)
-tools/extract_textures.py       static.dat -> PNGs (DXT1/DXT5, 180/180)
-tools/emulate_vehicle.py        runs real x86 physics under Unicorn  [ground truth]
-tools/validate_port.py          differential test: ported C vs real code (49/49)
-tools/extract_car_vdb.py        registrar emulation -> per-car physics from Data/vdb.xml
-tools/probe_fields.py           identifies struct fields by perturbation
-tools/field_usage.py            static read/write map of struct accesses
-tools/find_bgv_parser.py        INVALID SCORING -- plumbing is reusable, metric is not
+BUILD / RUN
+  Makefile                      desktop (`make`) and web (`make wasm`) targets
+  src/burnout3_isodata.c/.h     THE DATA MODEL: disc -> assets, materialise-on-miss
+  src/burnout3_isoshim.h        force-included; redirects fopen/access/IMG_Load
+  src/burnout3_full.c           the harness: frame loop, frontend, race flow
+  src/burnout3_render.c/.h      THE RENDERER: static VBOs + one GLSL program.
+                                The world, the scenery, the props and the HUD
+                                draw through it and nothing else; there is no
+                                fixed-function path left in those four.
+                                docs/web/webprof_sweep.md "fourth wave" has the
+                                call counts, the pixel gates and what is left.
+  src/burnout3_backend.c/.h     per-feature RE-vs-retail switch (build/backends.cfg)
+  src/burnout3_emu.c            the bridge to the Unicorn sidecar
+  src/*_runtime.h               loaders that replaced the eight baked-in headers
 
-src/burnout3_full.c             test harness (original code, NOT decompiled)
-src/burnout3_vehicle_sim.c      physics; bottom section is ported 1:1 and verified
-src/burnout3_vehicle_struct.h   live vehicle layout, per-field evidence + confidence
-src/burnout3_trackmesh.c        loads the extracted track OBJ
-src/burnout3_physics_params.h   generated: 64 params + defaults
-src/burnout3_car_physics.h      generated: per-car real values from Data/vdb.xml (100 cars)
-src/burnout3_vehicle_data.h     generated: 107-vehicle roster
+EXTRACTION
+  tools/cextract/               the C pipeline; cx_main.c is the `cxtract` driver
+  tools/cextract/verify_cextract.py   the byte-identity acceptance gate
+  tools/py_extract_archive/     the archived Python oracle — IMMUTABLE, read its README
+  tools/extract_*.py            forwarding stubs onto the archive (validators import them)
 
-docs/RE_NOTES.md                all findings, with evidence, dead ends, retractions
+GROUND TRUTH
+  tools/xbe2elf.py              XBE -> correctly mapped ELF32   [essential first step]
+  tools/apply_ghidra_types.py   applies structs + prototypes to the DB, self-verifying
+  tools/xboxkrnl_ordinals.py    kernel ordinal -> name table
+  tools/b3_emu_server.py        runs retail x86 under Unicorn for the live backends
+  tools/emulate_*.py            per-subsystem emulation oracles
+  tools/validate_*.py|.c        the differential suites
+  tools/probe_fields.py         identifies struct fields by perturbation
+  tools/field_usage.py          static read/write map of struct accesses
+  tools/find_bgv_parser.py      INVALID SCORING -- plumbing is reusable, metric is not
+
+DOCS
+  README.md                     build, run, and the honest real/verified/glue split
+  TODO.md                       the live open-item board
+  docs/RE_MASTER.md             master index into the per-subsystem records
+  docs/PHYSICS_GLUE_LEDGER.md   the physics ledger
+  BGV_EXTRACTION.md             the .bgv car geometry format
+  INTEGRATION_NOTE.md           the destructible-props evidence record
 ```
 
 **`src/burnout3_full.c` is not decompiled code.** It is an original harness
-written to have something runnable. Only the clearly-marked ported section of
-`burnout3_vehicle_sim.c`, the generated headers, and the extracted assets are
-real game data. The repo previously claimed to be a "full decompile" that was
-"FULLY PLAYABLE"; that was false and the claim has been removed. Please keep it
-that way — mark provenance on everything.
+written to have something runnable, and it still is: recovered retail logic
+lives in the dedicated modules beside it and is marked with its addresses. The
+repo previously claimed to be a "full decompile" that was "FULLY PLAYABLE"; that
+was false and the claim has been removed. Please keep it that way — mark
+provenance on everything.
 
 ---
 
@@ -338,5 +352,5 @@ Track/texture formats and the VDB layout come from the Burnout Modding community
 - EdnessP's Noesis plugin `fmt_Burnout3LRD.py` — burnout.wiki, discord.gg/8zxbb4x
 - `Sokka06/burnout-data-tool` — VDB/VList reader, and the reference VDB dump
 
-The extractors here are independent Python reimplementations so the data can be
-used without Noesis, but the format knowledge is theirs.
+The extractors here are independent reimplementations so the data can be used
+without Noesis, but the format knowledge is theirs.

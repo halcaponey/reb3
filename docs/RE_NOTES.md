@@ -5,6 +5,25 @@ Everything below is **verified against the binary or the data files**. Anything
 not verified is marked as such. Nothing here is inferred from the game's
 behaviour or from prior assumptions.
 
+> **How to read this file (note added 2026-08-22).** It is an **append-only
+> evidence record**, written in session order: the oldest text is at the top,
+> and later sections routinely supersede, correct or falsify earlier ones
+> (§9 in particular is a superseded status snapshot, and says so). Findings,
+> addresses and measurements are preserved as recorded — that is the point of
+> the record. But **do not read any sentence here as the current state of the
+> project.** For that: `README.md`, `TODO.md`,
+> `docs/PHYSICS_GLUE_LEDGER.md`, and `docs/RE_MASTER.md` as the index.
+>
+> In particular, the eight generated `src/` headers this file describes
+> emitting (`burnout3_track_paths.h`, `burnout3_car_physics.h`,
+> `burnout3_traffic_data.h`, `burnout3_vehicle_data.h`, `burnout3_font.h`,
+> `burnout3_ai_pace.h`, `burnout3_start_grid.h`, `burnout3_trackselect.h`)
+> **no longer exist**. No game-derived data is compiled into `src/`; each was
+> replaced by a `*_runtime.h` loader that reads the user's own files, and
+> `tools/validate_no_baked_data.py` is the permanent gate. Read every
+> "emits `src/<header>`" line below as "produces that data", not as a path
+> that exists.
+
 ---
 
 ## 1. Executable
@@ -279,6 +298,13 @@ submesh's index block. Indices are u16 triangle strips.
 so **the running program now draws real Burnout 3 track geometry** rather than
 the parametric placeholder. The placeholder circuit remains as a fallback when
 `build/track.obj` is absent.
+
+> **Status (2026-08-22):** the fallback is **gone**, deliberately. Tracks load
+> per-event from `build/tracks/<ID>/track.obj` and a missing mesh is now a fatal
+> error, not a substitution — a compiled-in stand-in does not *look* missing,
+> and silently racing Silver Lake's road on another track read as a physics bug
+> for a long time. `tools/validate_no_baked_data.py` asserts the global
+> `build/track.obj` and `build/collision.bin` fallbacks are absent from `src/`.
 
 Format credit: the Burnout Modding community (burnout.wiki), via EdnessP's
 Noesis plugin.
@@ -907,6 +933,27 @@ accumulate silently.
 ---
 
 ## 9. What is not done
+
+> **Status (2026-08-22): this section is a historical snapshot — every one of
+> items 1–4 has since been closed.** It is kept because the *reasoning* about
+> how to bound a port (the write-surface argument in item 1) is still the right
+> method. The current answers, all of them elsewhere in this same file or in
+> the tree:
+>
+> * item 1 (integrator) — `b3_vehicle_step()` is retired; the port runs
+>   `b3_vehicle_step_full()`, the 1:1 pipeline composition, trajectory-verified
+>   against retail under Unicorn. Section 14 below, and
+>   `docs/PHYSICS_GLUE_LEDGER.md` for what remains glue.
+> * item 2 (geometry) — the NV2A push-buffer theory was **falsified**. `.bgv`
+>   is a pointer-relocated container decoded from the game's own relinker
+>   (§9 addendum below, `BGV_EXTRACTION.md`); 36 real tracks and 107 real cars
+>   render.
+> * item 3 (textures) — decoded; `docs/RE_FRONTEND.md` §1.
+> * item 4 (audio) — decoded; `docs/AUDIO_NOTES.md`, `docs/RE_SFX.md`,
+>   `docs/RE_MUSIC.md`.
+>
+> Items 5 and 6 (function naming, RenderWare partitioning) are still accurate.
+> Live open items are `TODO.md` and the per-subsystem ledgers, never this list.
 
 Ordered by what stands between here and "races like the real thing".
 
@@ -3100,3 +3147,143 @@ the port applied one worth `veh+0x194 = 934`, and the trajectories split by
 0.22 m).  Fixed; the one non-retail call site (`b3_wreck_begin_*`, handed an
 already-classified crash-entry contact rather than a point velocity) takes
 `fabsf` explicitly and says so.
+
+---
+
+## Frame pacing: retail is NOT frame-locked (correction)
+
+The port stepped the sim exactly 1/60 s per RENDERED frame and its comment
+claimed that was the Xbox arrangement. It is not. [C] `FUN_000165F0`, the main
+frame dispatcher:
+
+```
+00016ABC  CMP [EBP+0x2E20C],0 ; JLE 0x00016C10   ; 0 ticks -> render only
+00016AD0  ---- inner loop: ONE 1/60 s sim tick per iteration ----
+00016ADC    INC [0x004A1EB4]                     ; frame counter, +1 per TICK
+00016B06    CALL FUN_001B5AC0 (ECX=0x0060EA00)   ; -> DAT_0060EA1C / DAT_0060EA20
+00016BED    i++ ; CMP i,[EBP+0x2E20C] ; JL 0x00016AD0
+00016C2D  PUSH 4 ; PUSH 1 ; CALL FUN_001B58E0    ; base = 1, MAX TICKS = 4
+00016C37  MOV [EBP+0x2E20C],EAX                  ; ticks for the NEXT frame
+```
+
+`FUN_001B58E0` is a 64-bit wall-clock residual accumulator; the clamp binds at
+0x001B59B8 and 0x001B59CA DISCARDS the backlog — retail's own spiral-of-death
+guard. The clock is `rdtsc` (`FUN_001D20AC`) at 733,333,333 Hz
+(`FUN_001D20BD` returns 0x2BB5C755). The period is set by `FUN_001B5880` from
+16.666666/33.333332 ms (NTSC) or 20/40 (PAL); the 33.33 ms arm pairs with
+`PUSH 8 / PUSH 2` @0x00016C27 — a 30 Hz RENDER mode that still ticks the sim
+at 60 Hz. `[ESI+0x00] == 0` @0x001B5A0D forces `n = base`, so retail does have
+a frame-lock mode — the port was effectively hard-wired to it.
+
+**Why it mattered.** Frame-locked, sim speed tracks the achieved frame rate
+one-for-one. Measured: all-RE ran at 121-131 fps = **2.0-2.2x too fast**;
+all-retail at 14-15 fps = **0.24x, four times slow motion**. And the HUD's
+"FPS" is `1.0f / g_delta_time` with `g_delta_time` pinned at the nominal 1/60,
+so it read 60 in both cases and measured nothing. The user's report was "the
+game is running 60fps but the action is slower than normal".
+
+**The fix** ports the governor (`src/burnout3_frametime.h`) and runs
+`sim_ticks` per rendered frame. Two traps found while landing it:
+
+1. The accumulator alone does NOT fix the too-fast case — `base = 1`, so it
+   never returns fewer than one tick per frame; it is catch-up only. On Xbox
+   the 60 Hz ceiling came from the vsync-locked Present, and the port had NO
+   `SDL_GL_SetSwapInterval` call anywhere.
+2. `SDL_GL_GetSwapInterval() > 0` is not a trustworthy vsync test — the SDL
+   offscreen driver REPORTS interval 1 and never blocks, so the fallback sleep
+   limiter stayed disabled and the game still free-ran at 102-115 fps. The gate
+   is now MEASURED: if the achieved rate exceeds 1.25/tick over a 30-frame
+   window, the limiter runs whatever the driver claimed.
+
+Result: all-RE now paces at **60.1 Hz = x1.00**. `B3_FIXED_DT` forces one tick
+per frame with no governor and no limiter, so the deterministic parity harness
+is unaffected — verified: X bit-identical to frame 273 across the two physics
+backends, over 5659 frames. Env: `B3_PACE=0` (pre-fix A/B),
+`B3_PACE_MAX_TICKS=n` (retail's is 4), `B3_NO_VSYNC=1`.
+
+An all-retail build cannot be rescued by pacing — at ~43 ms/frame of sidecar
+time the sim genuinely cannot keep up, and multi-ticking only makes each frame
+slower. Use `B3_PACE_MAX_TICKS=1` there until the emulation cost comes down.
+Measured cost per frame: ccol 21.6 ms, cam 11.2, stepra 3.5, crashres 2.9,
+score 2.0, hudtick 0.9, soup 0.6 (`B3_EMU_PROF=1` on the sidecar).
+
+### Sidecar cost, after the session-cache pass
+
+`B3_EMU_PROF=1` on the sidecar dumps per-command count/total/mean/max every
+5 s. Measured in game, all 10 features retail, ~1420 frames:
+
+| cmd | before | after | note |
+|---|---|---|---|
+| cam | 11.211 | **0.739** | built a fresh `Uc` + reloaded the 4.28 MB ELF EVERY call |
+| score | 6.217 | **1.127** | same, and see the trap below |
+| ccol | 4.284 | 5.188 | retail's own SAT; rose because more traffic now reaches it |
+| stepra | 3.524 | 4.596 | |
+| crashres | 0.292 | 0.361 | 10/frame = 5 cars x 2 substeps, at retail's own call site |
+| hudtick | 0.894 | 1.276 | unfiltered `UC_HOOK_CODE`, still to bound |
+
+**The trap.** Caching the `score` session regressed 160/160 -> 157/160 with
+memory and registers provably identical. Cause: the trampoline at `CODE` is
+SELF-MODIFYING across calls and Unicorn caches translated blocks by address,
+so every call after the first re-executed the PREVIOUS call's block — silently
+routing every `mark` case through `FUN_00197920` instead of `FUN_001979E0`.
+Fixed with `uc.ctl_remove_cache(CODE, ...)`. Any session reuse in this tree
+must consider the TB cache, not just memory state. A second, smaller cause was
+ELF globals leaking between calls, fixed with a pristine-page snapshot.
+
+Also removed: a `gc.collect()`-every-64 in `do_cam` that was the source of the
+outlier maxima (interleaved at the real 5:1 ratio it pushed ccol's max from
+0.745 to 25.6 ms while barely moving the median).
+
+**What is NOT reducible.** `ccol`'s ~2.3 ms per CONTACTING pair is retail's own
+narrow phase (0.45 ms on a miss) and cannot be cut without changing results —
+hull size is irrelevant (0.48-0.58 ms across every distinct shape on disk) and
+the session is already cached. `crashres` at 10/frame is 5 port-physics cars x
+2 substeps at retail's `FUN_0011BE50` call site @0x0011C0B7.
+
+**Why all-retail is still 0.26x.** 78% of broadphase pairs resolve to a real
+contact (6211/8000), which is far too high: traffic positions are re-derived
+from the path/lane cursor every frame, so the separation `carcol_pass()` writes
+to `t->rb` is discarded and the same cars re-contact forever. Fixing that (see
+RE_CARCOL "Still open") is the next real perf lever as well as a fidelity fix.
+Retail's own pair filter `FUN_00114610` (reject when BOTH bodies are asleep,
++0x20E) is now applied — correct for parity, but perf-neutral here because
+these bodies are not asleep.
+
+Practical pacing today: all retail 0.26x, all but carcol 0.47-0.50x, all but
+carcol+crash 0.56-0.60x. `carcol` is 1:1 validated at 1037/1037, so running it
+on `re` is the cheapest way to a playable retail-physics build.
+
+### In-game scenario testing (validate_collision_scenarios.py)
+
+The unit differentials prove functions match retail; this suite proves the
+JOINED in-game paths work, on both backends, for the things a player notices:
+driving into oncoming traffic, opponents, and walls, and getting takedowns.
+
+Hard-won methodology, in the order the mistakes were made:
+
+1. **Detectors must test the ORIENTED box.** The first pass-through detector
+   tested the world AABB; for a rotated 5 m trailer that box is far larger
+   than the vehicle, so driving alongside one read as "passed through" -- 29
+   false positives, 0 real events.
+2. **"A hard hit must deliver" needs the right gate.** Closing speed is wrong
+   (a car passing alongside has high closing speed and near-zero normal
+   velocity); |impact| is wrong too (built from |vn|, so it is just as large
+   for a pair SEPARATING after a hit, which must receive nothing).  Only the
+   SIGNED approach along the contact normal obliges an impulse -- measured,
+   vn > +3 delivered 12/12 and vn < -3 delivered 0/16, i.e. retail was right
+   and the first two gates were accusing it falsely.
+3. **Autodrive never touches an opponent** (0 contacts in 120 s), so takedown
+   coverage requires a scenario (B3_SCENARIO=slam).  A scenario must RETRY,
+   not fire once: the two backends' worlds diverge chaotically within seconds
+   (start pile-ups, different target states), so no single fixed moment is
+   comparable.  Assertions are therefore QUALITATIVE per backend ("commits a
+   takedown, pays positive BP"); numeric scoring parity belongs to the unit
+   differential (validate_takedown_score.py), where both sides see identical
+   seeded state.
+4. **Scenario teleports must release emulator ownership** (b3_emu_drop_car):
+   with physics=retail the sidecar owns the car, and a teleport that writes
+   only the port-side fsim is silently undone by the next handover.
+5. **Bound runs by RACE time (B3_EXIT_AT), never wall clock.**  With a fixed
+   dt the RE build simulates ~2x real time offscreen while all-retail does
+   ~0.25x, so a wall-bounded "110 s" run gave RE ~8x the simulated seconds --
+   and 8x the slam attempts -- of retail.

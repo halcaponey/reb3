@@ -47,25 +47,27 @@ Sections:
                      reflection sheet extract_envmap.py writes per track,
                      round-tripped against an independent DXT decode.
 
-Usage:  python3 tools/validate_carfx.py            (run from the repo root)
-        python3 tools/validate_carfx.py --no-emu   (skip the Unicorn sections)
+Usage:  python3 tools/validate_carfx.py             (run from the repo root)
+        python3 tools/validate_carfx.py --no-emu    (skip the Unicorn sections)
+        python3 tools/validate_carfx.py --no-render (skip the 14b pixel leg)
+Env:    B3_BIN   the binary section 14b renders with (default ./burnout3)
 Exit status is non-zero if any check fails.
 """
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-from b3_paths import game_path, game_root  # noqa: E402
 import glob
 import os
 import random
 import re
 import struct
 import sys
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from b3_paths import game_path, game_root  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ELF = os.path.join(ROOT, "build", "burnout3.elf")
 CARFX_C = os.path.join(ROOT, "src", "burnout3_carfx.c")
 CARFX_H = os.path.join(ROOT, "src", "burnout3_carfx.h")
-PVEH = (game_path('pveh'))
+PVEH = game_path('pveh')
 
 PASS, FAIL = [], []
 
@@ -645,7 +647,7 @@ def section9(elf, csrc, shc):
 
 
 # --------------------------------------------- 10. the sun colour (enviro.dat)
-TRACKS_ROOT = (game_path('Tracks'))
+TRACKS_ROOT = game_path('Tracks')
 ENVIRO_LIGHT_OFF = 0x60          # env object +0x60 == DAT_0060E0A0
 
 
@@ -703,8 +705,36 @@ def section10(elf, csrc):
        str(bad_range))
     ck(not bad_byte, "and is authored as an exact 8-bit colour",
        str(bad_byte))
-    ck(not bad_tbl, "module's per-track table == the shipped files "
+    ck(not bad_tbl, "module's per-track FALLBACK table == the shipped files "
                     "(%d tracks)" % len(files), str(bad_tbl))
+    # ...and the table is only the fallback: the value the module actually
+    # uses is read from the per-track sidecar tools/extract_postfx_art.py
+    # writes, so no track DATA is compiled into the C.
+    ck("light_rgb %f %f %f" in csrc
+       and "build/postfx/%s_env.txt" in csrc
+       and "b3fx_env_light_from_sidecar(track, out_rgb)" in csrc,
+       "the module reads the sun colour from build/postfx/<ID>_env.txt "
+       "before it falls back to the table")
+    side_missing, side_bad = [], []
+    for name, fp in files:
+        sp = os.path.join(ROOT, "build", "postfx", "%s_env.txt" % name)
+        if not os.path.exists(sp):
+            side_missing.append(name)
+            continue
+        got = None
+        for ln in open(sp):
+            if ln.startswith("light_rgb "):
+                got = [float(x) for x in ln.split()[1:4]]
+        with open(fp, "rb") as f:
+            f.seek(ENVIRO_LIGHT_OFF)
+            rgb = struct.unpack("<3f", f.read(12))
+        if got is None or not all(close(a, b, 1e-6)
+                                  for a, b in zip(got, rgb)):
+            side_bad.append(name)
+    ck(not side_missing and not side_bad,
+       "every build/postfx/<ID>_env.txt carries the enviro.dat +0x60 it "
+       "was extracted from (%d tracks)" % len(files),
+       "missing %s bad %s" % (side_missing, side_bad))
     # the reference capture's track, spelled out
     with open(os.path.join(TRACKS_ROOT, "US", "C3_V1", "enviro.dat"),
               "rb") as f:
@@ -1006,9 +1036,15 @@ def section11b():
                 stderr=subprocess.DEVNULL).decode().split()
         except Exception:
             cflags = []
+        # burnout3_render.c comes along because burnout3_trackmesh.c now
+        # includes burnout3_render.h -- it has to, or its glFrontFace/
+        # glEnable(GL_CULL_FACE) bypass the CPU state shadow that replaced
+        # glPushAttrib (GLES2 has no attribute stack).  Leaving it off the
+        # link silently SKIPPED four checks here rather than failing them.
         cmd = (["gcc", "-std=c11", "-O1", "-I", os.path.join(ROOT, "src"),
                 "-o", os.path.join(tmp, "drv"), drv,
-                os.path.join(ROOT, "src", "burnout3_trackmesh.c")]
+                os.path.join(ROOT, "src", "burnout3_trackmesh.c"),
+                os.path.join(ROOT, "src", "burnout3_render.c")]
                + cflags + ["-lGL", "-lm"])
         r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if r.returncode != 0:
@@ -1351,18 +1387,74 @@ def section14(elf, csrc):
     # asserted term by term below and is unchanged.
     for frag, why in (
             ("2.0 * paint.rgb * E", "the x2 albedo*irradiance"),
-            ("paint.a * (uP * uReflFloor + (1.0 - uP) * F)",
-             "the P floor and gloss mask"),
-            ("mix(base, envc, refl)", "the lerp to the environment"),
-            ("(paint.a * env.a * uFade - uKz) * uGain", "the specular")):
+            ("mix(base, envc, refl)", "the lerp to the environment")):
         ck(frag in csrc, "module implements %s" % why)
+    # ---- the P floor and the gloss mask ---------------------------------
+    # SHINE-SHAPE (2026-08-21) split this off its own line -- the weight is
+    # now built in `w` so the 1d sky term can be ADDED to it -- so the needle
+    # is no longer one contiguous fragment.  What the check was protecting is
+    # unchanged and is asserted term by term instead:
+    #   * the CONSTANT part is uP scaled by uReflFloor and nothing else,
+    #   * the Fresnel complement keeps its FULL recovered weight (1-uP)*F,
+    #   * paint.a -- the per-texel gloss mask, stage 1a `r0.a *= t0.a` --
+    #     multiplies the finished weight, so a matte panel still takes none
+    #     of the reflection however the weight was built.
+    # (the needles below are the SHADER SOURCE, which lives in C string
+    # literals, so a line end is the two characters \ n and not a newline.)
+    ck(r'float w    = uP * uReflFloor + (1.0 - uP) * F;\n"' in csrc,
+       "module implements the P floor and gloss mask "
+       "(the recovered weight uP*uReflFloor + (1-uP)*F)")
+    ck(re.search(r"float refl = paint\.a \* w\b", csrc) is not None
+       and r'* uFade * face * uReflGain * uEnvMod;\n"' in csrc,
+       "...and paint.a (the gloss mask) multiplies that whole weight, "
+       "times the fade")
+    # and the SHAPE term may only ever ADD to it, behind uTunedFx -- if it
+    # ever replaced or scaled the recovered weight, B3_CARFX_SHAPE=0 could no
+    # longer collapse to the recovered composition.  (The pixel leg below
+    # proves the collapse; this says the arithmetic admits it.)
+    m = re.search(r"float w    = uP \* uReflFloor[^;]*;\\n\"(.*?)"
+                  r"float refl = paint\.a \* w", csrc, re.S)
+    ck(m is not None and "uTunedFx != 0" in m.group(1)
+       and re.search(r"\bw \+= ", m.group(1)) is not None
+       and re.search(r"\bw (=|\*=|/=|-=) ", m.group(1)) is None,
+       "the SHAPE term only ADDS to that weight and is gated on uTunedFx")
+    # ---- the additive specular ------------------------------------------
+    # SHINE-HOT (2026-08-21) renamed the DRIVE of the recovered threshold from
+    # `env.a` to `envI`, because on the substituted sheet stage 1's alpha is
+    # the artists' cloud-coverage mask and not an intensity at all.  The
+    # THRESHOLD -- gloss * x * fade - (1-K), times M/(1-K) -- is what this
+    # check was protecting and it is unchanged; what `x` is, is a switch, and
+    # B3_CARFX_TUNE=0 forces it back to the recovered `env.a` (below).
+    ck("(paint.a * envI * uFade - uKz) * uGain" in csrc,
+       "module implements the specular "
+       "(the recovered (gloss*x*fade - (1-K)) * M/(1-K) threshold)")
+    ck(re.search(r"float envI = \(uSpecGate != 0\) \?[^:]*: env\.a;",
+                 csrc) is not None,
+       "...and its drive `x` is the recovered stage-1 ALPHA whenever "
+       "uSpecGate is 0")
     # ...and the tuned weights must all be neutral-able from one switch, so
     # the recovered composition is still reachable from the shipped binary.
-    ck('getenv("B3_CARFX_TUNE")' in csrc and "g.tune ? B3FX_T_REFL_GAIN" in csrc
-       and "g.tune ? B3FX_T_REFL_FLOOR" in csrc
-       and "g.tune ? g.envmod" in csrc,
-       "B3_CARFX_TUNE=0 sets all three TUNED weights to 1, i.e. restores the "
-       "untouched recovered composition")
+    # Each of these is now read through a local that carries the env-var
+    # override (B3_CARFX_REFLGAIN &c), so the needle is the `g.tune ? ... : 1`
+    # SHAPE of the uniform write rather than the constant's name.  The
+    # constants themselves are asserted to exist by the loop below, and the
+    # collapse is asserted ON PIXELS by section 14b.
+    tune_ok = True
+    for uni, why in (("u_reflgain", "REFL_GAIN"), ("u_reflfloor", "REFL_FLOOR"),
+                     ("u_envmod", "ENV_SHADE"), ("u_specgain", "SPEC_GAIN"),
+                     ("u_envrt", "ENV_RT")):
+        if not re.search(r"p_glUniform1f\(g\.%s,\s*g\.tune \? [^:]+: 1\.0f\);"
+                         % uni, csrc):
+            tune_ok = False
+    ck('getenv("B3_CARFX_TUNE")' in csrc
+       and re.search(r"g\.tune = \(t && atoi\(t\) == 0\) \? 0 : 1;", csrc)
+       is not None
+       and tune_ok
+       and re.search(r"p_glUniform1i\(g\.u_specgate,\s*g\.tune \? [^:]+: 0\);",
+                     csrc) is not None
+       and re.search(r"return on && g\.tune;", csrc) is not None,
+       "B3_CARFX_TUNE=0 sets every TUNED weight to 1 (and the SHAPE switch "
+       "to 0), i.e. restores the untouched recovered composition")
     for name in ("B3FX_T_REFL_GAIN", "B3FX_T_REFL_FLOOR",
                  "B3FX_T_ENV_SHADE_MIN", "B3FX_T_ENV_SHADE_POW",
                  "B3FX_T_PROBE_CONTRAST"):
@@ -1370,6 +1462,178 @@ def section14(elf, csrc):
     ck(csrc.count("TUNED (user-authorized deviation 2026-08-13)") >= 8,
        "every tuned magnitude carries the TUNED mark (%d marks)"
        % csrc.count("TUNED (user-authorized deviation 2026-08-13)"))
+
+
+# ===========================================================================
+# 14b. B3_CARFX_TUNE=0 RESTORES THE RECOVERED COMPOSITION -- ON PIXELS
+#
+# The claim "TUNE=0 is the untouched recovered composition" is a claim about
+# what comes out of the shader, and until this section it was asserted by
+# reading the C source for `g.tune ? <CONSTANT> : 1.0f`.  That needle broke
+# the moment SHINE-HOT gave the same weights runtime overrides (the constant
+# is now reached through a local), which is exactly the kind of drift a
+# source-text guard cannot survive -- and, worse, it would have kept passing
+# if a NEW tuned term had been added that forgot to consult g.tune at all.
+#
+# So the invariant is measured instead, and measured in the strongest form it
+# has: if TUNE=0 really does collapse every tuned weight, then NOTHING
+# downstream of that switch can reach the frame, and driving every one of the
+# module's tuned knobs to an absurd value must leave the TUNE=0 frame
+# BIT-IDENTICAL.  A single recorded golden image could only ever prove the
+# collapse for the default knob values; this proves it for all of them, and
+# it cannot go stale.
+#
+# The second leg is what makes the first mean something: the TUNED frame must
+# actually DIFFER from the TUNE=0 frame, so "identical" above is a statement
+# about the switch and not about a shader that ignores its uniforms.
+# ===========================================================================
+B3FX_TUNED_KNOBS = {
+    # every getenv() the module reads for a TUNED magnitude, driven far off
+    # its default in BOTH directions so no single value can coincide.
+    "B3_CARFX_REFLGAIN": "3.7", "B3_CARFX_SPECGAIN": "0.01",
+    "B3_CARFX_ENVRT": "4.0", "B3_CARFX_SPECGATE": "1",
+    "B3_CARFX_HEMUP": "1.0", "B3_CARFX_GROUND": "0.02",
+    "B3_CARFX_TOPBOOST": "5.0", "B3_CARFX_SKYW": "3.0",
+    "B3_CARFX_ENVCON": "4.0", "B3_CARFX_SUNPOW": "1.0",
+    "B3_CARFX_SUNGAIN": "9.0", "B3_CARFX_SUNFRES": "1.0",
+    # ...and the SHAPE switch turned explicitly ON, so TUNE=0 has to be the
+    # thing that clears it (b3fx_shape_on() is `on && g.tune`).
+    "B3_CARFX_SHAPE": "1",
+}
+# the B3_CARFX_* switches that are NOT tuned magnitudes, so the roster above
+# can be checked for completeness against the module instead of drifting off
+# it the next time a knob is added.
+B3FX_NON_TUNED = {
+    "B3_CARFX_TUNE",        # the switch itself
+    "B3_CARFX_ENVDBG",      # measurement hooks
+    "B3_CARFX_PROBEDBG", "B3_CARFX_PROBETRACE",
+    "B3_CARFX_ENVMAP",      # which asset to load
+    "B3_CARFX_ENVUV",       # which parameterisation -- section 17
+    "B3_CARFX_NOZMIRROR",   # the [C]/[S] world-mirror switch -- section 12
+    "B3_CARFX_VERBOSE",     # prints where the attributes actually landed
+}
+# the broadside autodrive station validate_car_shine.py uses: the player's
+# car fills the frame, so a difference in the CAR shader is a difference in
+# a lot of pixels.  Frame 240 of a fixed-dt autodrive.
+B3FX_SHOT_FRAME = 240
+# ...compared over the top 80% of the frame.  MEASURED: five renders of the
+# identical command line agree to the BIT over rows [0, 0.80h) -- all ten
+# pairs, zero differing pixels -- and disagree only in rows 630..695 of 768
+# (y/h 0.820..0.905), which is the HUD's scrolling music ticker: the song
+# title is picked per process, so its glyphs land differently.  Nothing else
+# in the frame moves, so the band below is a bit-exact instrument over the
+# whole world and the whole car, and the one strip it drops has nothing to
+# do with the car shader.
+B3FX_SHOT_BAND = 0.80
+
+
+def section14b(csrc):
+    print("\n[14b] B3_CARFX_TUNE=0 restores the recovered composition -- "
+          "MEASURED on pixels")
+    import shutil
+    import subprocess
+    import tempfile
+    # the roster is only a proof for the knobs it names, so it has to be all
+    # of them: every B3_CARFX_* the module reads is either a tuned magnitude
+    # this section drives, or one of the declared non-tuned switches.
+    seen = set(re.findall(r'getenv\("(B3_CARFX_[A-Z0-9_]*)"\)', csrc))
+    stray = seen - set(B3FX_TUNED_KNOBS) - B3FX_NON_TUNED
+    ck(not stray,
+       "every B3_CARFX_* switch the module reads is accounted for -- %d "
+       "tuned magnitudes driven below, %d declared non-tuned"
+       % (len(B3FX_TUNED_KNOBS), len(B3FX_NON_TUNED)),
+       "unaccounted: %s" % sorted(stray))
+    binary = os.environ.get("B3_BIN", os.path.join(ROOT, "burnout3"))
+    if "--no-render" in sys.argv:
+        print("     skipped (--no-render)")
+        return
+    if not os.path.isfile(binary):
+        print("     skipped (no binary at %s -- make burnout3, or set B3_BIN)"
+              % binary)
+        return
+    tmp = tempfile.mkdtemp(prefix="b3carfxtune")
+
+    def shot(name, extra):
+        out = os.path.join(tmp, name + ".bmp")
+        env = dict(os.environ)
+        env.update({
+            "SDL_VIDEODRIVER": "offscreen", "SDL_AUDIODRIVER": "dummy",
+            "B3_FIXED_DT": "0.0166667", "B3_PACE_MAX_TICKS": "1",
+            "B3_TRACK": "US_C3_V1", "B3_AUTODRIVE": "1", "B3_CAMSIDE": "1",
+            # THE TWO THINGS THIS CONFIGURATION IS NOT BIT-STABLE WITHOUT, and
+            # this section compares frames with EXACT EQUALITY.
+            #
+            # B3_MUSIC_SEED: nothing else calls b3_music_seed(), so the shuffle
+            #   bag opens on time(NULL) and the EA TRAX ticker differs run to
+            #   run.  B3FX_SHOT_BAND already crops that strip away, so this is
+            #   belt and braces -- but a gate should not depend on a crop to
+            #   hide a known nondeterminism.
+            # B3_TRACK_NOSHINE: the TRACK's class-1/7/10 additive specular pass
+            #   is GL_ONE/GL_ONE with depth writes off over overlapping
+            #   geometry, and float addition is commutative but not
+            #   associative -- so the GPU's fragment order decides the last bit
+            #   on a handful of road pixels.  Measured: the pass' whole CPU
+            #   input and output are bit-identical across runs (eye to six
+            #   decimals, FNV-1a over all 165 816 colour floats identical), and
+            #   the frame still differs on ~7 pixels at <= 2/255 in roughly one
+            #   run in six.  It is downstream of anything this file asserts.
+            #   The knobs this section is ABOUT are carfx's, not the track's,
+            #   so switching the track pass off narrows the comparison to what
+            #   the check actually claims instead of weakening it.
+            "B3_MUSIC_SEED": "1", "B3_TRACK_NOSHINE": "1",
+            "B3_SHOT": out, "B3_SHOT_FRAME": str(B3FX_SHOT_FRAME),
+            "B3_EXIT_AT": str(B3FX_SHOT_FRAME // 60 + 3),
+        })
+        for k in list(B3FX_TUNED_KNOBS) + ["B3_CARFX_TUNE"]:
+            env.pop(k, None)
+        env.update(extra)
+        subprocess.run([binary], cwd=ROOT, env=env, timeout=600,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return out if os.path.isfile(out) else None
+
+    try:
+        from PIL import Image
+    except ImportError:
+        print("     skipped (PIL missing)")
+        return
+
+    def band(path):
+        """the top B3FX_SHOT_BAND of the frame, as raw RGB -- see the note by
+        the constant for why the HUD strip at the bottom is dropped."""
+        im = Image.open(path).convert("RGB")
+        w, h = im.size
+        return im.crop((0, 0, w, int(h * B3FX_SHOT_BAND))).tobytes()
+
+    try:
+        plain = shot("tune0", {"B3_CARFX_TUNE": "0"})
+        if plain is None:
+            ck(False, "the TUNE=0 reference frame rendered")
+            return
+        knobs = shot("tune0_knobs", dict(B3FX_TUNED_KNOBS, B3_CARFX_TUNE="0"))
+        tuned = shot("tuned", {})
+        ck(knobs is not None and tuned is not None,
+           "the three probe frames rendered")
+        if knobs is None or tuned is None:
+            return
+        a, b, c = band(plain), band(knobs), band(tuned)
+
+        def npx(x, y):
+            return sum(1 for i in range(0, min(len(x), len(y)), 3)
+                       if x[i:i + 3] != y[i:i + 3])
+
+        ck(a == b,
+           "B3_CARFX_TUNE=0 is BIT-IDENTICAL with every tuned knob driven to "
+           "an absurd value -- i.e. the switch really does clear all %d of "
+           "them" % len(B3FX_TUNED_KNOBS),
+           "%d differing pixels over %d" % (npx(a, b), len(a) // 3))
+        ck(a != c,
+           "...and the TUNED composition is NOT that frame, so the equality "
+           "above is a statement about the switch, not about a dead uniform",
+           "%d differing pixels" % npx(a, c))
+    finally:
+        # three 3 MB frames per run; the harness's own scratch fills fast
+        # enough without this section adding to it.
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ===========================================================================
@@ -1620,8 +1884,49 @@ def section17(elf, csrc):
        "b3_carfx_set_track() loads build/tracks/<ID>/envmap.png and "
        "B3_CARFX_ENVMAP still overrides it")
     ck("texture2D(uEnv, R.xy)" in csrc,
-       "the shader samples stage 1 at the reflection vector's xy -- "
-       "PROJECT2D with the unwritten q = 1, as decoded in section 13")
+       "the recovered stage-1 lookup -- the reflection vector's xy, "
+       "PROJECT2D with the unwritten q = 1 (section 13) -- is still in "
+       "the shader verbatim")
+    # ...but it cannot be the lookup the SUBSTITUTE sheet answers: R is a
+    # unit vector, so R.xy ranges over [-1,1]^2 while a 2D lookup has
+    # [0,1]^2, and this stage is CLAMP -- measured in the running harness,
+    # 89% (US/C3, panorama) and 49% (EU/C3, sphere map) of the car's
+    # fragments therefore read ONE frozen border texel and the body has no
+    # reflection variation at all (tools/validate_car_shine.py).  So the
+    # module gates it and picks the sheet's own parameterisation instead.
+    ck("uEnvUV == 0" in csrc and "uniform int   uEnvUV" in csrc,
+       "and it is GATED as uEnvUV == 0, reachable from the shipped binary")
+    ck("B3_CARFX_ENVUV" in csrc
+       and '!strcmp(uv, "raw")' in csrc,
+       "B3_CARFX_ENVUV=raw pins the recovered lookup back on")
+    # SHINE-SHAPE (2026-08-21) gave the SQUARE sheets a third class -- the
+    # up-centred angular map, uEnvUV 3 -- so the selector is no longer the
+    # two-way expression this needle pinned.  The invariant it protects is
+    # not the expression, it is WHERE the answer comes from: the decoded
+    # image's own width and height (plus the global SHAPE switch), and never
+    # a per-track constant.  So the assignment is located and its right-hand
+    # side is checked for exactly that.
+    # (there are several `g.envuv = ...` -- the reset to 0, the env-var
+    # overrides -- so the SELECTOR is the one that reads the decoded size.)
+    allowed = {"ew", "eh", "b3fx_shape_on"}   # all it may depend on
+    sel = [r for r in re.findall(r"g\.envuv = ([^;]*);", csrc)
+           if re.search(r"\bew\b|\beh\b", r)]
+    rhs = sel[0] if len(sel) == 1 else ""
+    names = set(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", rhs))
+    ck(len(sel) == 1 and "ew" in names and "eh" in names
+       and not (names - allowed),
+       "the substitute parameterisation is chosen from the SHEET's own "
+       "decoded dimensions (4:1 strip -> panorama, else the square-sheet "
+       "class), not from a per-track constant",
+       "g.envuv = %s" % (rhs or "<%d selectors found>" % len(sel)))
+    # ...and nothing anywhere in the loader may reach for a track ID to
+    # decide it.  b3_carfx_load_env_map() takes a path and an image; if a
+    # track name ever appeared in it, the line above could still be true
+    # while the real choice was made per track somewhere else in the body.
+    body = csrc[csrc.find("int b3_carfx_load_env_map("):]
+    body = body[:body.find("\n}\n")]
+    ck(not re.search(r"[A-Z]{2}_[A-Z][0-9]_V[0-9]", body),
+       "...and no track ID appears anywhere in b3_carfx_load_env_map()")
 
 
 def main():
@@ -1653,6 +1958,7 @@ def main():
     section12(csrc, shc, nine)
     section13(elf, csrc)
     section14(elf, csrc)
+    section14b(csrc)
     section15(elf, csrc)
     section16()
     section17(elf, csrc)

@@ -55,6 +55,8 @@
 #ifndef BURNOUT3_SCORE_EVENTS_H
 #define BURNOUT3_SCORE_EVENTS_H
 
+#include <stddef.h>
+
 #include "burnout3_gameplay.h"
 
 #ifdef __cplusplus
@@ -143,20 +145,43 @@ void b3_score_params_defaults(B3ScoreParams* p);  /* compiled-in defaults */
  * the score object: air +0x358, oncoming +0x374, drift +0x390, near-miss
  * chain +0x418.  Field comments give the record-relative offsets.
  * ------------------------------------------------------------------ */
-typedef struct {
-    float        value;      /* +0x00 accumulated metres (near miss: count) */
-    float        clock;      /* +0x04 last update clock                     */
-    float        prev_value; /* +0x08                                       */
-    const float* minima;     /* +0x0C thresholds                            */
-    signed char  tier;       /* +0x11 current tier, -1 = none               */
-    signed char  prev_tier;  /* +0x12                                       */
-    signed char  count;      /* +0x13 number of thresholds                  */
+/* packed pins the retail offsets; aligned(4) pins only the struct BASE.
+ * No member moves (the offsetof asserts below prove it) -- but with a
+ * 4-aligned base the 4-byte fields ARE 4-aligned, so taking their address
+ * is no longer undefined and -Waddress-of-packed-member goes quiet on the
+ * fields that really are aligned (and still fires on any that are not). */
+typedef struct __attribute__((packed, aligned(4))) B3CatRecord {
+    // ---- RETAIL WINDOW 0x0000..0x001C: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    float                value;  /* +0x00 accumulated metres (near miss: count) */
+    float                clock;  /* +0x04 last update clock                     */
+    float                prev_value;  /* +0x08                                       */
+    unsigned char _pad00[0x4];
+    unsigned char        active;  /* +0x10 the event-open flag */
+    signed char          tier;  /* +0x11 current tier, -1 = none               */
+    signed char          prev_tier;  /* +0x12                                       */
+    signed char          count;  /* +0x13 number of thresholds                  */
+    unsigned char _pad01[0x8];
 } B3CatRecord;
+
+#define B3CATRECORD_RETAIL_SPAN 0x001Cu
+_Static_assert(offsetof(B3CatRecord, value) == 0x0000, "value off retail");
+_Static_assert(offsetof(B3CatRecord, clock) == 0x0004, "clock off retail");
+_Static_assert(offsetof(B3CatRecord, prev_value) == 0x0008, "prev_value off retail");
+_Static_assert(offsetof(B3CatRecord, active) == 0x0010, "active off retail");
+_Static_assert(offsetof(B3CatRecord, tier) == 0x0011, "tier off retail");
+_Static_assert(offsetof(B3CatRecord, prev_tier) == 0x0012, "prev_tier off retail");
+_Static_assert(offsetof(B3CatRecord, count) == 0x0013, "count off retail");
+
 
 /* FUN_00192D20 verbatim: store value/prev/clock, then -- only while
  * `tier < count-1` -- scan the minima top-down and take the highest index
  * whose minimum <= value.  Never downgrades within an event. */
-void b3_cat_track(B3CatRecord* r, float value, float clock);
+/* `minima` is passed in rather than stored: a host pointer inside a
+ * retail-shaped record would squat on the game's bytes, and it also
+ * inflated the record past retail's 0x1C stride. */
+void b3_cat_track(B3CatRecord* r, const float* minima, float value,
+                  float clock);
 
 /* Event-end reset (the tail of each detector): prev := value, tier := -1. */
 void b3_cat_reset(B3CatRecord* r, float clock);
@@ -192,79 +217,88 @@ int b3_score_obb_near(const B3ScoreObb* me, const B3ScoreObb* other,
  * over score+0x510 / +0x528 / +0x540 / +0x55E, and 0x510 + 6*4 == 0x528.] */
 #define B3_SE_RUB_CARS 6
 
-typedef struct {
-    B3CatRecord air;        /* score+0x358 */
-    B3CatRecord onc;        /* score+0x374 */
-    B3CatRecord drift;      /* score+0x390 */
-    B3CatRecord nm;         /* score+0x418 (value = chain length)          */
+/* packed pins the retail offsets; aligned(4) pins only the struct BASE.
+ * No member moves (the offsetof asserts below prove it) -- but with a
+ * 4-aligned base the 4-byte fields ARE 4-aligned, so taking their address
+ * is no longer undefined and -Waddress-of-packed-member goes quiet on the
+ * fields that really are aligned (and still fires on any that are not). */
+typedef struct __attribute__((packed, aligned(4))) B3ScoreEvents {
+    // ---- RETAIL WINDOW 0x0000..0x1900: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    unsigned char _pad00[0x358];
+    B3CatRecord          air;  /* score+0x358 */
+    B3CatRecord          onc;  /* score+0x374 */
+    B3CatRecord          drift;  /* score+0x390 */
+    unsigned char _pad01[0x1C];
+    unsigned char        air_scored;  /* score+0x3C8 */
+    unsigned char        onc_scored;  /* score+0x3C9 */
+    unsigned char        drift_scored;  /* score+0x3CA */
+    unsigned char _pad02[0x1];
+    int                  nm_total;  /* score+0x3CC lifetime near misses    */
+    int                  nm_chain;  /* score+0x3D0 links in the live chain */
+    unsigned char _pad03[0x8];
+    float                prev_clock;  /* score+0x3DC previous frame's clock  */
+    float                nm_last;  /* score+0x3E0 last link's clock       */
+    float                nm_chain_end;  /* score+0x3E4                         */
+    signed char          nm_id[B3_SE_NM_SLOTS];  /* score+0x3E8, -1 = free */
+    float                nm_seen[B3_SE_NM_SLOTS];  /* score+0x3F0 last-proximity clock */
+    unsigned char        nm_armed[B3_SE_NM_SLOTS];  /* score+0x410 */
+    B3CatRecord          nm;  /* score+0x418 (value = chain length)          */
+    unsigned char _pad04[0xDC];
+    float                rub_last[B3_SE_RUB_CARS];  /* score+0x510  last-contact clock   */
+    float                rub_time[B3_SE_RUB_CARS];  /* score+0x528  contact timer, s     */
+    float                rub_start[B3_SE_RUB_CARS];  /* score+0x540  contact start clock  */
+    unsigned char        rub_prev_touch[B3_SE_RUB_CARS];  /* score+0x558           */
+    unsigned char        rub_touch[B3_SE_RUB_CARS];  /* score+0x55E           */
+    B3CatRecord          rub;  /* score+0x564 value / +0x568 clock / */
+    int                  rub_target;  /* score+0x580 -- the opponent being rubbed */
+    unsigned char _pad05[0x137C];
 
-    unsigned char air_active;   /* score+0x368 */
-    unsigned char onc_active;   /* score+0x384 */
-    unsigned char drift_active; /* score+0x3A0 */
-    unsigned char nm_active;    /* score+0x428 */
-
-    /* "this event has already paid boost" -- makes the FIRST payment cover
-     * the whole accumulated distance and every later frame only its step. */
-    unsigned char air_scored;   /* score+0x3C8 */
-    unsigned char onc_scored;   /* score+0x3C9 */
-    unsigned char drift_scored; /* score+0x3CA */
-
-    /* near-miss tracking slots */
-    signed char   nm_id[B3_SE_NM_SLOTS];    /* score+0x3E8, -1 = free */
-    float         nm_seen[B3_SE_NM_SLOTS];  /* score+0x3F0 last-proximity clock */
-    unsigned char nm_armed[B3_SE_NM_SLOTS]; /* score+0x410 */
-    int   nm_chain;        /* score+0x3D0 links in the live chain */
-    int   nm_total;        /* score+0x3CC lifetime near misses    */
-    float nm_last;         /* score+0x3E0 last link's clock       */
-    float nm_chain_end;    /* score+0x3E4                         */
-    float prev_clock;      /* score+0x3DC previous frame's clock  */
-
-    /* stats (score+0x50..+0x64, +0x354) */
-    float air_total, air_best;   int air_count;
-    float onc_total, onc_best;
-    float drift_total, drift_best;
-
-    /* Burnout Points these events produced: bp == racecar+0x111C's share,
-     * bp_event == the +0x1188 event-side subtotal.  Both get every award. */
-    int bp, bp_event;
-
-    /* pending HUD earn callout (score+0x254 id / +0x260 tier / +0x134 flag) */
-    int callout_id;    /* 0 = none, else B3_SE_EVID_*                     */
-    int callout_cat;   /* B3_SE_CAT_*  -> b3_hud_boost_event(cat, tier)   */
-    int callout_tier;  /* 0..3                                            */
-
-    /* The two racecar state bytes FUN_001935F0 tests before it runs any
-     * detector (0x001939AD / 0x001939D1).  Mirrored here because this module
-     * owns no racecar pointer; set them with b3_score_events_set_crash()
-     * or through B3ScoreFrame.crashed / .respawning.  GLUE: only the SOURCE
-     * of the two bytes is bridged -- the gate itself is the game's.  */
-    unsigned char rc_crashed;     /* racecar+0x18FA */
-    unsigned char rc_respawning;  /* racecar+0x18FB */
-
-    /* score+0x27C == 3 -> the race is over; FUN_00197920 @0x00197928 and
-     * FUN_001979E0 @0x001979E8 both refuse to record a contact then. */
-    unsigned char race_finished;
-
-    /* ---- the per-opponent CONTACT arrays + the RUBBING event ---------
-     * FUN_001979E0 fills them, FUN_00194A80 consumes them, FUN_001935F0's
-     * tail rotates them and its crash block wipes them. */
-    float rub_last[B3_SE_RUB_CARS];   /* score+0x510  last-contact clock   */
-    float rub_time[B3_SE_RUB_CARS];   /* score+0x528  contact timer, s     */
-    float rub_start[B3_SE_RUB_CARS];  /* score+0x540  contact start clock  */
-    unsigned char rub_prev_touch[B3_SE_RUB_CARS]; /* score+0x558           */
-    unsigned char rub_touch[B3_SE_RUB_CARS];      /* score+0x55E           */
-    B3CatRecord   rub;          /* score+0x564 value / +0x568 clock /
-                                 * +0x56C prev / +0x570 minima / +0x575
-                                 * tier / +0x576 prev tier / +0x577 count */
-    unsigned char rub_active;   /* score+0x574 */
-    int   rub_target;           /* score+0x580 -- the opponent being rubbed */
-    /* The closing rub's payout, left for the caller: retail hands it to
-     * FUN_0019A050 (the shared aggression/combo payout), which is NOT
-     * ported -- so no Rubbing Category BP is invented here.  tier < 0 =
-     * nothing pending; the caller clears it. */
-    signed char rub_payout_tier;
-    int   rub_payout_target;
+    // ---- HARNESS SIDE, past the retail window: no recovered
+    // offset in THIS object, so it must not squat on retail's bytes.
+    float                air_total;  
+    float                air_best;  
+    int                  air_count;  
+    float                onc_total;  
+    float                onc_best;  
+    float                drift_total;  
+    float                drift_best;  
+    int                  bp;  
+    int                  bp_event;  
+    int                  callout_id;  /* 0 = none, else B3_SE_EVID_*                     */
+    int                  callout_cat;  /* B3_SE_CAT_*  -> b3_hud_boost_event(cat, tier)   */
+    int                  callout_tier;  /* 0..3                                            */
+    unsigned char        rc_crashed;  /* racecar+0x18FA */
+    unsigned char        rc_respawning;  /* racecar+0x18FB */
+    unsigned char        race_finished;  
+    signed char          rub_payout_tier;  
+    int                  rub_payout_target;  
 } B3ScoreEvents;
+
+#define B3SCOREEVENTS_RETAIL_SPAN 0x1900u
+_Static_assert(offsetof(B3ScoreEvents, air) == 0x0358, "air off retail");
+_Static_assert(offsetof(B3ScoreEvents, onc) == 0x0374, "onc off retail");
+_Static_assert(offsetof(B3ScoreEvents, drift) == 0x0390, "drift off retail");
+_Static_assert(offsetof(B3ScoreEvents, air_scored) == 0x03C8, "air_scored off retail");
+_Static_assert(offsetof(B3ScoreEvents, onc_scored) == 0x03C9, "onc_scored off retail");
+_Static_assert(offsetof(B3ScoreEvents, drift_scored) == 0x03CA, "drift_scored off retail");
+_Static_assert(offsetof(B3ScoreEvents, nm_total) == 0x03CC, "nm_total off retail");
+_Static_assert(offsetof(B3ScoreEvents, nm_chain) == 0x03D0, "nm_chain off retail");
+_Static_assert(offsetof(B3ScoreEvents, prev_clock) == 0x03DC, "prev_clock off retail");
+_Static_assert(offsetof(B3ScoreEvents, nm_last) == 0x03E0, "nm_last off retail");
+_Static_assert(offsetof(B3ScoreEvents, nm_chain_end) == 0x03E4, "nm_chain_end off retail");
+_Static_assert(offsetof(B3ScoreEvents, nm_id) == 0x03E8, "nm_id off retail");
+_Static_assert(offsetof(B3ScoreEvents, nm_seen) == 0x03F0, "nm_seen off retail");
+_Static_assert(offsetof(B3ScoreEvents, nm_armed) == 0x0410, "nm_armed off retail");
+_Static_assert(offsetof(B3ScoreEvents, nm) == 0x0418, "nm off retail");
+_Static_assert(offsetof(B3ScoreEvents, rub_last) == 0x0510, "rub_last off retail");
+_Static_assert(offsetof(B3ScoreEvents, rub_time) == 0x0528, "rub_time off retail");
+_Static_assert(offsetof(B3ScoreEvents, rub_start) == 0x0540, "rub_start off retail");
+_Static_assert(offsetof(B3ScoreEvents, rub_prev_touch) == 0x0558, "rub_prev_touch off retail");
+_Static_assert(offsetof(B3ScoreEvents, rub_touch) == 0x055E, "rub_touch off retail");
+_Static_assert(offsetof(B3ScoreEvents, rub) == 0x0564, "rub off retail");
+_Static_assert(offsetof(B3ScoreEvents, rub_target) == 0x0580, "rub_target off retail");
+
 
 /* Module init: loads b3_score_params with the retail VDB tune. */
 void b3_score_events_init(void);
@@ -273,14 +307,31 @@ void b3_score_events_init(void);
 void b3_score_events_reset(B3ScoreEvents* s);
 
 /* ---- the per-frame detector inputs -------------------------------- */
-typedef struct {
-    float clock;      /* race clock, racecar+0x10DC                      */
-    float dist_step;  /* |pos - pos_prev| this frame, metres (FUN_00013C10) */
-    float speed_mph;  /* racecar+0x64 * B3_SE_MPH_PER_MS                  */
-    int   airborne;   /* racecar+0x10C0                                   */
-    int   oncoming;   /* racecar+0x18FC -- the lane-type flag above       */
-    int   drifting;   /* racecar+0x10C2                                   */
+typedef struct __attribute__((packed)) B3ScoreFrame {
+    // ---- RETAIL WINDOW 0x0000..0x1900: fields at the offsets the
+    // game uses. Packed with explicit padding; asserted below.
+    unsigned char _pad00[0x64];
+    float                speed_mph;  /* racecar+0x64 * B3_SE_MPH_PER_MS                  */
+    unsigned char _pad01[0x1058];
+    unsigned char        airborne;  /* racecar+0x10C0                                   */
+    unsigned char _pad02[0x1];
+    unsigned char        drifting;  /* racecar+0x10C2                                   */
+    unsigned char _pad03[0x19];
+    float                clock;  /* race clock, racecar+0x10DC                      */
+    unsigned char _pad04[0x81C];
+    int                  oncoming;  /* racecar+0x18FC -- the lane-type flag above       */
+
+    // ---- HARNESS SIDE, past the retail window: no recovered
+    // offset in THIS object, so it must not squat on retail's bytes.
+    float                dist_step;  /* |pos - pos_prev| this frame, metres (FUN_00013C10) */
 } B3ScoreFrame;
+
+#define B3SCOREFRAME_RETAIL_SPAN 0x1900u
+_Static_assert(offsetof(B3ScoreFrame, speed_mph) == 0x0064, "speed_mph off retail");
+_Static_assert(offsetof(B3ScoreFrame, airborne) == 0x10C0, "airborne off retail");
+_Static_assert(offsetof(B3ScoreFrame, drifting) == 0x10C2, "drifting off retail");
+_Static_assert(offsetof(B3ScoreFrame, clock) == 0x10DC, "clock off retail");
+_Static_assert(offsetof(B3ScoreFrame, oncoming) == 0x18FC, "oncoming off retail");
 /* NOTE: the crash gate's two inputs (racecar+0x18FA/+0x18FB) are deliberately
  * NOT fields of this struct -- callers build a B3ScoreFrame field by field on
  * the stack, and silently adding members would leave them uninitialised.

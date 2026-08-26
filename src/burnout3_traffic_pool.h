@@ -1,7 +1,13 @@
 #ifndef BURNOUT3_TRAFFIC_POOL_H
 #define BURNOUT3_TRAFFIC_POOL_H
 
-#define B3_TRAFFIC_POOL_MAX 64
+/* [C] FUN_001A3EA0 @0x001A3F2B/@0x001A3F60: retail's free list is built by
+ * two `while (i < 0xFE)` loops -- 254 physical bodies.  The port's 64 was a
+ * harness guess; with retail's direction-split population law (spawn and
+ * retire as separate requests, ~4 windows apart) the pool depth IS the live
+ * density, and 64 starved the road to the point that a 90 s race met almost
+ * no traffic at all. */
+#define B3_TRAFFIC_POOL_MAX 254
 
 typedef struct {
     int physical_head;

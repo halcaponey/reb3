@@ -189,7 +189,19 @@ static void bag_refill(void) {
 }
 
 int b3_music_pick_next(void) {
-    if (!g_rng) b3_music_seed((unsigned)time(NULL));
+    /* THE PINNED FRAME'S LAST PIECE OF NONDETERMINISM.  Nothing calls
+     * b3_music_seed(), so the shuffle bag opened on time(NULL) and two runs of
+     * the SAME binary drew different songs -- which put a different title in
+     * the EA TRAX ticker and made every pinned-frame comparison in this repo
+     * carry a "identical outside the banner" caveat (docs/web/webprof_sweep.md
+     * section 5, and again in section 3's gate).  B3_MUSIC_SEED=<n> pins it,
+     * so a legacy-vs-retained frame compare can demand BIT identity instead of
+     * a masked one.  Unset, the behaviour is exactly what it was. */
+    if (!g_rng) {
+        const char* e = getenv("B3_MUSIC_SEED");
+        b3_music_seed(e && *e ? (unsigned)strtoul(e, NULL, 0)
+                              : (unsigned)time(NULL));
+    }
     if (g_bag_n <= 0) bag_refill();
     if (g_bag_n <= 0) return -1;             /* nothing playable          */
     g_last_picked = g_bag[--g_bag_n];        /* draw from the top         */
@@ -299,15 +311,49 @@ void b3_music_set_dir(const char *dir) {
     snprintf(g_dir, sizeof(g_dir), "%s", dir);
 }
 
+/* THE STANDALONE SEAM.  b3_music_init() asks src/burnout3_isodata.c whether a
+ * song is on the disc rather than finding out by opening it -- see the note in
+ * the loop below.  But this module is also compiled ON ITS OWN, by
+ * tools/validate_music.py, which links exactly burnout3_music.c and
+ * burnout3_hud.c to drive the selection logic through the real code; isodata is
+ * not in that link and neither is the isoshim that declares its API.
+ *
+ * A WEAK definition costs nothing and keeps both worlds honest: every shipping
+ * build (native, wasm, Android) links burnout3_isodata.c, whose strong
+ * definition overrides this one, and the standalone probe gets the answer the
+ * contract already defines for "not my question" -- -1, meaning probe the
+ * build/ tree the way you always did.  No #ifdef, so there is no build in which
+ * this file compiles differently from the one that ships. */
+__attribute__((weak)) int b3_iso_music_available(int song) {
+    (void)song;
+    return -1;
+}
+
 int b3_music_init(void) {
     char path[320];
     crash_module_reset();   /* retail zeroes the rotation in the audio ctor */
     g_playable = 0;
     for (int i = 0; i < B3MUSIC_TRACKS; i++) {
-        FILE *f = NULL;
-        long n = wav_open(i, &f);
-        if (f) fclose(f);
-        g_have[i] = (n > 0);
+        /* ASKING BY OPENING IS THE EXTRACTION.  In iso mode -- the default --
+         * build/music/track_NN.wav does not exist until something asks for it,
+         * and this loop asks 44 times.  That used to be free, because the
+         * music stage was not linked and the answer was always "no"; now it
+         * decodes, and this probe alone would cost 722 MB and 22.7 s before
+         * the title screen.  b3_iso_music_available() answers the same
+         * question off the disc's own wave banks instead, and returns -1 in
+         * build mode to say "probe the tree the way you always did".
+         *
+         * A song that says yes here and still fails later is not a problem:
+         * stream_open() clears g_have[] on a failed open, so the shuffle drops
+         * it and moves on. */
+        int avail = b3_iso_music_available(i);
+        if (avail < 0) {
+            FILE *f = NULL;
+            long n = wav_open(i, &f);
+            if (f) fclose(f);
+            avail = (n > 0);
+        }
+        g_have[i] = avail;
         g_enabled[i] = 1;
         if (g_have[i]) g_playable++;
     }
@@ -320,7 +366,8 @@ int b3_music_init(void) {
     if (!g_playable) {
         b3_music_track_path(0, path, sizeof(path));
         fprintf(stderr, "[b3_music] no playable tracks (looked for %s) -- "
-                        "run tools/extract_eatrax.py\n", path);
+                        "run `cxtract --only eatrax`, or boot with the disc "
+                        "(--iso), which decodes them on demand\n", path);
     }
     return g_playable;
 }

@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Reb3</title>
+<meta name="description" content="Play your own Xbox game file in the browser.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="corner">
+  <button id="theme-btn" class="icon-btn" title="Light, dark or system" aria-label="Toggle theme">auto</button>
+</div>
+
+<!-- ============================================================= LANDING -->
+<section id="landing">
+  <canvas id="fire" width="160" height="90" aria-hidden="true"></canvas>
+  <div class="landing-inner">
+    <h1 class="marque">
+      Reb<span class="t3">3</span>
+      <span class="sub2">in your browser</span>
+    </h1>
+
+    <p class="tagline">A reverse-engineering project of Burnout 3: Takedown (Xbox).</p>
+
+    <button id="play" class="btn-primary">PLAY</button>
+
+    <div class="badges" id="badges">
+      <span class="badge" id="b-coi">cross-origin isolated: &hellip;</span>
+      <span class="badge" id="b-sab">SharedArrayBuffer: &hellip;</span>
+      <span class="badge" id="b-gl">WebGL2: &hellip;</span>
+      <span class="badge" id="b-fsa">file picker: &hellip;</span>
+      <span class="badge" id="b-pad">controller: none</span>
+    </div>
+
+    <div class="privacy">
+      Your ISO stays on this machine &mdash; nothing is uploaded.
+    </div>
+  </div>
+  <div class="foot">Bring your own copy of the game.</div>
+</section>
+
+<!-- =============================================================== STAGE -->
+<div id="stage" aria-hidden="true">
+
+  <div id="hud">
+    <span class="hud-title">REB3</span>
+    <span class="hud-chip" id="hud-status">idle</span>
+    <span class="hud-chip" id="hud-pad" hidden>controller: none</span>
+    <span class="spacer"></span>
+    <button id="scale-btn" title="Sharp or smooth picture">scaling: smooth</button>
+    <button id="fs-btn" title="Fullscreen (Esc to leave)">fullscreen</button>
+    <button id="quit-btn" title="Back to the start page">&#215; back</button>
+  </div>
+
+  <div id="viewport">
+    <div id="frame">
+      <!-- The width/height here are only what the canvas is until the engine
+           takes it over: b3_web_pin_resolution() sets the backing store to
+           retail's 640x480 (B3_RES overrides) and object-fit:contain
+           pillarboxes that 4:3 picture inside this 16:9 frame.  `smooth` is
+           the default scaling because a 640x480 drawable is now being blown up
+           several times over, and nearest-neighbour at 3x reads as blocky
+           rather than sharp; the HUD's "scaling" button switches back. -->
+      <canvas id="canvas" class="smooth" width="640" height="480" tabindex="0"
+              aria-label="Game view"></canvas>
+    </div>
+
+    <div id="overlay">
+      <div id="overlay-inner">
+
+        <!-- --------------------------------------------------- pick a disc -->
+        <section class="card" id="panel-pick">
+          <div class="card-hd"><h2>Game file</h2><span class="spacer"></span>
+            <span class="muted small" id="pick-hint"></span>
+          </div>
+          <div class="card-bd">
+            <div class="padline" id="pad-line">
+              <span class="padmark" id="pad-mark">&#9679;</span>
+              <span id="pad-text">Using a controller? Press any button on it now.</span>
+            </div>
+
+            <div id="resume-row" hidden>
+              <div class="filecard">
+                <span class="fname" id="resume-name">&mdash;</span>
+                <span class="fmeta" id="resume-meta"></span>
+              </div>
+              <button class="btn-primary" id="resume-btn">Use this file</button>
+              <button id="forget-btn">Forget it</button>
+            </div>
+
+            <div class="drop" id="drop">
+              <div class="big">Select Xbox ISO file to play</div>
+              <div class="small">Drop it here, or use the buttons below.</div>
+              <div class="drop-actions">
+                <button class="btn-primary" id="choose-btn">Choose file&hellip;</button>
+                <button id="browse-btn">Browse&hellip;</button>
+              </div>
+            </div>
+            <input type="file" id="file-input" class="sr" accept=".iso,.xiso,.img,application/octet-stream">
+            <div class="note" id="pick-error" hidden></div>
+          </div>
+        </section>
+
+        <!-- ------------------------------------------------- verification -->
+        <section class="card" id="panel-verify" hidden>
+          <div class="card-hd"><h2>File check</h2><span class="spacer"></span>
+            <span class="muted small" id="verify-head"></span>
+          </div>
+          <div class="card-bd">
+            <div class="filecard">
+              <span class="fname" id="v-name">&mdash;</span>
+              <span class="fmeta" id="v-meta"></span>
+            </div>
+
+            <table class="checks">
+              <thead><tr><th style="width:1%">&nbsp;</th><th>Check</th><th>Expected / got</th></tr></thead>
+              <tbody id="checks"></tbody>
+            </table>
+
+            <div class="note bad" id="verify-warn" hidden></div>
+            <div class="note ok" id="verify-ok" hidden></div>
+          </div>
+          <div class="card-ft">
+            <button class="btn-primary" id="start-btn" disabled>Start game</button>
+            <button id="reverify-btn">Check again</button>
+            <span class="spacer"></span>
+            <button id="change-btn">Pick another file</button>
+          </div>
+        </section>
+
+        <!-- ------------------------------------------------------ loading -->
+        <section class="card" id="panel-load" hidden>
+          <div class="card-hd"><h2>Loading</h2><span class="spacer"></span>
+            <span class="muted small" id="load-head"></span>
+          </div>
+          <div class="card-bd">
+            <div id="load-status" class="stage-line">starting&hellip;</div>
+            <div class="stage-line" id="load-stage" hidden></div>
+            <div class="phases" id="phases"></div>
+            <div class="note" id="load-note" hidden></div>
+          </div>
+          <div class="card-ft">
+            <span class="muted small">The keyboard works, and so does a controller.</span>
+            <span class="spacer"></span>
+            <button id="load-back-btn">Back</button>
+          </div>
+        </section>
+
+      </div>
+    </div>
+  </div>
+
+  <div id="drawer" class="closed">
+    <div id="drawer-hd" role="button" tabindex="0" aria-expanded="false">
+      <span class="tw">&#9660;</span>
+      <span>console</span>
+      <span class="muted" id="log-count">0 lines</span>
+      <span class="spacer"></span>
+      <button id="log-copy">copy</button>
+      <button id="log-clear">clear</button>
+    </div>
+    <div id="log-wrap"><pre id="log"></pre></div>
+  </div>
+
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

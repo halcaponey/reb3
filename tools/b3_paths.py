@@ -31,7 +31,7 @@ Set {env} to the folder containing default.xbe, e.g.
     export {env}="/path/to/Burnout 3 Takedown"
 
 That folder is YOUR dump of a game you own; this repository ships no retail
-content. See docs/ASSETS.md for the full extraction walkthrough.
+content. See docs/ASSETS.md for where the data comes from.
 """
 
 

@@ -1,5 +1,17 @@
 # Takedown presentation FX — time dilation, the takedown camera, the callout
 
+> **Status (2026-08-22).** Two entries below have since been closed.
+> (1) §5's GLUE mark on "scaling a *variable* real dt by 1/divisor" is
+> **retired** — the frame loop hands `b3_tdfx_step` the nominal period
+> unconditionally (`g_tdfx_real_dt = 0.016666668f`), which is retail's
+> expression bit for bit; `src/burnout3_takedown.c` says so at the site.
+> (2) §9.7(e)'s "top follow-up" on `racecar+0x19BE` is **answered** by PH-11 in
+> `docs/PHYSICS_GLUE_LEDGER.md`: an all-segment sweep shows `+0x19BE` has
+> exactly one write (immediate `1`, never cleared) and is the asset-load-complete
+> latch, while the 5-second stamp at `racecar+0x240C` has zero readers — there is
+> no timed releaser, so it is not an open lead. Everything else stands as
+> recorded.
+
 Recovered 2026-08-11 from the analysed `burnout3.elf` (corrected VAs;
 `.text` = old flat address + 0x10000).
 
@@ -1271,3 +1283,31 @@ takedown: the message id **is** the priority (`0x0019937F`), so a 0x80
   retail leans on the boost release at `0x001188D6`. Top follow-up.
 * **[?]** what sets the type-3 spawn flag bit 0 that designates the big-hit
   traffic vehicle.
+
+---
+
+## "I lose directional control after the takedown cinematic" (2026-08-20)
+
+Root cause: `Vehicle.emu_ai_car_valid` was set on the first frame the AI block
+built a racecar view for a car and NEVER cleared.  The flag is what licenses
+the combined `b3_emu_step_ai` path (the retail driver running INSIDE the
+physics session), so after the takedown cinematic's AI wheel-hold ended, every
+subsequent human frame still stepped through the combined path -- retail's
+driver kept the wheel forever.  Steering was dead and the throttle only
+"worked" because the AI floors it.
+
+Reproduced deterministically (`B3_POST_TD_STEER=1` + the slam scenario, fixed
+dt): 3 s of full lock after the wheel handback produced `omega.y = 0.00` with
+the steer never reaching the vehicle.  After the one-line fix (clear the flag
+at `vehicle_update()` entry so it is per-frame), the same probe turns at a
+sustained -1.24 rad/s.
+
+Two probes were kept, env-gated, because chasing this without them was blind:
+`B3_WHEEL_DBG` (AI-wheel take/release edges with authority/drift state) and
+`B3_POST_TD_STEER` (forced post-handback steer + yaw response;
+`B3_POST_TD_RIGHT=1` flips the direction -- steering INTO the wall the slam
+pinned you against reads as "no response" and is physics, not the bug).
+
+The handback itself was verified correct all along: the wheel releases 0.57 s
+after the cinematic take, `FUN_0018CB60`'s edge restores authority_1534 = 1.0
+and clears drift state 4 (`b3_ai_wheel_set`).

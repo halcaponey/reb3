@@ -9,12 +9,12 @@ consecutive spacing looks like a path. Every candidate is then plotted over the
 track mesh top-down for visual ground truth -- a run that traces the roads is a
 real path; scattered noise is not.
 """
+import struct, sys, os
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 from b3_paths import game_path, game_root  # noqa: E402
-import struct, sys, os
 
-BGD = (game_path('Tracks/AS/C1_V1/Gamedata.bgd'))
+BGD = game_path('Tracks/AS/C1_V1/Gamedata.bgd')
 BASE = 0x00320000
 
 XR = (-900.0, 2450.0)
