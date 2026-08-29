@@ -139,6 +139,11 @@ typedef struct {
 #else
 #  define CX_FN_SCENERY NULL
 #endif
+#ifdef CX_HAVE_BVH
+#  define CX_FN_BVH cx_extract_bvh
+#else
+#  define CX_FN_BVH NULL
+#endif
 #ifdef CX_HAVE_LIGHT_PROBES
 #  define CX_FN_LIGHT_PROBES cx_extract_light_probes
 #else

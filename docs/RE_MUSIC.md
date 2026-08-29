@@ -523,7 +523,10 @@ Crash Mode.
 
 | | retail | port | why |
 |---|---|---|---|
-| song level under the bed | 0.30, never ducked | ducked to `0.30 / master`, released on stop | **TUNED.** The harness's song master is a user setting (0.65 as of 2026-08-13, "music too quiet"). Ducking to retail's own 0.30 absolute restores both the 2.33:1 balance and the 0.30 + 0.70 = 1.0 sum retail mixed at. At a 0.30 master the duck is 1.0 and nothing is ducked, exactly like retail. |
+| song level under the bed | 0.30, never ducked | **PAUSED** by default (`B3_MUSIC_CRASH=pause`); `=retail` ducks to `0.30 / master` and releases on stop | **DEVIATION [S], user request (2026-08-28):** "when crashing, the music should be paused". The song freezes and resumes on the sample it stopped on — `b3_music_next_sample()` returns the bed alone and does not advance `g_rd`. The bed is unaffected and still plays at 0.70. `B3_MUSIC_CRASH=retail` restores the recovered mix, whose own tuning note is below. |
+| — the retail-mode tuning | 0.30, never ducked | ducked to `0.30 / master`, released on stop | **TUNED.** The harness's song master is a user setting (0.65 as of 2026-08-13, "music too quiet"). Ducking to retail's own 0.30 absolute restores both the 2.33:1 balance and the 0.30 + 0.70 = 1.0 sum retail mixed at. At a 0.30 master the duck is 1.0 and nothing is ducked, exactly like retail. |
+| song under a DJ line | advanced away; the next song starts after (§6.3 of RE_CRASHFM.md) | same — `b3_music_set_hold()` | [C]. The earlier 0.7583 duck is retired to `B3_DJ_DUCK=1`. |
+| when a song is decoded | streamed off the disc by hardware | `T:eatrax:<n>`, ~0.5 s of WMA, on a **decode worker** | **GLUE.** It used to run inside `b3_music_pump()` on the frame thread, which froze a live race for ~0.45 s per song change — and the loading screen's progress hook drew *over* the race to hide it. See §7 below. |
 | volume steps | written once per frame | walked to over 5 ms in the mixer | **GLUE (anti-zipper).** A 735-sample step would click; 5 ms still reads as a cut. |
 | 1-in-5 track-local bed | `<track>/crash{1,2}.rws` | always the global pick | §6.1 — different sub-stream pairing, and no track→audio-dir map yet. |
 | Crash Mode branch | `mgr+0x838` ramp | absent | no Crash Mode in the harness |
@@ -553,3 +556,76 @@ SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy B3_AUTODRIVE=1 \
 `validate_music.py` builds `build/music_probe` and drives the real
 `b3_music_pick_next()` / `b3_hud_music_box()` — the selection and banner
 checks are not a Python re-implementation.
+
+---
+
+## 7. The decode worker — a song change is invisible now
+
+**GLUE. Retail has no equivalent**: its songs stream off the disc in
+hardware, so there is nothing to decode and nothing to hide.
+
+Ours are WMA, decoded once per song by `T:eatrax:<n>` (~0.45–0.55 s) and
+cached. That decode used to run inside `b3_music_pump()` — on the frame
+thread — so **every mid-race song change froze the game for about half a
+second**. It was not reported as a freeze because it was worse than one:
+the loading screen's `b3_iso_set_progress` hook fires for *any*
+materialisation, so it drew the retail LOADING screen over a live race for
+the duration.
+
+Both halves are fixed:
+
+- **The frame thread never decodes.** `stream_open()` asks
+  `b3_iso_is_materialised()` — which never extracts — and if the song is
+  not on disk yet it hands the path to a decode worker and returns
+  `STREAM_PENDING`. `pump()` retries the *same* track next frame (retrying
+  `pick_next()` would burn the shuffle bag while one song decoded). The
+  ring has 11.9 s in front of it, so the wait is inaudible; after a DJ
+  hand-over the ring is empty by design and the gap is the beat of quiet a
+  radio has between songs.
+- **In-race is never a load screen.** `ls_suppressed_now()` refuses the
+  progress hook and the mesh pump whenever the race loop is live and no
+  explicit `b3_loadscreen_begin()` phase owns the bar. Boot and track load
+  are untouched.
+
+### What made it legal
+
+`burnout3_isodata.c` was single-threaded by design and its header said so.
+Three things changed, all narrow:
+
+| | why |
+|---|---|
+| the return ring is `__thread` | it is the only shared state a cache HIT touches; per-thread means the hit path takes **no lock**, so a 0.5 s decode cannot stall the frame thread's own resolves behind it |
+| one mutex on the materialise **slow** path | two extractions must not interleave; a hit never reaches it |
+| `run_global()` refuses a non-main thread | those stages `chdir()`, which is process-global and would misdirect the game thread's next relative open. `T:eatrax:<n>` is deliberately not one of them — this makes that a guarantee instead of a comment |
+
+The worker is handed exactly one shape of path, `build/music/track_NN.wav`,
+and nothing else may be. `PTHREAD_POOL_SIZE` went 9 → 10 for it, since the
+web pool is sized so `pthread_create` never has to grow at runtime.
+
+A first version of `b3_iso_is_materialised()` answered "yes" for anything
+present in a real `build/` tree next door — which is wrong, because
+`resolve_inner()` does not prefer that copy for a mapped path with an
+owning stage. The music module believed a song was free, opened it on the
+frame thread, and took the whole decode it was built to avoid; the hitch
+trace was unchanged until it mirrored `resolve_inner()` exactly.
+
+### Measured
+
+Forced in-race song changes (`B3_DJ_COOLDOWN=18`, cold music cache, three
+decodes of 0.42–0.54 s), `B3_FRAME_PROF=60`:
+
+| | before | after |
+|---|---:|---:|
+| worst single frame | **469.8 ms** | **32.0 ms** |
+| worst 60-frame window | 23.9 ms (41.8 fps) | 16.7 ms (60.0 fps) |
+| loading-screen frames drawn in-race | the decode's whole length | **0** (`ls_drawn` flat at 21) |
+| refused in-race draws | — | 6 (`ls_suppressed`) |
+| audio underruns | 0 | 0 |
+
+32.0 ms is one dropped frame's worth and is not at a decode — the windows
+straddling all three decodes read 18.5–19.0 ms, indistinguishable from
+their neighbours.
+
+**Determinism note.** The song *choice* is still seeded (`B3_MUSIC_SEED`)
+and unchanged. The *frame* a song starts on now depends on how long the
+worker took, so a pinned-frame gate must not assert audio-start frames.

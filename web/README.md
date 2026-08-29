@@ -624,6 +624,23 @@ bound. That is the port to look at if this one ever needs a layer again.
 extracted assets stay in the wasm heap for the session (a boot plus one track
 is order 100–200 MiB on top of the game's own usage).
 
+**THE GAME'S OWN CONFIG DOES NOT PERSIST HERE YET**, and that is a known gap
+rather than a surprise: `build/mixer.cfg` and `build/settings.cfg` are written
+by `resolve_write()` to the real `build/` tree, which on wasm is `/app/build`
+— outside the OPFS sync, which covers `/app/build/.isocache`. So the audio
+mixer and the pause screen's `SETTINGS` block (the ray-tracing row) both work
+within a session and both come back at their defaults on a reload. The fix is
+to add the two config files to the sync list; it is not done here because it
+is a change to the cache's contract and not to either feature.
+
+**Ray tracing on the web**: it works, it is offered, and it costs nothing
+extra to reach — the same ESSL 1.00 shader as the desktop, unchanged, under
+WebGL 2, with `RGBA32F` + `NEAREST` data textures which are core there.
+`docs/PHOTOREALISM.md` tier 4r carries the measurement (`--gl hw`, 32 in-race
+windows at 1080p: every one at 60.0 fps with the option on or off).
+`B3_RT_WEB_OPTION` in `src/burnout3_rt.h` is the one line that would hide the
+row if a later measurement said to.
+
 ## Testing
 
 Headless only — never a visible browser.

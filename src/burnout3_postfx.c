@@ -481,6 +481,14 @@ static int    g_verbose = 0;
 static unsigned char *g_grad_px = NULL;
 static int            g_grad_w = 0, g_grad_h = 0;
 
+/* The cloud sheet, kept on the CPU as well as in GL: b3_sky_horizon_band()
+ * has to run the cloud pass's own alpha-over, and the alpha it needs is the
+ * sheet's, at the elevation it is asked for. A megabyte at the widest shipped
+ * size (1024x256), freed and reloaded with the track like the gradient sheet
+ * beside it. */
+static unsigned char *g_cloud_px = NULL;
+static int            g_cloud_w = 0, g_cloud_h = 0;
+
 /* The 64x32 LUT those blits produce — retail's DAT_004A1D04. */
 static GLuint        g_tex_lut = 0;
 static unsigned char g_lut_px[B3_SKY_LUT_W * B3_SKY_LUT_H * 4];
@@ -590,6 +598,39 @@ static int postfx_load_sheet(void)
     return 1;
 }
 
+/* Keep the cloud sheet on the CPU as well. It is loaded a second time for
+ * this rather than threaded out of postfx_load_png(), because that function
+ * has other callers' contract to keep and this is one PNG read per track. */
+static void postfx_load_cloud_cpu(void)
+{
+    char path[768];
+    SDL_Surface *img, *rgba;
+    int y;
+
+    free(g_cloud_px);
+    g_cloud_px = NULL;
+    g_cloud_w = g_cloud_h = 0;
+
+    snprintf(path, sizeof(path), "%s/%s_clouds.png", g_art_dir, g_track_tag);
+    img = IMG_Load(path);
+    if (!img) return;
+    rgba = SDL_ConvertSurfaceFormat(img, SDL_PIXELFORMAT_ABGR8888, 0);
+    SDL_FreeSurface(img);
+    if (!rgba) return;
+    if (rgba->w > 0 && rgba->h > 0) {
+        g_cloud_px = (unsigned char *)malloc((size_t)rgba->w * rgba->h * 4);
+        if (g_cloud_px) {
+            for (y = 0; y < rgba->h; y++)
+                memcpy(g_cloud_px + (size_t)y * rgba->w * 4,
+                       (unsigned char *)rgba->pixels + (size_t)y * rgba->pitch,
+                       (size_t)rgba->w * 4);
+            g_cloud_w = rgba->w;
+            g_cloud_h = rgba->h;
+        }
+    }
+    SDL_FreeSurface(rgba);
+}
+
 /* The sun vector sidecar tools/extract_postfx_art.py writes from enviro.dat
  * env+0x80 (see the header). One line: "sun_dir <x> <y> <z>", in the GAME's
  * left-handed world frame and pointing the way the light TRAVELS. */
@@ -637,6 +678,7 @@ int b3_postfx_gl_init(void)
     /* Clouds wrap twice around the dome in S; T clamps so the zenith's
      * tc1.v = -0.176 does not wrap the band back over the top. */
     g_tex_clouds = postfx_load_png("clouds", GL_REPEAT, GL_CLAMP_TO_EDGE);
+    postfx_load_cloud_cpu();
     if (g_ready) {
         glGenTextures(1, &g_tex_lut);
         glBindTexture(GL_TEXTURE_2D, g_tex_lut);
@@ -683,6 +725,86 @@ static float postfx_sky_gain(void)
         if (gain < 0.0f) gain = 0.0f;
     }
     return gain;
+}
+
+/* ==========================================================================
+ * 1c. THE SKY NEAR THE HORIZON — what a distant object silhouettes against
+ * ==========================================================================
+ *
+ * See burnout3_postfx.h for the contract. This is postfx_draw_sky's own two
+ * passes, evaluated on the CPU at one elevation of the sky half, per azimuth:
+ *
+ *     pass A  gain * LUT.rgb                at (u,  yhat*(V_HIGH-V_LOW)+V_LOW)
+ *     pass B  alpha-over of the cloud sheet at (2u, 1 - yhat*TC1_VSCALE),
+ *             halved by B3_SKY_CLOUD_C0_RGB, i.e.
+ *             out = 0.5*gain*cloud.rgb*cloud.a + A*(1 - cloud.a)
+ *
+ * both term for term the same numbers the draw hands GL_MODULATE and
+ * SRC_ALPHA/ONE_MINUS_SRC_ALPHA, and both texcoords the same LINEAR
+ * functions of yhat b3_sky_build() writes on the vertices -- so this is what
+ * the dome writes to the scene target at that elevation, not a model of it.
+ *
+ * THE CLOUD TERM IS NOT OPTIONAL, and that is the whole reason this reads
+ * the composite rather than the gradient LUT alone. On the storm track the
+ * cloud plate over the skyline covers 76% of it and is nearly black; the
+ * gradient under it is a bright grey-blue. Take the LUT and you get the
+ * bright, which is the very error this function exists to stop.
+ *
+ * B3_SKY_NOCLOUD is honoured for the same reason the draw honours it: an A/B
+ * that removes the cloud pass from the picture must remove it from here too,
+ * or the haze goes on matching a sky that is no longer on screen. */
+int b3_sky_horizon_band(int n, float y0, float y1, float *out)
+{
+    const float gain = postfx_sky_gain();
+    const int   taps = B3_SKY_HORIZON_TAPS;
+    /* latched, like every other switch this file reads: it is asked once a
+     * frame and the answer cannot change under a running process. */
+    static int  nocloud = -1;
+    int use_cloud, k, c, t;
+
+    if (!g_ready || !out || n <= 0) return 0;
+    if (nocloud < 0) nocloud = getenv("B3_SKY_NOCLOUD") != NULL;
+    use_cloud = (g_cloud_px && g_cloud_w > 0 && g_cloud_h > 0
+                 && g_tex_clouds && !nocloud);
+    if (y0 < 0.0f) y0 = 0.0f;
+    if (y1 > 1.0f) y1 = 1.0f;
+    if (y1 < y0)   y1 = y0;
+
+    for (k = 0; k < n; k++) {
+        float u = ((float)k + 0.5f) / (float)n;
+        float acc[3] = { 0.0f, 0.0f, 0.0f };
+        for (t = 0; t < taps; t++) {
+            float yh = (taps > 1)
+                     ? y0 + (y1 - y0) * ((float)t / (float)(taps - 1))
+                     : y0;
+            /* [C] b3_sky_build()'s own two texcoord formulas, sky half —
+             * both LINEAR in yhat, so this is what the rasteriser gets. */
+            float v0 = yh * (B3_SKY_V_HIGH - B3_SKY_V_LOW) + B3_SKY_V_LOW;
+            float v1 = 1.0f - yh * B3_SKY_TC1_VSCALE;
+            float lut[4], cl[4];
+            float a = 0.0f;
+
+            sky_sample(g_lut_px, B3_SKY_LUT_W, B3_SKY_LUT_H, u, v0, 1, lut);
+            if (use_cloud) {
+                /* the cloud band wraps TWICE around: tc1.u = 2*u0. */
+                sky_sample(g_cloud_px, g_cloud_w, g_cloud_h,
+                           u * 2.0f, v1, 1, cl);
+                a = cl[3] * (1.0f / 255.0f) * B3_SKY_CLOUD_C0_A;
+                if (a < 0.0f) a = 0.0f;
+                if (a > 1.0f) a = 1.0f;
+            }
+            for (c = 0; c < 3; c++) {
+                float base = lut[c] * (1.0f / 255.0f) * gain;
+                float over = use_cloud
+                           ? cl[c] * (1.0f / 255.0f) * B3_SKY_CLOUD_C0_RGB
+                             * gain
+                           : 0.0f;
+                acc[c] += over * a + base * (1.0f - a);
+            }
+        }
+        for (c = 0; c < 3; c++) out[k * 3 + c] = acc[c] / (float)taps;
+    }
+    return 1;
 }
 
 /* Emit one dome. `unit` selects which texcoord set is used: 0 = the gradient
@@ -1940,5 +2062,10 @@ void b3_postfx_sky_draw(const float eye[3], float f, float p)
 void b3_postfx_blur(int w, int h, float s, float b, float dt)
 { (void)w; (void)h; (void)s; (void)b; (void)dt; }
 int  b3_postfx_gamma(int w, int h) { (void)w; (void)h; return 0; }
+/* No dome has been drawn in a probe build, so there is no sky to read: the
+ * caller keeps its own constant, which is exactly the no-gradient-sheet
+ * answer the GL build gives. */
+int  b3_sky_horizon_band(int n, float y0, float y1, float *out)
+{ (void)n; (void)y0; (void)y1; (void)out; return 0; }
 
 #endif

@@ -286,6 +286,17 @@ def run(track, outdir, extra, car=None):
     env = dict(os.environ)
     env.update({
         "SDL_VIDEODRIVER": "offscreen", "SDL_AUDIODRIVER": "dummy",
+        # THE PHOTOREALISM WAVE IS PINNED OFF HERE.
+        # src/burnout3_aftereffects.h ships six INSPIRED screen-space
+        # effects on by default.  This suite verifies RECOVERED pixel
+        # behaviour, so it owns its conditions and turns them off -- the
+        # same move, and the same reasoning, as the B3_MUSIC_SEED /
+        # B3_TRACK_NOSHINE pins.  It is sound rather than a dodge because
+        # tools/validate_photo.py section 2 PROVES B3_PHOTO=0 renders
+        # bit-identically to the pre-wave build; if that leg ever fails,
+        # this pin stops being valid and this suite stops measuring what
+        # it says it measures.
+        "B3_PHOTO": "0",
         "B3_FIXED_DT": "0.0166667", "B3_PACE_MAX_TICKS": "1",
         "B3_EXIT_AT": str(int((FIRST + EVERY * NFRAMES) / 60.0) + 3),
         "B3_TRACK": track, "B3_AUTODRIVE": "1", "B3_CAMSIDE": "1",

@@ -640,6 +640,12 @@ def check_runtime(track, seconds, res, verbose):
     # Measured on a parked player: 159 drawn samples, none within 160 m.
     env = dict(os.environ,
                SDL_VIDEODRIVER="offscreen", SDL_AUDIODRIVER="dummy",
+               # THE PHOTOREALISM WAVE IS PINNED OFF HERE -- see the same note
+               # in tools/validate_carfx.py's shot().  This suite reads log
+               # lines rather than pixels, so it is belt and braces; what it
+               # buys is that a run of it costs the shadow pass' geometry
+               # neither time nor a chance to change the frame count.
+               B3_PHOTO="0",
                B3_TRACK=track, B3_FIXED_DT="0.0166667",
                B3_PACE_MAX_TICKS="1", B3_EXIT_AT=str(seconds),
                B3_AUTODRIVE="1",

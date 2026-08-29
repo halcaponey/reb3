@@ -75,9 +75,11 @@
 #include "burnout3_score_events.h"
 #include "burnout3_postfx.h"
 #include "burnout3_aftereffects.h"
+#include "burnout3_rt.h"
 #include "burnout3_carfx.h"
 #include "burnout3_boostfx.h" /* BOOSTFX: exhaust flame (light type 8) */
 #include "burnout3_music.h"
+#include "burnout3_dj.h"
 #include "burnout3_ai.h"
 #include "burnout3_ai_pace_runtime.h"
 #include "burnout3_props.h"
@@ -950,20 +952,165 @@ static int g_keys[SDL_NUM_SCANCODES] = {0};
 // live-tunable via mouse sliders on the pause screen and persist across
 // runs in build/mixer.cfg. g_mix = {engine, sfx master, music master}.
 static int g_paused = 0;
-static float g_mix[3] = { 0.33f, 0.24f, 0.78f };
-static const float g_mix_max[3] = { 0.80f, 0.80f, 1.50f };  // slider tops
+// B3_MIX_N rows: {engine, sfx, music, crash fm}. The count used to be the
+// bare literal 3 in eleven places; adding the DJ row made that untenable.
+#define B3_MIX_N B3HUD_MIX_ROWS
+static float g_mix[B3_MIX_N] = { 0.33f, 0.24f, 0.78f, 1.00f };
+static const float g_mix_max[B3_MIX_N] = { 0.80f, 0.80f, 1.50f, 1.50f };
+static const char* const g_mix_key[B3_MIX_N] = { "engine", "sfx", "music", "dj" };
 static int g_mix_drag = -1;
+
+/* ---- THE SETTINGS BLOCK, and the pause screen's first keyboard cursor ---
+ *
+ * This overlay was mouse-only for its whole life -- three sliders and a
+ * button, all hit-tested -- and it stays fully usable that way.  What a
+ * SETTINGS row needs that a slider did not is a way to change a value with
+ * no pointer, so `g_pause_row` is the first cursor this screen has had:
+ *
+ *     0..2                  the three mixer sliders
+ *     3..3+B3_SET_N-1       the settings rows
+ *     3+B3_SET_N            RESTART RACE
+ *
+ * ARROWS AND ENTER ONLY, deliberately, where the track and car selects also
+ * take WASD: this overlay sits on top of a LIVE RACE and W/A/S/D are the
+ * driving keys.  A settings screen that steered the car while you read it
+ * would be a settings screen nobody opened twice. */
+enum { B3_SET_RT = 0, B3_SET_MSAA, B3_SET_HEAD, B3_SET_N };
+static int g_pause_row = 0;
+
+/* WHY A ROW MIGHT BE GREYED.  Two reasons, and the menu says which rather
+ * than showing a value the renderer is not using: the track shipped no
+ * bvh.bin (so there is nothing to trace), or $B3_RT has already taken the
+ * decision for this process (a harness pinned it). */
+static const char* pause_rt_note(void) {
+    if (b3_rt_env_forced()) return "pinned by B3_RT for this run";
+    if (!b3_rt_world_ready()) return b3_rt_status() ? b3_rt_status()
+                                                    : "no world on this track";
+    return NULL;
+}
+
+/* WHY THE MSAA ROW MIGHT BE GREYED, and it is the same two shapes: an env has
+ * already decided for this process, or the context would not give it.  The
+ * second is not a hypothetical -- MSAA is best-effort in this chain and a
+ * WebGL 1 context has no glBlitFramebuffer at all -- so the row reports what
+ * the renderer GOT rather than what the user asked for. */
+static const char* pause_msaa_note(void) {
+    if (b3_afx_msaa_env_forced()) return "pinned by B3_MSAA for this run";
+    if (b3_afx_msaa_want() > 1 && b3_afx_msaa_live() == 0)
+        return b3_afx_msaa_why() ? b3_afx_msaa_why()
+                                 : "this context would not give it";
+    return NULL;
+}
+
+/* WHY THE HEADLIGHTS ROW MIGHT BE GREYED, and there is only one way here: an
+ * env has already decided.  Unlike the other two there is no "the context
+ * would not give it" arm -- the row moves a float in a uniform the deferred
+ * pass uploads every frame, so either that pass is running (and the row works)
+ * or the whole SETTINGS block is about a renderer that is not there. */
+static const char* pause_head_note(void) {
+    if (b3_afx_head_env_forced())
+        return "pinned by B3_PHOTO_HEAD_* for this run";
+    return NULL;
+}
+
+static void pause_settings_fill(B3HudSetting* out) {
+    const char* note = pause_rt_note();
+    const char* mnote = pause_msaa_note();
+    const char* hnote = pause_head_note();
+    out[B3_SET_RT].label = "RAY TRACING";
+    out[B3_SET_RT].value = b3_rt_want() ? "ON" : "OFF";
+    out[B3_SET_RT].note  = note;
+    out[B3_SET_RT].dim   = note != NULL;
+
+    /* THE VALUE IS WHAT IS LIVE, not what was asked for.  A row that said 4x
+     * while the driver had quietly given 0 would be the settings screen lying,
+     * which is the one thing this block's own note about greying says it must
+     * not do.  `want` still shows through when the chain has not built yet
+     * (live is 0 before the first frame), which is why the fallback is the
+     * user's number rather than OFF. */
+    {
+        int n = b3_afx_msaa_live() ? b3_afx_msaa_live() : b3_afx_msaa_want();
+        static char buf[16];
+        if (n <= 1) snprintf(buf, sizeof buf, "OFF");
+        else        snprintf(buf, sizeof buf, "%dx", n);
+        out[B3_SET_MSAA].label = "MSAA";
+        out[B3_SET_MSAA].value = buf;
+        out[B3_SET_MSAA].note  = mnote;
+        out[B3_SET_MSAA].dim   = mnote != NULL;
+    }
+
+    out[B3_SET_HEAD].label = "HEADLIGHTS";
+    out[B3_SET_HEAD].value = b3_afx_head_name();
+    out[B3_SET_HEAD].note  = hnote;
+    out[B3_SET_HEAD].dim   = hnote != NULL;
+}
+
+/* Toggle row `i`.  A settings change is written through IMMEDIATELY rather
+ * than on un-pause: the mixer can afford to save on release because a slider
+ * drag is one gesture, but a toggle is the whole gesture and a player who
+ * flips it and then alt-tabs away has still made a decision. */
+static void pause_settings_toggle(int i) {
+    if (i == B3_SET_RT) {
+        if (pause_rt_note()) return;      /* greyed: not ours to change    */
+        b3_rt_set(!b3_rt_want());
+        b3_rt_save();
+        printf("[rt] ray tracing %s (build/settings.cfg)\n",
+               b3_rt_want() ? "ON" : "OFF");
+        fflush(stdout);
+        return;
+    }
+    if (i == B3_SET_MSAA) {
+        /* OFF -> 2x -> 4x -> OFF.  A CYCLE and not a toggle, because the
+         * value is not a boolean; three stops rather than every power of two
+         * up to GL_MAX_SAMPLES because past 4x this chain resolves more
+         * samples for a difference nobody reported wanting, and a settings
+         * row with eight stops is a settings row people scroll past.
+         * B3_MSAA still reaches every value the driver has. */
+        int n = b3_afx_msaa_want();
+        if (pause_msaa_note()) return;
+        n = (n <= 1) ? 2 : (n < 4 ? 4 : 0);
+        b3_afx_msaa_set(n);
+        b3_afx_msaa_save();
+        printf("[afx] msaa %s (build/settings.cfg)\n",
+               n <= 1 ? "OFF" : (n == 2 ? "2x" : "4x"));
+        fflush(stdout);
+        return;
+    }
+    if (i == B3_SET_HEAD) {
+        /* OFF -> LOW -> MED -> HIGH -> OFF.  Four stops rather than the MSAA
+         * row's three because this row exists to answer a question of TASTE
+         * ("the headlights are too bright"), and a taste row with one stop
+         * either side of the default is a row that can be disagreed with
+         * twice.  MED is the shipped default; HIGH is the pre-playtest look
+         * to the digit, so the change is reversible from inside the game. */
+        int n = b3_afx_head_want();
+        if (pause_head_note()) return;   /* greyed: an env owns it */
+        n = (n >= B3_AFX_HEAD_HIGH) ? B3_AFX_HEAD_OFF : n + 1;
+        b3_afx_head_set(n);
+        b3_afx_head_save();
+        /* OFF prints no wrap, because at OFF the caller never fills a beam
+         * slot and the wrap is not a number anything reads -- a log line that
+         * quoted one would be inviting the next reader to tune it. */
+        if (n == B3_AFX_HEAD_OFF)
+            printf("[afx] headlights OFF (build/settings.cfg)\n");
+        else
+            printf("[afx] headlights %s (wrap %.2f, build/settings.cfg)\n",
+                   b3_afx_head_name(), (double)b3_afx_head_wrap());
+        fflush(stdout);
+    }
+}
 
 static void mixer_apply(void) {
     b3_sfx_set_master(g_mix[1]);
     b3_music_set_master(g_mix[2]);
+    b3_dj_set_master(g_mix[3]);   /* CRASH FM: scales the recovered balance */
     /* engine gain (g_mix[0]) is read directly by the audio callback */
 }
 static void mixer_save(void) {
     FILE* f = fopen("build/mixer.cfg", "w");
     if (!f) return;
-    fprintf(f, "engine %.4f\nsfx %.4f\nmusic %.4f\n",
-            g_mix[0], g_mix[1], g_mix[2]);
+    for (int i = 0; i < B3_MIX_N; i++)
+        fprintf(f, "%s %.4f\n", g_mix_key[i], g_mix[i]);
     fclose(f);
 }
 static void mixer_load(void) {
@@ -972,12 +1119,11 @@ static void mixer_load(void) {
     char k[32];
     float v;
     while (fscanf(f, "%31s %f", k, &v) == 2) {
-        if (!strcmp(k, "engine")) g_mix[0] = v;
-        else if (!strcmp(k, "sfx")) g_mix[1] = v;
-        else if (!strcmp(k, "music")) g_mix[2] = v;
+        for (int i = 0; i < B3_MIX_N; i++)
+            if (!strcmp(k, g_mix_key[i])) { g_mix[i] = v; break; }
     }
     fclose(f);
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < B3_MIX_N; i++) {
         if (g_mix[i] < 0.0f) g_mix[i] = 0.0f;
         if (g_mix[i] > g_mix_max[i]) g_mix[i] = g_mix_max[i];
     }
@@ -989,7 +1135,7 @@ static int mixer_hit(int mx, int my, float* out_frac) {
     if (ww <= 0 || wh <= 0) return -1;
     float vx = (float)mx * 640.0f / (float)ww;
     float vy = (float)my * 480.0f / (float)wh;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < B3_MIX_N; i++) {
         float y = B3HUD_MIX_Y0 + i * B3HUD_MIX_DY;
         if (vy >= y - 8.0f && vy <= y + B3HUD_MIX_H + 8.0f
             && vx >= B3HUD_MIX_BAR_X - 12.0f
@@ -999,6 +1145,27 @@ static int mixer_hit(int mx, int my, float* out_frac) {
             if (f > 1.0f) f = 1.0f;
             *out_frac = f;
             return i;
+        }
+    }
+    return -1;
+}
+
+/* The settings block's own hit test, in the same virtual space: the row
+ * index, or -1.  A whole row is clickable rather than just the value,
+ * because the value is two characters wide and a two-character target is
+ * not a target. */
+static int settings_hit(int mx, int my) {
+    int ww, wh;
+    SDL_GetWindowSize(g_window, &ww, &wh);
+    if (ww <= 0 || wh <= 0) return -1;
+    {
+        float vx = (float)mx * 640.0f / (float)ww;
+        float vy = (float)my * 480.0f / (float)wh;
+        for (int i = 0; i < B3_SET_N; i++) {
+            float y = B3HUD_SET_Y0 + i * B3HUD_SET_DY;
+            if (vy >= y - 6.0f && vy <= y + B3HUD_SET_H + 6.0f
+                && vx >= B3HUD_MIX_X - 8.0f
+                && vx <= B3HUD_MIX_X + B3HUD_SET_W + 8.0f) return i;
         }
     }
     return -1;
@@ -1563,10 +1730,36 @@ static void ls_set(const char* caption, float frac) {
  * draws a frame, and a frame that somehow reached back into a mesh load would
  * be parsing two files into one TrackMesh. */
 static int g_ls_pump_in = 0;
+static long g_ls_suppressed = 0;   /* draws refused mid-race, for the gate */
+static SDL_threadID g_ls_main_thread = 0;   /* the one that owns the GL context */
+
+/* ------------------------------------------ IN-RACE IS NEVER A LOAD SCREEN
+ * A song change decodes an EA TRAX track off the disc, and a Crash FM line
+ * may decode a voice bank.  Both used to arrive here as an ordinary burst
+ * of materialisation, and this hook drew the retail loading screen over a
+ * live race for as long as they took.
+ *
+ * The bar is only ever legitimate when an explicit load owns it -- boot and
+ * track load call b3_loadscreen_begin()/phase(), which is exactly what
+ * g_ls_outer_n > 0 means.  A FREE-RUNNING burst during a race is the case
+ * this refuses; those are now off the frame path entirely (see THE
+ * MATERIALISE WORKER in burnout3_music.c), so there is nothing to cover
+ * and covering it was always the wrong answer anyway. */
+static int ls_suppressed_now(void) {
+    /* NEVER FROM THE WORKER.  Materialisation now also happens on the
+     * music module's decode thread, and this callback draws GL.  A GL
+     * call from a thread that does not own the context is undefined at
+     * best; refusing here is the belt to the in-race gate's braces, and
+     * it holds even if some future load path runs off the main thread. */
+    if (!SDL_ThreadID() || SDL_ThreadID() != g_ls_main_thread) return 1;
+    if (g_ls_outer_n > 0) return 0;          /* an explicit load owns it */
+    return g_state == RACING || g_state == CRASHED;
+}
 
 static void loadscreen_mesh_pump(float frac, void* user) {
     (void)user;
     if (g_ls_pump_in) return;
+    if (ls_suppressed_now()) { g_ls_suppressed++; return; }
     if (frac < 0.f) frac = 0.f;
     if (frac > 1.f) frac = 1.f;
     g_ls_pump_in = 1;
@@ -1581,6 +1774,7 @@ static void loadscreen_iso_progress(const char* stage, const char* track_id,
     float f;
     (void)user;
     if (total <= 0) return;
+    if (ls_suppressed_now()) { g_ls_suppressed++; return; }
     if (g_ls_outer_n <= 0) {
         /* Free running: no phase list owns the bar, so each burst of
          * materialisation is its own little job.  The monotonic maximum is
@@ -1657,6 +1851,7 @@ static void b3_loadscreen_init(void) {
     if (g_ls_live || !loadscreen_on()) return;
     if (!g_window || !g_gl_context) return;
     g_ls_live = 1;
+    g_ls_main_thread = SDL_ThreadID();   /* whoever inits owns the context */
     srand((unsigned)SDL_GetTicks() ^ (unsigned)(size_t)g_window);
 
 #ifndef __ANDROID__
@@ -6047,7 +6242,7 @@ static int raceflow_save_enabled(void) {
         "B3_TELEM", "B3_PAIR_DUMP", "B3_AI_WORLD_DUMP", "B3_CARLIST_DUMP",
         "B3_BRANCH_AUDIT", "B3_TEST_CRASH_AT", "B3_TEST_AT_TAKEDOWN",
         "B3_TEST_AFTERTOUCH", "B3_TEST_PAD_BOOST", "B3_PACE_MAX_TICKS",
-        "B3_LOADSCREEN_SHOT", "B3_POS_DEBUG",
+        "B3_LOADSCREEN_SHOT", "B3_POS_DEBUG", "B3_PAUSE_AT",
         /* the two ported CHEATS-menu overrides: a forced result must
          * never bank a medal unless the operator says so explicitly */
         "B3_FORCE_COMPLETION", "B3_FIN_POSITION", NULL
@@ -9481,8 +9676,16 @@ static int car_glerr_on(void) {
     return v;
 }
 
+/* Every car span that went into the sun's depth map, ever.  It has to stay
+ * zero: the cars are not shadow casters (they keep retail's own recovered blob
+ * shadow, and a second car shadow would fight it), and this counter is what
+ * turns that from a comment into a measurement.  See the caster inventory
+ * printed under B3_PHOTO_VERBOSE at the shadow pass' call site. */
+static long g_car_draws_in_shadow;
+
 static void car_mesh_draw(const B3CarMesh* m) {
     if (!m || !m->vbo) return;
+    if (b3r_shadow_active()) g_car_draws_in_shadow += m->nspan;
     /* WHICH PROGRAM, AND WITH WHICH MATRIX.  Under fixed function neither
      * question existed: a mesh with no program drew through the FF stage, and
      * ftransform() read the matrix stack at draw time so a wheel's own
@@ -9787,6 +9990,11 @@ static int load_car_wheels(int slot, const char* cls, const char* base) {
     return n;
 }
 
+/* tier 4rc: the car-tree selection.  DEFINED below the traffic fleet's own
+ * globals, because it is built from both fleets at once; declared here because
+ * load_car_meshes() calls it as soon as the racers are known. */
+static void rt_cars_select(void);
+
 static void load_car_meshes(void) {
     for (int i = 0; i < g_num_vehicles; i++) {
         const VehicleInfo* info = g_vehicles[i].info;
@@ -9955,6 +10163,10 @@ static void load_car_meshes(void) {
             g_car_ymin[i] = -g_car_wheel_radius[i];
         }
     }
+    /* tier 4rc: the racers' trees, now that their models are known.  Called
+     * again after the traffic fleet loads, because the selection is rebuilt
+     * from both. */
+    rt_cars_select();
     printf("[Burnout3] REAL car meshes: ");
     for (int i = 0; i < g_num_vehicles; i++) {
         char c = g_car_lists[i] ? 'M' : '-';
@@ -10181,6 +10393,97 @@ static float g_traffic_ymin[B3_TRAFFIC_CAR_MAX] = {0};
 // Traffic wheels (same .bgv-family records, shared relinker [C]; their
 // omission left traffic wheel-less and sunk to the body skirt, dump 023).
 static B3CarMesh* g_traffic_wheel_lists[B3_TRAFFIC_CAR_MAX];
+
+/* ---- tier 4rc: WHICH CAR TREES THIS RACE NEEDS ------------------------
+ *
+ * INSPIRED; the design is in src/burnout3_rt.h.  build/cars/carbvh.bin holds a
+ * model-space BVH for all 106 vehicles and about 24 MB of float texture; a
+ * race puts six racers and at most a dozen traffic models on the road, so the
+ * runtime packs a SELECTION and uploads only that.
+ *
+ * REBUILT FROM BOTH FLEETS EVERY TIME, rather than appended to: the racers and
+ * the traffic load at different moments and either can change without the
+ * other, and a selection that grew by appending would carry the last race's
+ * cars for as long as the process lived.  It is a bisection per name over a
+ * sorted table and a memcpy per model -- cheap enough to do twice at load
+ * rather than track.
+ *
+ * The two arrays below are the ONLY mapping from a car to its tree; a negative
+ * entry means that vehicle has no tree (the extractor refused its mesh, or the
+ * fleet file is absent) and it keeps retail's blob shadow. */
+static int g_car_rt_model[8];
+static int g_traffic_rt_model[B3_TRAFFIC_CAR_MAX];
+static int g_rt_cars_loaded;
+/* the nearest-N traffic pick's "already taken" flags.  A static rather than a
+ * local because B3_TRAFFIC_N is 254 and this runs inside render_frame(). */
+static unsigned char g_rt_traffic_taken[B3_TRAFFIC_N];
+
+static void rt_cars_select(void) {
+    const char* names[8 + B3_TRAFFIC_CAR_MAX];
+    static char store[(8 + B3_TRAFFIC_CAR_MAX)][40];
+    int slots[8 + B3_TRAFFIC_CAR_MAX];
+    int n = 0, i, nrace = 0, ntraf = 0;
+
+    for (i = 0; i < 8; i++) g_car_rt_model[i] = -1;
+    for (i = 0; i < B3_TRAFFIC_CAR_MAX; i++) g_traffic_rt_model[i] = -1;
+    if (b3_rt_cars_mode() == B3_RT_CARS_OFF) return;
+
+    if (!g_rt_cars_loaded) {
+        /* The fleet file lives with the meshes and the hulls, and the ISO
+         * shim materialises it on the first open exactly as it does those.
+         * A miss is not an error: every car keeps its blob and the arming
+         * line says why. */
+        g_rt_cars_loaded = 1;
+        b3_rt_cars_load("build/cars");
+    }
+    if (!b3_rt_cars_ready()) return;
+
+    for (i = 0; i < g_num_vehicles && i < 8; i++) {
+        const VehicleInfo* info = g_vehicles[i].info;
+        char base[32]; char* dot;
+        if (!info || !g_car_lists[i]) continue;
+        snprintf(base, sizeof base, "%s", info->file);
+        dot = strrchr(base, '.');
+        if (dot) *dot = '\0';
+        snprintf(store[n], sizeof store[n], "%s_%s", info->class_code, base);
+        names[n] = store[n];
+        n++;
+        nrace++;
+    }
+    if (b3_rt_cars_mode() == B3_RT_CARS_ALL) {
+        for (i = 0; i < B3_TRAFFIC_CAR_COUNT && i < B3_TRAFFIC_CAR_MAX; i++) {
+            if (!g_traffic_lists[i]) continue;
+            snprintf(store[n], sizeof store[n], "%s_%s",
+                     B3_TRAFFIC_CARS[i].cls, B3_TRAFFIC_CARS[i].car);
+            names[n] = store[n];
+            n++;
+            ntraf++;
+        }
+    }
+    if (!n) { b3_rt_car_select(NULL, 0, NULL); return; }
+    b3_rt_car_select(names, n, slots);
+
+    /* unpack the answer back onto the two fleets, in the order they went in */
+    {
+        int k = 0;
+        for (i = 0; i < g_num_vehicles && i < 8; i++) {
+            const VehicleInfo* info = g_vehicles[i].info;
+            if (!info || !g_car_lists[i]) continue;
+            g_car_rt_model[i] = slots[k++];
+        }
+        if (b3_rt_cars_mode() == B3_RT_CARS_ALL)
+            for (i = 0; i < B3_TRAFFIC_CAR_COUNT && i < B3_TRAFFIC_CAR_MAX;
+                 i++) {
+                if (!g_traffic_lists[i]) continue;
+                g_traffic_rt_model[i] = slots[k++];
+            }
+    }
+    printf("[rt] car trees: %d racer%s + %d traffic model%s asked for, "
+           "%d packed\n", nrace, nrace == 1 ? "" : "s",
+           ntraf, ntraf == 1 ? "" : "s", b3_rt_car_selected());
+    fflush(stdout);
+}
+
 static float  g_traffic_wheel_pos[B3_TRAFFIC_CAR_MAX][6][3];
 static int    g_traffic_wheel_mirror[B3_TRAFFIC_CAR_MAX][6];
 static int    g_traffic_wheel_count[B3_TRAFFIC_CAR_MAX] = {0};
@@ -12637,6 +12940,11 @@ static void traffic_init(void) {
         meshes++;
     }
 
+    /* tier 4rc: rebuild the selection now the traffic fleet is known.  Under
+     * B3_RT_CARS=racers this changes nothing and costs one bisection per
+     * racer; under `all` it is what puts the traffic models in the texture. */
+    rt_cars_select();
+
     // Trailer bogie centre, mesh-local .btv Z (the harness mesh loader
     // negates Z, so the sidecar values come back negated).
     for (int c = 0; c < B3_TRAFFIC_CAR_COUNT; c++) {
@@ -14832,6 +15140,11 @@ static void load_real_audio(void) {
         load_engine_bank(dir);
     }
     int mus = b3_music_init();          /* MUSIC: scans build/music */
+    /* CRASH FM: the radio DJ.  Pre-materialises the track's E_DJRACE
+     * bank here, on the load path, so the lazy WMA decode is paid
+     * during loading rather than mid-race.  See docs/RE_CRASHFM.md. */
+    b3_dj_init();
+    b3_dj_set_track(getenv("B3_TRACK"));
     printf("[Burnout3] REAL audio: %d engine loops, EA TRAX %d/44 tracks\n",
            g_eng_n, mus);
     /* WHICH labels, out of WHICH bank.  "0 engine loops" survived for as long
@@ -14975,6 +15288,7 @@ static void audio_callback(void* userdata, Uint8* stream, int len) {
         out += b3_music_next_sample(); /* MUSIC: the EA TRAX stream */
         out += b3_sfx_next_sample();   /* SFX: event voices */
         out += fe_next_sample();       /* FRONTEND: menu cues + femain */
+        out += b3_dj_next_sample();    /* CRASH FM: the DJ + station ident */
         if (out > 32767.0f) out = 32767.0f;
         if (out < -32768.0f) out = -32768.0f;
         s[i] = (Sint16)out;
@@ -15033,12 +15347,380 @@ static void b3_retained_camera(const Mat4* proj, const Mat4* view) {
     b3r_set_camera(p, (const float*)view->m);
 }
 
+/* ======================================================================
+ * THE PHOTOREALISM LAYER's three helpers.
+ *
+ * They live here rather than in burnout3_aftereffects.c because they are what
+ * the CALLER needs to publish the frame: the layer reconstructs every world
+ * position from the inverse of the matrix the world was drawn with, and this
+ * is the only file that knows which of five camera paths drew it.
+ * ====================================================================== */
+
+/* o = a * b, column-major, the same association burnout3_render.c's mat_mul
+ * uses -- so `b3_mat4_mul(VP, proj, view)` is the matrix a vertex is
+ * transformed by, in that order. */
+static void b3_mat4_mul(float* o, const float* a, const float* b) {
+    float t[16];
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++)
+            t[c * 4 + r] = a[0 * 4 + r] * b[c * 4 + 0]
+                         + a[1 * 4 + r] * b[c * 4 + 1]
+                         + a[2 * 4 + r] * b[c * 4 + 2]
+                         + a[3 * 4 + r] * b[c * 4 + 3];
+    memcpy(o, t, sizeof t);
+}
+
+/* The general 4x4 inverse, by cofactors.  Returns 0 on a singular matrix,
+ * which is not a hypothetical: a frame rendered while the window is 0 pixels
+ * wide produces a projection with a zero row, and the layer has to stand down
+ * on that frame rather than fill the screen with NaN. */
+static int b3_mat4_inverse(float* o, const float* m) {
+    float inv[16], det;
+    int i;
+    inv[0]  =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15]
+             + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+    inv[4]  = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15]
+             - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+    inv[8]  =  m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15]
+             + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+    inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14]
+             - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+    inv[1]  = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15]
+             - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+    inv[5]  =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15]
+             + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+    inv[9]  = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15]
+             - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+    inv[13] =  m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14]
+             + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+    inv[2]  =  m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15]
+             + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
+    inv[6]  = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15]
+             - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
+    inv[10] =  m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15]
+             + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
+    inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14]
+             - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
+    inv[3]  = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11]
+             - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
+    inv[7]  =  m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11]
+             + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
+    inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11]
+             - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
+    inv[15] =  m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10]
+             + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+    det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+    if (det > -1e-12 && det < 1e-12) return 0;
+    det = 1.0f / det;
+    for (i = 0; i < 16; i++) o[i] = inv[i] * det;
+    return 1;
+}
+
+/* One env read with a default, latched per NAME.  The shadow pass' three
+ * numbers are read here rather than in burnout3_aftereffects.c's knob block
+ * because this is where the box is fitted -- and the alternative (exporting
+ * the whole knob struct) would put a header dependency on a struct that is
+ * meant to be private tuning state. */
+static float b3_photo_env_f(const char* name, float def) {
+    const char* e = getenv(name);
+    return (e && *e) ? (float)atof(e) : def;
+}
+
+/* HOW LATE IN THE DAY IS THIS TRACK, from the track's own data.
+ *
+ * There is no night flag in enviro.dat and -- measured across all 36 circuits'
+ * sidecars -- no night TRACK either: every sun in the game sits between 15 and
+ * 45 degrees above the horizon.  What the roster does have is a DUSK END, and
+ * both halves of it are enviro.dat fields:
+ *
+ *   +0x80, the sun vector    EU_M2 at 15 degrees is the lowest sun in the
+ *                            game; US_C5 at 45 is the highest.
+ *   +0x60, the sun colour    US_P1's is (1.00, 0.65, 0.55), a sunset; AS_C3's
+ *                            and EU_C1's are pure white.
+ *
+ * Half from each, so neither a low white sun nor a high warm one alone reads
+ * as evening.  It comes out ~0.6 on US_P1 and EU_M2, ~0.2 on US_C3 and 0 on
+ * US_C5 -- lamps that sing at the dusk end and stay honest at noon, with no
+ * list of track names anywhere.  B3_PHOTO_LIGHT_DUSK >= 0 overrides it, which
+ * is what the validator's day/dusk legs use. */
+static float b3_photo_dusk(int have, const float sun_dir_game[3],
+                           const float sun_rgb[3]) {
+    float over = b3_photo_env_f("B3_PHOTO_LIGHT_DUSK", B3_PHOTO_LIGHT_DUSK);
+    float e0   = b3_photo_env_f("B3_PHOTO_LIGHT_ELEV",   B3_PHOTO_LIGHT_ELEV);
+    float ew   = b3_photo_env_f("B3_PHOTO_LIGHT_ELEV_W", B3_PHOTO_LIGHT_ELEV_W);
+    float w0   = b3_photo_env_f("B3_PHOTO_LIGHT_WARM",   B3_PHOTO_LIGHT_WARM);
+    float ww   = b3_photo_env_f("B3_PHOTO_LIGHT_WARM_W", B3_PHOTO_LIGHT_WARM_W);
+    float elev, lum, a, b;
+    if (over >= 0.0f) return over > 1.0f ? 1.0f : over;
+    if (!have) return 0.0f;
+    /* THE VECTOR POINTS AT THE SUN.  The sidecar stores the direction of
+     * TRAVEL (y < 0 for a sun that is up); b3_carfx_sun hands out the negated
+     * one, the same way burnout3_postfx.c consumes it, so here +y IS the
+     * elevation.  Getting this backwards is not subtle and was caught by the
+     * number: US_C3_V1's 30-degree sun read as dusk 0.60 instead of 0.20. */
+    elev = (float)(asin(sun_dir_game[1] >  1.0f ?  1.0
+                      : sun_dir_game[1] < -1.0f ? -1.0
+                      : (double)sun_dir_game[1]) * 57.29577951);
+    lum  = 0.299f * sun_rgb[0] + 0.587f * sun_rgb[1] + 0.114f * sun_rgb[2];
+    a = (e0 - elev) / (ew > 1e-3f ? ew : 1e-3f);
+    b = (w0 - lum)  / (ww > 1e-6f ? ww : 1e-6f);
+    if (a < 0.0f) a = 0.0f;
+    if (a > 1.0f) a = 1.0f;
+    if (b < 0.0f) b = 0.0f;
+    if (b > 1.0f) b = 1.0f;
+    return 0.5f * a + 0.5f * b;
+}
+
+/* THE POSE THE CAR'S OWN LAMPS RIDE, and there is exactly one of it.
+ *
+ * The lamp offsets are model-space points on the bodywork, so they must ride
+ * the SAME rigid pose the body draws with -- yaw alone tore the emitters off
+ * the car on any pitch or roll, and off a tumbling wreck entirely (debug dump
+ * 018: both tail coronas hanging in mid air beside the car).  Same three-way
+ * selection as the draw matrix: wreck frame, else the rigid body's frame,
+ * else yaw.
+ *
+ * It became a function when the photorealism layer's headlights needed the
+ * same answer EARLIER in the frame than the corona pass computes it -- and a
+ * second copy of this selection is precisely the way the coronas and the beams
+ * would come to disagree about where a car's headlamps are. */
+/* THE LIGHT LEDGER'S HOLDING PEN.  Filled where tier 7's per-frame light list
+ * is built and printed once, later in the same frame, after the corona pass
+ * has had its say -- one line carrying every number the three ways this
+ * feature can fail are told apart by.  See B3_PHOTO_LIGHT_STATS. */
+static int   g_lightstat_valid, g_lightstat_beams, g_lightstat_total;
+static int   g_lightstat_budget, g_lightstat_racers, g_lightstat_lamped;
+static float g_lightstat_dusk, g_lightstat_lampy;
+/* tier 7c/7d's three: how many tail slots were filled, how many of those cars
+ * were on the brakes (so the ledger can tell a brake frame from a tail frame
+ * without a screenshot), and how many flames got one of the two transient
+ * slots.  validate_photo section 14 parses all three. */
+static int   g_lightstat_tails, g_lightstat_braking, g_lightstat_flames;
+/* WHICH cars are showing brake rather than tail, as a slot bitmask.  Same
+ * reason as the flame mask below: a count alone cannot tell a validator
+ * whether the braking car is the one filling half the frame or one that is
+ * forty metres behind the camera, and the leg that proves the brake lamp is
+ * the one being lit has to photograph a braking car it can actually see -- so
+ * the distance of the nearest one to the eye goes out beside the mask, for the
+ * same reason and in the same units as the flame's. */
+static unsigned g_lightstat_brakemask;
+static float g_lightstat_brakedist;
+/* ...and the flicker the FIRST flame slot was multiplied by this frame, 0 when
+ * no flame was lit.  It is in the ledger because "the flame light flickers"
+ * and "the flame light is deterministic" are both claims about this one
+ * number, and a screenshot can support neither: a validator can watch it vary
+ * over a drive and match it between two runs without rendering anything. */
+static float g_lightstat_flick;
+/* ...and WHICH cars are burning, as a slot bitmask, plus how far the nearest
+ * of them is from the eye.  Both exist because of a real dead end: the first
+ * attempt to gate this tier rendered a boost window on/off and measured NO
+ * pixels moving, and there is no way to tell from that frame whether the light
+ * was never written, was written somewhere off screen, or was written on
+ * screen and is too weak.  The mask and the range separate the three, and they
+ * are what section 14's boost leg selects its frames with -- a flame sixty
+ * metres up the road is a correct light and a useless measurement.
+ *
+ * ...and the LEVEL the first flame slot was lit at, which is the recovered
+ * envelope's own number: 2.0 for the ignition flare, 1.0 while it burns, and
+ * whatever the release decay has left on the way down.  The pool fades WITH
+ * it, so a gate that demanded the same brightness of a burning frame and a
+ * frame two thirds of the way through the fade would be demanding that the
+ * recovered envelope be ignored. */
+static unsigned g_lightstat_flamemask;
+static float g_lightstat_flamedist, g_lightstat_flamelev;
+
+/* IS THIS CAR ON THE BRAKES?  One spelling, because there are now two readers.
+ *
+ * The corona pass has always asked `v->last_brake > 0.05f` inline, and tier 7c
+ * has to ask the same question to decide between the tail lamp and the brake
+ * lamp.  Two inline copies of a threshold is precisely how the light pool and
+ * the corona sprite would come to disagree about what a car is doing -- and
+ * that disagreement would be invisible in every screenshot where only one of
+ * them is on screen. */
+static int car_braking(int i)
+{
+    if (i < 0 || i >= g_num_vehicles) return 0;
+    return g_vehicles[i].last_brake > 0.05f;   /* the corona pass's own test */
+}
+
+/* THE FLAME'S TWO COLOURS, derived from the shipped sprites -- the whole
+ * derivation, with the texel means and the recovered per-pool modulation
+ * constants it is built from, is over B3_PHOTO_FLAME_R in
+ * src/burnout3_aftereffects.h.  COOL is `coronaboost` (everybody) and HOT is
+ * `coronaboostred` (the five Car10 specials, carObj+0x1901). */
+static const float B3_FLAME_COOL[3] = { B3_PHOTO_FLAME_R, B3_PHOTO_FLAME_G,
+                                        B3_PHOTO_FLAME_B };
+static const float B3_FLAME_HOT[3]  = { B3_PHOTO_FLAMEHOT_R,
+                                        B3_PHOTO_FLAMEHOT_G,
+                                        B3_PHOTO_FLAMEHOT_B };
+
+/* A DETERMINISTIC 0..1 FROM TWO INTEGERS, and the emphasis is on
+ * deterministic.  The boost flame flickers, and retail flickers it with a
+ * per-frame rand() -- which this port cannot reuse, because every pinned-frame
+ * gate in the tree (validate_photo's identity leg, its world pins, afx_sweep,
+ * photo_strip, the resize sweeps) rests on two renders of the SAME frame
+ * producing the same pixels.  A rand() in the light list would have made the
+ * A and B legs of every one of those light the road differently for a reason
+ * that has nothing to do with the thing under test.
+ *
+ * So the flicker is a function of (frame counter, car slot) and of nothing
+ * else: no clock, no PRNG state, and no dependence on how many cars were
+ * processed before this one -- which also means a car's flame does not change
+ * when a car ahead of it wrecks.  The mix is the well-known 32-bit finaliser
+ * pair; it is bijective, so distinct (frame, slot) pairs stay distinct, and
+ * the two constants are chosen so that consecutive frames of one car and one
+ * frame of consecutive cars both decorrelate. */
+static float b3_light_hash01(unsigned frame, unsigned slot)
+{
+    unsigned h = frame * 0x9E3779B9u + slot * 0x85EBCA6Bu;
+    h ^= h >> 16; h *= 0x7FEB352Du;
+    h ^= h >> 15; h *= 0x846CA68Bu;
+    h ^= h >> 16;
+    return (float)(h >> 8) * (1.0f / 16777216.0f);   /* 24 bits, [0,1) */
+}
+
+static int car_lamp_pose(int i, float p[3], float R[9]) {
+    const Vehicle* v;
+    if (i < 0 || i >= g_num_vehicles) return 0;
+    v = &g_vehicles[i];
+    if (!v->active) return 0;
+    p[0] = v->pos.x;
+    p[1] = v->pos.y - 0.5f - g_car_ymin[i];
+    p[2] = v->pos.z;
+    if (v->crashed_until > 0.0f && g_wrecks[i].active) {
+        const B3WreckState* wk = &g_wrecks[i];
+        R[0] = wk->frame[0][0]; R[1] = wk->frame[1][0];
+        R[2] = -wk->frame[2][0];
+        R[3] = wk->frame[0][1]; R[4] = wk->frame[1][1];
+        R[5] = -wk->frame[2][1];
+        R[6] = wk->frame[0][2]; R[7] = wk->frame[1][2];
+        R[8] = -wk->frame[2][2];
+        /* the wreck body draws AT its own frame's pos row, not v->pos */
+        p[0] = wk->frame[3][0];
+        p[1] = wk->frame[3][1];
+        p[2] = wk->frame[3][2];
+    } else if (v->fsim_ready) {
+        const float (*f)[4] = (const float (*)[4])v->fsim.rb.frame;
+        R[0] =  f[0][0]; R[1] =  f[1][0]; R[2] = -f[2][0];
+        R[3] =  f[0][1]; R[4] =  f[1][1]; R[5] = -f[2][1];
+        R[6] = -f[0][2]; R[7] = -f[1][2]; R[8] =  f[2][2];
+    } else {
+        b3_carfx_rot3_from_yaw(v->rot.y, R);
+    }
+    return 1;
+}
+
+/* THE RESIZE SETTLE -- why a dragged window border used to stop the game.
+ *
+ * render_frame() read SDL_GetWindowSize() every frame and handed it straight
+ * to b3_afx_frame_begin(), and afx_resize() rebuilds the WHOLE chain whenever
+ * that size differs from the last one -- by any amount, one pixel included.
+ * A programmatic resize is one such event; a DRAGGED BORDER is one PER FRAME,
+ * for as long as the drag lasts.  So the full rebuild -- fifteen colour
+ * targets, the depth-attachment format probe, the multisampled colour+depth
+ * renderbuffer pair, seventeen framebuffer completeness checks -- was paid
+ * every frame of every drag.
+ *
+ * Measured on this box (RTX 3090, the offscreen SDL driver is the real desktop
+ * GL path), one resize per frame:
+ *
+ *     2020x1540, RT + all seven effects   render_frame  2.7 ms -> 10.4 ms
+ *     ~1300x870, retail pacing            render 26 fps while the sim held
+ *                                         62 Hz -- i.e. the governor spending
+ *                                         its full four catch-up ticks on
+ *                                         every rendered frame
+ *     RSS during the drag                 +234 MB
+ *
+ * At the resolution this was reported from (2048x1536, all seven effects, ray
+ * tracing, MSAA 4x -- 12.93 ms a frame before any of this) the rebuild roughly
+ * doubles the frame, every frame, until the user lets go.
+ *
+ * THE WEB HAS HAD A GUARD AGAINST EXACTLY THIS since the ResizeObserver work
+ * (B3_WEB_RES_QUANTUM / B3_WEB_RES_DEADBAND in web/b3_web.c: snap to 4, refuse
+ * to act under 8 px of movement, and only look every 30 presents).  The
+ * desktop never got one, and the chain has roughly doubled in size since --
+ * the photorealism targets and the MSAA pair are all new on this path.
+ *
+ * THE RULE HERE IS A SETTLE, not the web's dead band, because a dead band
+ * leaves the chain permanently off-size at any window the band swallows.  A
+ * settle always converges on the window's exact size:
+ *
+ *   * a new size is adopted once it has HELD STILL for B3_RESIZE_SETTLE
+ *     frames (default 4 -- 67 ms, below the threshold anyone reports);
+ *   * ...or unconditionally after B3_RESIZE_SETTLE_MAX frames (default 60) of
+ *     never holding still, which is the bound that matters: a window manager
+ *     whose size OSCILLATES -- fractional scaling rounding against a
+ *     compositor's own configure is the classic one -- would otherwise keep
+ *     the chain rebuilding for the rest of the run.  With the cap it costs one
+ *     rebuild a second instead of sixty.
+ *
+ * While the size is unsettled the chain keeps its old targets and the FINAL
+ * present stretches them over the live window (b3_afx_frame_end takes the live
+ * size below), so a drag is momentarily soft and never a stall.
+ *
+ * B3_RESIZE_SETTLE=0 restores the old adopt-immediately behaviour exactly --
+ * it is what the flood gate in tools/desktop_resize_sweep.py runs as its
+ * control leg, and what a user can set to A/B this against.
+ *
+ * NOTHING CHANGES AT A SETTLED SIZE.  Every pinned frame, every strip and
+ * every capture in the tree runs at a size that has not moved for hundreds of
+ * frames, where live == settled and the code below is the old two lines. */
+static void resize_settle(int lw, int lh, int *out_w, int *out_h)
+{
+    static int settled_w = 0, settled_h = 0;   /* what the chain is built at */
+    static int cand_w = 0, cand_h = 0;         /* the size being waited on   */
+    static int held = 0;                       /* frames it has held still   */
+    static int waiting = 0;                    /* frames since it last moved */
+    static int n_settle = -1, n_max = 0;
+
+    if (n_settle < 0) {
+        const char *e = getenv("B3_RESIZE_SETTLE");
+        const char *m = getenv("B3_RESIZE_SETTLE_MAX");
+        n_settle = (e && *e) ? atoi(e) : 4;
+        if (n_settle < 0) n_settle = 0;
+        n_max = (m && *m) ? atoi(m) : 60;
+        if (n_max < n_settle) n_max = n_settle;
+    }
+
+    /* The first size, and any size reached with the settle switched off, is
+     * adopted on the spot -- there is nothing to protect yet. */
+    if (!settled_w || !settled_h || n_settle == 0) {
+        settled_w = lw; settled_h = lh;
+        cand_w = lw; cand_h = lh; held = 0; waiting = 0;
+        *out_w = lw; *out_h = lh;
+        return;
+    }
+    if (lw == settled_w && lh == settled_h) {  /* nothing is happening */
+        cand_w = lw; cand_h = lh; held = 0; waiting = 0;
+        *out_w = settled_w; *out_h = settled_h;
+        return;
+    }
+    /* The size is off the chain's.  Count how long the LIVE size has held
+     * still, and how long it has been off, and adopt on either. */
+    if (lw == cand_w && lh == cand_h) held++;
+    else { cand_w = lw; cand_h = lh; held = 0; }
+    waiting++;
+    if (held >= n_settle || waiting >= n_max) {
+        if (getenv("B3_RESIZE_VERBOSE"))
+            printf("[resize] adopt %dx%d (held %d, waiting %d, settle %d, "
+                   "max %d)\n", lw, lh, held, waiting, n_settle, n_max);
+        settled_w = lw; settled_h = lh; held = 0; waiting = 0;
+    } else if (getenv("B3_RESIZE_VERBOSE")) {
+        printf("[resize] live %dx%d vs chain %dx%d (held %d, waiting %d)\n",
+               lw, lh, settled_w, settled_h, held, waiting);
+    }
+    *out_w = settled_w; *out_h = settled_h;
+}
+
 static void render_frame(void) {
-    int w, h;
-    SDL_GetWindowSize(g_window, &w, &h);
+    int w, h, lw, lh;
+    SDL_GetWindowSize(g_window, &lw, &lh);
     // Resizable window: track the live size every frame (projection aspect,
     // HUD scale and the blur's frame grab all already read w/h per frame;
-    // the viewport was the only fixed piece).
+    // the viewport was the only fixed piece).  The size the FRAME is rendered
+    // at is the SETTLED one -- see resize_settle() above for why a dragged
+    // border must not rebuild the effects chain sixty times a second.
+    resize_settle(lw, lh, &w, &h);
     glViewport(0, 0, w, h);
 
     // AFTEREFFECTS hook 1 of 3 (src/burnout3_aftereffects.c): put the scene in
@@ -15064,8 +15746,27 @@ static void render_frame(void) {
                    g_afx_on ? "aftereffects chain" : "legacy postfx", w, h,
                    (g_afx_on || !why) ? "" : " -- aftereffects unavailable: ",
                    (g_afx_on || !why) ? "" : why);
+            /* ...AND WHICH OF THE SIX PHOTOREALISM EFFECTS SURVIVED, on the
+             * same line of reasoning the line above exists for: an effect that
+             * stood down because this context could not give it a depth
+             * texture is indistinguishable, from the outside, from an effect
+             * that was never asked for.  One line, unconditional, next to the
+             * post-path verdict, so the first thing the game says about
+             * post-processing says the whole truth about it. */
+            if (g_afx_on)
+                printf("[Burnout3] %s\n", b3_photo_status());
             fflush(stdout);
         }
+    }
+    /* THE LEGACY PATH TAKES THE LIVE SIZE, and it is not an exception to the
+     * settle -- it is the settle's own reason applied honestly.  The settle
+     * exists to stop the CHAIN being rebuilt per frame; with no chain there is
+     * nothing to rebuild and nothing to protect, and the old path draws the
+     * world straight into the default framebuffer, so rendering it at a stale
+     * size would letterbox the window instead of merely softening it. */
+    if (!g_afx_on && (w != lw || h != lh)) {
+        w = lw; h = lh;
+        glViewport(0, 0, w, h);
     }
     if (!g_afx_on)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -15287,6 +15988,826 @@ static void render_frame(void) {
         b3_retained_camera(&proj, &view);
     }
 cam_done:;
+    /* ==================================================================
+     * THE PHOTOREALISM LAYER's two per-frame publications, and its one
+     * geometry pass.  All INSPIRED -- see burnout3_aftereffects.h.
+     *
+     * WHY IT IS HERE, between the camera and the sky.  The camera is what the
+     * layer reconstructs world positions with, so it cannot be published
+     * earlier; the shadow pass has to own a framebuffer for the length of its
+     * draw list, so it has to finish before the first thing that draws into
+     * the scene target -- and that is the sky dome, on the next line.
+     * ================================================================== */
+    if (g_afx_on && b3_photo_on()) {
+        B3PhotoCamera pc;
+        float VP[16], invVP[16];
+        /* THE MATRICES ARE READ BACK OFF THE RENDERER'S OWN STACK, not
+         * rebuilt from cam_pos/proj here.  Four different code paths above can
+         * have set the camera (the chase cam, B3_CAM, B3_CAMSIDE, B3_AGGRO_CAM)
+         * and one of them applies the display mirror with b3r_scale(-1,1,1)
+         * inside the projection.  Rebuilding would mean reproducing that
+         * decision tree, and the first time someone added a fifth camera the
+         * layer would silently reconstruct every world position mirrored --
+         * which reads as shadows and fog on the wrong side of the screen.
+         * b3r_mat() is what the world was actually drawn with. */
+        b3_mat4_mul(VP, b3r_mat(B3R_MAT_PROJECTION), b3r_mat(B3R_MAT_MODELVIEW));
+        if (b3_mat4_inverse(invVP, VP)) {
+            memcpy(pc.vp, VP, sizeof VP);
+            memcpy(pc.inv_vp, invVP, sizeof invVP);
+            pc.eye[0] = cam_pos.x; pc.eye[1] = cam_pos.y; pc.eye[2] = cam_pos.z;
+            pc.near_z = b3_view_near();
+            pc.far_z  = b3_view_far();
+            b3_photo_set_camera(&pc);
+        } else {
+            b3_photo_set_camera(NULL);   /* singular: stand the layer down */
+        }
+
+        /* THE SUN, out of the same sidecar the car paint's glint reads, so the
+         * two cannot disagree about where it is.  carfx hands it over in the
+         * GAME's frame; this harness's GL world is the Z-mirror of it
+         * (RE_NOTES 12), so z is negated exactly once, here. */
+        {
+            float sg[3], srgb[3], sgl[3];
+            int have = b3_carfx_sun(sg, srgb);
+            sgl[0] = sg[0]; sgl[1] = sg[1]; sgl[2] = -sg[2];
+            b3_photo_set_sun(sgl, srgb, have);
+
+            /* ---- the shadow pass ------------------------------------- */
+            /* ...UNLESS THE RAY IS ANSWERING.  Tier 4r replaces this term
+             * outright rather than adding to it (src/burnout3_rt.h), so with
+             * ray tracing live the map would be a second full geometry pass
+             * whose result nothing reads -- and the +0.25 ms it costs comes
+             * straight back.  b3_photo_set_shadow(0) so a frame that toggles
+             * mid-race cannot leave the deferred pass holding the last
+             * matrix's worth of stale shadow. */
+            /* ---- TIER 4rc: THE CARS' OWN INSTANCES --------------------
+             *
+             * INSPIRED; src/burnout3_rt.h has the design.  Published HERE,
+             * beside the shadow decision and well before the cars are drawn,
+             * for one reason: the blob-shadow pass further down has to know
+             * which cars the ray took, and it must be able to ask a FACT
+             * rather than re-derive the same decision from the same inputs
+             * and hope the two agree.
+             *
+             * THE POSE IS car_lamp_pose()'s and nothing else's.  That is the
+             * same rigid frame the body's own draw matrix is built from and
+             * the same one the coronas and the headlights ride -- a shadow
+             * that disagreed with the bodywork about where the car is would
+             * be worse than no shadow, and this codebase has already paid
+             * once for a second copy of a pose selection (the beams and the
+             * coronas came to disagree about where a headlamp was).
+             *
+             * THE PLAYER GOES IN FIRST, because the budget is finite and the
+             * one shadow a player will certainly look at is their own. */
+            if (b3_afx_rt_car_budget() > 0) {
+                int budget = b3_afx_rt_car_budget(), used = 0;
+                b3_afx_rt_cars_begin();
+                for (int i = 0; i < g_num_vehicles && used < budget; i++) {
+                    float p[3], R[9];
+                    if (g_car_rt_model[i] < 0) continue;
+                    if (!car_lamp_pose(i, p, R)) continue;
+                    b3_afx_rt_car_add(i, g_car_rt_model[i], p, R);
+                    used++;
+                }
+                /* ...then the NEAREST traffic, and only under B3_RT_CARS=all.
+                 * Nearest to the camera rather than to the player: it is the
+                 * frame's shadows that are being paid for, and a car behind
+                 * the camera casts into a part of the world nobody is looking
+                 * at.  A partial selection, not a sort -- the same O(n)
+                 * shape, and the same argument, as tier 7's light pick. */
+                if (b3_rt_cars_mode() == B3_RT_CARS_ALL) {
+                    while (used < budget) {
+                        int best = -1;
+                        float bd = 1e30f;
+                        for (int i = 0; i < g_traffic_n; i++) {
+                            const TrafficCar* t = &g_traffic[i];
+                            float dx, dy, dz, d2;
+                            if (!t->active || g_rt_traffic_taken[i]) continue;
+                            if (t->car < 0 || t->car >= B3_TRAFFIC_CAR_MAX)
+                                continue;
+                            if (g_traffic_rt_model[t->car] < 0) continue;
+                            dx = t->pos.x - cam_pos.x;
+                            dy = t->pos.y - cam_pos.y;
+                            dz = t->pos.z - cam_pos.z;
+                            d2 = dx * dx + dy * dy + dz * dz;
+                            if (d2 < bd) { bd = d2; best = i; }
+                        }
+                        if (best < 0) break;
+                        g_rt_traffic_taken[best] = 1;
+                        {
+                            float org[3], R9[9];
+                            traffic_pose(&g_traffic[best], org, R9);
+                            /* slot -1: traffic has no blob to suppress
+                             * (traffic_render draws none), so nothing needs
+                             * to ask about it later. */
+                            b3_afx_rt_car_add(-1, g_traffic_rt_model[
+                                                    g_traffic[best].car],
+                                              org, R9);
+                        }
+                        used++;
+                    }
+                    memset(g_rt_traffic_taken, 0,
+                           sizeof g_rt_traffic_taken);
+                }
+            }
+
+            if (b3_afx_rt_active()) {
+                b3_photo_set_shadow(0, NULL, 0);
+            } else
+            if (have && b3_photo_fx(B3_PHOTO_FX_SHADOW) && g_have_real_track) {
+                float lvp[16], centre[3];
+                float ext   = b3_photo_env_f("B3_PHOTO_SH_EXTENT",
+                                             B3_PHOTO_SH_EXTENT);
+                float ahead = b3_photo_env_f("B3_PHOTO_SH_AHEAD",
+                                             B3_PHOTO_SH_AHEAD);
+                float dep   = b3_photo_env_f("B3_PHOTO_SH_DEPTH",
+                                             B3_PHOTO_SH_DEPTH);
+                int   size  = (int)b3_photo_env_f("B3_PHOTO_SH_SIZE",
+                                                  (float)B3_PHOTO_SH_SIZE);
+                /* THE BOX LEADS THE CAMERA.  Centring it on the eye spends
+                 * half the map behind the car, which is the half nobody can
+                 * see; leading it puts the texels where the road is. */
+                float fx = cam_target.x - cam_pos.x;
+                float fz = cam_target.z - cam_pos.z;
+                float fl = sqrtf(fx * fx + fz * fz);
+                if (fl > 1e-4f) { fx /= fl; fz /= fl; } else { fx = 0; fz = -1; }
+                centre[0] = cam_pos.x + fx * ahead;
+                centre[1] = cam_pos.y;
+                centre[2] = cam_pos.z + fz * ahead;
+                if (b3r_shadow_begin(sgl, centre, ext, dep, size, lvp)) {
+                    /* THE CASTER LIST.  The track's own geometry, the props
+                     * and the scenery -- i.e. everything static and large
+                     * enough to throw a shadow a driver would notice.  They
+                     * draw through the ORDINARY calls: b3r_shadow_begin has
+                     * loaded the light's matrices onto the same stack, so
+                     * these are the same functions the main pass calls and
+                     * the cut-out alpha test comes along for free.
+                     *
+                     * The cars are NOT in it, and that is deliberate rather
+                     * than unfinished: they already have retail's own blob
+                     * shadow under them (b3_carfx_shadow_pass_*, recovered),
+                     * a second car shadow would fight it, and eight moving
+                     * meshes are the most expensive casters on the list for
+                     * the least screen area. */
+                    /* B3_PHOTO_SH_CASTERS=<subset> keeps only the named
+                     * casters in the map -- "track", "props", "scenery", any
+                     * combination, or "none".  DIAGNOSTIC, and the reason it
+                     * is worth its four lines: a shadow that should not be
+                     * there is attributable to the thing that cast it in one
+                     * run each, and a suspicion about a caster stops being an
+                     * argument.  Unset (the default) is all three, and the
+                     * lookup is done once. */
+                    static int cast_mask = -1;
+                    if (cast_mask < 0) {
+                        const char* cs = getenv("B3_PHOTO_SH_CASTERS");
+                        cast_mask = !cs ? 7
+                                  : ((strstr(cs, "track")   ? 1 : 0)
+                                   | (strstr(cs, "props")   ? 2 : 0)
+                                   | (strstr(cs, "scenery") ? 4 : 0));
+                    }
+                    b3r_begin();
+                    b3r_fog(NULL, 0, 0);
+                    if (cast_mask & 1) b3r_track_draw(&g_real_track);
+                    if (cast_mask & 2) b3_props_draw();
+                    if (cast_mask & 4) b3_scenery_draw(centre);
+                    b3r_end();
+                    /* ---- THE CASTER INVENTORY, and it is an inspection of
+                     * the DRAW LIST rather than a re-reading of the intent
+                     * above.  Three passes went in; the renderer counted what
+                     * actually reached the map, and the car mesh -- which
+                     * draws through a raw glDrawArrays this counter cannot
+                     * see -- counts itself.  A player reported "a large shadow
+                     * travelling with the car" and "the car is casting after
+                     * all" was one of the four suspects; this is what rules it
+                     * in or out in the LIVE default config instead of on
+                     * paper.  One line, the first time the pass runs. */
+                    if (getenv("B3_PHOTO_VERBOSE")) {
+                        static int said;
+                        if (!said) {
+                            said = 1;
+                            printf("[photo] shadow casters: track %d + props "
+                                   "%d + scenery %d = %ld draws in the map; "
+                                   "cars %ld\n",
+                                   b3r_stat_get(B3R_STAT_TRACK),
+                                   b3r_stat_get(B3R_STAT_PROPS),
+                                   b3r_stat_get(B3R_STAT_SCENERY),
+                                   b3r_shadow_draws(),
+                                   g_car_draws_in_shadow);
+                            fflush(stdout);
+                        }
+                    }
+                    b3r_shadow_end();
+                    b3_photo_set_shadow(b3r_shadow_tex(), lvp, size);
+                } else {
+                    b3_photo_set_shadow(0, NULL, 0);
+                }
+                /* hand the frame back to the chain, unclear ed */
+                b3_afx_rebind_scene(w, h);
+                /* ...and the camera's matrices with it: the pass left the
+                 * stack popped, but the uniform cache still holds the light's,
+                 * and the sky dome is drawn from a raw GL path that would
+                 * inherit them. */
+                b3r_sync();
+            }
+
+            /* ---- TIER 7: THE PER-SOURCE LIGHTS, nearest-N -------------
+             *
+             * The whole track's lights were derived once at load
+             * (b3_scenery_lights, and the long note over B3_PHOTO_LIGHT_* in
+             * burnout3_aftereffects.h for why they are derived and not read).
+             * What happens per frame is only the PICK, and it is a partial
+             * selection rather than a sort: the shader has room for N and
+             * nothing else about the frame depends on their order, so the
+             * cost is O(lights) and not O(lights log lights).
+             *
+             * NEAREST TO A POINT AHEAD OF THE EYE, not to the eye.  A chase
+             * camera sits behind the car and half of what is "near" it is
+             * behind the car with it; leading the pick point puts the budget
+             * on the street the player is driving into.  Same argument, and
+             * the same B3_PHOTO_*_AHEAD spelling, as the shadow box above.
+             *
+             * A light whose own radius does not reach the pick point at all
+             * still counts as a candidate -- the pick is about the CAMERA and
+             * the falloff is about the PIXEL, and conflating them puts a lamp
+             * out while its pool of light is still on screen. */
+            if (b3_photo_light_budget() > 0) {
+                const B3ScLight* sl = NULL;
+                int nsl = b3_scenery_lights(&sl);
+                int budget = b3_photo_light_budget();
+                float lp[32 * 4], lc[32 * 4];
+                float far_ = b3_photo_env_f("B3_PHOTO_LIGHT_FAR",
+                                            B3_PHOTO_LIGHT_FAR);
+                float ahead = b3_photo_env_f("B3_PHOTO_LIGHT_AHEAD",
+                                             B3_PHOTO_LIGHT_AHEAD);
+                float pick[3], fx, fz, fl, dusk;
+                int   chosen[32], nch = 0, i;
+                float chd[32], nearest = 1e30f;
+                float ld[32 * 4];
+                int   nhead = 0;
+                /* THE FRONT OF THE ARRAY, in reservation order: beams, then
+                 * tails, then flames.  `nres` is where the scenery pick may
+                 * start writing and the floor it may never evict below -- one
+                 * number instead of three, so a fourth class of car lamp is a
+                 * line rather than an audit. */
+                int   nres = 0;
+
+                fx = cam_target.x - cam_pos.x;
+                fz = cam_target.z - cam_pos.z;
+                fl = sqrtf(fx * fx + fz * fz);
+                if (fl > 1e-4f) { fx /= fl; fz /= fl; } else { fx = 0; fz = -1; }
+                pick[0] = cam_pos.x + fx * ahead;
+                pick[1] = cam_pos.y;
+                pick[2] = cam_pos.z + fz * ahead;
+
+                if (budget > 32) budget = 32;
+
+                /* ---- TIER 7b: THE CARS' OWN HEADLIGHTS, FIRST ----------
+                 *
+                 * Written into the front of the array before the scenery pick
+                 * runs, so the pick fills what is LEFT.  That ordering is the
+                 * feature: a headlight is the one light in the frame whose
+                 * absence the player would notice immediately, and a
+                 * nearest-N that sorted the player's own beams away the
+                 * moment a street got busy would be the one visible way this
+                 * can fail.  The player is car 0 and goes in first.
+                 *
+                 * The lamp POSITION and its AIM are the car's own recovered
+                 * table (docs/RE_CARFX.md 534-549, [C], type 0), through the
+                 * same pose the corona pass draws them at -- so the beam
+                 * leaves the same point on the bodywork the glow sprite is
+                 * drawn at, on a tumbling wreck as much as on a straight.
+                 *
+                 * THE AIM IS NUDGED DOWN by B3_PHOTO_HEAD_AIM.  The recovered
+                 * normal is the lamp's own facing, which on these models is
+                 * dead level -- correct for a billboard, and for a beam it
+                 * puts the pool on the horizon instead of on the road.  The
+                 * nudge is the one number here that is not retail's, and it
+                 * is a look. */
+                /* The env still decides when it is set (b3_afx_head_on() is
+                 * pinned to it in that case); otherwise the pause menu's
+                 * HEADLIGHTS row does, and OFF there means the caller simply
+                 * does not fill the slots -- which is what "off" already meant
+                 * here, so the row costs no second mechanism. */
+                if (b3_photo_env_f("B3_PHOTO_HEAD_ON",
+                                   (float)B3_PHOTO_HEAD_ON) != 0.0f
+                    && b3_afx_head_on()) {
+                    float rng  = b3_photo_env_f("B3_PHOTO_HEAD_RANGE",
+                                                B3_PHOTO_HEAD_RANGE);
+                    /* THE ELLIPSE'S TWO RECIPROCAL TANGENTS, computed once for
+                     * the frame.  Degrees at the knob because degrees are what
+                     * a look is argued in; 1/tan^2 on the wire because that is
+                     * the form the shader's quadrature test wants and it is
+                     * the same number for every pixel of every beam. */
+                    float spr  = b3_photo_env_f("B3_PHOTO_HEAD_SPREAD",
+                                                B3_PHOTO_HEAD_SPREAD);
+                    float cut  = b3_photo_env_f("B3_PHOTO_HEAD_CUTOFF",
+                                                B3_PHOTO_HEAD_CUTOFF);
+                    float itH2, itV2;
+                    float aim  = b3_photo_env_f("B3_PHOTO_HEAD_AIM",
+                                                B3_PHOTO_HEAD_AIM);
+                    int   ncar = (int)b3_photo_env_f("B3_PHOTO_HEAD_CARS",
+                                                (float)B3_PHOTO_HEAD_CARS);
+                    float r2 = rng * rng;
+                    int c;
+                    if (spr <  1.0f) spr =  1.0f;
+                    if (spr > 80.0f) spr = 80.0f;
+                    if (cut <  0.5f) cut =  0.5f;
+                    if (cut > 80.0f) cut = 80.0f;
+                    itH2 = tanf(spr * 0.01745329252f);
+                    itV2 = tanf(cut * 0.01745329252f);
+                    itH2 = 1.0f / (itH2 * itH2);
+                    itV2 = 1.0f / (itV2 * itV2);   /* > 0 IS "this is a spot" */
+                    /* THE BEAMS ARE ALWAYS ON, and the floor is the point.
+                     *
+                     * This used to ride `dusk` SQUARED on the argument that a
+                     * headlight does nothing in sunshine.  That is true of a
+                     * headlight pointed at sunlit tarmac and false of every
+                     * other surface a racing car drives past: the roster's
+                     * dusk factor only spans 0.14 (US_C1, a bright afternoon)
+                     * to 0.61 (US_P1's sunset), so squaring it left US_C1 at
+                     * 0.02 -- two per cent, i.e. off -- and this track spends
+                     * a third of its lap under a stadium deck with the lights
+                     * on.  A car whose lamps are visibly lit and which throws
+                     * nothing into an underpass is the defect, not the fix.
+                     *
+                     * THE FLOOR NOW LIVES IN THE SHADER, with the beams' gain
+                     * and their wrap term, and that is a simplification this
+                     * block earns rather than a move for its own sake: while
+                     * the lamps and the beams shared one uniform gain, the only
+                     * way for the beams to have their own day curve was to
+                     * smuggle the RATIO of the two through the per-light
+                     * COLOUR and let the shader cancel it -- which worked, and
+                     * which nobody reading either end could see was happening.
+                     * B3_PHOTO_HEAD_DAY / _GAIN / _LIT / _WRAP are read once,
+                     * next to each other, in afx_photo_lights().  What this
+                     * loop still owns is the beam's PLACE and its AIM. */
+                    if (ncar > g_num_vehicles) ncar = g_num_vehicles;
+                    /* ONE BEAM PER CAR, not one per LAMP, and the reason is
+                     * arithmetic rather than thrift: a car's two headlamps sit
+                     * about 1.4 m apart and throw 34 m, so their pools overlap
+                     * over all but the first metre and the pair is worth one
+                     * light at the midpoint.  Two would have cost twice the
+                     * budget for a difference no one can see -- and with six
+                     * racers the pair spelling filled the whole of a 12-light
+                     * frame and left the streetlights with nothing, which is
+                     * how this was noticed.
+                     *
+                     * THE CAP IS THE RESERVATION, and it is no longer half of
+                     * the lamps' budget.  b3_photo_head_slots() is the count
+                     * the shader's array was SIZED for over and above
+                     * B3_PHOTO_LIGHT_N, so filling it takes nothing from the
+                     * street: 6 beams and 18 lamps both fit, at once, every
+                     * frame.  Half-of-N was correct at the shipped N=18 and
+                     * quietly wrong below it -- at N=8 two of six racers drove
+                     * with no beam at all. */
+                    int cap = b3_photo_head_slots();
+                    g_lightstat_lamped = 0;
+                    for (c = 0; c < ncar && nhead < cap; c++) {
+                        float pp[3], R[9], mp[8][3], mn[8][3];
+                        float sp[3] = { 0, 0, 0 }, sn[3] = { 0, 0, 0 };
+                        float wx, wy, wz, dx, dy, dz, dl2;
+                        int nl, k;
+                        if (!car_lamp_pose(c, pp, R)) continue;
+                        nl = b3_carfx_car_lamps(c, 0, mp, mn, 8);
+                        if (nl <= 0) continue;
+                        g_lightstat_lamped++;
+                        for (k = 0; k < nl; k++) {
+                            sp[0] += mp[k][0]; sp[1] += mp[k][1];
+                            sp[2] += mp[k][2];
+                            sn[0] += mn[k][0]; sn[1] += mn[k][1];
+                            sn[2] += mn[k][2];
+                        }
+                        for (k = 0; k < 3; k++) sp[k] /= (float)nl;
+                        /* R IS ROW-MAJOR OBJECT->WORLD AND MUST BE APPLIED THE
+                         * WAY THE CORONA PASS APPLIES IT, which is
+                         *   world.x = R[0]*m.x + R[1]*m.y + R[2]*m.z
+                         * (b3fx_corona_draw_table, burnout3_carfx.c).  This
+                         * block used to index it down the columns instead --
+                         * R TRANSPOSED -- under a comment claiming the two
+                         * agreed, and for a rotation the transpose is the
+                         * INVERSE, so the beam was placed and aimed by the
+                         * car's rotation run backwards.
+                         *
+                         * That is not a subtle drift.  Worked through on the
+                         * player's own pose in the user's dump (yaw 1.37, so
+                         * the car is heading (+0.98, 0, -0.20)): the recovered
+                         * type-0 lamps sit at model (0, 0.305, -1.772) facing
+                         * (0, 0, -1), which the corona pass puts 1.74 m in
+                         * FRONT of the car's origin aiming along the heading.
+                         * Transposed, the same table lands 1.74 m BEHIND it
+                         * aiming at (-0.98, 0, -0.20) -- backwards.  So the
+                         * beam left the tail and lit the road the car had
+                         * already driven over, which is exactly the "bright
+                         * glow at the rear, and no pools ahead of any car"
+                         * that was reported.  The corona sprites were always
+                         * right because they never took this path. */
+                        wx = R[0]*sp[0] + R[1]*sp[1] + R[2]*sp[2];
+                        wy = R[3]*sp[0] + R[4]*sp[1] + R[5]*sp[2];
+                        wz = R[6]*sp[0] + R[7]*sp[1] + R[8]*sp[2];
+                        dx = R[0]*sn[0] + R[1]*sn[1] + R[2]*sn[2];
+                        dy = R[3]*sn[0] + R[4]*sn[1] + R[5]*sn[2];
+                        dz = R[6]*sn[0] + R[7]*sn[1] + R[8]*sn[2];
+                        dl2 = dx*dx + dy*dy + dz*dz;
+                        if (dl2 < 1e-6f) continue;
+                        dl2 = 1.0f / sqrtf(dl2);
+                        dx *= dl2; dy *= dl2; dz *= dl2;
+                        dy -= aim;                    /* onto the road */
+                        dl2 = dx*dx + dy*dy + dz*dz;
+                        if (dl2 < 1e-6f) continue;
+                        dl2 = 1.0f / sqrtf(dl2);
+                        dx *= dl2; dy *= dl2; dz *= dl2;
+                        lp[nhead*4+0] = pp[0] + wx;
+                        lp[nhead*4+1] = pp[1] + wy;
+                        lp[nhead*4+2] = pp[2] + wz;
+                        lp[nhead*4+3] = 1.0f / r2;
+                        /* THE COLOUR IS NOW JUST THE COLOUR.  The gain and
+                         * the day curve moved to uHeadK, so this array carries
+                         * a lamp's rgb and nothing smuggled. */
+                        lc[nhead*4+0] = B3_PHOTO_HEAD_R;
+                        lc[nhead*4+1] = B3_PHOTO_HEAD_G;
+                        lc[nhead*4+2] = B3_PHOTO_HEAD_B;
+                        lc[nhead*4+3] = itH2;  /* the beam's width ACROSS... */
+                        ld[nhead*4+0] = dx;
+                        ld[nhead*4+1] = dy;
+                        ld[nhead*4+2] = dz;
+                        ld[nhead*4+3] = itV2;  /* ...and its ELEVATION, which
+                                                * doubles as "this is a spot" */
+                        if (c == 0) {
+                            float gh2, gn2[3];
+                            if (b3_collision_ready()
+                                && b3_ground_probe(lp[nhead*4+0],
+                                                   lp[nhead*4+1],
+                                                   lp[nhead*4+2],
+                                                   &gh2, gn2) >= 0)
+                                g_lightstat_lampy = lp[nhead*4+1] - gh2;
+                        }
+                        nhead++;
+                    }
+                }
+                nres = nhead;
+
+                /* ---- TIER 7c: THE CARS' TAIL AND BRAKE LAMPS -----------
+                 *
+                 * The same table two rows down (type 1 and type 2), through
+                 * the same pose the corona pass draws the sprites at, under
+                 * RETAIL'S OWN EXCLUSIVITY RULE: FUN_00187C70 tests the brake
+                 * bit 0x10 before the tail bit 0x08 and the tail row carries
+                 * an explicit skip, so a braking car shows brake INSTEAD of
+                 * tail.  b3fx_corona_draw_table() applies exactly that to the
+                 * sprites; this applies it to the light, from the same
+                 * predicate, so the pool and the glow can never disagree
+                 * about which lamp is lit.
+                 *
+                 * AND IT IS THE BYTE THAT DECIDES, NOT THE MODEL.  If a car is
+                 * braking and its model has no type-2 records, retail draws
+                 * nothing at all -- the brake row finds no lamps and the tail
+                 * row was already skipped.  `continue` on an empty gather
+                 * reproduces that rather than falling back to the tail, which
+                 * would have been the one place this port was more helpful
+                 * than the game and therefore wrong.
+                 *
+                 * THEY ARE SPOTS, NOT OMNI POINTS.  The long argument is in
+                 * the header; the short one is that a tail lamp is 0.42 m off
+                 * the road and every pixel it lights is grazing, so it needs
+                 * the beams' wrap term and the beams' day floor, and both of
+                 * those live behind `uLightD[i].w > 0.0`.  Aiming the cone
+                 * down the lamp's own recovered normal also stops it washing
+                 * red over the road in FRONT of the car, which is what an omni
+                 * point at the same place would have done. */
+                if (b3_photo_env_f("B3_PHOTO_TAIL_ON",
+                                   (float)B3_PHOTO_TAIL_ON) != 0.0f) {
+                    float rng = b3_photo_env_f("B3_PHOTO_TAIL_RANGE",
+                                               B3_PHOTO_TAIL_RANGE);
+                    float bre = b3_photo_env_f("B3_PHOTO_BRAKE_REACH",
+                                               B3_PHOTO_BRAKE_REACH);
+                    float gan = b3_photo_env_f("B3_PHOTO_TAIL_GAIN",
+                                               B3_PHOTO_TAIL_GAIN);
+                    float spr = b3_photo_env_f("B3_PHOTO_TAIL_SPREAD",
+                                               B3_PHOTO_TAIL_SPREAD);
+                    float cut = b3_photo_env_f("B3_PHOTO_TAIL_CUTOFF",
+                                               B3_PHOTO_TAIL_CUTOFF);
+                    int   ncar = (int)b3_photo_env_f("B3_PHOTO_TAIL_CARS",
+                                                (float)B3_PHOTO_TAIL_CARS);
+                    int   cap = nres + b3_photo_tail_slots();
+                    float itH2, itV2;
+                    int   c;
+                    if (spr <  1.0f) spr =  1.0f;
+                    if (spr > 80.0f) spr = 80.0f;
+                    if (cut <  0.5f) cut =  0.5f;
+                    if (cut > 80.0f) cut = 80.0f;
+                    if (rng < 0.5f)  rng = 0.5f;
+                    if (bre < 0.1f)  bre = 0.1f;
+                    itH2 = tanf(spr * 0.01745329252f);
+                    itV2 = tanf(cut * 0.01745329252f);
+                    itH2 = 1.0f / (itH2 * itH2);
+                    itV2 = 1.0f / (itV2 * itV2);   /* > 0 IS "this is a spot" */
+                    if (ncar > g_num_vehicles) ncar = g_num_vehicles;
+                    g_lightstat_braking = 0;
+                    g_lightstat_brakemask = 0u;
+                    g_lightstat_brakedist = -1.0f;
+                    for (c = 0; c < ncar && nres < cap; c++) {
+                        float pp[3], R[9], mp[8][3], mn[8][3];
+                        float sp[3] = { 0, 0, 0 }, sn[3] = { 0, 0, 0 };
+                        float wx, wy, wz, dx, dy, dz, dl2, r2;
+                        int nl, k, braking, type;
+                        if (!car_lamp_pose(c, pp, R)) continue;
+                        /* THE SAME PREDICATE THE CORONA PASS USES, through the
+                         * same helper -- two spellings of "is this car
+                         * braking" is exactly how the pool and the sprite come
+                         * to disagree. */
+                        braking = car_braking(c);
+                        type = braking ? 2 : 1;    /* 0x10 before 0x08    [C] */
+                        nl = b3_carfx_car_lamps(c, type, mp, mn, 8);
+                        if (nl <= 0) continue;     /* retail draws nothing */
+                        if (braking) {
+                            g_lightstat_braking++;
+                            g_lightstat_brakemask |= 1u << c;
+                        }
+                        for (k = 0; k < nl; k++) {
+                            sp[0] += mp[k][0]; sp[1] += mp[k][1];
+                            sp[2] += mp[k][2];
+                            sn[0] += mn[k][0]; sn[1] += mn[k][1];
+                            sn[2] += mn[k][2];
+                        }
+                        for (k = 0; k < 3; k++) sp[k] /= (float)nl;
+                        /* R IS ROW-MAJOR OBJECT->WORLD, applied the way the
+                         * corona pass applies it -- see the long note in the
+                         * beam loop above about what indexing it down the
+                         * columns instead did to the headlights. */
+                        wx = R[0]*sp[0] + R[1]*sp[1] + R[2]*sp[2];
+                        wy = R[3]*sp[0] + R[4]*sp[1] + R[5]*sp[2];
+                        wz = R[6]*sp[0] + R[7]*sp[1] + R[8]*sp[2];
+                        dx = R[0]*sn[0] + R[1]*sn[1] + R[2]*sn[2];
+                        dy = R[3]*sn[0] + R[4]*sn[1] + R[5]*sn[2];
+                        dz = R[6]*sn[0] + R[7]*sn[1] + R[8]*sn[2];
+                        dl2 = dx*dx + dy*dy + dz*dz;
+                        if (dl2 < 1e-6f) continue;
+                        dl2 = 1.0f / sqrtf(dl2);
+                        dx *= dl2; dy *= dl2; dz *= dl2;
+                        /* NO AIM NUDGE.  The beams need one because their cone
+                         * is 3.2 degrees tall and a dead-level normal puts it
+                         * on the horizon; this cone is 55 degrees tall and the
+                         * road is well inside it, so nudging would only tilt
+                         * the pool off the lamp's own recovered facing. */
+                        r2 = braking ? rng * bre : rng;
+                        r2 = r2 * r2;
+                        lp[nres*4+0] = pp[0] + wx;
+                        lp[nres*4+1] = pp[1] + wy;
+                        lp[nres*4+2] = pp[2] + wz;
+                        lp[nres*4+3] = 1.0f / r2;
+                        lc[nres*4+0] = (braking ? B3_PHOTO_BRAKE_R
+                                                : B3_PHOTO_TAIL_R) * gan;
+                        lc[nres*4+1] = (braking ? B3_PHOTO_BRAKE_G
+                                                : B3_PHOTO_TAIL_G) * gan;
+                        lc[nres*4+2] = (braking ? B3_PHOTO_BRAKE_B
+                                                : B3_PHOTO_TAIL_B) * gan;
+                        lc[nres*4+3] = itH2;
+                        ld[nres*4+0] = dx;
+                        ld[nres*4+1] = dy;
+                        ld[nres*4+2] = dz;
+                        ld[nres*4+3] = itV2;   /* > 0: take the spot branch */
+                        if (braking) {
+                            float ex = lp[nres*4+0] - cam_pos.x;
+                            float ey = lp[nres*4+1] - cam_pos.y;
+                            float ez = lp[nres*4+2] - cam_pos.z;
+                            float ed = sqrtf(ex*ex + ey*ey + ez*ez);
+                            if (g_lightstat_brakedist < 0.0f
+                                || ed < g_lightstat_brakedist)
+                                g_lightstat_brakedist = ed;
+                        }
+                        nres++;
+                    }
+                    g_lightstat_tails = nres - nhead;
+                } else {
+                    g_lightstat_tails = g_lightstat_braking = 0;
+                    g_lightstat_brakemask = 0u;
+                }
+
+                /* ---- TIER 7d: THE BOOST FLAME'S LIGHT, TRANSIENT --------
+                 *
+                 * Type 8 -- the tailpipes FUN_0017F730 emits the flame from --
+                 * lit by b3_boostfx_level(), which is the flame's OWN recovered
+                 * level and not a second envelope: 2.0 for the ignition flare,
+                 * 1.0 while it burns, and the two recovered decay rates on the
+                 * way down.  A crashed car's level is zero, so retail's wreck
+                 * gate (carObj+0x18FA) comes along for free and a tumbling car
+                 * throws no flame light.
+                 *
+                 * *** TWO SLOTS, TO THE NEAREST BURNING CARS. ***  The ceiling
+                 * is 32 and the other three tiers have spent 30 of it -- the
+                 * whole argument, including why AFX_LIGHT_MAX does not simply
+                 * rise, is over b3_photo_boost_slots().  So this is a partial
+                 * selection like the streetlights' rather than a reservation
+                 * like the beams': gather every car that is actually burning,
+                 * keep the `bcap` nearest the pick point, and on the frames
+                 * where nobody is boosting -- which is most of them -- write
+                 * nothing at all and let the street have the room. */
+                if (b3_photo_env_f("B3_PHOTO_BOOST_ON",
+                                   (float)B3_PHOTO_BOOST_ON) != 0.0f) {
+                    float rng = b3_photo_env_f("B3_PHOTO_BOOST_RANGE",
+                                               B3_PHOTO_BOOST_RANGE);
+                    float gan = b3_photo_env_f("B3_PHOTO_BOOST_GAIN",
+                                               B3_PHOTO_BOOST_GAIN);
+                    float flk = b3_photo_env_f("B3_PHOTO_BOOST_FLICKER",
+                                               B3_PHOTO_BOOST_FLICKER);
+                    float spr = b3_photo_env_f("B3_PHOTO_BOOST_SPREAD",
+                                               B3_PHOTO_BOOST_SPREAD);
+                    float cut = b3_photo_env_f("B3_PHOTO_BOOST_CUTOFF",
+                                               B3_PHOTO_BOOST_CUTOFF);
+                    int   bcap = b3_photo_boost_slots();
+                    float itH2, itV2, bd[8];
+                    int   bsel[8], nb = 0, c;
+                    g_lightstat_flick = 0.0f;
+                    g_lightstat_flamemask = 0u;
+                    g_lightstat_flamedist = -1.0f;
+                    g_lightstat_flamelev = 0.0f;
+                    if (spr <  1.0f) spr =  1.0f;
+                    if (spr > 80.0f) spr = 80.0f;
+                    if (cut <  0.5f) cut =  0.5f;
+                    if (cut > 80.0f) cut = 80.0f;
+                    if (rng < 0.5f)  rng = 0.5f;
+                    if (flk < 0.0f)  flk = 0.0f;
+                    if (flk > 0.9f)  flk = 0.9f;
+                    itH2 = tanf(spr * 0.01745329252f);
+                    itV2 = tanf(cut * 0.01745329252f);
+                    itH2 = 1.0f / (itH2 * itH2);
+                    itV2 = 1.0f / (itV2 * itV2);
+                    if (bcap > 8) bcap = 8;
+                    /* the pick: nearest-first among the cars that are LIT */
+                    for (c = 0; c < g_num_vehicles && c < B3_BOOSTFX_MAX_CARS;
+                         c++) {
+                        float dx, dy, dz, d2;
+                        int j, worst;
+                        if (!g_vehicles[c].active) continue;
+                        if (b3_boostfx_level(c) <= 0.0f) continue;
+                        dx = g_vehicles[c].pos.x - pick[0];
+                        dy = g_vehicles[c].pos.y - pick[1];
+                        dz = g_vehicles[c].pos.z - pick[2];
+                        d2 = dx*dx + dy*dy + dz*dz;
+                        if (nb < bcap) { bsel[nb] = c; bd[nb] = d2; nb++;
+                                         continue; }
+                        if (!bcap) break;
+                        worst = 0;
+                        for (j = 1; j < nb; j++)
+                            if (bd[j] > bd[worst]) worst = j;
+                        if (d2 < bd[worst]) { bsel[worst] = c; bd[worst] = d2; }
+                    }
+                    for (c = 0; c < nb && nres < budget; c++) {
+                        int slot = bsel[c];
+                        float pp[3], R[9], mp[8][3], mn[8][3];
+                        float sp[3] = { 0, 0, 0 }, sn[3] = { 0, 0, 0 };
+                        float wx, wy, wz, dx, dy, dz, dl2, r2, lev, amp;
+                        const float *col;
+                        int nl, k;
+                        if (!car_lamp_pose(slot, pp, R)) continue;
+                        nl = b3_carfx_car_lamps(slot, 8, mp, mn, 8);
+                        if (nl <= 0) continue;
+                        lev = b3_boostfx_level(slot);
+                        for (k = 0; k < nl; k++) {
+                            sp[0] += mp[k][0]; sp[1] += mp[k][1];
+                            sp[2] += mp[k][2];
+                            sn[0] += mn[k][0]; sn[1] += mn[k][1];
+                            sn[2] += mn[k][2];
+                        }
+                        for (k = 0; k < 3; k++) sp[k] /= (float)nl;
+                        wx = R[0]*sp[0] + R[1]*sp[1] + R[2]*sp[2];
+                        wy = R[3]*sp[0] + R[4]*sp[1] + R[5]*sp[2];
+                        wz = R[6]*sp[0] + R[7]*sp[1] + R[8]*sp[2];
+                        dx = R[0]*sn[0] + R[1]*sn[1] + R[2]*sn[2];
+                        dy = R[3]*sn[0] + R[4]*sn[1] + R[5]*sn[2];
+                        dz = R[6]*sn[0] + R[7]*sn[1] + R[8]*sn[2];
+                        dl2 = dx*dx + dy*dy + dz*dz;
+                        if (dl2 < 1e-6f) continue;
+                        dl2 = 1.0f / sqrtf(dl2);
+                        dx *= dl2; dy *= dl2; dz *= dl2;
+                        /* THE FLICKER, DETERMINISTICALLY.  A hash of the frame
+                         * counter and the car's slot -- never rand(), never a
+                         * clock: every pinned-frame gate in the tree depends on
+                         * two renders of the same frame producing the same
+                         * pixels, and retail's own flame flicker IS a per-frame
+                         * rand().  Reusing it would have broken the harness
+                         * rather than the look. */
+                        amp = 1.0f + flk * (2.0f * b3_light_hash01(
+                                  (unsigned)g_frame_count, (unsigned)slot)
+                              - 1.0f);
+                        if (nres == nhead + g_lightstat_tails) {
+                            g_lightstat_flick = amp;
+                            g_lightstat_flamelev = lev;
+                        }
+                        g_lightstat_flamemask |= 1u << slot;
+                        {   /* from the EYE, not from the pick point: what the
+                             * measurement cares about is whether this pool is
+                             * near enough to the camera to cover pixels. */
+                            float ex = pp[0] + wx - cam_pos.x;
+                            float ey = pp[1] + wy - cam_pos.y;
+                            float ez = pp[2] + wz - cam_pos.z;
+                            float ed = sqrtf(ex*ex + ey*ey + ez*ez);
+                            if (g_lightstat_flamedist < 0.0f
+                                || ed < g_lightstat_flamedist)
+                                g_lightstat_flamedist = ed;
+                        }
+                        col = b3_boostfx_car_red(slot) ? B3_FLAME_HOT
+                                                       : B3_FLAME_COOL;
+                        r2 = rng * rng;
+                        lp[nres*4+0] = pp[0] + wx;
+                        lp[nres*4+1] = pp[1] + wy;
+                        lp[nres*4+2] = pp[2] + wz;
+                        lp[nres*4+3] = 1.0f / r2;
+                        lc[nres*4+0] = col[0] * gan * lev * amp;
+                        lc[nres*4+1] = col[1] * gan * lev * amp;
+                        lc[nres*4+2] = col[2] * gan * lev * amp;
+                        lc[nres*4+3] = itH2;
+                        ld[nres*4+0] = dx;
+                        ld[nres*4+1] = dy;
+                        ld[nres*4+2] = dz;
+                        ld[nres*4+3] = itV2;
+                        nres++;
+                    }
+                }
+                g_lightstat_flames = nres - nhead - g_lightstat_tails;
+                nch = nres;
+
+                for (i = 0; i < nsl; i++) {
+                    float dx = sl[i].pos[0] - pick[0];
+                    float dy = sl[i].pos[1] - pick[1];
+                    float dz = sl[i].pos[2] - pick[2];
+                    float d2 = dx * dx + dy * dy + dz * dz;
+                    int   j, worst;
+                    if (d2 < nearest) nearest = d2;
+                    if (d2 > far_ * far_) continue;
+                    if (nch < budget) {
+                        chosen[nch] = i; chd[nch] = d2; nch++;
+                        continue;
+                    }
+                    /* replace the farthest of the N held, if this beats it --
+                     * and NEVER one of the reserved CAR-LAMP slots, which is
+                     * what `nres` is doing in the loop bound.  It used to be
+                     * `nhead`; the beams are still in there, and so now are the
+                     * tails and whichever flames were lit this frame. */
+                    worst = nres;
+                    for (j = nres + 1; j < nch; j++)
+                        if (chd[j] > chd[worst]) worst = j;
+                    if (worst < nch && d2 < chd[worst]) {
+                        chosen[worst] = i; chd[worst] = d2;
+                    }
+                }
+                for (i = nres; i < nch; i++) {
+                    const B3ScLight* L = &sl[chosen[i]];
+                    float r2 = L->radius * L->radius;
+                    lp[i * 4 + 0] = L->pos[0];
+                    lp[i * 4 + 1] = L->pos[1];
+                    lp[i * 4 + 2] = L->pos[2];
+                    lp[i * 4 + 3] = r2 > 1e-3f ? 1.0f / r2 : 0.0f;
+                    lc[i * 4 + 0] = L->rgb[0] * L->power;
+                    lc[i * 4 + 1] = L->rgb[1] * L->power;
+                    lc[i * 4 + 2] = L->rgb[2] * L->power;
+                    lc[i * 4 + 3] = 0.0f;
+                    ld[i * 4 + 0] = 0.0f;   /* a scenery lamp is OMNI: w == 0 */
+                    ld[i * 4 + 1] = 0.0f;
+                    ld[i * 4 + 2] = 0.0f;
+                    ld[i * 4 + 3] = 0.0f;
+                }
+                dusk = b3_photo_dusk(have, sg, srgb);
+                b3_photo_set_lights(lp, lc, ld, nch, dusk);
+                /* THE PER-FRAME LIGHT LEDGER.  Off unless asked for, one
+                 * printf when it is, and it exists because "the headlights do
+                 * not show" has three completely different causes that no
+                 * screenshot can tell apart: the beams never got a slot, the
+                 * beams got slots and are too dim to read, or the source
+                 * sprite is culled.  tools/validate_photo.py's beam leg parses
+                 * this line; see B3_PHOTO_LIGHT_STATS in
+                 * burnout3_aftereffects.h. */
+                g_lightstat_beams   = nhead;
+                g_lightstat_total   = nch;
+                g_lightstat_budget  = budget;
+                g_lightstat_dusk    = dusk;
+                g_lightstat_racers  = g_num_vehicles;
+                g_lightstat_valid   = 1;
+                /* EVERY 120 FRAMES, not once: the derivation is a load-time
+                 * fact and prints itself, but the PICK is a per-frame answer
+                 * and the interesting question about it -- how full the
+                 * budget runs down a real lap -- cannot be answered by the
+                 * first frame of a race, where the grid is nowhere near a
+                 * lamp.  Same cadence as the god rays' sun print. */
+                if (getenv("B3_PHOTO_VERBOSE")) {
+                    static int tick;
+                    if ((tick++ % 120) == 0)
+                        printf("[afx] PHOTO lights f%d: %d derived, %d lamps "
+                               "+ %d headlamps + %d taillamps + %d flames "
+                               "= %d of a budget of %d within "
+                               "%.0f m (nearest %.0f m), dusk %.2f\n",
+                               tick - 1, nsl, nch - nres, nhead,
+                               g_lightstat_tails, g_lightstat_flames,
+                               nch, budget,
+                               far_,
+                               nearest < 1e29f ? sqrtf(nearest) : -1.0f, dusk);
+                }
+            } else {
+                b3_photo_set_lights(NULL, NULL, NULL, 0, 0.0f);
+            }
+        }
+    }
+
     /* POSTFX: the sky dome draws first, before any world geometry, with
      * depth writes off (FUN_00032580 / FUN_000323D0 [C]); centred on the
      * camera, scaled by far_clip - 1000. progress picks the gradient-LUT
@@ -15763,6 +17284,20 @@ cam_done:;
     for (int i = 0; i < g_num_vehicles; i++) {
         Vehicle* v = &g_vehicles[i];
         if (!v->active || !g_car_lists[i]) continue;
+        /* TIER 4rc: NOT IF THE RAY IS ALREADY DRAWING THIS CAR'S SHADOW.
+         *
+         * INSPIRED; see src/burnout3_rt.h.  A blobbyshadow quad under a car
+         * that is casting a traced shadow is the same darkness applied twice
+         * -- and worse than twice, because the blob is a fixed ellipse on the
+         * ground plane and the traced shadow has the car's actual outline
+         * wherever the sun happens to be, so the two do not even overlap.
+         *
+         * The question is asked of what was actually UPLOADED this frame, not
+         * of what was wanted, which is what makes the transition clean in both
+         * directions: a car past the instance budget, a car whose model the
+         * extractor refused, and every frame with ray tracing off all answer
+         * no and keep retail's shadow exactly as before. */
+        if (b3_afx_rt_car_traced(i)) continue;
         float p[3] = { v->pos.x, v->pos.y, v->pos.z };
         // Probe the real surface under the car so the blob rests ON the
         // slope plane instead of a flat quad slicing the upslope (dump 030).
@@ -15778,41 +17313,48 @@ cam_done:;
     b3_carfx_corona_pass_begin();
     for (int i = 0; i < g_num_vehicles; i++) {
         Vehicle* v = &g_vehicles[i];
+        float p[3], R[9];
         if (!v->active || !g_car_lists[i]) continue;
-        // FULL POSE. The lamp offsets are model-space points on the bodywork,
-        // so they must ride the SAME rigid pose the body draws with -- yaw
-        // only tore the emitters off the car on any pitch or roll, and off a
-        // tumbling wreck entirely (debug dump 018: both tail coronas hanging
-        // in mid air beside the car). Same three-way selection as the draw
-        // matrix: wreck frame, else the rigid body's frame, else yaw.
-        float p[3] = { v->pos.x, v->pos.y - 0.5f - g_car_ymin[i], v->pos.z };
-        float R[9];
-        if (v->crashed_until > 0.0f && g_wrecks[i].active) {
-            const B3WreckState* wk = &g_wrecks[i];
-            R[0] = wk->frame[0][0]; R[1] = wk->frame[1][0];
-            R[2] = -wk->frame[2][0];
-            R[3] = wk->frame[0][1]; R[4] = wk->frame[1][1];
-            R[5] = -wk->frame[2][1];
-            R[6] = wk->frame[0][2]; R[7] = wk->frame[1][2];
-            R[8] = -wk->frame[2][2];
-            // the wreck body draws AT its own frame's pos row, not v->pos
-            p[0] = wk->frame[3][0];
-            p[1] = wk->frame[3][1];
-            p[2] = wk->frame[3][2];
-        } else if (v->fsim_ready) {
-            const float (*f)[4] = (const float (*)[4])v->fsim.rb.frame;
-            R[0] =  f[0][0]; R[1] =  f[1][0]; R[2] = -f[2][0];
-            R[3] =  f[0][1]; R[4] =  f[1][1]; R[5] = -f[2][1];
-            R[6] = -f[0][2]; R[7] = -f[1][2]; R[8] =  f[2][2];
-        } else {
-            b3_carfx_rot3_from_yaw(v->rot.y, R);
-        }
-        unsigned lb = b3_carfx_light_byte(v->last_brake > 0.05f, 0,
+        if (!car_lamp_pose(i, p, R)) continue;
+        /* car_braking(), not an inline `> 0.05f`: tier 7c's tail/brake light
+         * asks the same question earlier in the frame and the two must not be
+         * able to drift apart. */
+        unsigned lb = b3_carfx_light_byte(car_braking(i), 0,
                                           B3_CARFX_LIGHT_HEAD
                                           | B3_CARFX_LIGHT_TAIL);
         b3_carfx_corona_draw_pose(i, p, R, lb);
     }
     b3_carfx_corona_pass_end();
+
+    /* ...and here is where the ledger goes out, because this is the first
+     * point in the frame where all three numbers exist at once. */
+    {
+        static int stat_on = -1;
+        if (stat_on < 0) {
+            const char* e = getenv("B3_PHOTO_LIGHT_STATS");
+            stat_on = (e && *e && atoi(e) != 0) ? 1 : 0;
+        }
+        if (stat_on && g_lightstat_valid) {
+            printf("[photo-lights] f=%d beams=%d lamped=%d racers=%d "
+                   "tails=%d braking=%d brakemask=0x%02x brakedist=%.1f "
+                   "flames=%d "
+                   "flick=%.6f flamemask=0x%02x flamedist=%.1f "
+                   "flamelev=%.3f "
+                   "scenery=%d total=%d budget=%d dusk=%.3f headcorona=%d "
+                   "lampy=%.3f\n",
+                   g_frame_count, g_lightstat_beams, g_lightstat_lamped,
+                   g_lightstat_racers,
+                   g_lightstat_tails, g_lightstat_braking,
+                   g_lightstat_brakemask, (double)g_lightstat_brakedist,
+                   g_lightstat_flames, (double)g_lightstat_flick,
+                   g_lightstat_flamemask, (double)g_lightstat_flamedist,
+                   (double)g_lightstat_flamelev,
+                   g_lightstat_total - g_lightstat_beams
+                       - g_lightstat_tails - g_lightstat_flames,
+                   g_lightstat_total, g_lightstat_budget, g_lightstat_dusk,
+                   b3_carfx_corona_head_count(), g_lightstat_lampy);
+        }
+    }
 
     /* BOOSTFX: the boost exhaust flame.  FUN_0017F730 emits it in the
      * same per-car FX step as the coronas (0x0017F73C), from the SAME
@@ -16144,9 +17686,13 @@ cam_done:;
      * unavailable, in which case the capture paths fall back to the software
      * table (they are mutually exclusive -- see b3_gamma_apply_rgba). */
     if (g_paused) {   // pause mixer overlay (under the gamma pass)
-        float fr[3] = { g_mix[0] / g_mix_max[0], g_mix[1] / g_mix_max[1],
-                        g_mix[2] / g_mix_max[2] };
-        b3_hud_pause_mixer(fr);
+        float fr[B3_MIX_N];
+        for (int i = 0; i < B3_MIX_N; i++) fr[i] = g_mix[i] / g_mix_max[i];
+        B3HudSetting set[B3_SET_N];
+        int nset = b3_rt_option_visible() ? B3_SET_N : 0;
+        memset(set, 0, sizeof set);
+        pause_settings_fill(set);
+        b3_hud_pause_mixer(fr, nset ? set : NULL, nset, g_pause_row);
     }
     b3_raceflow_results_draw();                             /* race flow (agent) */
     B3_ZONE(B3_ZONE_POST);
@@ -16154,7 +17700,13 @@ cam_done:;
      * framebuffer through the retail gamma ramp. This is also what removes
      * the SECOND full-canvas copy the old chain made -- b3_postfx_gamma()
      * re-grabbed the whole canvas every frame purely to read it back. */
-    b3_gamma_in_gl = g_afx_on ? b3_afx_frame_end(w, h)
+    /* THE PRESENT TAKES THE LIVE SIZE.  This is the one call that touches the
+     * DEFAULT framebuffer, and the default framebuffer is always the window's
+     * real size -- so while a drag is in flight this is what stretches the
+     * chain's settled-size output over it.  Soft for the length of the drag,
+     * sharp the moment it ends, and never a rebuild in between.  (At a settled
+     * size lw/lh ARE w/h and this is the old call.) */
+    b3_gamma_in_gl = g_afx_on ? b3_afx_frame_end(lw, lh)
                               : b3_postfx_gamma(w, h);
     B3_ZONE(B3_ZONE_NONE);
     /* B3_RENDER_STATS=<n>: the renderer's own per-pass DRAW count, which is
@@ -16203,10 +17755,17 @@ static void process_input(void) {
             && e.button.button == SDL_BUTTON_LEFT) {
             float f;
             int row = mixer_hit(e.button.x, e.button.y, &f);
+            int srow = row >= 0 ? -1 : settings_hit(e.button.x, e.button.y);
             if (row >= 0) {
                 g_mix_drag = row;
+                g_pause_row = row;
                 g_mix[row] = f * g_mix_max[row];
                 mixer_apply();
+            } else if (srow >= 0 && b3_rt_option_visible()) {
+                /* a whole settings ROW toggles: the value is two characters
+                 * wide and a two-character target is not a target */
+                g_pause_row = B3_MIX_N + srow;
+                pause_settings_toggle(srow);
             } else {
                 int ww, wh;
                 SDL_GetWindowSize(g_window, &ww, &wh);
@@ -16256,6 +17815,59 @@ static void process_input(void) {
                 && g_state == RACING) {
                 g_paused = !g_paused;
                 if (!g_paused) mixer_save();
+            }
+
+            /* ---- THE PAUSE SCREEN'S KEYBOARD, and it is ARROWS ONLY.
+             *
+             * The track and car selects take WASD as well as the arrows, and
+             * this screen deliberately does not: it sits on top of a LIVE
+             * RACE, where W/A/S/D are the throttle, the brake and the wheel.
+             * A settings screen that steered the car while you read it would
+             * be a settings screen nobody opened twice.
+             *
+             * UP/DOWN move the cursor over sliders, settings and the button
+             * alike; LEFT/RIGHT adjust (a slider by 5%, a setting by
+             * flipping it); RETURN/SPACE activate.  Repeats are allowed on
+             * the movement keys and on the slider nudge -- holding LEFT to
+             * run a slider down is the gesture a mouse-less player expects
+             * -- and NOT on the toggles, where a repeat would flicker the
+             * setting and rewrite the file at the key-repeat rate. */
+            if (g_paused) {
+                int rows = B3_MIX_N + (b3_rt_option_visible() ? B3_SET_N : 0) + 1;
+                int sc = e.key.keysym.scancode;
+                int rep = e.key.repeat;
+                if (g_pause_row >= rows) g_pause_row = rows - 1;
+                if (sc == SDL_SCANCODE_UP)
+                    g_pause_row = (g_pause_row + rows - 1) % rows;
+                else if (sc == SDL_SCANCODE_DOWN)
+                    g_pause_row = (g_pause_row + 1) % rows;
+                else if (sc == SDL_SCANCODE_LEFT
+                         || sc == SDL_SCANCODE_RIGHT) {
+                    int dir = (sc == SDL_SCANCODE_RIGHT) ? 1 : -1;
+                    if (g_pause_row < B3_MIX_N) {
+                        int i = g_pause_row;
+                        float v = g_mix[i] + dir * 0.05f * g_mix_max[i];
+                        if (v < 0.0f) v = 0.0f;
+                        if (v > g_mix_max[i]) v = g_mix_max[i];
+                        g_mix[i] = v;
+                        mixer_apply();
+                        mixer_save();
+                    } else if (!rep && g_pause_row < B3_MIX_N + B3_SET_N) {
+                        pause_settings_toggle(g_pause_row - B3_MIX_N);
+                    }
+                } else if (!rep && (sc == SDL_SCANCODE_RETURN
+                                    || sc == SDL_SCANCODE_KP_ENTER
+                                    || sc == SDL_SCANCODE_SPACE)) {
+                    if (g_pause_row >= B3_MIX_N
+                        && g_pause_row < B3_MIX_N + B3_SET_N) {
+                        pause_settings_toggle(g_pause_row - B3_MIX_N);
+                    } else if (g_pause_row == rows - 1) {
+                        g_paused = 0;
+                        mixer_save();
+                        race_restart();
+                        printf("[Burnout3] Restarting race (pause menu)\n");
+                    }
+                }
             }
 
             // T: dump the full gamestate + a screenshot to build/debug/
@@ -19147,19 +20759,78 @@ static void game_update(void) {
         static const float RETRY_S = 6.0f, TGT_MIN = 10.0f;
         static int scen = -1; static float scen_t = 8.0f, scen_d = 7.0f;
         static int tries = 0; static float next_try = 0.0f;
-        static int scen_traffic = 0;
+        static int scen_traffic = 0, scen_props = 0, scen_propclass = 1;
         if (scen < 0) {
             const char* e = getenv("B3_SCENARIO");
             scen = (e && strncmp(e, "slam", 4) == 0);
             scen_traffic = (e && strncmp(e, "traffic", 7) == 0);
-            if (scen_traffic) scen = 1;
+            scen_props = (e && strncmp(e, "props", 5) == 0);
+            if (scen_traffic || scen_props) scen = 1;
             const char* col = e ? strchr(e, ':') : NULL;
             if (scen && col) {
                 scen_t = (float)atof(col + 1);
                 const char* c2 = strchr(col + 1, ':');
                 if (c2) scen_d = (float)atof(c2 + 1);
             }
+            { const char* pc = getenv("B3_SCENARIO_PROPCLASS");
+              if (pc && *pc) scen_propclass = atoi(pc); }
             next_try = scen_t;
+        }
+        /* B3_SCENARIO=props[:T] -- the deterministic PROP hit.
+         *
+         * Autodrive follows the racing line, so which props it happens to
+         * clip is an accident of the route: a 90 s run brushes a handful of
+         * cones and, before the box gate landed, no signpost at all.  The
+         * contact suite needs guaranteed samples of a NAMED prop class, so
+         * this aims the player at the nearest still-standing prop of
+         * B3_SCENARIO_PROPCLASS (default 1 = the cone family; 6 = the tall
+         * signposts) from 35 m out at B3_SCENARIO_SPEED and lets go.  A cone
+         * is rarely alone -- they ship in lines -- so one placement usually
+         * carries the car through several.  Everything after the placement is
+         * the real game. */
+        if (scen_props && tries < MAX_TRIES && g_race_time >= next_try
+            && g_player.crashed_until <= 0.0f && b3_props_ready()) {
+            float ppos[3] = { g_player.pos.x, g_player.pos.y, g_player.pos.z };
+            float tp[3], td;
+            int inst = b3_props_nearest_class(ppos, scen_propclass, 25.0f,
+                                              &td, tp);
+            next_try = g_race_time + RETRY_S;
+            if (inst >= 0 && td < 400.0f) {
+                tries++;
+                B3RigidBody* pr = &g_player.fsim.rb;
+                float gx = tp[0], gz = -tp[2];          /* harness -> game */
+                float dx = gx - pr->frame[3][0], dz = gz - pr->frame[3][2];
+                float dl = sqrtf(dx * dx + dz * dz);
+                float spd = 40.0f;
+                { const char* e2 = getenv("B3_SCENARIO_SPEED");
+                  if (e2 && *e2) spd = (float)atof(e2); }
+                if (dl > 1.0f) {
+                    dx /= dl; dz /= dl;
+                    for (int r = 0; r < 3; r++)
+                        for (int c = 0; c < 4; c++) pr->frame[r][c] = 0.0f;
+                    pr->frame[0][0] =  dz; pr->frame[0][2] = -dx;
+                    pr->frame[1][1] = 1.0f;
+                    pr->frame[2][0] =  dx; pr->frame[2][2] =  dz;
+                    pr->frame[3][0] = gx - dx * 35.0f;
+                    pr->frame[3][2] = gz - dz * 35.0f;
+                    pr->frame[3][3] = 1.0f;
+                    for (int c = 0; c < 3; c++) pr->vel[c] = 0.0f;
+                    pr->vel[0] = dx * spd; pr->vel[2] = dz * spd;
+                    pr->vel[3] = spd;
+                    for (int c = 0; c < 4; c++) {
+                        pr->omega[c] = 0.0f; pr->imp_force[c] = 0.0f;
+                        pr->deflection[c] = 0.0f;
+                    }
+                    g_player.pos = (Vec3){ pr->frame[3][0], g_player.pos.y,
+                                           -pr->frame[3][2] };
+                    b3_emu_drop_car(&g_player);
+                    printf("[Burnout3] [scenario] prop hit try %d/%d at "
+                           "t=%.2f: 35 m from instance %d (class %d, %.1f m "
+                           "away), closing %.0f m/s\n",
+                           tries, (int)MAX_TRIES, g_race_time, inst,
+                           scen_propclass, td, spd);
+                }
+            }
         }
         /* B3_SCENARIO=traffic[:T] -- the deterministic ONCOMING-TRAFFIC hit.
          * With retail's population law in place (160 m spawn view-gate,
@@ -19219,7 +20890,7 @@ static void game_update(void) {
                 }
             }
         }
-        if (scen && !scen_traffic && tries < MAX_TRIES
+        if (scen && !scen_traffic && !scen_props && tries < MAX_TRIES
             && g_race_time >= next_try
             && g_num_vehicles >= 2 && g_player.crashed_until <= 0.0f
             && !g_player_takedowns) {
@@ -19329,8 +21000,17 @@ static void game_update(void) {
             if (!pv->active) continue;
             float ppos[3] = { pv->pos.x, pv->pos.y, pv->pos.z };
             float pvel[3] = { pv->vel.x, pv->vel.y, pv->vel.z };
+            /* The gate wants the bbox PAIR, not the max alone: retail's
+             * FUN_001084E0 derives the box centre from (MAX+MIN)*0.5 and the
+             * half extents from (MAX-MIN)*0.5, and a shipped car's box is not
+             * symmetric about its origin (COMPCAR1: max y 1.1222, min y
+             * -0.1505, so the true box is 0.64 m half-height centred 0.49 m
+             * up, not 1.12 m half-height centred on the origin). */
             float pext[3] = { g_car_ext[i][0], g_car_ext[i][1],
                               g_car_ext[i][2] };
+            float pcen[3] = { g_car_cen[i][0], g_car_cen[i][1],
+                              g_car_cen[i][2] };
+            const float* pminp = (g_car_ext[i][2] > 0.1f) ? pcen : NULL;
             B3PropHit ph[8];
             int nph;
             /* PROP-PHYSICS: the recovered generic solver (FUN_00113960 ->
@@ -19343,12 +21023,13 @@ static void game_update(void) {
              * pre-fsim_ready fallback. */
             if (pv->fsim_ready)
                 nph = b3_props_collide_rb(i, &pv->fsim.rb, pv->fsim.mass,
-                                          pext,
+                                          pv->fsim.half_ext,
+                                          pv->fsim.center_off,
                                           pv->crashed_until > 0.0f ? 1 : 0,
                                           ph, 8);
             else
                 nph = b3_props_collide_car(i, ppos, pvel, pv->rot.y,
-                                           pext, ph, 8);
+                                           pext, pminp, ph, 8);
             for (int k = 0; k < nph; k++) {
                 /* game space = harness with z negated (RE_NOTES 12) */
                 float vr[3] = { ph[k].vrel[0], ph[k].vrel[1],
@@ -21971,8 +23652,22 @@ int main(int argc, char* argv[]) {
             win_w = rw;
             win_h = rh;
         }
+        /* THE CLAMP IS ABOUT A USER'S SCREEN, AND OFFSCREEN HAS NOT GOT ONE.
+         *
+         * SDL's `offscreen` driver reports a fixed 1024x768 desktop, so this
+         * clamp silently gave every headless run a 1024x768 drawable however
+         * large a B3_RES it was handed -- which is fine for a correctness
+         * suite comparing a frame against itself, and useless for a
+         * PERFORMANCE measurement, where the whole question is what the chain
+         * costs at 1080p.  It was measured before it was believed: B3_RES=
+         * 1920x1080 came back as `[afx] chain ready 1024x768`.
+         *
+         * There is no display to fit inside when there is no display, so the
+         * clamp only applies when a real one is being driven. */
+        const char* vd = SDL_GetCurrentVideoDriver();
+        int headless_video = vd && strcmp(vd, "offscreen") == 0;
         SDL_Rect usable;
-        if (SDL_GetDisplayUsableBounds(0, &usable) == 0) {
+        if (!headless_video && SDL_GetDisplayUsableBounds(0, &usable) == 0) {
             if (win_w > usable.w) win_w = usable.w;
             if (win_h > usable.h) win_h = usable.h;
         }
@@ -22107,6 +23802,25 @@ int main(int argc, char* argv[]) {
                "(the SCENE's samples are the [afx] chain-ready line's `msaa`)\n",
                msaa, got);
     }
+    /* WHICH GL IS ACTUALLY DRAWING THIS, said once and unconditionally.
+     *
+     * A headless run can be on the real GPU through EGL or on a software
+     * rasteriser, and the two differ by two orders of magnitude -- so every
+     * performance number this build prints is meaningless without knowing
+     * which one produced it.  It is one line and it settles the question that
+     * otherwise gets settled by assumption. */
+    {
+        const GLubyte* rend = glGetString(GL_RENDERER);
+        const GLubyte* vend = glGetString(GL_VENDOR);
+        const GLubyte* ver  = glGetString(GL_VERSION);
+        printf("[Burnout3] GL: %s | %s | %s | video driver %s\n",
+               rend ? (const char*)rend : "?",
+               vend ? (const char*)vend : "?",
+               ver  ? (const char*)ver  : "?",
+               SDL_GetCurrentVideoDriver()
+                   ? SDL_GetCurrentVideoDriver() : "?");
+        fflush(stdout);
+    }
 
     b3_loadscreen_init();            /* loading screen (agent) */
 
@@ -22223,6 +23937,22 @@ int main(int argc, char* argv[]) {
         snprintf(pdir, sizeof pdir, "build/tracks/%s", tid);
         b3_props_load(pdir);
         b3_scenery_load(pdir);   /* the +0x34 instanced scenery, same dir */
+        /* TIER 4r's WORLD, from the same directory and after the two loads
+         * whose artefacts it was built out of.  It is loaded whether or not
+         * the option is on: an ISO boot materialises bvh.bin here rather
+         * than in the middle of a race the first time somebody opens the
+         * pause menu and presses a key.  The buffers are freed with the
+         * track, and a track that has no bvh.bin simply cannot offer the
+         * option (b3_rt_status() says why). */
+        if (!b3_rt_world_load(pdir))
+            printf("[rt] %s -- ray tracing unavailable on this track\n",
+                   b3_rt_status() ? b3_rt_status() : "no world");
+        else
+            printf("[rt] %s/bvh.bin: %d triangles, %d nodes, depth %d "
+                   "(%.1f MB of float texture)\n", pdir, b3_rt_tri_count(),
+                   b3_rt_node_count(), b3_rt_max_depth(),
+                   (double)(b3_rt_node_texels() + b3_rt_tri_texels())
+                   * 16.0 / (1024.0 * 1024.0));
     }
     b3_loadscreen_phase(14, "HUD");                     /* loading screen (agent) */
     b3_hud_init("build/frontend");   // real HUD art from Data/Global.txd
@@ -22358,6 +24088,15 @@ int main(int argc, char* argv[]) {
              * (0x0014C269) and leaves it buffered and paused until a
              * car crashes.  Sequential rotation over crash1..20. */
             b3_music_crash_arm();
+            /* CRASH FM: mode 4 first, NOT mode 5.  Retail enters the
+             * radio at mode 4 on the pre-race branch (SetMode(4) at
+             * 0x0002703F) and only moves to 5 once the session is
+             * actually racing -- and mode 4's machine has no cooldown
+             * gate, so the DJ introduces the event straight away.  That
+             * is the "he talks at the start of the race" everybody
+             * remembers.  The module hands itself over to mode 5 when
+             * the intro line ends; see RE_CRASHFM.md section 3.2. */
+            b3_dj_set_mode(B3_DJ_MODE_LOADING);
             // ROLLING START (user-requested; retail starts standing): every
             // car launches at exactly 50 mph (22.352 m/s, the same exact-mph
             // constant family as the recovered relaunch speeds) along its
@@ -22463,6 +24202,19 @@ int main(int argc, char* argv[]) {
                 b3_music_crash_tick(g_player.crashed_until > 0.0f,
                                     cbst.divisor, g_delta_time);
             }
+            /* CRASH FM: the radio's own clock, and it belongs to the TICK
+             * for the same reason the crash bed's does.  Retail counts the
+             * 60-70 s gap down with DAT_0060EA1C, the dilated per-tick
+             * delta, so a crash cinema stretches the wait exactly as it
+             * stretches everything else.
+             *
+             * This used to sit below the loop, once per rendered FRAME.
+             * That is wrong in both directions and the 5-minute soak found
+             * it: a frame carrying two ticks advanced the race clock twice
+             * and the radio once, and -- the one that actually bit -- a
+             * frame carrying NO tick still charged the radio a full 1/60,
+             * so offscreen the DJ drifted to roughly twice his rate. */
+            b3_dj_tick(g_delta_time);
         }   /* end retail inner loop */
         B3_WEB_T1(B3_WEB_PROF_SIM, t_sim);
 
@@ -22472,8 +24224,103 @@ int main(int argc, char* argv[]) {
          * race and swallowing both.) */
 
         b3_music_pump();                 /* MUSIC: refill the stream */
+        /* CRASH FM: suppression stays OUT here, because the inner loop
+         * does not run while paused and the radio still has to be told --
+         * b3_dj_next_sample() reads the flag straight off the audio
+         * thread, so a pause silences a line already in the air. */
+        b3_dj_set_suppressed(g_paused);
+        /* ...and hand the music back if the race ended while the radio
+         * had the bus.  See b3_dj_release_if_idle(). */
+        b3_dj_release_if_idle();
         {   B3_WEB_T0(t_scene);
+            /* B3_FRAME_PROF=<n>: the DESKTOP frame profiler, and it exists
+             * because the web has had one (B3_WEB_HWPROF, web/b3_web.c) since
+             * the renderer wave and the desktop has had nothing.  "Does this
+             * effect fit in the budget" is a question about milliseconds, and
+             * a wave that answers it with a frame rate read off a HUD is not
+             * answering it.
+             *
+             * Two numbers, every n frames: the whole loop iteration and
+             * render_frame() inside it.  Wall clock, not a GPU timer query --
+             * so with vsync on it measures the wait, which is why every
+             * measurement taken with it also sets B3_NO_VSYNC=1.  The first
+             * window is DISCARDED: it contains shader compiles, the first
+             * texture uploads and the chain's build, none of which happen
+             * again. */
+            static double prof_acc_frame, prof_acc_scene, prof_t_prev;
+            /* THE WORST FRAME IN THE WINDOW.  An average cannot answer
+             * "did anything hitch": a single 500 ms stall spread over a
+             * 30-frame window reads as 33 ms, which looks like a slow
+             * frame rather than the freeze it is.  This is the number the
+             * in-race materialisation gate is written against. */
+            static double prof_worst;
+            static long prof_n;
+            static int prof_every = -1, prof_sync = 0;
+            double prof_t0 = 0.0;
+            if (prof_every < 0) {
+                const char* pe = getenv("B3_FRAME_PROF");
+                const char* ps = getenv("B3_FRAME_PROF_SYNC");
+                prof_every = (pe && *pe) ? atoi(pe) : 0;
+                if (prof_every < 0) prof_every = 0;
+                prof_sync = ps && *ps && atoi(ps) != 0;
+                if (prof_every && prof_sync)
+                    printf("[Burnout3] [frameprof] SYNC mode: a glFinish "
+                           "before each timestamp, so render_frame includes "
+                           "the GPU work it queued instead of only the CPU "
+                           "time spent queueing it\n");
+            }
+            if (prof_every) prof_t0 = (double)SDL_GetPerformanceCounter();
             render_frame();
+            if (prof_every) {
+                double freq, now;
+                /* B3_FRAME_PROF_SYNC=1 -- THE SAME SUBSTITUTE THE WEB
+                 * PROFILER MAKES (B3_WEB_HWPROF_SYNC, web/b3_web.c), and for
+                 * the same reason.  Without it this is a CPU wall clock and
+                 * GL is asynchronous, so a pass that costs the GPU two
+                 * milliseconds and the CPU one draw call measures as one draw
+                 * call: the photorealism wave's first table came back with
+                 * every effect at +/-0.05 ms, which is not a budget, it is a
+                 * measurement of glDrawArrays.  A glFinish drains the queue so
+                 * the number is what the frame actually costs.
+                 *
+                 * It is OPT-IN because a glFinish in the frame loop is itself
+                 * a performance defect -- it serialises CPU and GPU, so the
+                 * total it reports is a CEILING (the real pipelined frame
+                 * overlaps them) and it must never be on in a shipped run. */
+                if (prof_sync) glFinish();
+                freq = (double)SDL_GetPerformanceFrequency();
+                now = (double)SDL_GetPerformanceCounter();
+                prof_acc_scene += (now - prof_t0) * 1000.0 / freq;
+                if (prof_t_prev > 0.0) {
+                    double one = (now - prof_t_prev) * 1000.0 / freq;
+                    prof_acc_frame += one;
+                    if (one > prof_worst) prof_worst = one;
+                }
+                prof_t_prev = now;
+                if (++prof_n >= prof_every) {
+                    static int said;
+                    double fn = (double)prof_n;
+                    if (said)
+                        printf("[Burnout3] [frameprof] frame %.3f ms "
+                               "(%.1f fps) | render_frame %.3f ms | "
+                               "worst %.3f ms | ls_drawn %ld ls_suppressed %ld"
+                               " | n %ld\n",
+                               prof_acc_frame / fn,
+                               prof_acc_frame > 0.0
+                                   ? 1000.0 * fn / prof_acc_frame : 0.0,
+                               prof_acc_scene / fn, prof_worst,
+                               g_ls_frames, g_ls_suppressed, prof_n);
+                    else
+                        printf("[Burnout3] [frameprof] first window DISCARDED "
+                               "(shader compiles, first uploads, chain "
+                               "build)\n");
+                    said = 1;
+                    fflush(stdout);
+                    prof_acc_frame = prof_acc_scene = 0.0;
+                    prof_worst = 0.0;
+                    prof_n = 0;
+                }
+            }
             B3_WEB_T1(B3_WEB_PROF_SCENE, t_scene); }
         // Screenshot/dump captures read the BACK buffer, so they must run
         // BEFORE the swap -- after it the back buffer holds stale previous-
@@ -22554,6 +24401,68 @@ int main(int argc, char* argv[]) {
                         SDL_FreeSurface(s2);
                     }
                     free(px);
+                }
+            }
+        }
+        /* B3_PAUSE_AT=<frame> -- OPEN THE PAUSE OVERLAY, for a harness.
+         *
+         * The overlay is a keypress away for a player and unreachable for a
+         * headless run, so the settings screen had no way to be photographed
+         * or regression-checked at all.  This is the same shape B3_SHOT_FRAME
+         * has and it is read once; the overlay then behaves exactly as if
+         * ESCAPE had been pressed on that frame, cursor and all
+         * (B3_PAUSE_ROW=<n> parks the cursor on a given row). */
+        {
+            static int pause_at = -1;
+            if (pause_at < 0) {
+                const char* pa = getenv("B3_PAUSE_AT");
+                pause_at = pa ? atoi(pa) : 0;
+                if (pause_at > 0) {
+                    const char* pr = getenv("B3_PAUSE_ROW");
+                    if (pr && *pr) g_pause_row = atoi(pr);
+                }
+            }
+            if (pause_at > 0 && g_frame_count == pause_at && !g_paused) {
+                g_paused = 1;
+                /* B3_PAUSE_KEYS="down,down,down,enter" -- a KEY SCRIPT, run
+                 * through the real SDL queue and therefore through the real
+                 * handler above.  A harness that reached in and flipped the
+                 * setting directly would gate the setting and not the MENU,
+                 * and the menu is the thing with a cursor, a hit test and a
+                 * key-repeat rule to get wrong. */
+                const char* ks = getenv("B3_PAUSE_KEYS");
+                if (ks && *ks) {
+                    static const struct { const char* n; int sc; } K[] = {
+                        { "up",    SDL_SCANCODE_UP },
+                        { "down",  SDL_SCANCODE_DOWN },
+                        { "left",  SDL_SCANCODE_LEFT },
+                        { "right", SDL_SCANCODE_RIGHT },
+                        { "enter", SDL_SCANCODE_RETURN },
+                        { "space", SDL_SCANCODE_SPACE },
+                        { NULL, 0 }
+                    };
+                    const char* q = ks;
+                    while (*q) {
+                        char name[16];
+                        size_t n = 0;
+                        while (*q && *q != ',' && n + 1 < sizeof name)
+                            name[n++] = *q++;
+                        name[n] = 0;
+                        while (*q == ',') q++;
+                        for (int i = 0; K[i].n; i++) {
+                            if (strcmp(name, K[i].n)) continue;
+                            SDL_Event ke;
+                            SDL_zero(ke);
+                            ke.type = SDL_KEYDOWN;
+                            ke.key.keysym.scancode = K[i].sc;
+                            SDL_PushEvent(&ke);
+                            SDL_zero(ke);
+                            ke.type = SDL_KEYUP;
+                            ke.key.keysym.scancode = K[i].sc;
+                            SDL_PushEvent(&ke);
+                            break;
+                        }
+                    }
                 }
             }
         }

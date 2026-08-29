@@ -297,6 +297,23 @@ int      b3_music_crash_layer(void);     /* B3MUSIC_CRASH_LAYER_*, -1 off */
 float    b3_music_crash_gain(void);      /* the recovered 0..0.70 volume  */
 float    b3_music_crash_elapsed(void);   /* seconds of bed emitted        */
 float    b3_music_crash_duck(void);      /* the song duck the bed asks for*/
+
+/* 1 while the SONG is frozen under a crash cinematic -- B3_MUSIC_CRASH's
+ * default "pause" mode.  The bed keeps playing; the song neither sounds
+ * nor advances, so it resumes on the sample it stopped on.  This is [S]:
+ * retail runs the song at 0.30 under the 0.70 bed and never pauses it
+ * (RE_MUSIC.md section 6.3).  B3_MUSIC_CRASH=retail restores that.      */
+int      b3_music_song_held(void);
+
+/* The DJ's hand-over: while held there is NO song -- the current one is
+ * stopped and the pump will not roll on to the next.  Releasing starts
+ * the next song, which is retail's order (RE_CRASHFM.md section 6.3).  */
+void     b3_music_set_hold(int on);
+int      b3_music_held(void);
+
+/* The song's share of the last mixed sample, crash bed excluded.
+ * Gating only -- see the note in burnout3_music.c.                      */
+float    b3_music_last_song_sample(void);
 unsigned b3_music_crash_starts(void);    /* beds started since init       */
 unsigned b3_music_crash_underruns(void);
 

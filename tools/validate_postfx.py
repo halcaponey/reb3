@@ -719,8 +719,15 @@ def section_d(defs):
     check("D5 the gain multiplies the recovered cloud constant rather than "
           "replacing it",
           "B3_SKY_CLOUD_C0_RGB * postfx_sky_gain()" in src)
-    check("D6 both dome passes take the same one gain (no per-channel fit)",
-          src.count("postfx_sky_gain()") == 2
+    # THREE, not two: the two dome passes and b3_sky_horizon_band(), which
+    # READS what those two passes write (the photorealism layer's tier-3 fade
+    # target).  A reader that dropped the gain would report a sky the dome
+    # does not draw, so it belongs under this same claim -- what is being
+    # gated is that ONE scalar gain serves every use, not how many uses there
+    # are.  Anything that took a per-channel or a second gain would still fail.
+    check("D6 both dome passes and the horizon read take the same one gain "
+          "(no per-channel fit)",
+          src.count("postfx_sky_gain()") == 3
           and 'getenv("B3_POSTFX_SKYGAIN")' in src)
     # D7 -- the sky's two TUNED magnitudes are GONE (the dome gain and the
     # cloud gain both derive from the recovered blit colour now), so the only

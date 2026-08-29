@@ -129,7 +129,8 @@
     X(PACE,         pace)         \
     X(PROPS,        props)        \
     X(SCENERY,      scenery)      \
-    X(LIGHT_PROBES, light_probes)
+    X(LIGHT_PROBES, light_probes) \
+    X(BVH,          bvh)
 
 typedef int (*cx_stage_fn)(const char *game_dir, const char *track_dir,
                            const char *track_id, const char *out_dir);
@@ -307,6 +308,25 @@ int cx_extract_props(const char *game_dir, const char *track_dir,
 int cx_extract_scenery(const char *game_dir, const char *track_dir,
                        const char *track_id, const char *out_dir);
 
+#define CX_HAVE_BVH 1
+/* NO PYTHON ORACLE and NO RETAIL COUNTERPART -- a DERIVED artefact, see
+ * cx_bvh.c's header.  -> <out_dir>/bvh.bin ('B3BV' v1): a binned-SAH BVH2
+ * over the STATIC world (the opaque track submeshes out of track.obj, every
+ * prop placement out of props.bin and every scenery placement out of
+ * scenery.bin, baked to world space), flattened depth-first with ESCAPE
+ * INDICES so an ESSL 1.00 fragment shader can walk it with no stack.  It
+ * serves the INSPIRED ray-traced sun shadow (docs/PHOTOREALISM.md tier 4r)
+ * and is NOT a claim about Burnout 3 -- the Xbox had no such structure.
+ *
+ * It runs LAST in CX_STAGE_LIST because it reads three earlier stages'
+ * output rather than the game files, the same ordering rule nav_edges has
+ * against bgd_paths.  Because it has no oracle, verify_cextract.py cannot
+ * cover it -- tools/validate_bvh.py is the gate, and it re-derives the
+ * geometry from the same three artefacts and re-traces rays against a
+ * brute-force reference. */
+int cx_extract_bvh(const char *game_dir, const char *track_dir,
+                   const char *track_id, const char *out_dir);
+
 #define CX_HAVE_LIGHT_PROBES 1
 /* tools/extract_light_probes.py -> <out_dir>/light_probes.bin ('B3LP').  The
  * 9-byte quantised SH probe per collision vertex that FUN_0019D400 samples by
@@ -441,6 +461,17 @@ int cx_extract_rws(const char *game_dir, const char *out_root);
  * paths are ported for completeness and are unexercised.  Set CX_NO_FFMPEG to
  * dump the .wma only (the python's --no-ffmpeg). */
 int cx_extract_xwb(const char *game_dir, const char *out_root);
+
+/* ONE bank, and nothing else.  What src/burnout3_isodata.c calls when the
+ * game opens build/audio/<BANK>/NNN.wav in iso mode -- the stage above is the
+ * whole-disc dump, 33 banks and 885 entries with the two 361 MB EA TRAX banks
+ * in the middle of it, which is not a thing to do when Crash FM wants one
+ * line.  `bank_name` is the OUTPUT directory name, i.e. the bank's own
+ * BANKDATA name ("DJGEN", "US_C1"), not its filename -- on disc every one of
+ * these carries a language prefix and the per-track banks are all called
+ * E_DJRACE.xwb.  See the block comment above the definition. */
+int cx_extract_xwb_one(const char *game_dir, const char *out_root,
+                       const char *bank_name);
 
 #define CX_HAVE_AUDIO_EATRAX 1
 /* tools/extract_eatrax.py -> <out_root>/track_NN.wav + eatrax.txt.  The 44
@@ -710,10 +741,41 @@ int cx_extract_traffic_cars(const char *game_dir, const char *track_dir,
  * hatch for a stage outside the seven lettered blocks: this is not agent D's
  * family and its block may not be edited from here. */
 #define CX_GLOBAL_STAGES_EXTRA(X)   \
-    X(hulls)
+    X(hulls)                        \
+    X(car_bvh)
 
 #define CX_HAVE_HULLS 1
 int cx_extract_hulls(const char *game_dir, const char *out_root);
+
+/* --- the CARS' ray-tracing tree --- */
+/* <out_root>/build/cars/carbvh.bin ('B3CV' v1): one MODEL-SPACE BVH per
+ * vehicle -- both fleets, 67 .bgv + 40 .btv -- in one file, for the optional
+ * ray-traced sun shadow's two-level trace.  Module: tools/cextract/cx_car_bvh.c.
+ *
+ * The static world's tree (cx_bvh.c) cannot hold a car, because a BVH is built
+ * once and a car moves every frame.  A car is RIGID, though, so its tree is
+ * built ONCE in model space and the per-frame cost is one 3x4 matrix per
+ * instance; src/burnout3_aftereffects.c uploads those as uniforms and the
+ * shadow ray transforms itself into each car's space rather than anything
+ * being rebuilt.  Both artefacts are flattened by the SAME builder
+ * (tools/cextract/cx_bvh_build.c) so the two cannot drift apart from the one
+ * ESSL 1.00 traversal that walks them.
+ *
+ * DUMP-GLOBAL, and it reads the .bgv/.btv CONTAINERS through cx_cars_common.c
+ * rather than the OBJs that cx_cars_bgv.c writes -- deliberately, because the
+ * traffic fleet's OBJs are written PER TRACK and a global artefact may not
+ * depend on which tracks somebody happened to visit first.  That makes "is
+ * this the mesh the renderer draws" a claim rather than a construction, so it
+ * is gated: tools/validate_car_bvh.py re-derives the triangle set from
+ * build/cars/<NAME>_intact.obj and compares it as a multiset.
+ *
+ * NO PYTHON ORACLE and no retail counterpart -- the Xbox drew a blobbyshadow
+ * quad and nothing else.  INSPIRED; see src/burnout3_rt.h.
+ *
+ * Registered through CX_GLOBAL_STAGES_EXTRA for the same reason `hulls` is:
+ * it is not agent D's family and that block may not be edited from here. */
+#define CX_HAVE_CAR_BVH 1
+int cx_extract_car_bvh(const char *game_dir, const char *out_root);
 
 /* --- purge 2: the RUNTIME ASSETS that retire the last compiled-in tables ---
  *

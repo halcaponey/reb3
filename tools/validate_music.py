@@ -421,10 +421,20 @@ int main(void) {
 def build_probe(ck):
     with open(PROBE_C, "w") as f:
         f.write(PROBE_SRC.replace("/*CRASHPROBE*/", CRASH_PROBE))
+    # burnout3_hud.c draws through the retained renderer's 2D batcher
+    # (b3r2d_*, b3r_state_*), which in turn needs the track-mesh material
+    # decode -- so those come along even though this probe never draws.
+    # burnout3_music.c calls into the DJ for the hand-over, and the DJ
+    # reaches the backend/emu pair.  Same shape as validate_boostfx.py.
     cmd = ["gcc", "-O2", "-std=c11", "-I", os.path.join(REPO, "src"),
            "-o", PROBE, PROBE_C,
            os.path.join(REPO, "src", "burnout3_music.c"),
-           os.path.join(REPO, "src", "burnout3_hud.c"), "-lm"]
+           os.path.join(REPO, "src", "burnout3_hud.c"),
+           os.path.join(REPO, "src", "burnout3_render.c"),
+           os.path.join(REPO, "src", "burnout3_trackmesh.c"),
+           os.path.join(REPO, "src", "burnout3_dj.c"),
+           os.path.join(REPO, "src", "burnout3_backend.c"),
+           os.path.join(REPO, "src", "burnout3_emu.c"), "-lm"]
     try:
         cmd += subprocess.check_output(
             ["pkg-config", "--cflags", "--libs", "sdl2", "SDL2_image"]
@@ -436,8 +446,19 @@ def build_probe(ck):
     if r.returncode != 0:
         print(r.stderr.decode()[-2000:])
         raise SystemExit("could not build the probe")
-    out = subprocess.check_output([PROBE], cwd=REPO).decode()
-    return out
+    return run_probe()
+
+
+def run_probe(env_extra=None):
+    """Run the already-built probe, optionally under extra env.
+
+    B3_MUSIC_CRASH is latched on first use inside the module, so the two
+    crash arms cannot be exercised in one process -- the retail arm is a
+    second run rather than a second call."""
+    env = dict(os.environ)
+    if env_extra:
+        env.update(env_extra)
+    return subprocess.check_output([PROBE], cwd=REPO, env=env).decode()
 
 
 def check_selection(out, D, ck, playable):
@@ -736,6 +757,28 @@ CRASH_PROBE = r'''
         printf("CRASHGAIN %.6f %d %d\n", b3_music_crash_gain(),
                b3_music_crash_playing(), b3_music_crash_file());
 
+        /* THE SONG UNDER THE BED.  b3_music_next_sample() is song + bed
+         * and the bed is deliberately loud here, so the mixed channel
+         * cannot answer this -- b3_music_last_song_sample() is the
+         * song's own share of it.  Peak rather than RMS: no math.h in
+         * this probe, and the CRASHPEAK block below already does it
+         * this way. */
+        {
+            float pk = 0.0f;
+            for (int k = 0; k < 30; k++) {
+                b3_music_crash_tick(1, 5, DT);
+                b3_music_pump();
+                for (int s = 0; s < 735; s++) {
+                    float g;
+                    b3_music_next_sample();
+                    g = b3_music_last_song_sample();
+                    if (g < 0.0f) g = -g;
+                    if (g > pk) pk = g;
+                }
+            }
+            printf("CRASHSONG %.6f %d\n", pk, b3_music_song_held());
+        }
+
         /* the release */
         printf("CRASHFADE");
         for (int k = 0; k < 60; k++) {
@@ -770,16 +813,24 @@ CRASH_PROBE = r'''
 '''
 
 
-def check_crashbed_c(out, D, ck, have):
-    print("\n[10] the crash bed through the module itself")
-    if not have:
-        print("  --   beds not extracted, module not exercised")
-        return
+def _crash_keys(out):
     K = {}
     for line in out.splitlines():
         f = line.split()
         if f and f[0].startswith("CRASH"):
             K[f[0]] = f[1:]
+    return K
+
+
+def check_crashbed_c(out, D, ck, have, out_retail=None):
+    print("\n[10] the crash bed through the module itself")
+    if not have:
+        print("  --   beds not extracted, module not exercised")
+        return
+    K = _crash_keys(out)
+    KR = _crash_keys(out_retail) if out_retail else None
+    if KR is not None and "CRASHSONG" not in KR:
+        KR = None
     if "CRASHARM" not in K:
         ck.true("the probe ran the crash bed", False, "no CRASH lines")
         return
@@ -817,12 +868,32 @@ def check_crashbed_c(out, D, ck, have):
           float(K["CRASHGAIN"][0]), vol, "mgr+0x834 * [0x003EC418]")
     ck.eq("and it is playing", int(K["CRASHGAIN"][1]), 1, "")
 
+    # --- what happens to the SONG under the bed, both arms -----------
+    # B3_MUSIC_CRASH picks between them, so the suite tests the SWITCH
+    # rather than whichever side happens to be the default.
     duck = [float(v) for v in K["CRASHDUCK"]]
-    ck.eq("at retail's own 0.30 master nothing is ducked", duck[1], 1.0,
-          "the recovered mix state machine ducks nothing")
-    ck.eq("at the harness's 0.65 master the song drops to 0.30 absolute",
-          duck[0] * 0.65, D["B3MUSIC_SONG_VOL_F"],
-          "DEVIATION (TUNED): restores retail's 0.30 + 0.70 = 1.0")
+    ck.eq("the default pauses the song under the bed",
+          float(K["CRASHSONG"][0]), 0.0,
+          "[S] user request 2026-08-28; the bed still plays")
+    ck.eq("and it is held, not stopped", int(K["CRASHSONG"][1]), 1,
+          "b3_music_song_held(): resumes on the sample it stopped on")
+    ck.eq("a paused song is not also ducked", duck[0], 1.0,
+          "one mechanism, not two fighting over the fader")
+
+    if KR is None:
+        ck.true("B3_MUSIC_CRASH=retail was exercised", False, "no second run")
+    else:
+        rduck = [float(v) for v in KR["CRASHDUCK"]]
+        ck.true("B3_MUSIC_CRASH=retail keeps the song audible",
+                float(KR["CRASHSONG"][0]) > 0.0,
+                "[C] retail never pauses it -- RE_MUSIC.md 6.3")
+        ck.eq("and does not report it held", int(KR["CRASHSONG"][1]), 0,
+              "the pause is the only thing that holds")
+        ck.eq("at retail's own 0.30 master nothing is ducked", rduck[1], 1.0,
+              "the recovered mix state machine ducks nothing")
+        ck.eq("at the harness's 0.65 master the song drops to 0.30 absolute",
+              rduck[0] * 0.65, D["B3MUSIC_SONG_VOL_F"],
+              "DEVIATION (TUNED): restores retail's 0.30 + 0.70 = 1.0")
 
     fade = [float(v) for v in K["CRASHFADE"]]
     dt = 1.0 / 60.0
@@ -893,7 +964,8 @@ def main():
     check_banner_text(ck, rows)
     check_crashbed_binary(img, D, ck)
     beds = check_crashbed_assets(D, ck)
-    check_crashbed_c(out, D, ck, beds)
+    check_crashbed_c(out, D, ck, beds,
+                     run_probe({"B3_MUSIC_CRASH": "retail"}) if beds else None)
 
     print("\n%s: %d/%d checks green" %
           ("PASS" if not ck.fail else "FAIL",

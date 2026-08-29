@@ -105,16 +105,31 @@ const char *b3_iso_cache(void);     /* the cache root,      "" in build mode */
  * pass straight into fopen/IMG_Load, not fine to hold across a dozen more
  * calls.  Anything that is not a "build/..." path is returned unchanged.
  *
- * MAIN THREAD ONLY, AND STILL IS.  The ring is unsynchronised, and so is the
- * stage runner behind it -- a cextract stage chdir()s into its output root
- * while it works.  Every asset open in this port is already on the main thread
- * (the audio thread reads a ring the main thread filled -- see the threading
- * note at the top of src/burnout3_music.c), and that has to stay true.
+ * MAIN THREAD, AND ONE NAMED EXCEPTION.  The rule was "main thread only",
+ * and for every asset in the game it still is.  The exception is the music
+ * module's decode worker: an EA TRAX song is ~0.5 s of WMA and decoding it
+ * on the frame thread froze a live race for that long (and, worse, drew the
+ * retail loading screen over the race to hide it).  So the worker calls this
+ * for exactly one shape of path -- build/music/track_NN.wav -- and nothing
+ * else may be handed to it.  What makes that legal:
+ *
+ *   - the return ring is __thread, so a cache HIT touches no shared state
+ *     and cannot be stalled behind the worker;
+ *   - the materialise SLOW path takes one mutex, so two extractions cannot
+ *     interleave;
+ *   - 'T:eatrax:<n>' is deliberately not a GLOBAL_FN stage and never
+ *     chdir()s.  chdir is process-global and would send the game thread's
+ *     next relative open somewhere else entirely, so run_global() now
+ *     REFUSES to run off the main thread rather than trusting this note.
+ *
+ * Everything else -- every loader in src/ -- is still main-thread-only, and
+ * that has to stay true.
  *
  * There ARE worker threads in a load now -- the extraction stages walk their
  * per-item fleets on tools/cextract/cx_pool.h, and load_track_textures()
  * inflates a track's PNGs there -- and NONE of them calls this.  The rule they
- * keep is: THE MAIN THREAD RESOLVES, THE WORKER OPENS WHAT IT WAS HANDED.  A
+ * keep is (the music worker above being the one documented exception):
+ * THE MAIN THREAD RESOLVES, THE WORKER OPENS WHAT IT WAS HANDED.  A
  * worker only ever sees a path this function has already returned, which is
  * either an absolute cache path or (in build mode, or for a non-asset) the
  * literal one; both leave resolve_inner() at its first two tests without
@@ -160,6 +175,18 @@ int   b3_iso_track_available(const char *track_id);
  * "not my question, probe the build/ tree the way you always did". */
 int   b3_iso_music_available(int song);
 
+/* IS THIS DJ BANK AVAILABLE?  The same question a third time, for Crash FM.
+ * A bank is materialised one at a time (build/audio/<BANK>/), so asking by
+ * opening a line would extract the bank in order to find out whether the disc
+ * has it.  The answer comes off the disc's directory instead.
+ *
+ * `bank` is the output/BANKDATA name -- "DJGEN", "DJWWW", "US_C1".  Returns
+ * 1 = yes, 0 = no, and -1 for "not my question": in build mode, and ALSO for
+ * a per-track commentary bank, whose source path cannot be derived from its
+ * name (every one of them is called E_DJRACE.xwb).  See the comment on the
+ * definition. */
+int   b3_iso_dj_available(const char *bank);
+
 /* ------------------------------------------------- PROGRESS (additive seam)
  * Materialising a unit takes a while, and the CALLING thread cannot draw
  * while it does (see the MAIN THREAD ONLY note above -- a unit's own internal
@@ -184,6 +211,12 @@ int   b3_iso_music_available(int song);
 typedef void (*b3_iso_progress_fn)(const char *stage, const char *track_id,
                                    int index, int total, void *user);
 void b3_iso_set_progress(b3_iso_progress_fn cb, void *user);
+
+/* 1 if `path` resolves without running a stage -- it is already in the
+ * cache (or we are not in iso mode).  Never extracts anything.  Lets a
+ * caller decide between opening on this frame and handing the work to a
+ * worker; see the materialise worker in burnout3_music.c.              */
+int b3_iso_is_materialised(const char *path);
 
 #ifdef __cplusplus
 }

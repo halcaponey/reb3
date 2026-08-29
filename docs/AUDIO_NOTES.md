@@ -250,7 +250,11 @@ rate/channel sanity, exact byte counts, RMS 1800–15800).
 ## 4. Not extracted / open items
 
 - **XWB cue names**: ENTRYNAMES segments are empty; DJ line names would have
-  to come from the XACT sound bank compiled into the XBE.
+  to come from the XACT sound bank compiled into the XBE. This turns out not
+  to matter for the radio: retail addresses a DJ line by **integer index
+  only**, never by name — see docs/RE_CRASHFM.md section 1.3. The 807
+  speech entries break down as 18 per-track banks of 38, three region banks
+  of 20, `DJGEN` 18, `DJWWW` 10 and seven mode banks of 5.
 - **AWD [unknown] fields**: header dwords @0x38/0x3C/0x44 and the per-wave
   `4/6` dword — constant-ish, not needed for extraction.
 - **RWS segment u32** after the segment name (0 or 2) — unexplained,

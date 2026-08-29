@@ -307,6 +307,12 @@ BUILD / RUN
                                 fixed-function path left in those four.
                                 docs/web/webprof_sweep.md "fourth wave" has the
                                 call counts, the pixel gates and what is left.
+  src/burnout3_rt.c/.h          tier 4r: the OPTIONAL ray-traced sun shadow's
+                                switch (build/settings.cfg), its per-track BVH
+                                loader and a GL-free reference traversal the
+                                suites execute.  OFF by default, and with it
+                                off the frame is the build before it, bit for
+                                bit.  INSPIRED -- see docs/PHOTOREALISM.md.
   src/burnout3_backend.c/.h     per-feature RE-vs-retail switch (build/backends.cfg)
   src/burnout3_emu.c            the bridge to the Unicorn sidecar
   src/*_runtime.h               loaders that replaced the eight baked-in headers

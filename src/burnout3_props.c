@@ -90,6 +90,20 @@
  * B3_PROP_BALLISTIC=1 still skips the whole pass. */
 #define B3P_WORLD_RESTITUTION  0.1f    /* [0x003A69C4] @0x001094C5      [C] */
 
+/* The one harness guard on the knock gate, m/s.  Retail ships nothing here --
+ * FUN_001084E0 @0x00113901 is purely geometric -- so this is GLUE, and it is
+ * deliberately a SPEED and not a normal component: see the note at the gate in
+ * b3p_collide().  A car doing anything at all clears it; a parked one does
+ * not, which is the only case it exists for. */
+#define B3P_KNOCK_MIN_SPEED    0.05f   /* GLUE */
+
+/* How far below its own authored ground a knocked prop has to be, with no
+ * collision soup and no surface under it, before it counts as having left the
+ * world and is retired.  GLUE -- see the note at its use.  Generous enough
+ * that a real drop off a raised section (the tallest on the shipped tracks is
+ * under 20 m) is a FLIGHT and not a retirement. */
+#define B3P_LOST_BELOW         25.0f   /* GLUE */
+
 typedef struct {
     float bb_min[3], bb_max[3];
     unsigned first_vertex, n_vertex, first_index, n_index;
@@ -100,6 +114,11 @@ typedef struct {
     /* runtime */
     unsigned tex;
     unsigned list;
+    /* FUN_001084E0 @0x001084EF/@0x001085B4: the gate's two derived numbers,
+     * the bbox CENTRE and the bbox HALF EXTENTS, both in model space.  Held
+     * per model because the gate rebuilds them from the same bbox every call
+     * and nothing about them is per instance.                            [C] */
+    float bb_c[3], bb_h[3];
 } B3PropModel;
 
 /* World-slot type, exactly the retail one: 5 = static prop, 6 = knocked
@@ -114,9 +133,24 @@ typedef struct {
     unsigned prop_class;
     unsigned unit;
     float ground_y;        /* surface height under the authored position     */
+    float bound_r;         /* broad-phase radius: |ax_k| . h_k summed, which
+                            * bounds the instance's OBB whatever its rotation
+                            * (the instance matrices carry scale -- row
+                            * lengths run 1.000..1.516 on US_C1_V1 -- and
+                            * b3p_orthonormalize only ever shrinks them, so
+                            * the load-time value stays conservative).       */
     short body;            /* class-6 body slot, -1 = none                   */
     unsigned char state;
     unsigned char has_ground;
+    unsigned char aud_swept;   /* B3_PROP_AUDIT: the car's SWEPT box overlapped
+                                * this instance at some point in the run     */
+    unsigned char aud_hit;     /* B3_PROP_AUDIT: a contact was admitted      */
+    unsigned char aud_rest;    /* B3_PROP_AUDIT: reached rest -- frozen by the
+                                * world resolve, or retired to B3P_SETTLED   */
+    float aud_disp;            /* B3_PROP_AUDIT: furthest the instance has
+                                * travelled from its authored transform, m   */
+    float aud_turn;            /* B3_PROP_AUDIT: 1 - (live up . authored up),
+                                * 0 = upright, 1 = on its side, 2 = inverted */
 } B3PropInst;
 
 /* One of the 16 class-6 rigid bodies (gameworld+0xC4380, stride 0x780).
@@ -133,11 +167,41 @@ typedef struct {
     float bbmin[3];        /* +0x1E0, ditto @0x0011A0AF                      */
     int   owner;           /* +0x220 as a prop instance index, -1 = free     */
     unsigned char frozen;  /* +0x20E, the settle latch FUN_00109EA0 raises   */
+    unsigned char hit_211; /* +0x211, "a rigid PAIR contact touched me this
+                            * frame" -- FUN_00113960 sets it on both bodies
+                            * (@0x00113B4x); FUN_00109560 @0x00109592 reads it
+                            * and only then clears the sleep latch, so being
+                            * hit by a car is what WAKES a settled prop.  [C] */
 } B3PropBody;
 
 static B3PropModel* g_model;
 static B3PropInst*  g_inst;
 static B3PropBody   g_body[B3P_MAX_LIVE];
+
+/* Which of FUN_001084E0's three contact-point arms decided each contact:
+ * [0] one of A's face normals, [1] one of B's, [2] an edge cross.  Telemetry
+ * only -- the edge arm is the one still standing on GLUE, so its share is
+ * worth being able to quote. */
+static unsigned long g_obb_arm[3];
+
+/* Regression telemetry for the two defects section 12 fixed, so neither can
+ * come back silently:
+ *   g_lost  -- props retired for having left the world entirely.  A prop
+ *              falling through the road looks exactly like a prop flying away
+ *              if all you read is "max travel", which is how the old single
+ *              plane-per-polygon narrow phase hid for a whole wave.
+ *   g_creep -- the fastest an UNDISTURBED frozen body is still moving.
+ *              "Undisturbed" is the whole point: the freeze deliberately does
+ *              not clear the impulse accumulator +0x110 (retail rejoins the
+ *              normal path @0x00109728 so a car can still knock a settled
+ *              prop), so a frozen body that took a world or pair contact this
+ *              frame legitimately carries it -- sampling those measures the
+ *              knock, not the creep, and reads tens of m/s.  Sampled only when
+ *              the body is frozen and NOTHING touched it, which is exactly the
+ *              state the old un-acted-on latch left drifting at 0.15-0.31 m/s
+ *              for the rest of the race. */
+static unsigned long g_lost;
+static float g_creep;
 
 /* Point every pooled body at its own frame storage.
  *
@@ -163,6 +227,92 @@ static unsigned g_nvtx, g_nidx;
 static char g_dir[512];
 static B3RInstSet*   g_retained;
 static unsigned char* g_retained_skip;   /* one byte per instance */
+
+/* ---- B3_PROP_AUDIT: contact-admission telemetry, off by default ---------
+ * Resolved once and cached, so the OFF cost is one `if (g_audit)` per collide
+ * call.  See the sweep block in b3p_collide(). */
+#define B3P_AUDIT_CARS 8
+static int   g_audit = -1;
+static float g_aud_prev[B3P_AUDIT_CARS][3];
+static float g_aud_prev_ax[B3P_AUDIT_CARS][3][3];
+static unsigned char g_aud_have[B3P_AUDIT_CARS];
+static float g_aud_next_report;
+
+static void b3p_audit_init(void) {
+    if (g_audit >= 0) return;
+    const char* e = getenv("B3_PROP_AUDIT");
+    g_audit = (e && *e && *e != '0') ? 1 : 0;
+}
+
+/* One cumulative line per second.  The LAST one in a run is the verdict the
+ * validator reads; the format is append-only, like the wreck log's. */
+static void b3p_audit_report(void) {
+    if (!g_audit || !g_ready) return;
+    if (g_clock < g_aud_next_report) return;
+    g_aud_next_report = g_clock + 1.0f;
+    int swept = 0, hit = 0, miss = 0, hit_only = 0;
+    int swept_cone = 0, hit_cone = 0, swept_sign = 0, hit_sign = 0;
+    for (int i = 0; i < g_ninst; i++) {
+        const B3PropInst* p = &g_inst[i];
+        int cls = (int)p->prop_class;
+        if (p->aud_swept) {
+            swept++;
+            if (cls == 1) swept_cone++;
+            if (cls == 6) swept_sign++;
+            if (p->aud_hit) {
+                hit++;
+                if (cls == 1) hit_cone++;
+                if (cls == 6) hit_sign++;
+            } else {
+                miss++;
+            }
+        } else if (p->aud_hit) {
+            hit_only++;     /* contacted without a swept sample: a teleport */
+        }
+    }
+    printf("[propaudit] t=%.1f swept %d admitted %d missed %d "
+           "(cones %d/%d, signposts %d/%d) untracked %d\n",
+           g_clock, swept, hit, miss, hit_cone, swept_cone,
+           hit_sign, swept_sign, hit_only);
+    /* Did the knock actually DO anything?  A gate that admits a contact but
+     * leaves the prop standing on its authored transform is no better than
+     * one that never fires, so the flight is measured on the same instances.
+     * `flew` counts an instance that left its transform by more than half a
+     * metre, `tumbled` one whose up axis turned past 60 degrees
+     * (1 - cos 60 = 0.5), `atrest` one the world resolve froze or the pool
+     * retired -- retail's two ways for a knocked prop to stop. */
+    int knocked = 0, flew = 0, tumbled = 0, atrest = 0;
+    int sflew = 0, sknock = 0;
+    float maxdisp = 0.0f;
+    for (int i = 0; i < g_ninst; i++) {
+        const B3PropInst* p = &g_inst[i];
+        if (!p->aud_hit) continue;
+        knocked++;
+        if (p->aud_disp > 0.5f) flew++;
+        if (p->aud_turn > 0.5f) tumbled++;
+        if (p->aud_rest) atrest++;
+        if (p->aud_disp > maxdisp) maxdisp = p->aud_disp;
+        if ((int)p->prop_class == 6) {
+            sknock++;
+            if (p->aud_disp > 0.5f) sflew++;
+        }
+    }
+    printf("[propflight] t=%.1f knocked %d flew %d tumbled %d atrest %d "
+           "maxdisp %.2f signposts %d/%d flew\n",
+           g_clock, knocked, flew, tumbled, atrest, maxdisp, sflew, sknock);
+    printf("[proparm] t=%.1f aface %lu bface %lu edge %lu lost %lu "
+           "creep %.4f\n", g_clock, g_obb_arm[0], g_obb_arm[1], g_obb_arm[2],
+           g_lost, g_creep);
+    if (getenv("B3_PROP_TRACE"))
+        for (int i = 0; i < g_ninst; i++) {
+            const B3PropInst* p = &g_inst[i];
+            if (p->aud_disp > 30.0f)
+                printf("[propfar] inst %d class %d disp %.1f state %d "
+                       "body %d\n", i, (int)p->prop_class, p->aud_disp,
+                       p->state, p->body);
+        }
+    fflush(stdout);
+}
 
 /* ---- small helpers ---------------------------------------------------- */
 static unsigned rd_u32(const unsigned char* p) {
@@ -307,7 +457,8 @@ static void b3p_build_inv_frame(B3RigidBody* rb) {
     for (int j = 0; j < 4; j++) rb->inv_frame[3][j] = -p[j];
 }
 
-static void b3p_integrate(B3RigidBody* rb, float mass, float com, float dt) {
+static void b3p_integrate(B3RigidBody* rb, float mass, float com, float dt,
+                          int frozen) {
     /* DAT_0040A8A0 = (0, -20, 0, 0), scaled by (1, mass, 1, -) */
     const float g[4] = { 0.0f, -20.0f * mass, 0.0f, 0.0f };
     float pt[4], r[3];
@@ -319,6 +470,30 @@ static void b3p_integrate(B3RigidBody* rb, float mass, float com, float dt) {
     rb->torque_acc[0] += r[1]*g[2] - r[2]*g[1];
     rb->torque_acc[1] += r[2]*g[0] - r[0]*g[2];
     rb->torque_acc[2] += r[0]*g[1] - r[1]*g[0];
+
+    /* THE SLEEP LATCH, @0x00109692..0x001096EC [C].  After the gravity
+     * accumulation and before the accumulators are consumed, a body whose
+     * +0x20E is still raised has its whole dynamic state zeroed: omega
+     * (+0xD0), angular momentum (+0xE0), velocity and speed (+0xB0..+0xBC),
+     * the travel direction reset to matrix row 2 (+0xC0 = [[+0x204]+0x20]),
+     * and BOTH accumulators +0xF0/+0x100 cleared -- which cancels the gravity
+     * just added.  Execution then rejoins the normal path @0x00109728, so the
+     * IMPULSE accumulator +0x110 is deliberately NOT cleared: a car that hits
+     * a settled prop still knocks it in the same frame.
+     *
+     * Without this a prop the world resolve had settled kept integrating with
+     * whatever residue it had left, and a cone at rest crept upward at about
+     * 0.02 m/s for the rest of the race. */
+    if (frozen) {
+        for (int i = 0; i < 4; i++) {
+            rb->vel[i] = 0.0f;
+            rb->omega[i] = 0.0f;
+            rb->angmom[i] = 0.0f;
+            rb->force_acc[i] = 0.0f;
+            rb->torque_acc[i] = 0.0f;
+            rb->dir[i] = rb->frame[2][i];
+        }
+    }
 
     const float dtv[4] = { dt, dt, dt, 0.0f };
     float vel4[4] = { rb->vel[0], rb->vel[1], rb->vel[2], rb->vel[3] };
@@ -548,6 +723,9 @@ void b3_props_shutdown(void) {
 
 int b3_props_load(const char* track_dir) {
     b3p_bind_body_frames();   /* the 4x4 is not inline any more */
+    b3p_audit_init();
+    memset(g_aud_have, 0, sizeof g_aud_have);
+    g_aud_next_report = 0.0f;
     b3_props_shutdown();
     if (!track_dir || !track_dir[0]) return 0;
     snprintf(g_dir, sizeof g_dir, "%s", track_dir);
@@ -610,6 +788,14 @@ int b3_props_load(const char* track_dir) {
         m->mat_flags    = rd_u32(r + 0x3C);
         memcpy(m->texture, r + 0x40, 31);
         m->texture[31] = 0;
+        /* FUN_001084E0 @0x0010851B/@0x001085B4 -- the gate's two derived
+         * numbers.  Done once here, in HARNESS space (the z reflection above
+         * has already swapped the z bounds back into min/max order). */
+        for (int k = 0; k < 3; k++) {
+            m->bb_c[k] = (m->bb_max[k] + m->bb_min[k]) * 0.5f;
+            m->bb_h[k] = (m->bb_max[k] - m->bb_min[k]) * 0.5f;
+            if (m->bb_h[k] < 0.0f) m->bb_h[k] = -m->bb_h[k];
+        }
     }
 
     for (unsigned i = 0; i < g_nvtx; i++) {
@@ -652,6 +838,23 @@ int b3_props_load(const char* track_dir) {
         if ((int)p->model >= g_nmodel) p->model = 0;
         p->state = B3P_REST;
         p->body = -1;
+        /* Broad-phase radius: sum_k |axis_k| * half_k bounds the OBB from its
+         * centre whatever the rotation, and the instance matrices carry scale
+         * (row lengths 1.000..1.516 on US_C1_V1), so it is measured off the
+         * authored matrix rather than assumed to be 1.  A knocked prop's frame
+         * is re-orthonormalised every step, which makes the axes unit -- so
+         * the bound is also floored at sum(half) and stays valid however the
+         * authored scale falls out. */
+        const B3PropModel* mm = &g_model[p->model];
+        float unit_r = 0.0f;
+        p->bound_r = 0.0f;
+        for (int k = 0; k < 3; k++) {
+            const float* ax = m + k * 4;
+            p->bound_r += sqrtf(ax[0]*ax[0] + ax[1]*ax[1] + ax[2]*ax[2])
+                        * mm->bb_h[k];
+            unit_r += mm->bb_h[k];
+        }
+        if (p->bound_r < unit_r) p->bound_r = unit_r;
     }
     free(d);
 
@@ -779,7 +982,11 @@ void b3_props_reset(void) {
         memcpy(p->cur, p->base, sizeof p->cur);
         p->state = B3P_REST;
         p->body = -1;
+        p->aud_swept = p->aud_hit = p->aud_rest = 0;
+        p->aud_disp = p->aud_turn = 0.0f;
     }
+    memset(g_aud_have, 0, sizeof g_aud_have);
+    g_aud_next_report = 0.0f;
     for (int i = 0; i < B3P_MAX_LIVE; i++) {
         memset(&g_body[i], 0, sizeof g_body[i]);
         /* the memset wiped rb.frame; re-point it at this slot's storage */
@@ -789,6 +996,9 @@ void b3_props_reset(void) {
     }
     g_live = 0;
     g_clock = 0.0f;
+    g_obb_arm[0] = g_obb_arm[1] = g_obb_arm[2] = 0;
+    g_lost = 0;
+    g_creep = 0.0f;
 }
 
 /* ---- knock ------------------------------------------------------------ */
@@ -839,6 +1049,7 @@ static int b3p_acquire(int self)
     if (prev >= 0 && prev < g_ninst) {
         g_inst[prev].state = B3P_SETTLED;      /* world slot -> type 8 */
         g_inst[prev].body = -1;
+        g_inst[prev].aud_rest = 1;             /* retired: retail's other stop */
     }
     g_body[victim].owner = -1;
     return victim;
@@ -892,7 +1103,8 @@ static void b3p_body_setup(B3RigidBody* rb, const float bbmax[4],
 
 /* FUN_0011A330 [C] minus the harness ground stop: the two quadratic drag
  * terms, FUN_00109560, and the matrix-w restore @0x0011A434. */
-static void b3p_body_step(B3RigidBody* rb, float mass, float com, float dt)
+static void b3p_body_step(B3RigidBody* rb, float mass, float com, float dt,
+                          int frozen)
 {
     /* force += dir * -(speed^2)          @0x0011A370, [0x003B16C0] */
     float f = B3P_LIN_DRAG * rb->vel[3] * rb->vel[3];
@@ -902,7 +1114,7 @@ static void b3p_body_step(B3RigidBody* rb, float mass, float com, float dt)
     for (int k = 0; k < 4; k++) rb->torque_acc[k] += rb->omega[k] * wl;
     /* in_race = body+0x210 = 0, state6 = (body+0x215 == 6) = 1, so gravity is
      * applied at pos + up*com_height and therefore tumbles the prop. */
-    b3p_integrate(rb, mass, com, dt);
+    b3p_integrate(rb, mass, com, dt, frozen);
     rb->frame[0][3] = rb->frame[1][3] = rb->frame[2][3] = 0.0f;
     rb->frame[3][3] = 1.0f;
 }
@@ -1011,7 +1223,9 @@ void b3_props_test_body_setup(const float frame[4][4], const float bbmax[4],
 }
 void b3_props_test_body_step(B3RigidBody* rb, float mass, float com_height,
                              float dt) {
-    b3p_body_step(rb, mass, com_height, dt);
+    /* the differential cases all seed a body with the latch DOWN, which is
+     * the arm FUN_0011A330 takes for a body in flight */
+    b3p_body_step(rb, mass, com_height, dt, 0);
 }
 float b3_props_test_contact(B3RigidBody* prop_rb, float prop_mass,
                             const B3RigidBody* car_rb, float car_mass,
@@ -1038,6 +1252,7 @@ void b3_props_update(float dt) {
     if (!g_ready || dt <= 0.0f) return;
     if (dt > 0.1f) dt = 0.1f;
     g_clock += dt;
+    b3p_audit_report();
 
     static int ballistic = -1;
     if (ballistic < 0) {
@@ -1060,35 +1275,89 @@ void b3_props_update(float dt) {
          * surface first, which is exactly the reported clipping. The same
          * gathered collision soup feeds live cars and wrecks: a knocked prop
          * must not be reduced to a single downward ground plane. */
+        /* "did anything touch this body this frame" -- a pair contact from
+         * last frame's collide pass, or a world contact from the pass below */
+        int touched = b->hit_211 ? 1 : 0;
         if (!ballistic) {
             int surf = -1;
+            int probed = -1;       /* the raw ground-probe verdict */
             int hit = 0;
             int slept = 0;
+            int nsoup = 0;
             float h = 0.0f, nn[3] = {0.0f, 1.0f, 0.0f};
             if (b3_collision_ready()) {
-                B3CollisionPoly soup[32];
+                /* 96, the same cap the chassis gather uses.  At 32 this
+                 * TRUNCATED on real track soup -- a barrier board crossing a
+                 * dense patch at 41 m/s saw a full 32-entry list that did not
+                 * happen to contain the floor under it, passed through the
+                 * road in one frame, and was never caught again (the next
+                 * frame's y-band no longer reached the surface, soup went to
+                 * 0, and it fell to the drag terminal velocity of 61.7 m/s
+                 * until the 16-body pool recycled it 20 s later). */
+                B3CollisionPoly soup[96];
                 float half[3];
                 float velocity[3] = {rb->vel[0], rb->vel[1], rb->vel[2]};
+                /* ONE FRAME OF TRAVEL, retail's own broad-phase margin:
+                 * FUN_0011BC60 sizes its query as |box| + speed * dt
+                 * (@0x0011BC7A the speed*dt, @0x0011BCD9/@0x0011BD17 the
+                 * norm) rather than the box alone, which is what stops a fast
+                 * body tunnelling between two discrete frames.  Without it a
+                 * prop moving 0.68 m per tick could step clean through a
+                 * surface its resting box would have overlapped. */
+                const float travel = rb->vel[3] * dt;
                 for (int axis = 0; axis < 3; axis++) {
                     float lo = fabsf(b->bbmin[axis]);
                     float hi = fabsf(b->bbmax[axis]);
-                    half[axis] = (lo > hi ? lo : hi) + 0.5f;
+                    half[axis] = (lo > hi ? lo : hi) + 0.5f + travel;
                 }
-                int nsoup = b3_collision_gather_walls(rb->frame[3], half,
-                                                       velocity, 1.1f, soup,
-                                                       (int)(sizeof(soup)
-                                                             / sizeof(soup[0])));
+                nsoup = b3_collision_gather_walls(rb->frame[3], half,
+                                                   velocity, 1.1f, soup,
+                                                   (int)(sizeof(soup)
+                                                         / sizeof(soup[0])));
+                /* ONE narrow phase over the WHOLE soup, ONE resolve -- which
+                 * is what retail does: FUN_0011A490 calls FUN_00109EA0 exactly
+                 * once @0x0011A706, over the single soup FUN_00109D20 gathered
+                 * @0x0011A5FB.  This loop used to call the SINGLE-PLANE form
+                 * once per polygon with `soup[poly].v0` as the plane point --
+                 * the very pair of defects burnout3_full.c's wreck path had
+                 * already found and fixed (see the note at its
+                 * b3_wreck_world_contact_soup call):
+                 *
+                 *  (a) the plane form has no polygon, so it fabricates a
+                 *      square of half-size |box dims| + 1 centred on the point
+                 *      it is handed.  A triangle's FIRST VERTEX is not under
+                 *      the prop, so a large road face produced NO CONTACT AT
+                 *      ALL -- a cone at rest 0.15 m above the road was given
+                 *      19 candidate polygons and zero contacts, fell through
+                 *      the surface, and once below it the gather's own y-band
+                 *      no longer reached the road (soup went to 0), so nothing
+                 *      could ever catch it again: it accelerated to the
+                 *      terminal velocity of the -1.0 quadratic drag, 44.7 m/s,
+                 *      and the audit's "max travel" was 900 m of FALL.
+                 *  (b) resolving per polygon applies N impulses and N
+                 *      push-outs in a frame where retail applies one, which
+                 *      levitated resting props 0.5..1.3 m into the air and
+                 *      kept them jittering there instead of settling.
+                 *
+                 * b3_rigid_body_obb_soup_contact is FUN_00107950 as written:
+                 * it clips the real triangles, sums the clipping faces'
+                 * normals and averages their centroids into one contact. */
+                B3WorldPoly wp[(int)(sizeof(soup) / sizeof(soup[0]))];
                 for (int poly = 0; poly < nsoup; poly++) {
-                    B3WorldContact ct;
-                    B3WorldContactResult res;
-                    if (!b3_rigid_body_obb_plane_contact(
-                            rb, b->bbmin, b->bbmax, soup[poly].v0,
-                            soup[poly].normal, &ct))
-                        continue;
+                    memcpy(wp[poly].v[0], soup[poly].v0, sizeof wp[poly].v[0]);
+                    memcpy(wp[poly].v[1], soup[poly].v1, sizeof wp[poly].v[1]);
+                    memcpy(wp[poly].v[2], soup[poly].v2, sizeof wp[poly].v[2]);
+                    memcpy(wp[poly].n,    soup[poly].normal, sizeof wp[poly].n);
+                }
+                B3WorldContact ct;
+                B3WorldContactResult res;
+                if (nsoup > 0
+                    && b3_rigid_body_obb_soup_contact(rb, b->bbmin, b->bbmax,
+                                                      wp, nsoup, &ct)) {
                     b3_rigid_body_world_contact(rb, b->mass, 6, 0,
                                                 B3P_WORLD_RESTITUTION, &ct,
                                                 &res);
-                    hit++;
+                    hit = 1;
                     if (res.sleep) slept = 1;
                 }
                 // Telemetry only; collision response above already used the
@@ -1096,47 +1365,130 @@ void b3_props_update(float dt) {
                 surf = b3_ground_probe(rb->frame[3][0],
                                        rb->frame[3][1] + b->radius + 1.0f,
                                        rb->frame[3][2], &h, nn);
+                probed = surf;      /* before the fallback below rewrites it */
             }
-            if (!hit && surf < 0 && p->has_ground) {
-                const float ppt[3] = {rb->frame[3][0], p->ground_y,
-                                       rb->frame[3][2]};
-                B3WorldContact ct;
-                B3WorldContactResult res;
-                if (b3_rigid_body_obb_plane_contact(rb, b->bbmin, b->bbmax,
-                                                     ppt, nn, &ct)) {
-                    b3_rigid_body_world_contact(rb, b->mass, 6, 0,
-                                                B3P_WORLD_RESTITUTION, &ct,
-                                                &res);
-                    hit = 1;
-                    slept = res.sleep;
+            /* GLUE anti-tunnelling net.  Retail has only the soup; this is
+             * the harness's floor of last resort, and it fires whenever the
+             * soup produced NO contact -- not, as it did before, only when
+             * the ground PROBE also failed.  That guard was backwards: the
+             * case it locked itself out of is precisely the one that matters,
+             * a prop over known ground that the (then broken) narrow phase
+             * refused, which is how a resting cone fell through the road.
+             * The PROBED height is preferred over the authored one because
+             * `ground_y` is sampled under the prop's AUTHORED position and is
+             * meaningless once it has been knocked anywhere. */
+            if (!hit) {
+                float gy = 0.0f;
+                int have = 0;
+                float gn[3] = {0.0f, 1.0f, 0.0f};
+                if (surf >= 0) {
+                    gy = h; have = 1;
+                    gn[0] = nn[0]; gn[1] = nn[1]; gn[2] = nn[2];
+                } else if (p->has_ground) {
+                    gy = p->ground_y; have = 1;
                 }
-                h = p->ground_y;
-                surf = 0;
+                if (have) {
+                    const float ppt[3] = {rb->frame[3][0], gy,
+                                           rb->frame[3][2]};
+                    B3WorldContact ct;
+                    B3WorldContactResult res;
+                    if (b3_rigid_body_obb_plane_contact(rb, b->bbmin,
+                                                         b->bbmax, ppt, gn,
+                                                         &ct)) {
+                        b3_rigid_body_world_contact(rb, b->mass, 6, 0,
+                                                    B3P_WORLD_RESTITUTION,
+                                                    &ct, &res);
+                        hit = 1;
+                        slept = res.sleep;
+                    }
+                    h = gy;
+                    surf = 0;
+                }
             }
+            /* @0x00109592..0x001095C1: the sleep latch is cleared ONLY when
+             * +0x211 says a rigid PAIR contact touched this body -- so a car
+             * ploughing into a settled prop wakes it, and nothing else does. */
+            if (b->hit_211) b->frozen = 0;
             if (slept) b->frozen = 1;
+            if (hit) touched = 1;
+
+            /* OUT OF THE WORLD.  FUN_0011A490 runs its whole gather/resolve
+             * only while the body is inside a LOADED STREAMING UNIT
+             * (+0x216 != 0xFF); when it is not, retail clears the body's
+             * accumulators instead (@0x0011A6D5) and the body stops being
+             * driven by contacts at all.  The harness has no streaming units,
+             * so the equivalent test is "no soup and no surface anywhere near
+             * it": a prop that has left the track through a seam the narrow
+             * phase missed.  Retiring it hands its slot straight back to the
+             * 16-body pool, which is where retail's own recycle
+             * (FUN_00114730 @0x0011480C, world slot -> type 8) would have put
+             * it anyway -- and it is the difference between a cone that is
+             * simply gone and one that accelerates to the drag terminal
+             * velocity for twenty seconds while holding a body hostage.
+             * GLUE, and the only thing left standing between a soup miss and
+             * an unbounded fall. */
+            if (nsoup == 0 && probed < 0 && p->has_ground
+                && rb->frame[3][1] < p->ground_y - B3P_LOST_BELOW) {
+                p->state = B3P_SETTLED;
+                p->body = -1;
+                p->aud_rest = 1;
+                b->owner = -1;
+                g_lost++;
+                if (g_live > 0) g_live--;
+                if (getenv("B3_PROP_TRACE"))
+                    printf("[proplost] t=%.2f inst %d fell %.1f m below its "
+                           "ground -- body %d retired\n", g_clock, (int)(p - g_inst),
+                           p->ground_y - rb->frame[3][1], s);
+                continue;
+            }
             if (getenv("B3_PROP_TRACE")) {
-                static float next_at = 0.0f;
-                if (g_clock >= next_at) {
-                    next_at = g_clock + 1.0f;
+                static float next_at[B3P_MAX_LIVE];
+                /* B3_PROP_TRACE_NEAR: every frame while the body is within
+                 * a few metres of the surface, which is the window a
+                 * tunnelling defect has to be caught in. */
+                int near = getenv("B3_PROP_TRACE_NEAR") && surf >= 0
+                        && fabsf(rb->frame[3][1] - h) < 3.0f;
+                if (near || g_clock >= next_at[s]) {
+                    if (!near) next_at[s] = g_clock + 1.0f;
                     printf("[propgnd] t=%.1f body %d inst %d pos=(%.2f %.3f "
-                           "%.2f) ground=%.3f dy=%+.3f hit=%d |v|=%.2f "
-                           "frozen=%d\n",
+                           "%.2f) ground=%.3f dy=%+.3f soup=%d hit=%d "
+                           "|v|=%.2f frozen=%d\n",
                            g_clock, s, b->owner, rb->frame[3][0],
                            rb->frame[3][1], rb->frame[3][2],
                            surf >= 0 ? h : -999.0f,
                            surf >= 0 ? rb->frame[3][1] - h : 0.0f,
-                           hit, rb->vel[3], b->frozen);
+                           nsoup, hit, rb->vel[3], b->frozen);
                 }
             }
         }
 
-        b3p_body_step(rb, b->mass, b->com_height, dt);
+        b3p_body_step(rb, b->mass, b->com_height, dt, b->frozen);
+        /* after the step, so this reads what the latch actually left behind,
+         * and only for a body NOTHING touched this frame -- see the note on
+         * g_creep. */
+        if (b->frozen && !touched && rb->vel[3] > g_creep)
+            g_creep = rb->vel[3];
+        b->hit_211 = 0;        /* consumed, like retail's per-frame scratch */
 
         /* @0x0011A434..0x0011A45B: the four matrix w slots are restored after
          * the integrator -- they carry the instance colour, not transform. */
         rb->frame[0][3] = rb->frame[1][3] = rb->frame[2][3] = 0.0f;
         rb->frame[3][3] = 1.0f;
         frame_to_mat(rb->frame, p->cur);
+
+        if (g_audit) {
+            float dx = p->cur[12] - p->base[12];
+            float dy = p->cur[13] - p->base[13];
+            float dz = p->cur[14] - p->base[14];
+            float dd = sqrtf(dx*dx + dy*dy + dz*dz);
+            if (dd > p->aud_disp) p->aud_disp = dd;
+            /* the authored up axis is row 1 of the authored matrix; both are
+             * unit after b3p_orthonormalize, so the dot is the cosine */
+            float t = 1.0f - (p->cur[4]*p->base[4] + p->cur[5]*p->base[5]
+                            + p->cur[6]*p->base[6]);
+            if (t > p->aud_turn) p->aud_turn = t;
+            if (b->frozen) p->aud_rest = 1;
+        }
     }
 }
 
@@ -1152,12 +1504,286 @@ int b3_props_body_state(int instance, B3RigidBody* out_rb, float* out_mass,
     return 1;
 }
 
+/* =========================================================================
+ * FUN_001084E0 [C] -- retail's "may I knock it" gate, @0x001084EF..0x00108C71.
+ *
+ * FUN_00113890 (the dispatcher's prop arm) calls this at @0x00113901 and it is
+ * the WHOLE admission test: no mass veto, no size veto and -- the part that
+ * matters here -- NO VELOCITY TEST.  Re-read out of build/burnout3.elf with a
+ * capstone sweep over the PT_LOAD segments (the Ghidra bridge was refusing
+ * connections); the earlier record described it only as "reads both bbox rows
+ * and halves their sum", which is the first four instructions of it.
+ *
+ * It is a fifteen-axis SEPARATING-AXIS test between two ORIENTED BOXES.
+ * There is no sphere anywhere in it.
+ *
+ *   @0x001084EF  box A comes in as EDX -> {bbox MAX at +0x00, bbox MIN at
+ *                +0x10} and EAX -> a 4x4 (axis rows +0x00/+0x10/+0x20,
+ *                translation +0x30).
+ *   @0x0010851B  centre  = (MAX + MIN) * [0x003B1684] (= 0.5)
+ *   @0x00108541  the centre is pushed through the 4x4:
+ *                world_c = row3 + row0*c.x + row1*c.y + row2*c.z
+ *   @0x001085B4  half extents = (MAX - MIN) * 0.5
+ *   @0x001085CE  the same two for box B (ECX -> its bbox pair)
+ *   @0x0010869C..@0x00108AFA
+ *                FIFTEEN calls to FUN_00107FD0, one per candidate axis, each
+ *                followed by `TEST AL,AL / JNE 0x00108DEE`: A's three rows
+ *                ([0x0040A5B0] = (1,0,0), [0x0040A5C0] = (0,1,0),
+ *                [0x0040A5D0] = (0,0,1) mapped through A's frame), B's three
+ *                rows, and the nine edge crosses built by FUN_000328F0.
+ *                ANY separating axis -> no contact at all.
+ *
+ *   FUN_00107FD0 @0x00107FD0: projects both boxes with FUN_00107E90, returns
+ *                AL = 1 @0x00108076 when either `a.lo > b.hi` @0x0010800F or
+ *                `b.lo > a.hi` @0x00108020, otherwise writes
+ *                min(a.hi,b.hi) - max(a.lo,b.lo) @0x0010805D and returns 0.
+ *   FUN_00107E90 @0x00107E9A: interval = [c - r, c + r] with c = axis . centre
+ *                and r = sum_k |axis . row_k| * half_k.  The axes are used
+ *                UNNORMALISED -- prop instance matrices carry scale -- which
+ *                is exactly why
+ *   @0x00108B4E  each axis's overlap is divided by |axis| (FUN_0002C0D0)
+ *                before the comparison, and the axis of MINIMUM normalised
+ *                overlap wins (seed [0x003B172C] = FLT_MAX @0x00108B15,
+ *                degenerate crosses skipped by FUN_0003B060's zero test
+ *                @0x00108B32).  No axis chosen -> no contact @0x00108B7A.
+ *   @0x00108BB7  the winning axis is scaled by [0x003B16C0] (= -1) when
+ *                dot(axis, centreB - centreA) > [0x003B16E0] (= 0), so the
+ *                normal handed back always points from B toward A.
+ *   @0x00108BE3  contact point = the support point of the opposing box along
+ *                -normal (FUN_00108080, whose per-axis eps is [0x003B16D0] =
+ *                0.001 and which reads the half extents at +0x60/+0x64/+0x68),
+ *                pulled back by the penetration @0x00108C39.  Outputs are the
+ *                depth [ebp+0x08], the point [ebp+0x0C] and the normal
+ *                [ebp+0x10], with AL = 1.
+ *
+ * DEVIATION, marked: retail hands back the winning axis UNNORMALISED
+ * (FUN_000116A0 @0x00108C64 is a bare 16-byte copy, not a normalise) while the
+ * depth it pairs with it IS normalised @0x00108B4E, so retail's own point
+ * pull-back is off by |axis| (1.0..1.5 for a face axis, <= 1 for a cross).
+ * FUN_00113960 re-normalises the normal anyway at its bend @0x00113F49, so
+ * this port normalises here and keeps retail's depth -- the geometry the
+ * separation push-out needs.
+ * ====================================================================== */
+typedef struct {
+    float c[3];        /* world centre                          (desc +0x50) */
+    float ax[3][3];    /* the three world axes, SCALE INCLUDED  (+0x20/30/40) */
+    float h[3];        /* local half extents                    (desc +0x60) */
+} B3POBB;
+
+/* FUN_00107E90 [C]: project a box onto `n` (which need not be unit). */
+static void b3p_obb_project(const B3POBB* b, const float n[3],
+                            float* lo, float* hi)
+{
+    float c = n[0] * b->c[0] + n[1] * b->c[1] + n[2] * b->c[2];
+    float r = 0.0f;
+    for (int k = 0; k < 3; k++) {
+        float d = n[0] * b->ax[k][0] + n[1] * b->ax[k][1] + n[2] * b->ax[k][2];
+        r += fabsf(d) * b->h[k];
+    }
+    *lo = c - r;
+    *hi = c + r;
+}
+
+/* FUN_00107FD0 [C]: 1 = this axis SEPARATES them, 0 = they overlap by
+ * `*out_overlap` along it. */
+static int b3p_axis_separates(const B3POBB* a, const B3POBB* b,
+                              const float n[3], float* out_overlap)
+{
+    float alo, ahi, blo, bhi;
+    b3p_obb_project(a, n, &alo, &ahi);
+    b3p_obb_project(b, n, &blo, &bhi);
+    if (alo > bhi) return 1;              /* @0x0010800F */
+    if (blo > ahi) return 1;              /* @0x00108020 */
+    *out_overlap = (ahi < bhi ? ahi : bhi) - (alo > blo ? alo : blo);
+    return 0;
+}
+
+/* FUN_00108080 [C]: the support point of a box along `n`. */
+static void b3p_obb_support(const B3POBB* b, const float n[3], float out[3])
+{
+    for (int i = 0; i < 3; i++) out[i] = b->c[i];
+    for (int k = 0; k < 3; k++) {
+        float d = n[0] * b->ax[k][0] + n[1] * b->ax[k][1] + n[2] * b->ax[k][2];
+        float s = 0.0f;
+        if (d > 0.001f) s =  b->h[k];     /* [0x003B16D0] */
+        else if (d < -0.001f) s = -b->h[k];
+        for (int i = 0; i < 3; i++) out[i] += b->ax[k][i] * s;
+    }
+}
+
+/* FUN_001084E0 [C].  `out_n` is UNIT and oriented A -> B (retail returns
+ * B -> A @0x00108BB7; the caller here wants "away from the car", which is the
+ * direction the solver's own impulse `n * j` then pushes the prop). */
+static int b3p_obb_contact(const B3POBB* A, const B3POBB* B,
+                           float out_n[3], float* out_depth, float out_pt[3])
+{
+    float axes[15][3], ov[15];
+    int na = 0;
+    for (int k = 0; k < 3; k++, na++)
+        for (int i = 0; i < 3; i++) axes[na][i] = A->ax[k][i];
+    for (int k = 0; k < 3; k++, na++)
+        for (int i = 0; i < 3; i++) axes[na][i] = B->ax[k][i];
+    for (int p = 0; p < 3; p++)
+        for (int q = 0; q < 3; q++, na++) {   /* FUN_000328F0, the 9 crosses */
+            axes[na][0] = A->ax[p][1]*B->ax[q][2] - A->ax[p][2]*B->ax[q][1];
+            axes[na][1] = A->ax[p][2]*B->ax[q][0] - A->ax[p][0]*B->ax[q][2];
+            axes[na][2] = A->ax[p][0]*B->ax[q][1] - A->ax[p][1]*B->ax[q][0];
+        }
+    for (int i = 0; i < 15; i++) {
+        ov[i] = 0.0f;
+        if (b3p_axis_separates(A, B, axes[i], &ov[i])) return 0;
+    }
+    /* @0x00108B15..0x00108B75 */
+    float best = 3.4028235e38f;                       /* [0x003B172C] */
+    int bi = -1;
+    for (int i = 0; i < 15; i++) {
+        float l2 = axes[i][0]*axes[i][0] + axes[i][1]*axes[i][1]
+                 + axes[i][2]*axes[i][2];
+        if (l2 < B3P_EPS2) continue;                  /* FUN_0003B060 */
+        float o = ov[i] / sqrtf(l2);
+        if (best > o) { best = o; bi = i; }
+    }
+    if (bi < 0) return 0;                             /* @0x00108B7A */
+
+    float l = sqrtf(axes[bi][0]*axes[bi][0] + axes[bi][1]*axes[bi][1]
+                  + axes[bi][2]*axes[bi][2]);
+    float n[3];
+    for (int i = 0; i < 3; i++) n[i] = axes[bi][i] / l;
+    /* @0x00108BB7 with the sign taken the other way round -- see the header */
+    float d[3];
+    for (int i = 0; i < 3; i++) d[i] = B->c[i] - A->c[i];
+    if (n[0]*d[0] + n[1]*d[1] + n[2]*d[2] < 0.0f)
+        for (int i = 0; i < 3; i++) n[i] = -n[i];
+    /* THE CONTACT POINT.  Retail has THREE arms, keyed on WHICH axis won
+     * (`bi`), not one:
+     *   @0x00108BDA  bi <  3  -- the axis is one of box A's face normals, so
+     *                            the contact feature is a VERTEX OF B: take
+     *                            B's support point and retract it along the
+     *                            normal by the penetration (@0x00108BFD the
+     *                            support, @0x00108C43 the SUBPS retract).
+     *   @0x00108C72  bi <  6  -- the axis is one of box B's face normals, so
+     *                            the feature is a vertex of A (@0x00108C8B,
+     *                            @0x00108CD4 the ADDPS -- the other sign,
+     *                            because retail's normal points B -> A and
+     *                            ours points A -> B).
+     *   @0x00108D00  bi >= 6  -- an edge-cross axis: retail decodes the axis
+     *                            pair through the byte table at 0x0039A99C
+     *                            (@0x00108D0F/@0x00108D1E) and runs the
+     *                            edge-edge closest point FUN_00108240
+     *                            @0x00108D3D.
+     * This took box A's support point unconditionally, which is right only
+     * for the middle arm -- so on every contact decided by one of the CAR's
+     * own face normals the point sat on the car instead of on the prop, and
+     * the lever arm r = point - prop_origin that the impulse denominator and
+     * the torque are built from was wrong.  That is a FORCE defect, not a
+     * bookkeeping one: it is what sets which way a clipped cone tumbles. */
+    float pa[3], pb[3], nneg[3];
+    for (int i = 0; i < 3; i++) nneg[i] = -n[i];
+    if (bi < 3) {
+        b3p_obb_support(B, nneg, pb);
+        for (int i = 0; i < 3; i++) out_pt[i] = pb[i] + n[i] * best;
+    } else if (bi < 6) {
+        b3p_obb_support(A, n, pa);
+        for (int i = 0; i < 3; i++) out_pt[i] = pa[i] - n[i] * best;
+    } else {
+        /* GLUE: FUN_00108240's edge-edge closest point is not recovered.  The
+         * midpoint of the two support points is the standard stand-in and is
+         * far closer to it than either support point alone. */
+        b3p_obb_support(A, n, pa);
+        b3p_obb_support(B, nneg, pb);
+        for (int i = 0; i < 3; i++)
+            out_pt[i] = (pa[i] - n[i] * best + pb[i] + n[i] * best) * 0.5f;
+    }
+    g_obb_arm[bi < 3 ? 0 : (bi < 6 ? 1 : 2)]++;
+    for (int i = 0; i < 3; i++) out_n[i] = n[i];
+    *out_depth = best;
+    return 1;
+}
+
+/* The prop instance's OBB: the model bbox under the live instance matrix.
+ * `cur` is the GL column-major 4x4 and cur[r*4+c] == frame[r][c], so rows
+ * 0/1/2 are the object's world axes and row 3 the translation. */
+static void b3p_inst_obb(const B3PropInst* p, const B3PropModel* m, B3POBB* o)
+{
+    const float* M = p->cur;
+    for (int k = 0; k < 3; k++)
+        for (int i = 0; i < 3; i++) o->ax[k][i] = M[k * 4 + i];
+    for (int i = 0; i < 3; i++)
+        o->c[i] = M[12 + i] + o->ax[0][i] * m->bb_c[0]
+                            + o->ax[1][i] * m->bb_c[1]
+                            + o->ax[2][i] * m->bb_c[2];
+    for (int k = 0; k < 3; k++) o->h[k] = m->bb_h[k];
+}
+
 static int b3p_collide(int car, B3RigidBody* car_rb, B3RigidBody* game_rb,
-                       float car_mass, const float half_ext[3],
+                       float car_mass, const float bbmax[3],
+                       const float bbmin[3],
                        int car_crashed, B3PropHit* out, int max_out);
 
+/* The car box FUN_001084E0 builds for box A, out of the bbox PAIR the vehicle
+ * carries at +0x1D0/+0x1E0.  @0x001084EF the gate takes {MAX, MIN}; @0x0010851B
+ * centre = (MAX + MIN) * [0x003B1684] (= 0.5); @0x00108541 that local centre is
+ * carried into the world by the 4x4, `row3 + row0*c.x + row1*c.y + row2*c.z`;
+ * @0x001085B4 half = (MAX - MIN) * 0.5.  `bbmin` NULL keeps the old symmetric
+ * box so the pos/vel entry point still has something to use.            [C] */
+static void b3p_car_obb(const float frame[4][4], const float bbmax[3],
+                        const float bbmin[3], B3POBB* o)
+{
+    for (int k = 0; k < 3; k++)
+        for (int i = 0; i < 3; i++) o->ax[k][i] = frame[k][i];
+    float c[3], h[3];
+    for (int k = 0; k < 3; k++) {
+        float mx = bbmax ? fabsf(bbmax[k]) : 0.0f;
+        float mn = bbmin ? bbmin[k] : -mx;
+        c[k] = (mx + mn) * 0.5f;
+        h[k] = (mx - mn) * 0.5f;
+    }
+    /* Floors, GLUE, retained from the half-extent form: a car whose .bgv box
+     * failed to load must still present something a prop can be knocked by. */
+    if (h[0] < 0.4f) h[0] = 0.4f;
+    if (h[1] < 0.5f) h[1] = 0.5f;
+    if (h[2] < 0.8f) h[2] = 0.8f;
+    for (int i = 0; i < 3; i++)
+        o->c[i] = frame[3][i] + o->ax[0][i] * c[0] + o->ax[1][i] * c[1]
+                              + o->ax[2][i] * c[2];
+    for (int k = 0; k < 3; k++) o->h[k] = h[k];
+}
+
+void b3_props_test_car_obb(const float frame[4][4], const float bbmax[3],
+                           const float bbmin[3], float out_c[3],
+                           float out_h[3])
+{
+    B3POBB o;
+    b3p_car_obb(frame, bbmax, bbmin, &o);
+    for (int k = 0; k < 3; k++) { out_c[k] = o.c[k]; out_h[k] = o.h[k]; }
+}
+
+int b3_props_test_obb_contact(const float aframe[4][4], const float abbmax[3],
+                              const float abbmin[3],
+                              const float bframe[4][4], const float bbbmax[3],
+                              const float bbbmin[3],
+                              float* out_depth, float out_pt[3],
+                              float out_n[3])
+{
+    B3POBB A, B;
+    b3p_car_obb(aframe, abbmax, abbmin, &A);
+    /* box B the same way but with NO floors -- a prop's box is whatever the
+     * model bbox says, which is the pair FUN_0011A020 copies to +0x1D0/+0x1E0. */
+    for (int k = 0; k < 3; k++)
+        for (int i = 0; i < 3; i++) B.ax[k][i] = bframe[k][i];
+    float c[3];
+    for (int k = 0; k < 3; k++) {
+        c[k] = (bbbmax[k] + bbbmin[k]) * 0.5f;
+        B.h[k] = (bbbmax[k] - bbbmin[k]) * 0.5f;
+    }
+    for (int i = 0; i < 3; i++)
+        B.c[i] = bframe[3][i] + B.ax[0][i] * c[0] + B.ax[1][i] * c[1]
+                              + B.ax[2][i] * c[2];
+    return b3p_obb_contact(&A, &B, out_n, out_depth, out_pt);
+}
+
 int b3_props_collide_car(int car, const float pos[3], const float vel[3],
-                         float yaw, const float half_ext[3],
+                         float yaw, const float bbmax[3], const float bbmin[3],
                          B3PropHit* out, int max_out)
 {
     /* Compatibility entry: synthesise the car body FUN_00113960 would have
@@ -1180,13 +1806,13 @@ int b3_props_collide_car(int car, const float pos[3], const float vel[3],
     }
     for (int k = 0; k < 3; k++) rb.inv_inertia_world[k][k] = 1.0f / 1800.0f;
     /* the frame above is already HARNESS, so hand it over unmirrored */
-    return b3p_collide(car, &rb, NULL, B3P_CAR_MASS_FALLBACK, half_ext, 0,
+    return b3p_collide(car, &rb, NULL, B3P_CAR_MASS_FALLBACK, bbmax, bbmin, 0,
                        out, max_out);
 }
 
 int b3_props_collide_rb(int car, B3RigidBody* car_rb, float car_mass,
-                        const float half_ext[3], int car_crashed,
-                        B3PropHit* out, int max_out)
+                        const float bbmax[3], const float bbmin[3],
+                        int car_crashed, B3PropHit* out, int max_out)
 {
     b3p_bind_body_frames();
     /* car_rb is the pipeline's GAME-space body; mirror it into harness space,
@@ -1196,16 +1822,18 @@ int b3_props_collide_rb(int car, B3RigidBody* car_rb, float car_mass,
     if (!car_rb) return 0;
     b3p_mirror_rb(car_rb, &h);
     return b3p_collide(car, &h, car_crashed ? car_rb : NULL, car_mass,
-                       half_ext, car_crashed, out, max_out);
+                       bbmax, bbmin, car_crashed, out, max_out);
 }
 
 /* `car_rb` HARNESS space; `game_rb` non-NULL means "mirror the reaction back
  * onto this game-space body when the solver moves the car". */
 static int b3p_collide(int car, B3RigidBody* car_rb, B3RigidBody* game_rb,
-                       float car_mass, const float half_ext[3],
+                       float car_mass, const float bbmax[3],
+                       const float bbmin[3],
                        int car_crashed, B3PropHit* out, int max_out)
 {
     if (!g_ready || !car_rb) return 0;
+    b3p_audit_init();
     int nout = 0;
     if (car_mass < 1.0f) car_mass = B3P_CAR_MASS_FALLBACK;
     float car_imp0[4], car_tor0[4];
@@ -1213,14 +1841,6 @@ static int b3p_collide(int car, B3RigidBody* car_rb, B3RigidBody* game_rb,
     memcpy(car_tor0, car_rb->imp_torque, sizeof car_tor0);
 
     const float* pos = car_rb->frame[3];
-    const float* vel = car_rb->vel;
-    /* harness heading straight off the body frame (row 2 = at, row 0 = right) */
-    float fw[3] = { car_rb->frame[2][0], 0.0f, car_rb->frame[2][2] };
-    {
-        float l = sqrtf(fw[0]*fw[0] + fw[2]*fw[2]);
-        if (l > 1e-6f) { fw[0] /= l; fw[2] /= l; } else { fw[0] = 0.0f; fw[2] = 1.0f; }
-    }
-    float rt[3] = { -fw[2], 0.0f, fw[0] };
     /* B3_PROP_PROBE: once-a-second "where is the nearest prop" line, for
      * aiming the headless capture runs at a cone field. */
     if (getenv("B3_PROP_PROBE") && car == 0) {
@@ -1235,86 +1855,163 @@ static int b3p_collide(int car, B3RigidBody* car_rb, B3RigidBody* game_rb,
             fflush(stdout);
         }
     }
-    float hx = half_ext ? fabsf(half_ext[0]) : 0.95f;
-    float hz = half_ext ? fabsf(half_ext[2]) : 2.20f;
-    if (hx < 0.4f) hx = 0.4f;
-    if (hz < 0.8f) hz = 0.8f;
-    float hy = half_ext ? fabsf(half_ext[1]) : 0.75f;
-    if (hy < 0.5f) hy = 0.5f;
+    /* The CAR is retail's box A: the rigid-body frame rows are its world axes
+     * (row 0 right, row 1 up, row 2 at) and its extent is the bbox PAIR at
+     * +0x1D0/+0x1E0 (.bgv +0xE80/+0xE90).  Using the real frame rather than a
+     * yaw-only basis is retail's own geometry -- a pitched or rolled car
+     * presents a pitched box -- and using the PAIR rather than the max alone
+     * is the rest of it: see the note on b3_props_collide_car(). */
+    const float defmax[3] = { 0.95f, 0.75f, 2.20f };
+    B3POBB carbox;
+    b3p_car_obb((const float (*)[4])car_rb->frame,
+                bbmax ? bbmax : defmax, bbmin, &carbox);
+    /* Broad-phase radius about the box's OWN centre, which is no longer the
+     * body origin; the offset has to be carried or a car whose box sits well
+     * forward of its origin rejects props it really does overlap. */
+    const float car_r = carbox.h[0] + carbox.h[1] + carbox.h[2];
+
+    /* ---- B3_PROP_AUDIT: the independent geometry measurement -------------
+     * Off by default and OFF costs one getenv-cached int test per call.  It
+     * does NOT reuse the live gate's verdict -- that would make the answer
+     * true by construction.  It sweeps the car's box from where it was last
+     * frame to where it is now and asks the recovered SAT at each sample, so
+     * it also catches the contact a single discrete test would TUNNEL past.
+     * A prop it marks swept but the live path never marks hit is a MISS. */
+    if (g_audit && car >= 0 && car < B3P_AUDIT_CARS) {
+        float prev[3], prev_ax[3][3];
+        int have_prev = g_aud_have[car];
+        /* the sweep tracks the BOX CENTRE, which is offset from the body
+         * origin by the bbox pair -- sweeping the origin would slide the box
+         * along a line it never travelled. */
+        for (int k = 0; k < 3; k++) {
+            prev[k] = g_aud_prev[car][k];
+            g_aud_prev[car][k] = carbox.c[k];
+            for (int q = 0; q < 3; q++) {
+                prev_ax[k][q] = g_aud_prev_ax[car][k][q];
+                g_aud_prev_ax[car][k][q] = carbox.ax[k][q];
+            }
+        }
+        g_aud_have[car] = 1;
+        if (have_prev) {
+            float step[3];
+            float sl = 0.0f;
+            for (int k = 0; k < 3; k++) {
+                step[k] = carbox.c[k] - prev[k];
+                sl += step[k] * step[k];
+            }
+            sl = sqrtf(sl);
+            /* 0.25 m of travel per sample: fine enough that the smallest
+             * shipped prop (a 0.25 m WF_Cone) cannot slip between two
+             * samples, coarse enough to stay cheap.  A step past 5 m is a
+             * SCENARIO PLACEMENT or a stuck-rescue teleport, not travel -- its
+             * straight line crosses props the car never went near, so the
+             * frame is dropped rather than swept. */
+            int ns = (int)(sl / 0.25f) + 2;
+            if (sl > 5.0f) ns = 0;
+            if (ns > 1) {
+                B3POBB sweep = carbox;
+                for (int i = 0; i < g_ninst; i++) {
+                    B3PropInst* p = &g_inst[i];
+                    if (p->aud_swept || p->state == B3P_SETTLED) continue;
+                    B3POBB pb;
+                    b3p_inst_obb(p, &g_model[p->model], &pb);
+                    float far2 = car_r + p->bound_r + sl;
+                    float dd[3];
+                    for (int k = 0; k < 3; k++) dd[k] = pb.c[k] - carbox.c[k];
+                    if (dd[0]*dd[0] + dd[1]*dd[1] + dd[2]*dd[2]
+                        > far2 * far2) continue;
+                    for (int s = 0; s < ns; s++) {
+                        float u = (float)s / (float)(ns - 1);
+                        float nn[3], pp, qq[4];
+                        for (int k = 0; k < 3; k++)
+                            sweep.c[k] = prev[k] + step[k] * u;
+                        /* The car TURNS between frames too.  Blending the
+                         * axes and renormalising is not a slerp, but over one
+                         * 16 ms frame the error is far below a cone's width
+                         * -- and holding the current orientation over the
+                         * previous POSITION, which is what this did first,
+                         * invents overlaps a turning car never had. */
+                        for (int k = 0; k < 3; k++) {
+                            float l2 = 0.0f;
+                            for (int q = 0; q < 3; q++) {
+                                sweep.ax[k][q] = prev_ax[k][q]
+                                    + (carbox.ax[k][q] - prev_ax[k][q]) * u;
+                                l2 += sweep.ax[k][q] * sweep.ax[k][q];
+                            }
+                            if (l2 > 1e-12f) {
+                                float inv = 1.0f / sqrtf(l2);
+                                for (int q = 0; q < 3; q++)
+                                    sweep.ax[k][q] *= inv;
+                            }
+                        }
+                        if (b3p_obb_contact(&sweep, &pb, nn, &pp, qq)) {
+                            p->aud_swept = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     for (int i = 0; i < g_ninst; i++) {
         B3PropInst* p = &g_inst[i];
         if (p->state == B3P_SETTLED) continue;
         const B3PropModel* m = &g_model[p->model];
 
-        /* prop collision volume: a sphere at half the model's height,
-         * radius = the larger horizontal half extent (retail keeps the same
-         * two numbers on the body, +0x1CC/+0x1F4). */
-        float rx = 0.5f * (m->bb_max[0] - m->bb_min[0]);
-        float rz = 0.5f * (m->bb_max[2] - m->bb_min[2]);
-        float rr = rx > rz ? rx : rz;
-        if (rr < 0.15f) rr = 0.15f;
-        float ch = m->bb_max[1] - (m->bb_max[1] - m->bb_min[1]) * 0.5f;
-        float c[3] = {
-            p->cur[12] + p->cur[4] * ch,
-            p->cur[13] + p->cur[5] * ch,
-            p->cur[14] + p->cur[6] * ch
-        };
+        /* THE PROP'S COLLISION VOLUME IS ITS MODEL BOUNDING BOX under the live
+         * instance transform -- the same two bbox rows retail's constructor
+         * copies onto the body (+0x1D0 MAX @0x0011A0A8, +0x1E0 MIN
+         * @0x0011A0AF) and the same pair FUN_001084E0 reads.
+         *
+         * THIS IS THE FIX FOR BOTH REPORTED DEFECTS.  What stood here was a
+         * SPHERE at the model's mid height with radius max(halfX, halfZ),
+         * which is wrong in three different directions on shipped data:
+         *   WF_sign_prop  1.12 x 6.14 x 0.42  ->  a 0.56 m sphere floating
+         *       3.07 m above the road.  A car box roughly 1.2 m tall could
+         *       never reach it: every tall signpost in the game (class 6,
+         *       2056 instances across the 37 tracks) was UN-HITTABLE, which is
+         *       the reported "hitting signs should make them fly off".
+         *   WF_Cone       0.59 x 1.04 x 0.59  ->  a 0.30 m sphere spanning
+         *       0.22..0.82 m instead of the cone's real 0 .. 1.04 m, so a
+         *       cone only entered the test through a narrow band and the
+         *       degenerate-normal case below then threw most of those away.
+         *   WF_prop_mktbarrier 3.43 x 1.48 x 0.44 -> a 1.72 m sphere around a
+         *       0.44 m thick board, knocked from 1.7 m of clear air.       */
+        B3POBB pb;
+        b3p_inst_obb(p, m, &pb);
 
-        float d[3] = { c[0] - pos[0], c[1] - pos[1], c[2] - pos[2] };
-        /* cheap reject */
-        float far2 = (hx + hz + rr + 2.0f);
-        if (d[0] * d[0] + d[2] * d[2] > far2 * far2) continue;
+        float d[3] = { pb.c[0] - carbox.c[0], pb.c[1] - carbox.c[1],
+                       pb.c[2] - carbox.c[2] };
+        /* cheap reject (broad phase only; the gate below is the real test) */
+        float far2 = car_r + p->bound_r;
+        if (d[0]*d[0] + d[1]*d[1] + d[2]*d[2] > far2 * far2) continue;
 
-        float lx = d[0] * rt[0] + d[2] * rt[2];
-        float lz = d[0] * fw[0] + d[2] * fw[2];
-        float ly = d[1];
-        float qx = lx < -hx ? -hx : (lx > hx ? hx : lx);
-        float qz = lz < -hz ? -hz : (lz > hz ? hz : lz);
-        float qy = ly < -hy ? -hy : (ly > hy ? hy : ly);
-        float ex = lx - qx, ez = lz - qz, ey = ly - qy;
-        float dist2 = ex * ex + ez * ez + ey * ey;
-        if (dist2 > rr * rr) continue;
+        float nw[3], pen, cp[4];
+        if (!b3p_obb_contact(&carbox, &pb, nw, &pen, cp)) continue;
+        cp[3] = 0.0f;
 
-        /* contact normal, prop <- car, in world */
-        float dist = sqrtf(dist2);
-        float nl[3];
-        if (dist > 1e-4f) {
-            nl[0] = ex / dist; nl[1] = ey / dist; nl[2] = ez / dist;
-        } else {
-            nl[0] = (lx >= 0.0f) ? 1.0f : -1.0f; nl[1] = 0.0f; nl[2] = 0.0f;
-        }
-        float nw[3] = {
-            nl[0] * rt[0] + nl[2] * fw[0],
-            nl[1],
-            nl[0] * rt[2] + nl[2] * fw[2]
-        };
-        float nlen = v_len(nw);
-        if (nlen < 1e-4f) continue;
-        nw[0] /= nlen; nw[1] /= nlen; nw[2] /= nlen;
-
-        /* The contact point: the closest point on the car box.  (Retail gets
-         * it out of the hull narrow phase FUN_0010A9D0 / the OBB test
-         * FUN_00108EF0; the geometry here is the harness stand-in, the
-         * response below is the real one.) */
-        float cp[4] = {
-            pos[0] + rt[0] * qx + fw[0] * qz,
-            pos[1] + qy,
-            pos[2] + rt[2] * qx + fw[2] * qz,
-            0.0f
-        };
-
-        /* Pre-promotion gate: retail's FUN_001084E0 (@0x00113901) is a pure
-         * box overlap with no velocity test, but a prop resting against a
-         * parked car must not be re-knocked every frame, so a closing-speed
-         * check stands in until the prop has a body (once it has one the real
-         * solver's own `j > 0` test @0x00113F91 does the job). */
+        /* Pre-promotion gate.  Retail has NONE: FUN_001084E0 @0x00113901 is
+         * purely geometric and FUN_00113890 promotes on any overlap.  This
+         * guard exists only so a prop a PARKED car is resting against is not
+         * promoted again every frame, and it is now the SPEED of the car at
+         * the contact point -- the same |v_rel| the solver itself takes --
+         * rather than that speed's component along the contact normal.
+         *
+         * The normal-component form was the other half of the cone defect:
+         * once the car box had swallowed a cone the old sphere test reported
+         * distance 0 and fell back to a hard-coded LATERAL normal, so a car
+         * driving straight through a cone scored a normal component of ~0 and
+         * the cone was refused a body on every single frame of the pass.  A
+         * dead-centre cone was never knocked; only a glancing one was. */
         if (p->state == B3P_REST) {
-            float vc[3] = { vel[0], vel[1], vel[2] };
-            float vnc = vc[0]*nw[0] + vc[1]*nw[1] + vc[2]*nw[2];
-            if (vnc <= 0.05f) continue;
+            float vcp[4];
+            b3p_point_vel(car_rb, cp, vcp);
+            if (v_dot3(vcp, vcp) <= B3P_KNOCK_MIN_SPEED * B3P_KNOCK_MIN_SPEED)
+                continue;
             if (b3p_promote(i) < 0) continue;
         }
+        p->aud_hit = 1;
         B3PropBody* b = &g_body[p->body];
         B3RigidBody* prb = &b->rb;
 
@@ -1322,6 +2019,9 @@ static int b3p_collide(int car, B3RigidBody* car_rb, B3RigidBody* game_rb,
         float nbent[4], imp[4], nin[4] = { nw[0], nw[1], nw[2], 0.0f };
         float j = b3p_contact(prb, b->mass, car_rb, car_mass, cp, nin,
                               car_crashed, nbent, imp);
+        /* @0x00113B4x: the solver stamps +0x211 on BOTH bodies of the pair.
+         * On the prop that is the wake -- see the latch note in b3p_integrate. */
+        b->hit_211 = 1;
         b->lru_key = g_clock + B3P_LRU_OFFSET;   /* keep the freshest alive */
         float vpa[4], vpb[4], vrel[4];
         b3p_point_vel(car_rb, cp, vpa);
@@ -1331,8 +2031,8 @@ static int b3p_collide(int car, B3RigidBody* car_rb, B3RigidBody* game_rb,
         /* Separation.  FUN_00114F30's mass split degenerates to "the prop
          * takes all of it" when the car is role 2 (@0x00113BFF/@0x00113C05),
          * which is the un-crashed case; deflection is consumed by the next
-         * FUN_00109560 (+0x130). */
-        float pen = rr - dist;
+         * FUN_00109560 (+0x130).  `pen` is FUN_001084E0's own output, the
+         * minimum normalised overlap it hands back at [ebp+0x08]. */
         if (pen > 0.0f)
             for (int k = 0; k < 3; k++) prb->deflection[k] += nw[k] * pen;
 
@@ -1374,6 +2074,36 @@ static int b3p_collide(int car, B3RigidBody* car_rb, B3RigidBody* game_rb,
         game_rb->imp_torque[2] += dt[2];
     }
     return nout;
+}
+
+/* Nearest STILL-STANDING prop of `prop_class` at least `min_dist` away, in
+ * HARNESS space.  Aiming surface for the scripted prop drives -- the harness
+ * equivalent of b3_props_nearest, restricted so a scenario can ask for "a cone"
+ * or "a signpost" and never re-target the one it has just flattened. */
+int b3_props_nearest_class(const float pos[3], int prop_class, float min_dist,
+                           float* out_dist, float out_pos[3]) {
+    if (!g_ready || !pos) return -1;
+    int best = -1;
+    float bd = 1e30f;
+    const float md2 = min_dist * min_dist;
+    for (int i = 0; i < g_ninst; i++) {
+        if (g_inst[i].state != B3P_REST) continue;
+        if (prop_class >= 0 && (int)g_inst[i].prop_class != prop_class) continue;
+        float dx = g_inst[i].cur[12] - pos[0];
+        float dy = g_inst[i].cur[13] - pos[1];
+        float dz = g_inst[i].cur[14] - pos[2];
+        float d = dx * dx + dy * dy + dz * dz;
+        if (d < md2 || d >= bd) continue;
+        bd = d; best = i;
+    }
+    if (best < 0) return -1;
+    if (out_dist) *out_dist = sqrtf(bd);
+    if (out_pos) {
+        out_pos[0] = g_inst[best].cur[12];
+        out_pos[1] = g_inst[best].cur[13];
+        out_pos[2] = g_inst[best].cur[14];
+    }
+    return best;
 }
 
 int b3_props_nearest(const float pos[3], float* out_dist) {

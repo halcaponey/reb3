@@ -3287,3 +3287,19 @@ Hard-won methodology, in the order the mistakes were made:
    dt the RE build simulates ~2x real time offscreen while all-retail does
    ~0.25x, so a wall-bounded "110 s" run gave RE ~8x the simulated seconds --
    and 8x the slam attempts -- of retail.
+6. **A "did it happen" suite needs an INDEPENDENT truth, or it proves
+   nothing.**  `validate_prop_contact.py` (the props sibling of this suite,
+   2026-08-27) asks whether the car actually hits the track props.  Reading
+   the answer off the collision path itself would be circular -- the path
+   under test would be grading its own homework, and the un-hittable
+   signposts would have passed for as long as they existed.  `B3_PROP_AUDIT`
+   therefore runs a SECOND, swept geometry pass (the car's box interpolated
+   from its previous frame, 0.25 m per sample) and counts props the sweep
+   overlapped that the live path never contacted.  With that in place the
+   defect measured itself: 23 % of the cones a scripted drive passed through
+   were left standing, and 0 of 5 signposts were ever touched.
+   Corollaries learned the same afternoon: the sweep must blend the frame
+   AXES as well as the position (holding the current orientation over the
+   previous position invents overlaps a turning car never had -- 1..3 phantom
+   misses per run), and it must DROP frames whose step exceeds 5 m, because a
+   scenario placement's straight line crosses props the car never went near.

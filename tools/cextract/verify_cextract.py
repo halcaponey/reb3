@@ -68,11 +68,22 @@ BINARY_EXT = (".bin", ".mtl", ".obj", ".h", ".txt", ".wav")
 # artefact is tools/validate_scenery.py -- which re-derives every record and
 # every instance transform straight out of the shipped static.dat/streamed.dat
 # rather than trusting the C stage.
+#
+# `bvh.bin` is a FOURTH kind, and the only one so far: a DERIVED artefact with
+# neither a python original nor a retail counterpart.  cx_bvh.c builds a BVH
+# over the static world out of what the TRACK, PROPS and SCENERY stages have
+# already written, to serve the INSPIRED ray-traced sun shadow
+# (docs/PHOTOREALISM.md tier 4r).  The Xbox had no acceleration structure of
+# any kind, so there is nothing on the disc to diff it against either; its
+# gate is tools/validate_bvh.py, which re-derives the geometry from the same
+# three artefacts and re-traces a grid of rays through the flattened tree
+# against a brute-force test over every triangle.
 NO_ORACLE = (
     "build/cars/car_physics.bin",
     "build/cars/roster.bin",
     "build/frontend/font.bin",
     "scenery.bin",
+    "bvh.bin",
 )
 
 # THE THIRD KIND: an artefact whose ORACLE IS NOT A BYTE STRING.

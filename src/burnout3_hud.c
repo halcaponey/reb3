@@ -2820,8 +2820,26 @@ static void solid_px(float x, float y, float w, float h,
     b3r2d_prim_end();
 }
 
-void b3_hud_pause_mixer(const float vals[3]) {
-    static const char* names[3] = { "ENGINE", "SFX", "MUSIC" };
+/* THE CURSOR, and it is the front end's own idiom rather than a new one: the
+ * track and car selects mark the hot row with four white prongs that pulse,
+ * flanking it at both ends (burnout3_full.c's row pattern).  Same shape and
+ * the same phase source here -- SDL_GetTicks(), which is what those two
+ * screens pulse on -- so the pause overlay and the menus breathe together. */
+static void row_prongs(float x, float y, float w, float h) {
+    float pp = 2.5f + 2.5f * sinf((float)SDL_GetTicks() * 0.005f);
+    const float t = 3.0f, l = 9.0f;
+    solid_px(x - 8.f - pp, y, t, l, 1.f, 1.f, 1.f, 0.9f);
+    solid_px(x - 8.f - pp, y + h - l, t, l, 1.f, 1.f, 1.f, 0.9f);
+    solid_px(x + w + 5.f + pp, y, t, l, 1.f, 1.f, 1.f, 0.9f);
+    solid_px(x + w + 5.f + pp, y + h - l, t, l, 1.f, 1.f, 1.f, 0.9f);
+}
+
+void b3_hud_pause_mixer(const float vals[B3HUD_MIX_ROWS],
+                        const B3HudSetting *set, int nset, int cursor) {
+    static const char* names[B3HUD_MIX_ROWS] =
+        { "ENGINE", "SFX", "MUSIC", "CRASH FM" };
+    int n = (!set || nset < 0) ? 0
+          : (nset > B3HUD_SET_MAX ? B3HUD_SET_MAX : nset);
     state_begin();
     solid_px(0.f, 0.f, B3HUD_VIRT_W, B3HUD_VIRT_H,
              0.02f, 0.04f, 0.10f, 0.62f);
@@ -2829,7 +2847,7 @@ void b3_hud_pause_mixer(const float vals[3]) {
     ts.scale = 1.15f;
     draw_text(&b3_font_globalfont, g_font_global, "PAUSED",
               B3HUD_MIX_X, B3HUD_MIX_Y0 - 70.f, &ts);
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < B3HUD_MIX_ROWS; i++) {
         float y = B3HUD_MIX_Y0 + i * B3HUD_MIX_DY;
         B3TextStyle ls = STYLE_WHITE_LABEL;
         draw_text(&b3_font_globalfont, g_font_global, names[i],
@@ -2839,6 +2857,60 @@ void b3_hud_pause_mixer(const float vals[3]) {
         float f = vals[i] < 0.f ? 0.f : (vals[i] > 1.f ? 1.f : vals[i]);
         solid_px(B3HUD_MIX_BAR_X, y, B3HUD_MIX_W * f, B3HUD_MIX_H,
                  0.95f, 0.75f, 0.15f, 0.95f);
+        if (cursor == i)
+            row_prongs(B3HUD_MIX_BAR_X, y - 2.f, B3HUD_MIX_W + 4.f,
+                       B3HUD_MIX_H + 4.f);
+    }
+    /* ---- SETTINGS ---------------------------------------------------- */
+    if (n > 0) {
+        B3TextStyle hs = STYLE_GOLD_LABEL;
+        draw_text(&b3_font_globalfont, g_font_global, "SETTINGS",
+                  B3HUD_MIX_X, B3HUD_SET_HDR_Y, &hs);
+        /* the front end's blue rule under a heading */
+        solid_px(B3HUD_MIX_X, B3HUD_SET_HDR_Y + 24.f, B3HUD_SET_W, 1.5f,
+                 0.30f, 0.58f, 0.82f, 0.9f);
+        for (int i = 0; i < n; i++) {
+            float y = B3HUD_SET_Y0 + i * B3HUD_SET_DY;
+            float b = set[i].dim ? 0.42f : 1.0f;
+            int   k;
+            {
+                B3TextStyle ls = STYLE_WHITE_LABEL;
+                for (k = 0; k < 3; k++) { ls.top[k] *= b; ls.bot[k] *= b; }
+                draw_text(&b3_font_globalfont, g_font_global,
+                          set[i].label ? set[i].label : "",
+                          B3HUD_MIX_X, y, &ls);
+            }
+            {
+                /* GOLD FOR ON, the mixer's own slider-fill colour; the
+                 * label's pale blue for off.  Two colours the overlay is
+                 * already using, so the block needs no palette of its own. */
+                B3TextStyle vs = STYLE_WHITE_LABEL;
+                const char *v = set[i].value ? set[i].value : "";
+                int on = (v[0] == 'O' && v[1] == 'N');
+                float rgb[3];
+                rgb[0] = on ? 0.950f : 0.569f;
+                rgb[1] = on ? 0.750f : 0.733f;
+                rgb[2] = on ? 0.150f : 1.000f;
+                for (k = 0; k < 3; k++) {
+                    vs.top[k] = rgb[k] * b;
+                    vs.bot[k] = rgb[k] * b;
+                }
+                draw_text(&b3_font_globalfont, g_font_global, v,
+                          B3HUD_SET_VAL_X, y, &vs);
+            }
+            if (set[i].dim && set[i].note) {
+                B3TextStyle ns = STYLE_WHITE_LABEL;
+                ns.scale *= 0.70f;
+                ns.top[0] = ns.bot[0] = 0.55f;
+                ns.top[1] = ns.bot[1] = 0.62f;
+                ns.top[2] = ns.bot[2] = 0.70f;
+                draw_text(&b3_font_globalfont, g_font_global, set[i].note,
+                          B3HUD_MIX_X + 10.f, y + 13.f, &ns);
+            }
+            if (cursor == B3HUD_MIX_ROWS + i)
+                row_prongs(B3HUD_MIX_X, y - 2.f, B3HUD_SET_W,
+                           B3HUD_SET_H + 4.f);
+        }
     }
     solid_px(B3HUD_MIX_BTN_X - 2.f, B3HUD_MIX_BTN_Y - 2.f,
              B3HUD_MIX_BTN_W + 4.f, B3HUD_MIX_BTN_H + 4.f,
@@ -2851,6 +2923,9 @@ void b3_hud_pause_mixer(const float vals[3]) {
         draw_text(&b3_font_globalfont, g_font_global, "RESTART RACE",
                   B3HUD_MIX_BTN_X + 18.f, B3HUD_MIX_BTN_Y + 4.f, &bs);
     }
+    if (cursor == B3HUD_MIX_ROWS + n)
+        row_prongs(B3HUD_MIX_BTN_X - 2.f, B3HUD_MIX_BTN_Y - 2.f,
+                   B3HUD_MIX_BTN_W + 4.f, B3HUD_MIX_BTN_H + 4.f);
     state_end();
 }
 

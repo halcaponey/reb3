@@ -35,4 +35,38 @@ int  b3_scenery_models(void);
  * pass NULL to skip the cull. */
 void b3_scenery_draw(const float eye[3]);
 
+/* ---- THE DERIVED LIGHT FIELD (photorealism tier 7, INSPIRED) -------------
+ *
+ * There is no light table on the disc -- see the long note over
+ * B3_PHOTO_LIGHT_* in burnout3_aftereffects.h for the sweep that establishes
+ * that, and for why this is derived per MODEL rather than authored per track.
+ *
+ * What this module can see that nothing else can: the scenery models, their
+ * textures, and 1300-odd placements of them.  A lamp post's bulb is painted
+ * into its model's texture, so the bulb is FINDABLE -- bright, opaque texels
+ * sitting well above the texture's own mean -- and the model's vertices whose
+ * uv lands on them say where it is in model space.  One scan per model at
+ * load; every placement of that model then carries the same light.
+ *
+ * Positions and colours are therefore the ART's, not this port's: a sodium
+ * street lamp comes out orange and a fluorescent shopfront comes out white
+ * because that is what the artists painted, and no colour for any of it is
+ * written down anywhere in this tree.
+ *
+ * `rgb` is the mean of the bulb's own texels; `radius` is the model's own
+ * size times B3_PHOTO_LIGHT_REACH, clamped; `power` is how much of the model
+ * lights up, normalised, so a big neon sign outshines a single bulb. */
+typedef struct B3ScLight {
+    float    pos[3];     /* GL world space, ready to hand to the deferred pass */
+    float    rgb[3];     /* 0..1, the source's own texels                      */
+    float    radius;     /* metres                                             */
+    float    power;      /* 0..1                                               */
+    unsigned model;      /* which scenery model it came from                   */
+} B3ScLight;
+
+/* The whole track's derived lights.  Returns the count and, through `out`,
+ * the array (owned here, valid until b3_scenery_shutdown).  Zero on a track
+ * whose scenery has no emissive art at all, which is a legitimate answer. */
+int  b3_scenery_lights(const B3ScLight** out);
+
 #endif /* BURNOUT3_SCENERY_H */

@@ -161,10 +161,67 @@ source and `B3_TRACK` selects any of them. **107 vehicles** with their real
 meshes, liveries and per-car tuning. Real textures, collision, nav graphs,
 traffic sets, scenery, props and light probes per track; real engine and effect
 audio and streamed music; the retail frontend, loading screen and in-race HUD.
+**Crash FM** is on the air between songs — the station's own presenter, reading
+the race the way the disc's own clips do ([docs/RE_CRASHFM.md](docs/RE_CRASHFM.md)).
 
-It is a harness, not a shipped game: there is no career mode, and the
-presentation is deliberately not pixel-matched. Handling, collision, triggers
-and control flow are.
+It is a harness, not a shipped game: there is no career mode, and handling,
+collision, triggers and control flow are the parts held to retail. The
+presentation is not — deliberately, and that is now a feature rather than a
+shortfall.
+
+### Beyond retail, and labelled as such
+
+The **photorealism layer** ([docs/PHOTOREALISM.md](docs/PHOTOREALISM.md)) adds
+seven modern screen-space effects on top of the recovered renderer: a filmic
+tonemap and an authored grade, ambient occlusion, aerial perspective, sun
+shadow maps, screen-space reflections, light shafts, and per-source lights —
+every streetlight, traffic-light head and lit shopfront casting real light,
+plus the cars' own headlights.
+
+**None of it exists in the retail image**, and none of it may ever be cited as
+game behaviour; it is marked `INSPIRED` at every site. The light table nobody
+wrote is worth a sentence: the disc ships none, so the lights are *derived from
+the art* — a scenery model's own emissive texels locate its bulb and give it
+its colour, once, per model, and every placement of that model then carries it.
+That is retail's own shape for the one light table it does ship, the per-car
+corona records in the `.bgv`.
+
+The layer is **on by default**, because retail's look is this port's floor
+rather than its target — and `B3_PHOTO=0` renders **bit-identically** to the
+build before it landed, which is what lets every recovered-pixel suite go on
+pinning the retail look. `make test-photo` is the gate.
+
+**Ray-traced sun shadows** are the eighth, and the first thing here that is a
+player *option* rather than a default: off unless somebody turns them on in the
+pause screen's `SETTINGS` block. A per-track BVH over the static world
+(`tools/cextract/cx_bvh.c`, a new extraction stage) lets the deferred pass cast
+a cone of rays at the track's own sun instead of sampling a 2048 depth map —
+which buys contact hardness the map cannot have at any resolution, and shadows
+from occluders the map's 260 m box does not contain at all (counted: 95 of 4000
+ground samples on `US_C3_V1`, the furthest at 886 m). It costs +7 ms at 1080p
+on a 3090 and holds 60 with room to spare, on the desktop **and** on the web —
+the same ESSL 1.00 shader, unchanged, under WebGL 2. With the option off the
+frame is byte-for-byte the build before it existed, which is the gate that lets
+it be optional at all.
+
+**The cars cast too**, through a second and much smaller tree per car *model*
+and a two-level trace (`tools/cextract/cx_car_bvh.c`, all 106 vehicles in one
+file). A BVH is built once and a car moves every frame — but a car is a **rigid
+body**, so its tree is built once in model space and the whole per-frame cost
+is one 3×4 matrix per instance. A shadow ray walks the world as before, then
+transforms itself into each car's space and walks that car's tree; nothing is
+rebuilt, ever. Retail's own `blobbyshadow` quad is then suppressed for exactly
+the cars the ray took, because a fixed ground-plane ellipse under a car already
+casting its own outline is the same darkness applied twice. Six racers cost
+**+0.99 ms** at 2048×1536 with everything else live; `B3_RT_CARS=all` adds the
+nearest traffic for 0.24 ms more — the one setting that *adds* a shadow rather
+than replacing one, since traffic has no blob in this port at all.
+
+The pause screen's `SETTINGS` block is two rows: **RAY TRACING** and **MSAA**
+(OFF / 2× / 4×), both persisted next to the build and both greyed when an
+environment variable has already taken the decision.
+`tools/validate_bvh.py`, `tools/validate_car_bvh.py` and
+`tools/validate_photo.py` are the suites.
 
 ### Nothing game-derived is compiled in
 
@@ -223,15 +280,23 @@ Every recovered fact carries provenance:
 The test suites are **differential**: they execute the retail function out of
 `build/burnout3.elf` under Unicorn and compare it against this port, case by
 case. When `tools/validate_carcol.py` says the car-vs-car crash gate matches,
-it means the real `FUN_001121F0` was run and agreed. 41 Python suites, three C
+it means the real `FUN_001121F0` was run and agreed. 46 Python suites, three C
 ones and one JS one.
+
+The effects that have no retail counterpart are gated too — not against the
+x86, which has nothing to say about them, but against **themselves**: the
+photorealism and ray-tracing suites re-render fixed frames and assert both that
+the effect changed what it should and that switching it off restores the older
+frame bit-for-bit.
 
 ```bash
 python3 tools/xbe2elf.py "$B3_GAME_ROOT/default.xbe" build/burnout3.elf
 python3 tools/validate_port.py         # the physics pipeline vs real x86
 python3 tools/validate_carcol.py       # car-vs-car collision
 python3 tools/validate_gameplay.py     # scoring / boost / takedown rules
+python3 tools/validate_dj.py           # Crash FM's cue rules
 python3 tools/validate_no_baked_data.py # nothing retail is compiled in
+make test-photo test-bvh test-car-bvh   # the beyond-retail render gates
 make test-soup-ray test-traffic-pool test-traffic-reservations test-audio-ring
 ```
 
@@ -264,7 +329,11 @@ src/burnout3_traffic_*.c       traffic pool and reservations
 src/burnout3_crash.c           crash entry, wreck sim, aftertouch
 src/burnout3_carcol.c          car-vs-car contact
 src/burnout3_td_rules.c        takedown / near-miss / score event rules
+src/burnout3_props.c           destructible props; _scenery.c, _trackmesh.c
 src/burnout3_render.c          the retained renderer (GLES2-subset)
+src/burnout3_aftereffects.c    the effects chain + the photorealism layer
+src/burnout3_rt.c              the BVH ray tracer behind the shadow option
+src/burnout3_sfx.c, _music.c   audio; _dj.c is the Crash FM presenter
 src/burnout3_hud.c             the in-race HUD, using the XBE's own fonts
 src/*_runtime.h                the loaders that replaced the baked-in headers
 
@@ -297,6 +366,9 @@ docs/                          the evidence records
 | [RE_FRONTEND.md](docs/RE_FRONTEND.md) | track-select globe, car select, loading screen, HUD |
 | [BGV_EXTRACTION.md](docs/BGV_EXTRACTION.md) | how the `.bgv` car mesh format was cracked |
 | [RE_PROPS.md](docs/RE_PROPS.md) | destructible props |
+| [RE_CRASHFM.md](docs/RE_CRASHFM.md) | Crash FM: the station, the DJ, and what the disc actually holds |
+| [PHOTOREALISM.md](docs/PHOTOREALISM.md) | the beyond-retail render layer, effect by effect — all of it `INSPIRED` |
+| [AUDIO_NOTES.md](docs/AUDIO_NOTES.md) | the audio stack: mixer, streaming, WMA decode |
 | [LOAD_PARALLELISM.md](docs/LOAD_PARALLELISM.md) | what the load path does concurrently, and what it may not |
 | [web/README.md](web/README.md) | the web port's design and measurements |
 | [ANDROID_PORT.md](docs/ANDROID_PORT.md) | the Android port |

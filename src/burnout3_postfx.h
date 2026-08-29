@@ -365,6 +365,61 @@ void b3_sky_build_lut(const unsigned char *src, int sw, int sh,
  * B3_SKY_LUT_BLIT_RGB). The GL side wires B3_POSTFX_SKYBLIT=<f> to it. */
 void b3_sky_lut_set_blit(float f);
 
+/* -------------------------------------------- the sky NEAR THE HORIZON, read
+ *
+ * WHAT A DISTANT OBJECT SILHOUETTES AGAINST, per azimuth, in the SAME space
+ * the scene render target holds -- i.e. before the composite's uExposure.
+ *
+ * This is a READ of the dome, not a second authorship of the sky.  It runs
+ * postfx_draw_sky's two passes on the CPU over an elevation span of the sky
+ * half (y0..y1 in the dome's own yhat, averaged over B3_SKY_HORIZON_TAPS),
+ * with the dome's own texcoord formulas -- BOTH of which are linear in yhat,
+ * so evaluating them at a yhat between two rings gives exactly what the
+ * rasteriser interpolates there, not an approximation of it:
+ *
+ *     pass A   LUT.rgb  at tc0 = (u,       yhat*(V_HIGH - V_LOW) + V_LOW)
+ *     pass B   alpha-over of the cloud sheet at
+ *                       tc1 = (u * 2.0,    1 - yhat*B3_SKY_TC1_VSCALE),
+ *              with the recovered C0 halving -- B3_SKY_CLOUD_C0_RGB
+ *
+ * `u` is the dome vertex's own azimuth turn, atan2(z, x) / 2pi in the GL
+ * world frame the dome is emitted in, so bin k covers u = (k + 0.5) / n and
+ * the array wraps.
+ *
+ * WHY THE SPAN DOES NOT START AT ZERO.  yhat = 0 is the horizon RING itself,
+ * and on a 32-row gradient sheet that is one transition texel between the sky
+ * band and the ground half -- on US_M1 it is (84,95,103) with (176,191,198)
+ * directly above it and (20,34,49) directly below.  Nothing on screen is that
+ * colour but a thin line.  A distant building silhouettes against the sky a
+ * few degrees UP, which is the span B3_SKY_HORIZON_LO/HI covers.
+ *
+ * The consumer is the photorealism layer's tier-3 aerial perspective
+ * (src/burnout3_aftereffects.c): a fade target that is not the sky it
+ * silhouettes against makes distant geometry GLOW, which on a storm track
+ * reads as flat light-grey cut-outs against a near-black sky.
+ *
+ * Returns 0 -- and writes nothing -- when the track ships no gradient sheet,
+ * which is the caller's signal to keep its own compiled-in constant. */
+#define B3_SKY_HORIZON_N    64
+/* THE ELEVATION SPAN IT IS READ OVER, and why it is a span and not a point.
+ *
+ * The dome's yhat is 2a - a*a over a = k*0.2617994*0.63661975, so its first
+ * ring above the horizon is already at 0.3056 (about 17 degrees) and the
+ * whole skyline lives inside that one band of triangles -- the sky a distant
+ * object sits against is somewhere between the horizon and roughly 9 degrees
+ * up (measured on the US_M1 repro frame, the far city's top edge is at 7).
+ *
+ * A single elevation would be a knife edge: the gradient sheet is 32 rows,
+ * and on US_M1 three consecutive rows run (176,191,198), (84,95,103),
+ * (20,34,49) -- a point sample can land on any of those and the answer swings
+ * by 8x.  Averaging a few taps across the span is a prefilter over exactly
+ * the range that matters, and it is also cheaper to defend than a constant
+ * chosen to make one frame come out right. */
+#define B3_SKY_HORIZON_LO   0.01f
+#define B3_SKY_HORIZON_HI   0.15f
+#define B3_SKY_HORIZON_TAPS 4
+int b3_sky_horizon_band(int n, float y0, float y1, float *out_rgb);
+
 /* ------------------------------------------------------------- speed blur */
 
 /* [C] FUN_0002EBE0's two zoom layers. Layer A steps the frame in by 1% per

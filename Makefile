@@ -103,7 +103,9 @@ wma-deps:
 
 .PHONY: all clean run test-nav-walk test-nav-selector test-soup-ray test-traffic-paths \
 	test-traffic-reservations test-traffic-pool test-traffic-mix \
-	test-traffic-pop test-draw-distance test-engine-audio test-audio-ring
+	test-traffic-pop test-draw-distance test-engine-audio test-audio-ring \
+	test-dj \
+	test-photo test-bvh test-car-bvh test-rt-shimmer photo-strip photo-perf
 
 all: burnout3 build/dump_traj
 
@@ -134,6 +136,63 @@ test-traffic-pop:
 test-draw-distance: burnout3
 	python3 tools/validate_draw_distance.py
 
+# THE PHOTOREALISM WAVE (docs/PHOTOREALISM.md).  Six INSPIRED screen-space
+# effects, on by default, and the gate that makes them safe to ship: B3_PHOTO=0
+# renders BIT-IDENTICALLY to the pre-wave build, which is what lets every
+# recovered-pixel suite in this file pin it and go on verifying retail.
+#
+# THE REFERENCE BINARY.  Section 2's cross-build half needs one built without
+# the wave, and says so loudly when it has not got one -- it is a SKIP, not a
+# pass.  Build it from the wave's base commit:
+#
+#   git archive <the wave's base commit> | tar -x -C /tmp/b3ref \
+#       && make -C /tmp/b3ref burnout3
+#   B3_PHOTO_REF_BIN=/tmp/b3ref/burnout3 make test-photo
+test-photo: burnout3
+	python3 tools/validate_photo.py
+
+# TIER 4r's OTHER HALF: the per-track BVH the optional ray-traced sun shadow
+# traverses (tools/cextract/cx_bvh.c).  It has NO PYTHON ORACLE and no retail
+# counterpart -- the Xbox had no acceleration structure of any kind -- so
+# verify_cextract.py lists bvh.bin under NO_ORACLE and this is the gate
+# instead: it re-derives the geometry from track.obj / props.bin /
+# scenery.bin with an independent implementation, checks the tree's own
+# invariants and the float packing the ESSL 1.00 traversal depends on, and
+# re-traces a grid of rays through the flattened tree against a brute-force
+# test over every triangle.  It needs no GL and no game binary.
+test-bvh:
+	python3 tools/validate_bvh.py
+
+# THE CARS' half of the same tier: build/cars/carbvh.bin, one model-space BVH
+# per vehicle (tools/cextract/cx_car_bvh.c), which is what lets a car cast a
+# TRACED shadow instead of retail's blob.  Same situation as test-bvh -- no
+# python oracle, no retail counterpart -- and the same shape of gate, with two
+# additions that matter: it re-derives every body triangle from the OBJ a
+# DIFFERENT writer produced (the stage reads the .bgv containers, so agreeing
+# with the drawn mesh is a claim rather than a construction), and it drives the
+# runtime's packer through ctypes, because b3_rt_car_select() rewrites every
+# escape index onto a packed subset and that arithmetic has no artefact to
+# check it against.  Needs no GL and no game binary.
+test-car-bvh:
+	python3 tools/validate_car_bvh.py
+
+# DOES THE RAY-TRACED SHADOW HOLD STILL?  A player reported a far-field
+# shimmer, and no tool here could see it: photo_strip pins a frame so that
+# nothing moves and validate_photo section 6 measures a PINNED camera.  This
+# renders CONSECUTIVE frames of the same deterministic race and measures the
+# ones the world is not moving.  See THE FAR FIELD in src/burnout3_rt.h.
+test-rt-shimmer: burnout3
+	python3 tools/rt_shimmer.py --gate --res 960x540
+
+# The contact sheet and the frame-ms table -- measurement, not gates.  See
+# their own headers for the pinned-frame discipline they share with
+# tools/afx_sweep.py.
+photo-strip: burnout3
+	python3 tools/photo_strip.py --out build/photo/strip
+
+photo-perf: burnout3
+	python3 tools/photo_perf.py --res 1920x1080 --env B3_FRAME_PROF_SYNC=1
+
 # THE WEB AUDIO RING's consumer, on its own and in a second: the
 # AudioWorkletProcessor lifted out of web/b3_web_lib.js and run against a
 # SharedArrayBuffer laid out as web/b3_web.c lays it out.  No browser, no ISO
@@ -150,6 +209,14 @@ test-audio-ring:
 test-engine-audio: burnout3
 	tools/audio_capture.sh /tmp/b3_mix.raw /tmp/b3_drive.txt 30
 	python3 tools/validate_engine_audio.py /tmp/b3_mix.raw /tmp/b3_drive.txt
+
+# CRASH FM: the radio DJ against the laws recovered in docs/RE_CRASHFM.md.
+# Builds a probe from the REAL src/burnout3_dj.c and drives it, so the
+# cooldown, the three race sets, the 13/16 idle weighting, the anti-repeat
+# retry and the duck are all measured out of the shipping code.  Needs the
+# DJ banks extracted (B3_AUDIO_DIR, default build/audio); no GL, no ISO.
+test-dj:
+	python3 tools/validate_dj.py
 
 test-traffic-reservations: build/validate_traffic_reservations
 	./build/validate_traffic_reservations
@@ -188,9 +255,10 @@ SRCS = src/burnout3_full.c src/burnout3_vehicle_sim.c src/burnout3_trackmesh.c \
        src/burnout3_td_rules.c src/burnout3_sfx.c src/burnout3_ai.c \
        src/burnout3_ai_avoid.c \
        src/burnout3_carfx.c src/burnout3_postfx.c \
-       src/burnout3_aftereffects.c src/burnout3_music.c \
+       src/burnout3_aftereffects.c src/burnout3_music.c src/burnout3_dj.c \
        src/burnout3_boostfx.c src/burnout3_particlefx.c \
        src/burnout3_panels.c src/burnout3_props.c src/burnout3_scenery.c \
+       src/burnout3_rt.c \
 	       src/burnout3_traffic_reservations.c src/burnout3_traffic_pool.c \
        src/burnout3_backend.c src/burnout3_emu.c
 
@@ -229,13 +297,16 @@ run: burnout3
 #   * PROXY_TO_PTHREAD puts main() on a worker.  That is what makes the
 #     blocking `while (g_running)` frame loop legal, and what makes WORKERFS'
 #     synchronous FileReaderSync pread() of the 2.4 GB image possible at all.
-#   * PTHREAD_POOL_SIZE is 9: the base 4, plus the audio bridge's mixer
+#   * PTHREAD_POOL_SIZE is 10: the base 4, plus the audio bridge's mixer
 #     pthread (THE AUDIO BRIDGE, web/b3_web.h), plus cx_pool's 3 extraction
-#     workers and their calling thread (tools/cextract/cx_pool.h).  Sized so
-#     pthread_create never has to GROW the pool at runtime -- under
-#     PROXY_TO_PTHREAD growing means a round trip to the browser's main
-#     thread from a worker that is mid-boot.  Both prior sizings (5 for
-#     audio, 8 for cx_pool) were each unaware of the other's thread.
+#     workers and their calling thread (tools/cextract/cx_pool.h), plus the
+#     music module's decode worker (THE MATERIALISE WORKER,
+#     src/burnout3_music.c).  Sized so pthread_create never has to GROW the
+#     pool at runtime -- under PROXY_TO_PTHREAD growing means a round trip
+#     to the browser's main thread from a worker that is mid-boot.  Every
+#     prior sizing (5 for audio, 8 for cx_pool, 9 before the decode worker)
+#     was unaware of a thread somebody else had added; if you add one, it
+#     is this number's job to know about it.
 #
 # Requires the emsdk on PATH (emcc).  EMSDK_DIR can point at a checkout that
 # is not yet activated in this shell.
@@ -280,7 +351,7 @@ WASM_PORTS  = -sUSE_SDL=2 -sUSE_SDL_IMAGE=2 -sSDL2_IMAGE_FORMATS='["png"]' \
 # the note above.
 WASM_LDFLAGS = -pthread \
    -sMODULARIZE=1 -sEXPORT_NAME=createB3Module \
-   -sPROXY_TO_PTHREAD -sPTHREAD_POOL_SIZE=9 \
+   -sPROXY_TO_PTHREAD -sPTHREAD_POOL_SIZE=10 \
    -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4GB -sINITIAL_MEMORY=536870912 \
    -sSTACK_SIZE=33554432 \
    -sGL_ENABLE_GET_PROC_ADDRESS=1 \

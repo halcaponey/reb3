@@ -20,11 +20,31 @@
  * -- to `FUN_00113890`, which: [C-disasm, addresses re-checked against
  * build/burnout3.elf]
  *     0x00113901  FUN_001084E0        -- the "may I knock it" gate: a purely
- *                                        GEOMETRIC box-overlap test on the two
- *                                        bboxes (@0x001084EF..0x00108524 reads
- *                                        both bbox rows and halves their sum).
- *                                        There is no mass/size veto: every
+ *                                        GEOMETRIC test on the two bboxes, with
+ *                                        no mass, size OR VELOCITY veto -- every
  *                                        static prop retail overlaps is knocked.
+ *                                        Read out in full (2026-08-27, capstone
+ *                                        over build/burnout3.elf's PT_LOAD
+ *                                        segments; the Ghidra bridge was
+ *                                        refusing connections) it is a FIFTEEN
+ *                                        AXIS SEPARATING-AXIS TEST between two
+ *                                        ORIENTED BOXES: the car's, and the
+ *                                        prop's MODEL BBOX under its instance
+ *                                        transform.  Instruction by instruction
+ *                                        in src/burnout3_props.c above
+ *                                        b3p_obb_contact(); the earlier note
+ *                                        here, "reads both bbox rows and halves
+ *                                        their sum", was its first four
+ *                                        instructions.  The harness used to
+ *                                        stand a SPHERE in for the prop box and
+ *                                        that was two user-visible defects: a
+ *                                        6.14 m signpost became a 0.56 m ball
+ *                                        3.07 m up in the air, unreachable by
+ *                                        any car (class 6, 2056 instances, none
+ *                                        of them ever knocked), and a cone got
+ *                                        a volume small enough that 23 % of the
+ *                                        cones a scripted drive passed THROUGH
+ *                                        were left standing.
  *     0x0011392E  FUN_00197A20        -- prop-hit score/audio, and only when the
  *                                        other handle's type is 0/1/2 (cars)
  *     0x0011393B  FUN_00114730        -- PROMOTE: hand the prop one of the 16
@@ -209,11 +229,23 @@ void b3_props_draw(void);
 
 /* Collide one car against the props and knock what it touches.  `pos` is the
  * car's body centre and `vel` its velocity, both HARNESS space; `yaw` is the
- * harness heading (forward = (sin y, 0, -cos y)); `half_ext` the car's object
- * space half extents.  Contacts are written to `out` (up to `max_out`) for the
- * object-crash trigger to judge; returns how many were written. */
+ * harness heading (forward = (sin y, 0, -cos y)).
+ *
+ * THE CAR'S BOX IS A bbox PAIR, not a half-extent triple.  Retail's gate
+ * FUN_001084E0 reads box A as {MAX at +0x00, MIN at +0x10} and derives BOTH
+ * the centre (@0x001084EF..0x00108541, `(MAX+MIN)*0.5` carried through the
+ * 4x4) and the half extents (@0x001085B4, `(MAX-MIN)*0.5`) from it -- exactly
+ * the pair the vehicle carries at +0x1D0/+0x1E0 (.bgv +0xE80/+0xE90), which
+ * for a shipped car is NOT symmetric about the body origin.  Passing `bbmax`
+ * alone and centring on the origin, which is what this took before, built a
+ * box ~0.97 m too tall downwards on COMPCAR1 and put its centre 0.49 m below
+ * retail's -- so every contact POINT the gate hands back (the support point
+ * of the car box, @0x00108BE3) was low, and the lever arms it feeds the
+ * impulse denominator were wrong.  `bbmin` may be NULL, in which case the box
+ * falls back to the old symmetric one. */
 int  b3_props_collide_car(int car, const float pos[3], const float vel[3],
-                          float yaw, const float half_ext[3],
+                          float yaw, const float bbmax[3],
+                          const float bbmin[3],
                           B3PropHit* out, int max_out);
 
 /* The same thing over the car's REAL rigid body, which is what retail's
@@ -225,9 +257,27 @@ int  b3_props_collide_car(int car, const float pos[3], const float vel[3],
  * entry point; b3_props_collide_car() above forwards to it with a synthesised
  * body (zero omega, identity inertia, B3P_CAR_MASS_FALLBACK kg). */
 int  b3_props_collide_rb(int car, B3RigidBody* car_rb, float car_mass,
-                         const float half_ext[3], int car_crashed,
-                         B3PropHit* out, int max_out);
+                         const float bbmax[3], const float bbmin[3],
+                         int car_crashed, B3PropHit* out, int max_out);
 #define B3P_CAR_MASS_FALLBACK 1200.0f
+
+/* The car box retail's gate would build from a bbox pair under a frame:
+ * `out_c` the world centre (@0x00108541), `out_h` the half extents
+ * (@0x001085B4).  Exposed so tools/validate_props.py can diff the box the
+ * collide path actually uses against FUN_001084E0's own, rather than trusting
+ * that the two agree. */
+void b3_props_test_car_obb(const float frame[4][4], const float bbmax[3],
+                           const float bbmin[3], float out_c[3],
+                           float out_h[3]);
+/* FUN_001084E0 itself over two bbox-pair boxes: 1 = contact, with the depth,
+ * the world contact point and the unit normal (oriented A -> B; retail returns
+ * B -> A @0x00108BB7). */
+int  b3_props_test_obb_contact(const float aframe[4][4], const float abbmax[3],
+                               const float abbmin[3],
+                               const float bframe[4][4], const float bbbmax[3],
+                               const float bbbmin[3],
+                               float* out_depth, float out_pt[3],
+                               float out_n[3]);
 
 /* Live-body telemetry for the validator / the trace: returns 1 and fills the
  * caller's copy when `instance` currently owns one of the 16 class-6 bodies. */
@@ -266,6 +316,13 @@ float b3_props_test_contact(B3RigidBody* prop_rb, float prop_mass,
 /* Nearest prop to a point, for probes/telemetry.  Returns the instance index
  * or -1; `out_dist` may be NULL. */
 int  b3_props_nearest(const float pos[3], float* out_dist);
+
+/* Nearest still-standing prop of `prop_class` (-1 = any) at least `min_dist`
+ * from `pos`, HARNESS space.  Returns the instance index or -1.  The aiming
+ * surface for B3_SCENARIO=props, which drives the player through a cone line
+ * or into a signpost so the contact suite has guaranteed samples. */
+int  b3_props_nearest_class(const float pos[3], int prop_class, float min_dist,
+                            float* out_dist, float out_pos[3]);
 
 /* Per-instance query for the crash trigger and for telemetry. */
 int   b3_props_class_of(int instance);   /* static.dat +0x44 prop class 0..7 */

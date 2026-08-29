@@ -83,6 +83,16 @@ def run_leg(tag, mph, boost, outdir, extra_env):
         "B3_SHOT_FRAME": SHOT_FRAME,
         # the chain's own state must not drift between legs
         "B3_AFX": "1",
+        # THE PHOTOREALISM WAVE IS PINNED OFF HERE.
+        # src/burnout3_aftereffects.h ships six INSPIRED screen-space effects
+        # on by default, and three of them (the filmic curve, the grade and
+        # the atmospherics) rewrite the very quantities this sweep measures:
+        # `radial` and `tang` are gradient energies, and a contrast curve
+        # moves both without moving a single tap of the blur.  So this sweep
+        # keeps measuring THE BLUR by turning the rest off, which also keeps
+        # its numbers comparable with every sweep taken before the wave.
+        # tools/photo_strip.py is the equivalent instrument for the six.
+        "B3_PHOTO": "0",
     })
     env.update(extra_env)
     if mph is None:

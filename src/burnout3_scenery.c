@@ -37,6 +37,11 @@
  * transforms never move, so b3r bakes them into world space once and merges
  * the survivors of the LOD cull into a handful of glDrawArrays calls. */
 #include "burnout3_render.h"
+/* TIER 7's thresholds and its switch.  The derivation happens HERE because
+ * this is the only module that can see a scenery model's texture and its
+ * vertices at the same moment; the numbers it derives with live over there
+ * with the rest of the look.  See b3_scenery_lights in the header. */
+#include "burnout3_aftereffects.h"
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_image.h>
@@ -90,6 +95,8 @@ static int        g_ready;
 static float      g_far_override = -1.0f;
 static char       g_dir[256];
 static B3RInstSet* g_retained;
+static B3ScLight* g_light;         /* tier 7's derived field, see the header */
+static int        g_nlight;
 
 static float rd_f32(const unsigned char* p)
 {
@@ -103,14 +110,124 @@ static unsigned rd_u32(const unsigned char* p)
          | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
 }
 
+/* ---- THE EMISSIVE SCAN (photorealism tier 7) ---------------------------
+ *
+ * Built while the texture is on the CPU anyway, because that is the only
+ * moment its texels are reachable: after the upload it is a GL name, and
+ * glGetTexImage does not exist on GLES or in a browser.
+ *
+ * The mask is deliberately COARSE -- 64x64 regardless of the texture's own
+ * size.  What it is used for is "did this vertex's uv land on the bulb", and
+ * a vertex is a corner of a triangle several texels wide; a full-resolution
+ * mask would answer a more precise question than the geometry can ask.
+ */
+#define B3S_EM 64
+typedef struct {
+    int   found;
+    float rgb[3];                  /* mean colour of the emissive texels    */
+    float lum;                     /* ...its luminance, BEFORE normalising  */
+    float mean;                    /* the sheet's own opaque mean           */
+    float frac;                    /* fraction of the texture they are      */
+    unsigned char m[B3S_EM * B3S_EM];
+} B3ScEmis;
+
+static void scenery_lights_build(const B3ScEmis* em);
+
+/* WHAT COUNTS AS A BULB, and the third test is the one that matters.
+ *
+ * "Bright and opaque" alone calls a white van a light.  What separates a lamp
+ * from a white object is CONTRAST WITHIN THE TEXTURE: a bulb is a bright patch
+ * on a dark thing.  So a model qualifies only if its texture is dark on
+ * average (B3_PHOTO_LIGHT_EMIS_DK) and the emissive texels sit a good way
+ * above that mean (B3_PHOTO_LIGHT_EMIS_DL) as well as above an absolute floor
+ * (B3_PHOTO_LIGHT_EMIS).  Two more bounds catch the ends: a handful of stray
+ * bright texels is compression noise, and a texture that is bright over a
+ * fifth of its area is a wall.
+ *
+ * ALPHA MATTERS.  These sheets are cut-outs -- a chain-link fence, a foliage
+ * card -- and a transparent texel is not painted, it is absent.  The mean is
+ * taken over the OPAQUE texels only, or every cut-out reads as "a bright thing
+ * on a black background" and the whole tree lights up.
+ */
+static void scenery_scan_emissive(SDL_Surface* c, B3ScEmis* em)
+{
+    B3PhotoLightRules r;
+    const unsigned char* px = (const unsigned char*)c->pixels;
+    double sum = 0.0, esum[3] = { 0.0, 0.0, 0.0 };
+    long   opaque = 0, hot = 0;
+    int    x, y, pass;
+    float  mean, cut;
+
+    b3_photo_light_rules(&r);
+    if (c->w <= 0 || c->h <= 0) return;
+
+    for (y = 0; y < c->h; y++) {
+        const unsigned char* row = px + (size_t)y * (size_t)c->pitch;
+        for (x = 0; x < c->w; x++) {
+            const unsigned char* p = row + x * 4;   /* ABGR8888: r,g,b,a */
+            if (p[3] < 128) continue;
+            sum += (0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]) / 255.0;
+            opaque++;
+        }
+    }
+    if (opaque < 64) return;
+    mean = (float)(sum / (double)opaque);
+    if (mean >= r.emis_dark) return;          /* a bright OBJECT, not a bulb */
+    cut = mean + r.emis_lift;
+    if (cut < r.emis) cut = r.emis;
+    if (cut >= 1.0f) return;
+
+    /* two passes: count first so the fraction test can reject before the mask
+     * is written, then write the mask and accumulate the colour */
+    for (pass = 0; pass < 2; pass++) {
+        if (pass == 1) {
+            float frac = (float)hot / (float)opaque;
+            if (frac < r.emis_min || frac > r.emis_max) return;
+            em->frac = frac;
+        }
+        for (y = 0; y < c->h; y++) {
+            const unsigned char* row = px + (size_t)y * (size_t)c->pitch;
+            for (x = 0; x < c->w; x++) {
+                const unsigned char* p = row + x * 4;
+                float l;
+                if (p[3] < 128) continue;
+                l = (0.299f * p[0] + 0.587f * p[1] + 0.114f * p[2]) / 255.0f;
+                if (l < cut) continue;
+                if (pass == 0) { hot++; continue; }
+                esum[0] += p[0]; esum[1] += p[1]; esum[2] += p[2];
+                em->m[(y * B3S_EM / c->h) * B3S_EM + (x * B3S_EM / c->w)] = 1;
+            }
+        }
+        if (pass == 0 && hot == 0) return;
+    }
+    em->rgb[0] = (float)(esum[0] / (double)hot / 255.0);
+    em->rgb[1] = (float)(esum[1] / (double)hot / 255.0);
+    em->rgb[2] = (float)(esum[2] / (double)hot / 255.0);
+    em->mean   = mean;
+    em->lum    = 0.299f * em->rgb[0] + 0.587f * em->rgb[1]
+               + 0.114f * em->rgb[2];
+    /* NORMALISE THE HUE, keep the colour.  A sodium lamp's texels are
+     * (1.0, 0.72, 0.35) and a fluorescent's are (0.95, 0.97, 1.0); what the
+     * light should carry is the RATIO, with the brightness coming from the
+     * area and the tier's own gain.  Dividing by the peak channel keeps
+     * "orange" and "white" apart and stops a dim bulb being a dim light. */
+    {   float mx = em->rgb[0];
+        if (em->rgb[1] > mx) mx = em->rgb[1];
+        if (em->rgb[2] > mx) mx = em->rgb[2];
+        if (mx > 1e-3f) { em->rgb[0] /= mx; em->rgb[1] /= mx; em->rgb[2] /= mx; }
+    }
+    em->found = 1;
+}
+
 /* Same two-place texture search src/burnout3_props.c uses. */
-static unsigned load_tex(const char* dir, const char* name)
+static unsigned load_tex(const char* dir, const char* name, B3ScEmis* em)
 {
     char path[768];
     SDL_Surface* s;
     SDL_Surface* c;
     unsigned id = 0;
 
+    if (em) memset(em, 0, sizeof *em);
     if (!name || !name[0]) return 0;
     snprintf(path, sizeof path, "%s/textures/%s.png", dir, name);
     s = IMG_Load(path);
@@ -122,6 +239,7 @@ static unsigned load_tex(const char* dir, const char* name)
     c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_ABGR8888, 0);
     SDL_FreeSurface(s);
     if (!c) return 0;
+    if (em) scenery_scan_emissive(c, em);
     glGenTextures(1, &id);
     glBindTexture(GL_TEXTURE_2D, id);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
@@ -143,8 +261,191 @@ static unsigned load_tex(const char* dir, const char* name)
     return id;
 }
 
+/* ---- FROM A MASK TO A LIGHT FIELD --------------------------------------
+ *
+ * Per model: find the vertices whose uv lands on the bulb and take their
+ * centroid -- that is the bulb, in model space.  Then instance it.
+ *
+ * WHY THE VERTICES AND NOT THE BOUNDING BOX.  A lamp post's bbox centre is
+ * halfway down the pole and its top is the top of the pole, neither of which
+ * is where the light is; a traffic-light gantry's bbox centre is out over the
+ * road with nothing there at all.  The vertices that carry the bulb's texels
+ * ARE the bulb -- it is the only construction that is right for a lamp, a
+ * neon sign, a lit shopfront window and a traffic-light head at the same
+ * time, without a single word about which model is which.
+ *
+ * A model whose emissive texels attract fewer than three vertices is dropped.
+ * Two vertices are an edge, and an edge is what a compression artefact along
+ * a bright seam looks like; three is the first number that is a piece of a
+ * surface.
+ */
+static void scenery_lights_build(const B3ScEmis* em)
+{
+    B3PhotoLightRules r;
+    float (*bulb)[3];
+    float* rad;
+    float* spread;
+    int*   ok;
+    int i, n = 0, verbose;
+
+    free(g_light); g_light = NULL; g_nlight = 0;
+    if (!b3_photo_fx(B3_PHOTO_FX_LIGHTS) || g_nmodel <= 0 || g_ninst <= 0)
+        return;
+    b3_photo_light_rules(&r);
+    verbose = getenv("B3_PHOTO_VERBOSE") != NULL;
+
+    bulb   = (float(*)[3])calloc((size_t)g_nmodel, sizeof *bulb);
+    rad    = (float*)calloc((size_t)g_nmodel, sizeof *rad);
+    spread = (float*)calloc((size_t)g_nmodel, sizeof *spread);
+    ok     = (int*)calloc((size_t)g_nmodel, sizeof *ok);
+    if (!bulb || !rad || !spread || !ok) {
+        free(bulb); free(rad); free(spread); free(ok); return;
+    }
+
+    for (i = 0; i < g_nmodel; i++) {
+        const B3ScModel* m = &g_model[i];
+        double s[3] = { 0.0, 0.0, 0.0 };
+        long   hit = 0;
+        unsigned v;
+        if (!em[i].found) continue;
+        for (v = 0; v < m->n_vertex; v++) {
+            const float* p = g_vtx + (size_t)(m->first_vertex + v) * 8;
+            /* uv WRAPS -- these sheets are GL_REPEAT and a uv of 3.4 is a
+             * texture tiled three times, so the fractional part is the texel.
+             * fmodf on a negative gives a negative, hence the fold. */
+            float u = fmodf(p[6], 1.0f), w = fmodf(p[7], 1.0f);
+            int   ux, uy;
+            if (u < 0.0f) u += 1.0f;
+            if (w < 0.0f) w += 1.0f;
+            ux = (int)(u * (float)B3S_EM);
+            uy = (int)(w * (float)B3S_EM);
+            if (ux < 0) ux = 0;
+            if (ux >= B3S_EM) ux = B3S_EM - 1;
+            if (uy < 0) uy = 0;
+            if (uy >= B3S_EM) uy = B3S_EM - 1;
+            if (!em[i].m[uy * B3S_EM + ux]) continue;
+            s[0] += p[0]; s[1] += p[1]; s[2] += p[2];
+            hit++;
+        }
+        if (hit < 3) continue;
+        bulb[i][0] = (float)(s[0] / (double)hit);
+        bulb[i][1] = (float)(s[1] / (double)hit);
+        bulb[i][2] = (float)(s[2] / (double)hit);
+        /* ---- IS IT A LAMP, OR IS IT A WHITE BOAT?
+         *
+         * The first cut of this derivation found the street lamps, the
+         * traffic-light heads and the lit phone boxes -- and also five models
+         * of moored boat, whose white hulls are bright, opaque and sit well
+         * above a dark sheet's mean, which is every test above passed.
+         *
+         * What separates them is not brightness, it is EXTENT: a light source
+         * is a small bright part of a bigger object.  A lamp head is a
+         * third-of-a-metre blob on a ten-metre post; a hull is the boat.  So
+         * the emissive vertices' spread about their own centroid, measured
+         * against the model's own radius, is the test -- and it needs no new
+         * data, no model names and no per-track list. */
+        {   double sp = 0.0;
+            float  tight;
+            for (v = 0; v < m->n_vertex; v++) {
+                const float* p = g_vtx + (size_t)(m->first_vertex + v) * 8;
+                float u = fmodf(p[6], 1.0f), w = fmodf(p[7], 1.0f);
+                int   ux, uy;
+                float dx, dy, dz;
+                if (u < 0.0f) u += 1.0f;
+                if (w < 0.0f) w += 1.0f;
+                ux = (int)(u * (float)B3S_EM);
+                uy = (int)(w * (float)B3S_EM);
+                if (ux < 0) ux = 0;
+                if (ux >= B3S_EM) ux = B3S_EM - 1;
+                if (uy < 0) uy = 0;
+                if (uy >= B3S_EM) uy = B3S_EM - 1;
+                if (!em[i].m[uy * B3S_EM + ux]) continue;
+                dx = p[0] - bulb[i][0];
+                dy = p[1] - bulb[i][1];
+                dz = p[2] - bulb[i][2];
+                sp += (double)(dx * dx + dy * dy + dz * dz);
+            }
+            tight = m->radius > 1e-3f
+                  ? (float)sqrt(sp / (double)hit) / m->radius : 1.0f;
+            spread[i] = tight;
+            if (tight > r.tight) {
+                if (verbose)
+                    printf("[photo] light model %2d '%s': rejected, its "
+                           "emissive texels spread %.2f of the model's own "
+                           "radius -- that is a bright SURFACE, not a bulb\n",
+                           i, m->texture, tight);
+                continue;
+            }
+        }
+        rad[i] = m->radius * r.reach;
+        if (rad[i] < r.rmin) rad[i] = r.rmin;
+        if (rad[i] > r.rmax) rad[i] = r.rmax;
+        ok[i] = 1;
+        if (verbose) {
+            int placed = 0, k;
+            for (k = 0; k < g_ninst; k++)
+                if ((int)g_inst[k].model == i) placed++;
+            printf("[photo] light model %2d '%s': %ld emissive verts, "
+                   "rgb %.2f %.2f %.2f, lum %.3f over a sheet mean of "
+                   "%.3f, %.2f%% of the sheet, spread %.2f, r %.1f m, "
+                   "%d placements\n",
+                   i, m->texture, hit, em[i].rgb[0], em[i].rgb[1],
+                   em[i].rgb[2], em[i].lum, em[i].mean,
+                   em[i].frac * 100.0f, spread[i], rad[i], placed);
+        }
+    }
+
+    for (i = 0; i < g_ninst; i++)
+        if (ok[g_inst[i].model]) n++;
+    if (n > 0) g_light = (B3ScLight*)calloc((size_t)n, sizeof(B3ScLight));
+    if (!g_light) { free(bulb); free(rad); free(spread); free(ok); return; }
+
+    for (i = 0; i < g_ninst; i++) {
+        const B3ScInst* in = &g_inst[i];
+        const float* b;
+        B3ScLight* L;
+        unsigned mo = in->model;
+        if (!ok[mo]) continue;
+        b = bulb[mo];
+        L = &g_light[g_nlight++];
+        /* the same column-major apply b3r_inst_build bakes the mesh with, so
+         * the bulb lands exactly where its own texels are drawn */
+        L->pos[0] = in->m[0]*b[0] + in->m[4]*b[1] + in->m[8]*b[2]  + in->m[12];
+        L->pos[1] = in->m[1]*b[0] + in->m[5]*b[1] + in->m[9]*b[2]  + in->m[13];
+        L->pos[2] = in->m[2]*b[0] + in->m[6]*b[1] + in->m[10]*b[2] + in->m[14];
+        L->rgb[0] = em[mo].rgb[0];
+        L->rgb[1] = em[mo].rgb[1];
+        L->rgb[2] = em[mo].rgb[2];
+        L->radius = rad[mo];
+        /* AREA, SOFTENED.  A neon frontage is a bigger light than a bulb, but
+         * not fifty times bigger: the fourth root keeps the ordering and
+         * throws away the magnitude, which is what the tier's own gain is
+         * for. */
+        L->power  = r.emis_max > 1e-6f
+                  ? sqrtf(sqrtf(em[mo].frac / r.emis_max)) : 1.0f;
+        if (L->power > 1.0f) L->power = 1.0f;
+        L->model  = mo;
+    }
+    if (g_nlight) {
+        int lit = 0;
+        for (i = 0; i < g_nmodel; i++) if (ok[i]) lit++;
+        printf("[photo] %d per-source lights derived from %d of %d scenery "
+               "models (emissive texels -> bulb vertices -> placements)\n",
+               g_nlight, lit, g_nmodel);
+        fflush(stdout);
+    }
+    free(bulb); free(rad); free(spread); free(ok);
+}
+
+int b3_scenery_lights(const B3ScLight** out)
+{
+    if (out) *out = g_light;
+    return g_nlight;
+}
+
 void b3_scenery_shutdown(void)
 {
+    free(g_light); g_light = NULL; g_nlight = 0;
     if (g_retained) { b3r_inst_free(g_retained); g_retained = NULL; }
     if (g_model) {
         for (int i = 0; i < g_nmodel; i++)
@@ -295,8 +596,24 @@ int b3_scenery_load(const char* dir)
     }
     free(d);
 
-    for (int i = 0; i < g_nmodel; i++)
-        g_model[i].tex = load_tex(g_dir, g_model[i].texture);
+    {   /* the texture upload and, in the same pass, the emissive scan that
+         * tier 7's light field is derived from -- see scenery_lights_build.
+         *
+         * THE SCAN IS SKIPPED ENTIRELY WHEN THE TIER IS OFF, and that is not
+         * only about the work.  Under B3_PHOTO=0 this module must load in the
+         * same number of frames it loaded in before the tier existed, or the
+         * pinned-frame suites that gate the whole port on B3_PHOTO=0 would be
+         * photographing a different moment. */
+        int want = b3_photo_fx(B3_PHOTO_FX_LIGHTS);
+        B3ScEmis* em = want
+            ? (B3ScEmis*)calloc((size_t)(g_nmodel ? g_nmodel : 1),
+                                sizeof(B3ScEmis))
+            : NULL;
+        for (int i = 0; i < g_nmodel; i++)
+            g_model[i].tex = load_tex(g_dir, g_model[i].texture,
+                                      em ? &em[i] : NULL);
+        if (em) { scenery_lights_build(em); free(em); }
+    }
 
     /* RETAINED: one baked world-space buffer, model-major and Z-order sorted
      * inside each model, so the per-instance LOD cull below turns into a few

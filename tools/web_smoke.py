@@ -287,6 +287,11 @@ async def run(args):
                    # the audio ring reports every 5 s rather than its default
                    # 10, so a short run still produces rows to gate on
                    "B3_WEB_AUDIO_STATS": "5"}
+            # Caller-set B3_* vars reach the page too, and WIN over the
+            # defaults above -- so `B3_RT=1 tools/web_smoke.py` tests what it
+            # says it tests instead of the settings-file default.
+            env.update({k: v for k, v in os.environ.items()
+                        if k.startswith("B3_") and k != "B3_ISO"})
             # THE PINNED WEB FRAME.  --pin-frame turns this run into the web's
             # answer to the native offscreen screenshot the desktop gates use:
             # a fixed sim step and a fixed frame number, so the same build

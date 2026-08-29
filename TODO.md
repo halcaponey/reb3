@@ -176,7 +176,23 @@ anti-tunnelling/bootstrapping nets, so the systems are not fully unified yet.
 ### Remaining call-graph gaps (`PHYSICS_GLUE_LEDGER.md` "gaps, ranked")
 
 1. **Props and debris are not in the broadphase** — pair ordering and the A/B
-   swap differ from retail in pileups.
+   swap differ from retail in pileups. NARROWED (2026-08-27): the prop
+   *narrow* phase is now retail's own — `FUN_001084E0`'s 15-axis OBB
+   separating-axis test, recovered in full and ported
+   (`INTEGRATION_NOTE.md` §11, `b3p_obb_contact` in `src/burnout3_props.c`),
+   which is what fixed the un-hittable signposts and the 23 % of cones a
+   drive passed through and left standing. NARROWED AGAIN (2026-08-28): the
+   post-contact side is now retail's too — the world pass runs ONE
+   `b3_rigid_body_obb_soup_contact` over the whole soup and one resolve
+   instead of the single-plane form once per polygon (which was dropping
+   props through the road and levitating the rest), the car's box is the
+   `+0x1D0/+0x1E0` bbox PAIR rather than the MAX alone, the contact point
+   takes `FUN_001084E0`'s A-face and B-face arms instead of always box A's
+   support point, and `FUN_00109560`'s `+0x20E`/`+0x211` settle latch is
+   ported (`INTEGRATION_NOTE.md` §12). What remains here is the pair
+   ORDERING, not the test — plus `FUN_00108240`, the edge-edge closest point,
+   which is the one arm of the contact point still standing on GLUE (41 % of
+   contacts on a measured cone drive).
 2. **Wheel and chassis contact now share one frozen raw-collision snapshot**;
    the chassis view applies `FUN_0011BBE0`'s recovered wall predicate. The
    snapshot still omits retail's appended crash-floor records. This is now a
@@ -323,11 +339,61 @@ track id defaults to `US_C3_V1`. At minimum the label is stale.
 * The suites below were green at the counts recorded here and must stay green;
   the counts themselves grow as cases are added, so treat the *names* as the
   list and each suite's own output as the count: port 151, crash_traj 134,
-  crashcinema 115, td_rules 532, takedown 973, props 337, ai 163, carcol 752,
-  sfx 399, hud 760, carfx 223, postfx 171, music 100, particlefx 600,
-  boostfx 77. There are now 39 `tools/validate_*.py` in total, plus three C
-  suites (`validate_frozen_soup.c`, `validate_traffic_pool.c`,
+  crashcinema 115, td_rules 532, takedown 973, props 1705, ai 163, carcol 1296,
+  sfx 399, hud 769, carfx 248, postfx 179, music 100, particlefx 600,
+  boostfx 77, scenery 315, light_probes 61, no_baked_data 90,
+  draw_distance 12, photo 247/247 without a reference binary (section 3b's
+  six dark-sky atmospherics checks are new; with `B3_PHOTO_REF_BIN` set,
+  section 11's cross-build leg is the one red, which any deliberate
+  photo-stack change turns red and which section 14.1c discharges by
+  measurement — see `docs/PHOTOREALISM.md` §5), prop_contact 16.
+  There are now 44 `tools/validate_*.py` in total,
+  plus three C suites (`validate_frozen_soup.c`, `validate_traffic_pool.c`,
   `validate_traffic_reservations.c`) with `make test-*` targets.
+* **THE PHOTOREALISM LAYER IS PINNED OFF IN EVERY SUITE THAT RENDERS**
+  (`docs/PHOTOREALISM.md`). Six INSPIRED screen-space effects ship ON by
+  default; a suite that verifies RECOVERED pixel behaviour sets `B3_PHOTO=0`
+  in its own boot environment, exactly the way it already sets
+  `B3_MUSIC_SEED` and `B3_TRACK_NOSHINE`. That is sound rather than a dodge
+  because `tools/validate_photo.py` section 2 **proves** `B3_PHOTO=0` renders
+  bit-identically to the pre-wave build, on the desktop and on the web. **If
+  that leg ever fails, every one of those pins stops being valid** and the
+  suites stop measuring what they say they measure — fix the identity before
+  fixing anything else.
+* **Tier 4rc's own follow-ups** (`docs/PHOTOREALISM.md`, "What tier 4rc still
+  cannot do"). None of these blocks anything; each is written down so it is
+  reported as a known limit rather than as a bug.
+  - **A wreck is traced with its intact hull.** A faithful one needs a second
+    tree per car (the aperture shell) *and* a per-frame decision about which of
+    up to six panels are still attached — i.e. a tree whose contents change
+    while the car is being driven, which the whole two-level construction
+    exists to avoid. `carbvh.bin`'s model table already has room: an instance
+    names a *model* and nothing says a car may have only one.
+  - **Night tracks lose a grounding cue.** On US_P1's sunset the traced shadow
+    carries much less contrast than retail's stylised ellipse, so a car reads
+    slightly less planted with the blob suppressed. The traced shadow is the
+    more correct one; the blob was doing a job beyond representing the sun.
+    Keeping a *reduced* blob where the traced term is weak is the obvious fix.
+  - **Traffic retire in view.** `B3_RT_CARS=all` traces the nearest-N traffic
+    by distance to the camera, so an instance can leave the set while still on
+    screen. It costs a shadow, not a wrong picture, and 20 slots covers what a
+    frame actually holds — but it is a pop, and the nearest-N pick is where it
+    would be fixed.
+  - **`TSPC_Car5` has no tree**, because its mesh fails the same plausibility
+    gate the mesh exporters apply. The renderer draws a box for it and it keeps
+    its blob, so the two agree; the real fix is upstream, in whatever makes
+    that model parse as 72.8 m long.
+* `tools/validate_car_shine.py` was already failing 4/45 in this tree BEFORE
+  the photorealism wave (measured against a binary built from the wave's base
+  commit, same machine, same session). Do not attribute those to the layer;
+  the layer is pinned off in that suite.
+* **A single pinned render is NOT reproducible in this tree.** Ten runs of one
+  binary with an identical environment and a warm cache produced five distinct
+  frames — differing over 700,000 pixels, i.e. different MOMENTS, not
+  different pixels. Something upstream of the render occasionally spends an
+  extra simulation step before the green light. `tools/afx_sweep.py`'s
+  `pin_ok` and `tools/validate_photo.py`'s `world_pin` both exist to work
+  around it; the cause has not been found and is worth finding.
 * **`.panels` sidecars must be regenerated** after any change to the `.bgv`
   extractor — now `tools/cextract/cx_cars_bgv.c` (the Python
   `tools/extract_bgv.py` is a shim onto the archived oracle). They carry the

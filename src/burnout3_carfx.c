@@ -824,6 +824,25 @@ void b3_carfx_set_light_rgb(float r, float gg, float b)
     g.light_rgb[0] = r; g.light_rgb[1] = gg; g.light_rgb[2] = b;
 }
 
+/* The track's sun, for whoever else needs it -- see the header.  It is handed
+ * out in the GAME's frame, the frame it was authored and stored in, because
+ * that is the only frame the two numbers are unambiguous in; the caller
+ * mirrors z if it works in this harness's GL world. */
+int b3_carfx_sun(float out_dir_game[3], float out_rgb[3])
+{
+    if (out_dir_game) {
+        out_dir_game[0] = g.sun_dir[0];
+        out_dir_game[1] = g.sun_dir[1];
+        out_dir_game[2] = g.sun_dir[2];
+    }
+    if (out_rgb) {
+        out_rgb[0] = g.light_rgb[0];
+        out_rgb[1] = g.light_rgb[1];
+        out_rgb[2] = g.light_rgb[2];
+    }
+    return g.have_sun;
+}
+
 /* SHINE-DATA: the track's sun colour, READ FROM THE TRACK.  enviro.dat
  * bytes 0x60..0x6B are game DATA, so they belong in a loader and not in C:
  * tools/extract_postfx_art.py writes them into the per-track environment
@@ -2175,6 +2194,30 @@ int b3_carfx_load_car(int slot, const char* cls, const char* base)
     return b3fx_load_lights(&g.car[slot], cls, base);
 }
 
+int b3_carfx_car_lamps(int slot, int type, float (*pos)[3],
+                       float (*nrm)[3], int max)
+{
+    const B3FXCar* c;
+    int i, n = 0;
+    if (slot < 0 || slot >= B3_CARFX_MAX_CARS || max <= 0) return 0;
+    c = &g.car[slot];
+    for (i = 0; i < c->nlights && n < max; i++) {
+        if (c->light[i].type != type) continue;
+        if (pos) {
+            pos[n][0] = c->light[i].pos[0];
+            pos[n][1] = c->light[i].pos[1];
+            pos[n][2] = c->light[i].pos[2];
+        }
+        if (nrm) {
+            nrm[n][0] = c->light[i].nrm[0];
+            nrm[n][1] = c->light[i].nrm[1];
+            nrm[n][2] = c->light[i].nrm[2];
+        }
+        n++;
+    }
+    return n;
+}
+
 int b3_carfx_load_extra(int idx, const char* cls, const char* base)
 {
     if (idx < 0 || idx >= B3_CARFX_MAX_EXTRA) return 0;
@@ -2737,8 +2780,22 @@ unsigned b3_carfx_light_byte(int braking, int reversing, unsigned ambient)
     return b;
 }
 
+/* HOW MANY HEAD-LAMP CORONAS THE PASS ACTUALLY EMITTED, and why anyone cares.
+ *
+ * FUN_00187BE0 rejects a corona whose lamp normal faces away from the eye
+ * (`d <= 0` below), which is correct for a billboard and has one consequence
+ * that is easy to miss from a curated screenshot: in CHASE CAMERA nobody's
+ * head lamps face the eye -- not the player's, not a rival's you are behind --
+ * so the source glare is legitimately zero for most of a lap.  A report of
+ * "I cannot see the headlights" therefore has to be answered by the road
+ * POOL, not by the sprite, and this counter is what proves which of the two
+ * is missing instead of guessing.  Reset every pass; read after it. */
+static int g_corona_head_n;
+int b3_carfx_corona_head_count(void) { return g_corona_head_n; }
+
 void b3_carfx_corona_pass_begin(void)
 {
+    g_corona_head_n = 0;
     if (!g.tex_corona) return;
     /* Attrib push kept for the state; the quads themselves are buffered by the
      * retained batcher and flushed by b3_carfx_corona_pass_end() before the
@@ -2848,6 +2905,7 @@ static void b3fx_corona_draw_table(const B3FXCar* c, const float pos[3],
              * x64 overbright saturating).                             [C/S] */
             float d = (ex*wn[0] + ey*wn[1] + ez*wn[2]) / el;
             if (d <= 0.0f) continue;
+            if (cc->type == 0) g_corona_head_n++;
             /* the quad is emitted at the midpoint between the light and the
              * eye (corner = pos +- right*size +- up*size - 0.5*(pos-cam)),
              * which is what keeps it in front of the bodywork.         [S] */

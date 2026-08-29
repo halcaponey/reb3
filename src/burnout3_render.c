@@ -1432,14 +1432,34 @@ unsigned b3r_vbo_upload(const float* data, long nfloats, int dynamic) {
                     dynamic ? GL_DYNAMIC_DRAW : GL_STATIC_DRAW);
 }
 
+/* THE SUN SHADOW PASS' OWN DRAW LEDGER.  The pass claims a caster list --
+ * track, props, scenery, and deliberately NOT the cars (they keep retail's
+ * recovered blob shadow; see b3r_shadow_begin).  A claim like that is worth
+ * exactly as much as its proof, and reading the call site is not one: anything
+ * that draws between begin and end is a caster whether the comment mentions it
+ * or not.  So the pass counts what actually went through, and its caller
+ * compares that against the three passes' own ledger entries.  Both draw paths
+ * are covered -- this one, and the raw glDrawArrays the car mesh uses, which
+ * b3r_shadow_active() lets that call site count for itself. */
+static int  g_sh_live  = 0;
+static long g_sh_draws = 0;
+
+int  b3r_shadow_active(void) { return g_sh_live; }
+long b3r_shadow_draws(void)  { return g_sh_draws; }
+
 void b3r_draw(int first, int count) {
     if (g_state != 1 || count <= 0) return;
+    if (g_sh_live) g_sh_draws++;
     b3r_sync_matrices();
     glDrawArrays(GL_TRIANGLES, first, count);
 }
 
 void b3r_stat_set(int slot, int n) {
     if (slot >= 0 && slot < B3R_STAT_COUNT) g_stats[slot] = n;
+}
+
+int b3r_stat_get(int slot) {
+    return (slot >= 0 && slot < B3R_STAT_COUNT) ? g_stats[slot] : 0;
 }
 
 /* B3_RENDER_STATS=<n>: one line every n frames with the DRAW COUNT this
@@ -2106,6 +2126,567 @@ int b3r_track_draw_shine(TrackMesh* m, const float eye[3],
     b3r_fog(&m->scene, 0, 1);
     b3r_stat_set(B3R_STAT_SHINE, batches);
     return drawn;
+}
+
+/* ====================================================================== *
+ *  THE SUN SHADOW PASS, and the SHINE MASK
+ *
+ *  Both are the photorealism layer's (burnout3_aftereffects.h, tiers 4 and 5),
+ *  both are INSPIRED, and neither may be cited as retail behaviour: the
+ *  renderer range 0x00028000..0x00045000 has no shadow-map or reflection
+ *  machinery of any kind and the Xbox had no budget for either.
+ *
+ *  They live here rather than in the aftereffects module because they are
+ *  GEOMETRY passes -- they need this file's retained buffers, its batch state
+ *  and its one world program -- and everything else in the wave is a
+ *  screen-space pass over a depth texture.  See the header for the design.
+ * ====================================================================== */
+
+/* The FBO entry points, loaded on demand.  b3r_init() deliberately does not
+ * require them: a context with no framebuffer objects loses the shadow pass
+ * and the shine mask, and must not lose the renderer. */
+static void (*p_glGenFramebuffers)(int, unsigned*);
+static void (*p_glBindFramebuffer)(unsigned, unsigned);
+static void (*p_glDeleteFramebuffers)(int, const unsigned*);
+static void (*p_glFramebufferTexture2D)(unsigned, unsigned, unsigned,
+                                        unsigned, int);
+static unsigned (*p_glCheckFramebufferStatus)(unsigned);
+static int g_fbo_state = -1;      /* -1 untried, 0 unavailable, 1 ready */
+
+#ifndef GL_FRAMEBUFFER
+#define GL_FRAMEBUFFER          0x8D40
+#endif
+#ifndef GL_COLOR_ATTACHMENT0
+#define GL_COLOR_ATTACHMENT0    0x8CE0
+#endif
+#ifndef GL_DEPTH_ATTACHMENT
+#define GL_DEPTH_ATTACHMENT     0x8D00
+#endif
+#ifndef GL_FRAMEBUFFER_COMPLETE
+#define GL_FRAMEBUFFER_COMPLETE 0x8CD5
+#endif
+#ifndef GL_DEPTH_COMPONENT
+#define GL_DEPTH_COMPONENT      0x1902
+#endif
+#ifndef GL_DEPTH_COMPONENT16
+#define GL_DEPTH_COMPONENT16    0x81A5
+#endif
+#ifndef GL_DEPTH_COMPONENT24
+#define GL_DEPTH_COMPONENT24    0x81A6
+#endif
+#ifndef GL_CLAMP_TO_EDGE
+#define GL_CLAMP_TO_EDGE        0x812F
+#endif
+#ifndef GL_UNSIGNED_INT
+#define GL_UNSIGNED_INT         0x1405
+#endif
+
+static int b3r_fbo_load(void) {
+    if (g_fbo_state >= 0) return g_fbo_state;
+    g_fbo_state = 0;
+#define B3R_FBO(fn) do { *(void**)(&p_##fn) = SDL_GL_GetProcAddress(#fn); \
+                         if (!p_##fn) return 0; } while (0)
+    B3R_FBO(glGenFramebuffers);      B3R_FBO(glBindFramebuffer);
+    B3R_FBO(glDeleteFramebuffers);   B3R_FBO(glFramebufferTexture2D);
+    B3R_FBO(glCheckFramebufferStatus);
+#undef B3R_FBO
+    g_fbo_state = 1;
+    return 1;
+}
+
+static struct {
+    unsigned fbo, tex, colour;
+    int  size;
+    int  state;                  /* -1 untried, 0 unavailable, 1 ready     */
+    int  pushed;                 /* a b3r_state_push is outstanding        */
+    int  save_vp[4];
+} g_sh = { 0, 0, 0, 0, -1, 0, { 0, 0, 0, 0 } };
+
+/* THE TARGET.  Depth only where the driver will take it -- a shadow map has no
+ * colour and allocating one is a quarter of the bandwidth wasted.  GL 3.0+,
+ * GLES 3 / WebGL 2 and WebGL 1 + WEBGL_depth_texture all complete a depth-only
+ * framebuffer; some older desktop drivers do not, so a colour attachment is
+ * added as a fallback rather than losing the effect over it. */
+static int shadow_make(int size) {
+    static const unsigned ifmt[4] = { GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT16,
+                                      GL_DEPTH_COMPONENT,   GL_DEPTH_COMPONENT };
+    static const unsigned type[4] = { GL_UNSIGNED_INT, GL_UNSIGNED_SHORT,
+                                      GL_UNSIGNED_INT, GL_UNSIGNED_SHORT };
+    int i, pass;
+    if (g_sh.state == 1 && g_sh.size == size) return 1;
+    if (g_sh.state == 0) return 0;
+    if (!b3r_fbo_load()) {
+        g_sh.state = 0;
+        fprintf(stderr, "[b3r] shadow: this context has no framebuffer "
+                        "objects -- the sun shadow pass is off\n");
+        return 0;
+    }
+    if (!g_sh.fbo) p_glGenFramebuffers(1, &g_sh.fbo);
+    if (!g_sh.tex) b3r_gl_gen_textures(1, &g_sh.tex);
+    p_glBindFramebuffer(GL_FRAMEBUFFER, g_sh.fbo);
+
+    /* pass 0 is depth alone; pass 1 adds the colour attachment some drivers
+     * insist on.  Four depth spellings inside each, for the same four targets
+     * afx_scene_depth_texture spells them for. */
+    for (pass = 0; pass < 2; pass++) {
+        if (pass == 1) {
+            if (!g_sh.colour) b3r_gl_gen_textures(1, &g_sh.colour);
+            b3r_gl_bind_texture(GL_TEXTURE_2D, g_sh.colour);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, size, size, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                     GL_TEXTURE_2D, g_sh.colour, 0);
+        }
+        for (i = 0; i < 4; i++) {
+            b3r_gl_bind_texture(GL_TEXTURE_2D, g_sh.tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            (void)glGetError();
+            glTexImage2D(GL_TEXTURE_2D, 0, (int)ifmt[i], size, size, 0,
+                         GL_DEPTH_COMPONENT, type[i], NULL);
+            if (glGetError()) continue;
+            p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                     GL_TEXTURE_2D, g_sh.tex, 0);
+            if (glGetError()) continue;
+            if (p_glCheckFramebufferStatus(GL_FRAMEBUFFER)
+                    == GL_FRAMEBUFFER_COMPLETE) {
+                g_sh.size  = size;
+                g_sh.state = 1;
+                p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                printf("[b3r] shadow map %dx%d ready (%s)\n", size, size,
+                       pass ? "depth + a colour attachment the driver wanted"
+                            : "depth only");
+                fflush(stdout);
+                return 1;
+            }
+        }
+    }
+    p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    g_sh.state = 0;
+    fprintf(stderr, "[b3r] shadow: no usable depth target at %dx%d -- the sun "
+                    "shadow pass is off\n", size, size);
+    return 0;
+}
+
+unsigned b3r_shadow_tex(void) { return g_sh.state == 1 ? g_sh.tex : 0u; }
+
+/* WHICH pass B3_PHOTO_SH_DUMP photographs.  The first frame of a run is a
+ * loading frame and every capture in this tree pins a frame several hundred
+ * later, so a diagnostic that only ever showed pass 1 would answer a question
+ * about a moment nobody is looking at.  B3_PHOTO_SH_DUMP_AT=<n>, 1-based. */
+static long g_sh_pass = 0;
+static long b3r_shadow_dump_pass(void) {
+    static long want = -1;
+    if (want < 0) {
+        const char* e = getenv("B3_PHOTO_SH_DUMP_AT");
+        want = (e && *e) ? atol(e) : 1;
+        if (want < 1) want = 1;
+    }
+    return want;
+}
+
+void b3r_shadow_free(void) {
+    if (g_state == 1 && g_fbo_state == 1) {
+        if (g_sh.fbo) p_glDeleteFramebuffers(1, &g_sh.fbo);
+        if (g_sh.tex) b3r_gl_delete_textures(1, &g_sh.tex);
+        if (g_sh.colour) b3r_gl_delete_textures(1, &g_sh.colour);
+    }
+    g_sh.fbo = g_sh.tex = g_sh.colour = 0;
+    g_sh.size = 0;
+    g_sh.state = -1;
+}
+
+int b3r_shadow_begin(const float sun_toward[3], const float center[3],
+                     float extent, float depth_range, int size,
+                     float out_vp[16]) {
+    float L[3], U[3], R[3], up[3], eye[3];
+    float V[16], P[16], VP[16];
+    float n, half;
+    int i;
+
+    if (g_state != 1 || !sun_toward || !center || !out_vp) return 0;
+    if (extent <= 1.0f || depth_range <= 1.0f || size < 64) return 0;
+    if (!shadow_make(size)) return 0;
+
+    n = sqrtf(sun_toward[0] * sun_toward[0] + sun_toward[1] * sun_toward[1]
+              + sun_toward[2] * sun_toward[2]);
+    if (n < 1e-4f) return 0;
+    for (i = 0; i < 3; i++) L[i] = sun_toward[i] / n;
+
+    /* A sun directly overhead makes cross(L, +Y) degenerate; +Z is the
+     * substitute, and the choice only rotates the map's own axes. */
+    if (L[1] > 0.95f || L[1] < -0.95f) {
+        up[0] = 0.0f; up[1] = 0.0f; up[2] = 1.0f;
+    } else {
+        up[0] = 0.0f; up[1] = 1.0f; up[2] = 0.0f;
+    }
+    /* R = normalize(cross(up, L)), U = cross(L, R) -- an orthonormal frame
+     * with L as the third axis, i.e. looking ALONG -L from above. */
+    R[0] = up[1] * L[2] - up[2] * L[1];
+    R[1] = up[2] * L[0] - up[0] * L[2];
+    R[2] = up[0] * L[1] - up[1] * L[0];
+    n = sqrtf(R[0]*R[0] + R[1]*R[1] + R[2]*R[2]);
+    if (n < 1e-4f) return 0;
+    for (i = 0; i < 3; i++) R[i] /= n;
+    U[0] = L[1] * R[2] - L[2] * R[1];
+    U[1] = L[2] * R[0] - L[0] * R[2];
+    U[2] = L[0] * R[1] - L[1] * R[0];
+
+    half = depth_range * 0.5f;
+    for (i = 0; i < 3; i++) eye[i] = center[i] + L[i] * half;
+
+    /* the light's view matrix, column-major, exactly as gluLookAt builds one
+     * for forward = -L and this up */
+    V[0] = R[0]; V[4] = R[1]; V[8]  = R[2];
+    V[1] = U[0]; V[5] = U[1]; V[9]  = U[2];
+    V[2] = L[0]; V[6] = L[1]; V[10] = L[2];
+    V[3] = V[7] = V[11] = 0.0f; V[15] = 1.0f;
+    V[12] = -(R[0]*eye[0] + R[1]*eye[1] + R[2]*eye[2]);
+    V[13] = -(U[0]*eye[0] + U[1]*eye[1] + U[2]*eye[2]);
+    V[14] = -(L[0]*eye[0] + L[1]*eye[1] + L[2]*eye[2]);
+
+    /* ortho(-e, e, -e, e, 0, depth_range) */
+    memset(P, 0, sizeof P);
+    P[0]  =  1.0f / extent;
+    P[5]  =  1.0f / extent;
+    P[10] = -2.0f / depth_range;
+    P[14] = -1.0f;
+    P[15] =  1.0f;
+
+    /* ---- THE TEXEL SNAP, and it is the difference between "shadows" and
+     * "boiling shadows".
+     *
+     * The box follows the camera, so between two frames it slides by a
+     * fraction of a texel -- and every shadow edge in the map is then rendered
+     * from a slightly different sample grid, which reads as the edges CRAWLING
+     * along every kerb at exactly the speed the car is doing.  It is the first
+     * thing a viewer notices and no amount of PCF hides it.
+     *
+     * The fix is to make the map's texel grid stationary IN WORLD SPACE: put
+     * the world origin at a whole texel by nudging the projection, so the box
+     * can only ever slide in whole-texel steps.  One point is enough, because
+     * the rest of the grid is rigid with respect to it. */
+    mat_mul(VP, P, V);
+    {
+        float ox = VP[12] * (float)size * 0.5f;
+        float oy = VP[13] * (float)size * 0.5f;
+        float rx = floorf(ox + 0.5f);
+        float ry = floorf(oy + 0.5f);
+        P[12] += (rx - ox) * 2.0f / (float)size;
+        P[13] += (ry - oy) * 2.0f / (float)size;
+        mat_mul(VP, P, V);
+    }
+    memcpy(out_vp, VP, sizeof VP);
+
+    /* the fit, next to the map B3_PHOTO_SH_DUMP writes: a map and the matrix it
+     * was rendered with are one piece of evidence, not two.  Both are keyed to
+     * the SAME pass number, because the first frame of a run is a loading frame
+     * and the frame a capture pins is several hundred later. */
+    g_sh_pass++;
+    if (b3r_shadow_dump_pass() == g_sh_pass) {
+        printf("[photo] shadow fit @pass %ld: L (%.3f %.3f %.3f) centre "
+               "(%.1f %.1f %.1f) extent %.1f depth %.1f size %d "
+               "-> %.3f m/texel\n", g_sh_pass, L[0], L[1], L[2],
+               center[0], center[1], center[2], extent, depth_range, size,
+               2.0f * extent / (float)size);
+        fflush(stdout);
+    }
+
+    /* ---- bind and clear ------------------------------------------------- */
+    /* THROUGH b3r_state_push/pop, like every other pass in the tree that owns
+     * state for a while (the car body, the car glass, the particles, the boost
+     * flames, the legacy postfx).  This pass sets the colour mask, the depth
+     * function, blending and the fog uniform, and then hands the frame back to
+     * a world pass and a HUD pass whose own state calls are FILTERED against
+     * the shadow's record -- so a field this pass moved and did not put back
+     * is a filtered-out call later, which is the failure mode B3_STATE_AUDIT
+     * exists to catch and the one the tree's longest comments are about.
+     * Saving the whole shadow is one struct copy and it makes the question
+     * unaskable. */
+    b3r_state_push();
+    g_sh.pushed = 1;
+    g_sh_live   = 1;
+    g_sh_draws  = 0;
+    glGetIntegerv(GL_VIEWPORT, g_sh.save_vp);
+    p_glBindFramebuffer(GL_FRAMEBUFFER, g_sh.fbo);
+    glViewport(0, 0, size, size);
+    b3r_gl_color_mask(0, 0, 0, 0);       /* depth only; through the shadow */
+    b3r_gl_depth_mask(1);
+    b3r_gl_enable(GL_DEPTH_TEST);
+    b3r_gl_depth_func(GL_LEQUAL);
+    b3r_gl_disable(GL_BLEND);
+    /* ---- THE WINDING, and getting it wrong empties the map of exactly the
+     * surfaces a shadow map exists to record.
+     *
+     * The world pass draws through a projection that carries the DISPLAY
+     * MIRROR -- `b3r_scale(-1, 1, 1)`, burnout3_full.c -- which reverses the
+     * on-screen winding of every triangle, and it compensates with
+     * `glFrontFace(GL_CCW)`.  This pass' projection is a plain ortho with no
+     * mirror in it, so its parity is the OPPOSITE one, and inheriting the
+     * world's CCW leaves GL culling precisely backwards: it throws away every
+     * face TURNED TOWARD the sun and keeps the ones turned away.
+     *
+     * The track mesh is single-sided and says so at the top of its own OBJ
+     * ("the game culls backfaces... submeshes whose material is D3DCULL_NONE
+     * carry a reverse-wound duplicate instead"), so backwards culling does not
+     * dim the map, it EMPTIES it: measured on US_C1_V1 frame 655, the road
+     * under the car was simply not in the map at all -- the nearest drawn
+     * texel to the car's own ground point was 13.7 m away, and only 6.2% of
+     * the map held anything at road level while 70% sat at the far plane.
+     *
+     * What that looks like from the driver's seat is the report this fixes.
+     * The one caster group that draws with culling OFF (the scenery -- see
+     * inst_state) went on casting correctly, so the near field kept its tree
+     * and post shadows while the distant buildings lost theirs: against a
+     * ray-cast of the real geometry the map MISSED 21.8% of genuine occlusion
+     * (76% against a true 98% past 100 m) and false-shadowed 0.3%.  A near
+     * field that is shaded and a far field that is not, with the boundary
+     * travelling with the camera, is "a blanket over the near road with a
+     * straight edge at mid-distance beyond which the world is sunlit".
+     *
+     * With the parity right, GL_BACK culling in the light's clip space means
+     * exactly "drop the faces turned away from the sun", which is the correct
+     * caster set and half the fragments.  b3r_state_pop() in b3r_shadow_end
+     * puts the world's own winding back -- front_face is a field of the state
+     * shadow, so the restore is real. */
+    b3r_gl_front_face(GL_CW);
+    glClear(GL_DEPTH_BUFFER_BIT);
+
+    /* the light's matrices, on the ordinary stack -- so every existing draw
+     * call in the tree renders from the sun with no changes at all */
+    b3r_matrix_mode(B3R_MAT_PROJECTION);
+    b3r_push();
+    b3r_load(P);
+    b3r_matrix_mode(B3R_MAT_MODELVIEW);
+    b3r_push();
+    b3r_load(V);
+    return 1;
+}
+
+void b3r_shadow_end(void) {
+    if (g_sh.state != 1 || !g_sh.pushed) return;
+    g_sh.pushed = 0;
+    g_sh_live   = 0;
+    b3r_matrix_mode(B3R_MAT_MODELVIEW);
+    b3r_pop();
+    b3r_matrix_mode(B3R_MAT_PROJECTION);
+    b3r_pop();
+    b3r_matrix_mode(B3R_MAT_MODELVIEW);
+
+    /* RE-SYNC THE SHADOW BEFORE RESTORING FROM IT, and this is not paranoia --
+     * without it the restore below is a no-op on exactly the fields that
+     * matter.
+     *
+     * b3r_end() -- which every caster pass between begin and end goes through
+     * -- finishes with THREE RAW GL CALLS: glDepthMask(TRUE), the blend
+     * disable, and the world's cull setting.  They are raw deliberately (they
+     * reproduce the legacy world pass' own tail, and the comment there is
+     * emphatic about why), but raw means the state shadow does not see them,
+     * so by the time control reaches here the shadow's record and the driver
+     * can disagree on those three.  b3r_state_pop() restores through the
+     * shims, and a shim FILTERS a call whose recorded value already matches --
+     * so a field the shadow thinks is 0 and the driver has set to 1 is
+     * restored to 0 by changing nothing at all, and the frame carries on with
+     * the wrong one.
+     *
+     * The consequence is not subtle: the very next thing drawn is the SKY
+     * DOME, which has to be drawn with depth writes off, and in the pre-wave
+     * frame it inherited b3_afx_frame_begin()'s state directly because nothing
+     * ran in between.  Asserting the three through the shims first costs at
+     * most three redundant GL calls a frame and makes the record agree with
+     * the driver, after which the restore is real. */
+    b3r_gl_depth_mask(1);
+    b3r_gl_disable(GL_BLEND);
+    if (b3r_world_cull()) b3r_gl_enable(GL_CULL_FACE);
+    else                  b3r_gl_disable(GL_CULL_FACE);
+
+    /* the whole shadow back, colour mask included -- see b3r_shadow_begin */
+    b3r_state_pop();
+    /* B3_PHOTO_SH_DUMP=<path.pgm>: THE MAP ITSELF, once, read back off the
+     * target while it is still bound.  DIAGNOSTIC, and it earns its lines for
+     * the reason B3_PHOTO_SH_CASTERS does: every question about a shadow that
+     * should not be there -- is the box fitted, is the depth range sane, did
+     * this caster reach the map at all -- is answerable in one run instead of
+     * by argument.  Written as a 16-bit PGM because that is the one image
+     * format a depth buffer maps onto without a library. */
+    {
+        const char* dp = getenv("B3_PHOTO_SH_DUMP");
+        if (dp && *dp && b3r_shadow_dump_pass() == g_sh_pass) {
+            int n = g_sh.size;
+            float* px = (float*)malloc((size_t)n * (size_t)n * sizeof(float));
+            if (px) {
+                glReadPixels(0, 0, n, n, GL_DEPTH_COMPONENT, GL_FLOAT, px);
+                FILE* f = fopen(dp, "wb");
+                if (f) {
+                    double sum = 0.0;
+                    long   far_ = 0;
+                    int i;
+                    unsigned short* row =
+                        (unsigned short*)malloc((size_t)n * sizeof(short));
+                    fprintf(f, "P5\n%d %d\n65535\n", n, n);
+                    for (i = 0; i < n * n; i++) {
+                        sum += px[i];
+                        if (px[i] >= 0.999999f) far_++;
+                    }
+                    if (row) {
+                        int y, x;
+                        for (y = n - 1; y >= 0; y--) {
+                            for (x = 0; x < n; x++) {
+                                float v = px[y * n + x];
+                                unsigned u = (unsigned)(v * 65535.0f + 0.5f);
+                                if (u > 65535u) u = 65535u;
+                                row[x] = (unsigned short)
+                                         ((u >> 8) | ((u & 0xFFu) << 8));
+                            }
+                            fwrite(row, 2, (size_t)n, f);
+                        }
+                        free(row);
+                    }
+                    fclose(f);
+                    printf("[photo] shadow map @pass %ld -> %s (%dx%d, mean "
+                           "%.5f, %.1f%% at the far plane)\n", g_sh_pass, dp,
+                           n, n,
+                           sum / ((double)n * (double)n),
+                           100.0 * (double)far_ / ((double)n * (double)n));
+                    fflush(stdout);
+                }
+                free(px);
+            }
+        }
+    }
+    if (p_glBindFramebuffer) p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(g_sh.save_vp[0], g_sh.save_vp[1],
+               g_sh.save_vp[2], g_sh.save_vp[3]);
+}
+
+/* ---------------------------------------------------------------- the
+ * SHINE MASK.  One draw of the whole shine VBO, flat, into a colour target
+ * with the SCENE'S OWN DEPTH attached so the mask is depth-tested.
+ *
+ * The per-vertex colours are the ones b3r_track_draw_shine computed for this
+ * frame -- light * strength * gate * pow(R.V, power) -- so the mask is not a
+ * coverage bit but the specular intensity itself, and the reflection is
+ * strongest exactly where the game's own material said the surface was.  That
+ * is free: the buffer is already uploaded. */
+static struct {
+    unsigned fbo, tex;
+    int w, h;
+    int state;                   /* -1 untried, 0 unavailable, 1 ready */
+} g_sm = { 0, 0, 0, 0, -1 };
+
+unsigned b3r_shine_mask_render(unsigned depth_tex, int w, int h) {
+    int save_vp[4];
+    if (g_state != 1 || !depth_tex || w < 1 || h < 1) return 0;
+    if (!g_t.vbo_shine_pos || g_t.shine_verts <= 0) return 0;
+    if (g_sm.state == 0) return 0;
+    if (!b3r_fbo_load()) { g_sm.state = 0; return 0; }
+
+    if (!g_sm.fbo) p_glGenFramebuffers(1, &g_sm.fbo);
+    if (!g_sm.tex) b3r_gl_gen_textures(1, &g_sm.tex);
+    p_glBindFramebuffer(GL_FRAMEBUFFER, g_sm.fbo);
+    if (g_sm.w != w || g_sm.h != h || g_sm.state != 1) {
+        b3r_gl_bind_texture(GL_TEXTURE_2D, g_sm.tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                 GL_TEXTURE_2D, g_sm.tex, 0);
+        g_sm.w = w; g_sm.h = h;
+    }
+    /* the scene's depth, every frame: the aftereffects chain reallocates it on
+     * every resize and an attachment cached across one is a stale handle */
+    p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                             GL_TEXTURE_2D, depth_tex, 0);
+    if (p_glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        g_sm.state = 0;
+        fprintf(stderr, "[b3r] shine mask: the target would not complete at "
+                        "%dx%d -- screen-space reflections are off\n", w, h);
+        return 0;
+    }
+    g_sm.state = 1;
+
+    /* the same state discipline the shadow pass takes, and for the same
+     * reason: this runs in the MIDDLE of the aftereffects chain, between two
+     * passes that have their own ideas about depth and blending. */
+    b3r_state_push();
+    glGetIntegerv(GL_VIEWPORT, save_vp);
+    glViewport(0, 0, w, h);
+    /* COLOUR ONLY.  The depth attachment is the scene's, still holding the
+     * frame that was just drawn -- clearing it would destroy the buffer every
+     * other photorealism pass is about to read. */
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    {
+        B3RState st;
+        st.tex = 0;
+        st.mode = B3R_TEX_NONE;
+        st.blend = B3R_BLEND_NONE;
+        st.alpha_ref = -1.0f;
+        st.depth_mask = 0;              /* read the scene's depth, keep it   */
+        st.depth_test = 1;
+        st.depth_func = GL_LEQUAL;
+        st.cull = 0;
+        /* COVERAGE, NOT THE SPECULAR VALUE, and this was measured the wrong
+         * way round first.  The obvious thing is to hand the mask the shine
+         * pass' own per-vertex colours -- they are already uploaded, and they
+         * carry the material's strength times this frame's pow(R.V, power).
+         * That produces a mask which is BLACK almost everywhere, because a
+         * specular term is near zero except at an actual glint: the first cut
+         * of the reflection pass moved 0.02% of the pinned frame, i.e. it ran
+         * and did nothing.
+         *
+         * What the reflection wants to know is not "is this pixel glinting
+         * right now" but "is this surface the kind that reflects", and the
+         * material flag already answers that -- every vertex in this buffer is
+         * there BECAUSE its group had shine_strength > 0.  So the mask is flat
+         * coverage of the tagged geometry, and the angular falloff is left to
+         * the Fresnel term in the march, which is where it belongs.
+         *
+         * The colour attribute is therefore not bound at all: b3r_arrays_fmt
+         * pins a disabled generic attribute to white (see its own note -- a
+         * disabled attribute defaults to BLACK, which is exactly this bug in
+         * another spelling) and b3r_color carries the level. */
+        B3RVtxFmt fmt;
+        fmt.vbo     = g_t.vbo_shine_pos;
+        fmt.stride  = 5;
+        fmt.off_uv  = 3;
+        fmt.off_col = -1;
+        fmt.n_col   = 0;
+        fmt.off_nrm = -1;
+        b3r_begin();
+        b3r_fog(NULL, 0, 0);
+        b3r_state(&st);
+        b3r_model(NULL);
+        b3r_color(1.0f, 1.0f, 1.0f, 1.0f);
+        b3r_uv_offset(0.0f, 0.0f);
+        b3r_arrays_fmt(&fmt);
+        b3r_draw(0, g_t.shine_verts);   /* ONE call: the spans are contiguous */
+        b3r_end();
+    }
+    b3r_state_pop();
+    p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(save_vp[0], save_vp[1], save_vp[2], save_vp[3]);
+    return g_sm.tex;
+}
+
+void b3r_shine_mask_free(void) {
+    if (g_state == 1 && g_fbo_state == 1) {
+        if (g_sm.fbo) p_glDeleteFramebuffers(1, &g_sm.fbo);
+        if (g_sm.tex) b3r_gl_delete_textures(1, &g_sm.tex);
+    }
+    g_sm.fbo = g_sm.tex = 0;
+    g_sm.w = g_sm.h = 0;
+    g_sm.state = -1;
 }
 
 /* ====================================================================== *

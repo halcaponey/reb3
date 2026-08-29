@@ -25,6 +25,9 @@
  * harness targets (aligned 64-bit loads/stores are atomic on x86-64).
  */
 #include "burnout3_music.h"
+#include "burnout3_dj.h"          /* the DJ's independent duck factor */
+#include "burnout3_isodata.h"     /* b3_iso_is_materialised            */
+#include <pthread.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -115,6 +118,88 @@ static int      g_bag[B3MUSIC_TRACKS];
 static int      g_bag_n;                     /* entries left in the bag   */
 static int      g_last_picked = -1;
 
+/* Weak so the validators can link this module without the whole
+ * extraction pipeline behind it -- the same trick burnout3_dj.c uses for
+ * b3_iso_dj_available().  burnout3_isodata.c provides the strong
+ * definition in the real build.  "Yes, it is there" is the right answer
+ * for a probe: it then opens the file directly, exactly as before the
+ * worker existed. */
+int b3_iso_is_materialised(const char *path) __attribute__((weak));
+int b3_iso_is_materialised(const char *path) { (void)path; return 1; }
+
+/* ===================================================================== *
+ *  THE MATERIALISE WORKER -- GLUE, and the reason a song change is
+ *  invisible now
+ *
+ *  An EA TRAX song is decoded from the disc on first use ('T:eatrax:<n>',
+ *  ~0.5 s).  That used to happen inside b3_music_pump(), on the frame
+ *  thread, which meant a mid-race song change froze the game for half a
+ *  second -- and the only reason nobody SAW a freeze is that the loading
+ *  screen's progress hook was drawing frames from inside the decode, so
+ *  the player got a LOADING SCREEN mid-race instead.  Both halves of that
+ *  are wrong.
+ *
+ *  So: the frame thread never decodes.  It asks whether the file is on
+ *  disk (b3_iso_is_materialised, which never extracts), and if it is not,
+ *  hands the path to this worker and comes back next frame.  The ring has
+ *  11.9 s in front of it, so half a second of waiting is inaudible.
+ *
+ *  One request at a time, one thread, no queue -- there is only ever one
+ *  next song.  The iso layer's own locking is in burnout3_isodata.c
+ *  (THE MATERIALISE LOCK, and the thread-local return ring above it).
+ * ===================================================================== */
+static pthread_t       g_mat_th;
+static pthread_mutex_t g_mat_m  = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_mat_cv = PTHREAD_COND_INITIALIZER;
+static char            g_mat_want[512];
+static int             g_mat_run;        /* the thread exists            */
+static int             g_mat_busy;       /* a request is in flight       */
+/* Written by the main thread, read by the audio thread's underrun test --
+ * volatile for the same reason the ring counters are: this module's
+ * threading note at the top of the file. */
+static volatile int    g_pending = -1;   /* track we are waiting on      */
+
+static void *mat_worker(void *unused) {
+    (void)unused;
+    for (;;) {
+        char path[512];
+        pthread_mutex_lock(&g_mat_m);
+        while (!g_mat_busy) pthread_cond_wait(&g_mat_cv, &g_mat_m);
+        snprintf(path, sizeof path, "%s", g_mat_want);
+        pthread_mutex_unlock(&g_mat_m);
+
+        /* Opening it IS extracting it -- that is the iso layer's contract.
+         * The handle is dropped immediately; the point is the side effect. */
+        { FILE *f = fopen(path, "rb"); if (f) fclose(f); }
+
+        pthread_mutex_lock(&g_mat_m);
+        g_mat_busy = 0;
+        pthread_mutex_unlock(&g_mat_m);
+    }
+    return NULL;
+}
+
+/* 1 if the worker has the job.  0 means there is no worker to be had --
+ * a build without threads, or pthread_create failing -- and the caller
+ * must fall back to decoding inline, exactly as it always did.  Silence
+ * would be a far worse failure than a stall. */
+static int mat_request(const char *path) {
+    int queued;
+    pthread_mutex_lock(&g_mat_m);
+    if (!g_mat_run) {
+        g_mat_run = (pthread_create(&g_mat_th, NULL, mat_worker, NULL) == 0);
+        if (g_mat_run) pthread_detach(g_mat_th);
+    }
+    if (g_mat_run && !g_mat_busy) {
+        snprintf(g_mat_want, sizeof g_mat_want, "%s", path);
+        g_mat_busy = 1;
+        pthread_cond_signal(&g_mat_cv);
+    }
+    queued = g_mat_run;
+    pthread_mutex_unlock(&g_mat_m);
+    return queued;
+}
+
 /* ---- the stream ------------------------------------------------------ */
 static FILE    *g_fp;
 static int      g_fp_track = -1;
@@ -136,6 +221,8 @@ static volatile unsigned long long g_now_start;
 static volatile long               g_now_len;
 
 static float g_master = 0.30f;
+static volatile int g_hold;                  /* the DJ has the bus       */
+static float g_last_song;                    /* gating readback          */
 static float g_duck_target = 1.0f;
 static float g_duck = 1.0f;
 static unsigned g_started, g_underruns;
@@ -143,6 +230,7 @@ static unsigned g_started, g_underruns;
 /* the crash bed rides in the same pump and the same mixer; see the CRASH
  * BED section at the bottom of this file */
 static void  crash_pump(void);
+static int   crash_pause_mode(void);
 static float crash_next_sample(void);
 static void  crash_close_files(void);
 static void  crash_module_reset(void);
@@ -280,10 +368,23 @@ static void stream_close(void) {
 /* Queue `track` as the next thing the ring will carry.  The mark tells
  * the mixer where in the stream the new track begins so the banner turns
  * over exactly when the first sample is heard, not when it is read. */
+/* -2 from stream_open() means "not on disk yet, the worker has it, ask
+ * again next frame" -- distinct from -1, which means the track is bad. */
+#define STREAM_PENDING (-2)
+
 static int stream_open(int track) {
     FILE *f = NULL;
     long n;
     if (track < 0 || track >= B3MUSIC_TRACKS) return -1;
+    /* THE FRAME THREAD DOES NOT DECODE.  If the song still has to come off
+     * the disc, hand it to the worker and come back -- the ring has 11.9 s
+     * in front of it, and the decode is about half a second. */
+    {
+        char p[512];
+        b3_music_track_path(track, p, sizeof p);
+        if (!b3_iso_is_materialised(p) && mat_request(p))
+            return STREAM_PENDING;
+    }
     n = wav_open(track, &f);
     if (n <= 0) { g_have[track] = 0; return -1; }
     if (g_fp) fclose(g_fp);
@@ -331,6 +432,10 @@ __attribute__((weak)) int b3_iso_music_available(int song) {
 
 int b3_music_init(void) {
     char path[320];
+    /* Latch B3_MUSIC_CRASH here, on the main thread.  b3_music_song_held()
+     * is called from the audio callback, and a lazy getenv() on first use
+     * would put that call on the audio thread. */
+    (void)crash_pause_mode();
     crash_module_reset();   /* retail zeroes the rotation in the audio ctor */
     g_playable = 0;
     for (int i = 0; i < B3MUSIC_TRACKS; i++) {
@@ -389,6 +494,10 @@ void b3_music_stop(void) {
     g_rd = g_wr;                 /* drop whatever is buffered            */
     g_mark_r = g_mark_w;
     g_now_track = -1;
+    /* whatever the worker was fetching, nobody is waiting for it now --
+     * the decode itself still completes and stays cached, which is the
+     * point of a cache */
+    g_pending = -1;
 }
 
 int b3_music_play(int track) {
@@ -396,7 +505,16 @@ int b3_music_play(int track) {
     if (!g_have[track]) return -1;
     b3_music_stop();
     g_last_picked = track;
-    if (stream_open(track) < 0) return -1;
+    {
+        int r = stream_open(track);
+        /* pending is a success from the caller's point of view: the song
+         * IS starting, the worker is fetching it, and pump() will open it
+         * the moment it lands.  Reporting failure here would make the DJ
+         * think the playlist was empty. */
+        if (r == STREAM_PENDING) { g_pending = track; return track; }
+        g_pending = -1;
+        if (r < 0) return -1;
+    }
     b3_music_pump();
     return track;
 }
@@ -427,9 +545,23 @@ void b3_music_pump(void) {
         size_t want, got;
         if (space <= READ_CHUNK) return;              /* full enough      */
         if (!g_fp) {
-            /* the previous track ran out: roll on to the next one */
-            int t = b3_music_pick_next();
-            if (t < 0 || stream_open(t) < 0) return;
+            /* THE DJ HOLD.  Without this, b3_music_stop() is undone two
+             * frames later: no file open looks exactly like "the track
+             * ran out", so the pump rolls straight on to the next song
+             * and the DJ ends up talking over it after all. */
+            if (g_hold) return;
+            /* the previous track ran out: roll on to the next one.  A
+             * track we are already waiting on is retried rather than
+             * re-picked -- pick_next() draws from the shuffle bag, and
+             * re-picking every frame would burn the whole playlist while
+             * the worker decoded one song. */
+            int t = (g_pending >= 0) ? g_pending : b3_music_pick_next();
+            int r;
+            if (t < 0) return;
+            r = stream_open(t);
+            if (r == STREAM_PENDING) { g_pending = t; return; }
+            g_pending = -1;
+            if (r < 0) return;
         }
         want = READ_CHUNK;
         if ((long)want > g_fp_left) want = (size_t)g_fp_left;
@@ -454,6 +586,25 @@ void b3_music_set_master(float g) {
 }
 
 float b3_music_master(void) { return g_master; }
+
+/* The DJ's hand-over.  Retail advances the playlist before the line and
+ * starts the NEXT song after it (RE_CRASHFM.md section 6.3), so while
+ * the radio is talking there is no song at all -- not a quiet one.
+ * Holding stops the current track AND stops the pump rolling on. */
+void b3_music_set_hold(int on) {
+    on = on ? 1 : 0;
+    if (on == g_hold) return;
+    g_hold = on;
+    if (on) b3_music_stop();
+}
+
+int b3_music_held(void) { return g_hold; }
+
+/* The SONG's share of the last b3_music_next_sample(), crash bed
+ * excluded.  Gating only (tools/validate_dj.py): "the music is silent
+ * under the cinematic" is unmeasurable from the mixed channel, because
+ * the bed is deliberately loud in exactly that window. */
+float b3_music_last_song_sample(void) { return g_last_song; }
 
 void b3_music_set_duck(float g) {
     if (g < 0.f) g = 0.f;
@@ -483,9 +634,19 @@ float b3_music_next_sample(void) {
     unsigned long long rd = g_rd;
     float bed = crash_next_sample();   /* the pre-rendered crash stream   */
     float s;
+    /* CRASH PAUSE [S].  Return the bed alone and, crucially, do NOT
+     * advance g_rd -- that is what makes this a pause rather than a mute:
+     * the song resumes on the sample it stopped on.  g_now_track is left
+     * alone too, so the EA TRAX ticker keeps naming the held song instead
+     * of blanking for the length of the cinematic. */
+    if (b3_music_song_held()) { g_last_song = 0.0f; return bed; }
     if (!g_ready || rd >= g_wr) {
-        if (g_ready && g_playable) g_underruns++;
+        /* Neither a hold nor a pending decode is an underrun: both are
+         * silences we asked for.  A radio changing songs has a beat of
+         * quiet, and counting it as a starve would bury the real ones. */
+        if (g_ready && g_playable && !g_hold && g_pending < 0) g_underruns++;
         g_now_track = -1;
+        g_last_song = 0.0f;
         return bed;
     }
     /* has a queued track boundary come due? */
@@ -509,7 +670,13 @@ float b3_music_next_sample(void) {
             g_duck -= step; if (g_duck < g_duck_target) g_duck = g_duck_target;
         }
     }
-    return s * g_master * g_duck * edge_gain(rd) + bed;
+    /* The DJ's duck is a SECOND, independent factor.  b3_music_set_duck()
+     * is a single absolute set owned by the crash bed (crash_duck_target),
+     * so a DJ line sharing that setter would fight the bed for it and one
+     * of them would win at random.  Multiplying instead means both can
+     * duck at once and neither has to know about the other. */
+    g_last_song = s * g_master * g_duck * b3_dj_music_duck() * edge_gain(rd);
+    return g_last_song + bed;
 }
 
 void b3_music_mix_s16(int16_t *out, int frames) {
@@ -775,8 +942,39 @@ static void crash_module_reset(void) {
  * which restores both the ratio and the 0.30 + 0.70 = 1.0 sum retail
  * mixed at.  At a 0.30 master the duck is 1.0 and nothing is ducked --
  * exactly what the recovered mix state machine does. */
+/* B3_MUSIC_CRASH -- what happens to the SONG while the bed is up.
+ *
+ *   "pause"  (default)  [S]  the song FREEZES and resumes exactly where
+ *                            it left off when the bed releases.  This is
+ *                            a user request, not a recovered behaviour;
+ *                            retail has nothing like it.
+ *   "retail"            [C]  the recovered mix: the song keeps playing
+ *                            at 0.30 under the 0.70 bed, summing to 1.0
+ *                            and never ducked -- RE_MUSIC.md section 6.3,
+ *                            mgr+0x83C = [0x003EC424] @0x0014B59E.
+ *
+ * Read once, latched, so the audio thread never touches getenv(). */
+static int g_crash_pause = -1;
+
+static int crash_pause_mode(void) {
+    if (g_crash_pause < 0) {
+        const char *e = getenv("B3_MUSIC_CRASH");
+        g_crash_pause = (e && *e && !strcmp(e, "retail")) ? 0 : 1;
+    }
+    return g_crash_pause;
+}
+
+/* 1 while the song must be held silent and NOT advanced. */
+int b3_music_song_held(void) {
+    return crash_pause_mode() && g_cplaying;
+}
+
 static float crash_duck_target(void) {
-    float m = b3_music_master();
+    float m;
+    /* In pause mode the song is silent anyway; ducking as well would be
+     * two mechanisms fighting over the same fader. */
+    if (crash_pause_mode()) return 1.0f;
+    m = b3_music_master();
     if (m <= B3MUSIC_SONG_VOL_F) return 1.0f;
     return B3MUSIC_SONG_VOL_F / m;
 }

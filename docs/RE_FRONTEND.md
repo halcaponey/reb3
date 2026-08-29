@@ -158,9 +158,14 @@ Open [?]:
   `Sound/Prop/<category>/` VDB groups carry `Min Impulse`/`Max Impulse` (and
   presumably wave-selection) parameters; how a category resolves to its wave
   name/index was not recovered. Do not assume name-similarity mapping.
-- DJ speech selection: `.rdata` has `djmcr/djmbl/djmrr/…`, `DJAS/DJEU/DJUS`,
-  `djrace/djgen/djwww/ident` and a `"%s%s%d.awd"` builder near
-  `Sound/Radio.cfg`; the E_DJ*.xwb entry-selection logic was not decompiled.
+- DJ speech selection: **recovered — see docs/RE_CRASHFM.md.** The `.rdata`
+  run at `0x003AF1F8` (`djmcr/djmbl/djmrr/…`, `DJAS/DJEU/DJUS`,
+  `djrace/djgen/djwww/ident`, the `"%s%s%d.awd"` builder and
+  `Sound/Radio.cfg`) is the radio's bank table. Entry selection is
+  `FUN_001550B0` (three ranges into the 38-entry per-track bank),
+  `FUN_001551E0` (mode → `djm*`) and the three selectors at
+  `FUN_001554A0` / `FUN_00155590` / `FUN_00155630`; the pick itself is a
+  shuffled 0x26-byte table walked cyclically with one repeat retry.
 - The `Sound/*.cfg` gain/pitch parameters live in hashed form in
   `Data/vdb.xml` (same pipeline as RE_NOTES section 10); individual sound
   keys were not extracted this session.

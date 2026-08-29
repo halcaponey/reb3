@@ -73,6 +73,11 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
+#include <pthread.h>
+
+/* Emscripten builds this single-threaded unless -pthread is on; either way
+ * __thread is what both toolchains spell it, and the Android NDK too. */
+#define B3_THREAD_LOCAL __thread
 
 #include "burnout3_isodata.h"
 #include "cx_extract.h"
@@ -183,9 +188,25 @@ static int mkdir_p_parent(const char *path)
 }
 
 /* A ring, so several resolved paths can be alive across one expression. */
+/* THE RETURN RING, AND WHY IT IS THREAD-LOCAL.
+ *
+ * resolve_inner() hands back a pointer into this ring, so the ring is the
+ * one piece of shared mutable state a CACHE HIT touches -- and a cache hit
+ * is what nearly every resolve is once the load screen is done.  The music
+ * module now materialises the next song on a worker thread (see THE
+ * MATERIALISE LOCK below), which put a second caller in here.
+ *
+ * Making it __thread rather than locking it is deliberate: the hit path
+ * then takes NO lock at all, so a 0.5 s decode on the worker cannot block
+ * the frame thread's own resolves behind it.  That is the whole point of
+ * moving the decode off the frame path; a shared lock here would have put
+ * the stall straight back. */
+static pthread_mutex_t g_mat_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t       g_main_thread;      /* set in b3_iso_init() */
+
 #define B3_RING 8
-static char g_ring[B3_RING][B3_PATH_MAX];
-static int  g_ring_i = 0;
+static B3_THREAD_LOCAL char g_ring[B3_RING][B3_PATH_MAX];
+static B3_THREAD_LOCAL int  g_ring_i = 0;
 
 static char *ring_next(void)
 {
@@ -451,6 +472,7 @@ GLOBAL_FN[] = {
     { "car_paint",      cx_extract_car_paint,      OUT_REPO  },
     { "traffic_lights", cx_extract_traffic_lights, OUT_REPO  },
     { "hulls",          cx_extract_hulls,          OUT_REPO  },
+    { "car_bvh",        cx_extract_car_bvh,        OUT_REPO  },
     { "txd",            cx_extract_txd,            OUT_REPO  },
     { "font",           cx_extract_font,           OUT_REPO  },
     { "carfx_art",      cx_extract_carfx_art,      OUT_REPO  },
@@ -494,10 +516,17 @@ static const MapRule TRACK_MAP[] = {
     { "props.bin",        MATCH_EXACT,  "props"                    },
     { "scenery.bin",      MATCH_EXACT,  "scenery"                  },
     { "light_probes.bin", MATCH_EXACT,  "light_probes"             },
+    /* THE BVH READS THREE OTHER STAGES' ARTEFACTS, so the ordered list is
+     * the whole dependency: track (track.obj + track.mtl + textures/),
+     * props and scenery all have to be on disc before cx_bvh can walk
+     * them.  Same shape as "bgd_paths nav_edges". */
+    { "bvh.bin",          MATCH_EXACT,
+      "track textures props scenery bvh"                               },
     /* anything else under a track: the whole set, the ~3 s race-load cost */
     { "",                 MATCH_PREFIX,
       "tlist track textures collision envmap bgd_paths traffic "
-      "traffic_cars nav_edges start_grid pace props scenery light_probes" },
+      "traffic_cars nav_edges start_grid pace props scenery light_probes "
+      "bvh" },
 };
 #define N_TRACK_MAP (sizeof TRACK_MAP / sizeof TRACK_MAP[0])
 
@@ -506,6 +535,11 @@ static const MapRule TRACK_MAP[] = {
  * build cannot produce (build/music, see materialise()). */
 static const MapRule GLOBAL_MAP[] = {
     { "cars/car_physics.bin", MATCH_EXACT,  "car_tuning"              },
+    /* the optional ray-traced sun shadow's per-car trees.  It reads the
+     * .bgv/.btv containers rather than build/cars/, so unlike everything else
+     * under this prefix it owns itself outright and needs no other family to
+     * have run first. */
+    { "cars/carbvh.bin",      MATCH_EXACT,  "car_bvh"                 },
     { "cars/roster.bin",      MATCH_EXACT,  "vehicle_roster"          },
     { "cars/parts/",          MATCH_PREFIX, "car_meshes"              },
     { ".hull",                MATCH_SUFFIX, "hulls"                   },
@@ -827,10 +861,20 @@ static void absent_record(const char *rel)
  * the full transcript. */
 static int g_saved_out = -1;
 
+/* MAIN THREAD ONLY, and this one really is a correctness rule rather than
+ * a convention.  The silencing is a dup2 over file descriptor 1, which is
+ * PROCESS-global: doing it on the decode worker would send whatever the
+ * game thread happened to be printing -- the FPS line, a [dj] line, the
+ * frame profiler -- to /dev/null for the half second a song takes.
+ *
+ * Nothing is lost by skipping it there.  The only stage the worker ever
+ * runs is 'T:eatrax:<n>', and cx_extract_eatrax_one() writes to stderr
+ * alone; there is no stdout chatter to suppress. */
 static void quiet_begin(void)
 {
     int devnull;
     if (g_verbose) return;
+    if (!pthread_equal(pthread_self(), g_main_thread)) return;
     fflush(stdout);
     g_saved_out = dup(1);
     devnull = open("/dev/null", O_WRONLY);
@@ -840,6 +884,7 @@ static void quiet_begin(void)
 static void quiet_end(void)
 {
     if (g_verbose || g_saved_out < 0) return;
+    if (!pthread_equal(pthread_self(), g_main_thread)) return;
     fflush(stdout);
     dup2(g_saved_out, 1);
     close(g_saved_out);
@@ -859,6 +904,18 @@ static int run_global(const char *stage)
         else
             snprintf(out, sizeof out, "%s", g_root);
         if (mkdir_p(out) != 0) return -1;
+        /* NOT FROM A WORKER, EVER.  The chdir below is process-global: a
+         * stage running here while the game thread does a relative-path
+         * open would send that open somewhere else entirely.  The music
+         * module's decode worker only ever asks for 'T:eatrax:<n>', which
+         * is deliberately NOT in this table and never chdir()s (see the
+         * note on GLOBAL_FN) -- so this can only fire if someone widens
+         * what the worker is allowed to request.  Loudly, on purpose. */
+        if (!pthread_equal(pthread_self(), g_main_thread)) {
+            logline("%s: refused -- a chdir stage cannot run off the main "
+                    "thread\n", stage);
+            return -1;
+        }
         if (!getcwd(cwd, sizeof cwd)) cwd[0] = '\0';
         /* the driver's contract: the CWD is the output root while a global
          * stage runs (cx_main.c run_global_mode) */
@@ -937,6 +994,37 @@ static int run_music(const char *song)
             setenv("B3_GLOBALUS", glob, 1);
         rc = cx_extract_eatrax(g_source, out);
     }
+    quiet_end();
+    return rc;
+}
+
+/* ------------------------------------------------------ THE DJ VOICE BANKS
+ * build/audio/<BANK>/NNN.wav, out of the disc's XACT wave banks, one BANK at
+ * a time -- the same shape as THE MUSIC FAMILY above and for the same reason.
+ *
+ * `xwb` is the whole-disc dump: 33 banks, 885 entries, the two 361 MB
+ * _EATraxN.xwb among them.  That is why it is not in GLOBAL_FN and the game
+ * cannot ask for it.  What Crash FM actually wants is ONE bank -- the twelve
+ * global DJ* banks are 5 to 20 lines each, and a race's own commentary is the
+ * per-track E_DJRACE.xwb, which names itself after its track.  So the unit
+ * here is a BANK, keyed 'T:djbank:<BANK>' so it is stamped, memoised and
+ * retried exactly like every other unit.
+ *
+ * `bank` is the OUTPUT directory name, which is the bank's own BANKDATA name
+ * and not its filename: on disc these carry a language prefix (E_ for
+ * English, also I_ S_ F_ G_ J_).  cx_extract_xwb_one() resolves one to the
+ * other by reading headers, so nothing here has to know the prefix. */
+static int run_djbank(const char *bank)
+{
+    char out[B3_PATH_MAX];
+    int  rc;
+
+    if (!bank || !*bank) return -1;
+    snprintf(out, sizeof out, "%s/audio", g_cache);
+    if (mkdir_p(out) != 0) return -1;
+
+    quiet_begin();
+    rc = cx_extract_xwb_one(g_source, out, bank);
     quiet_end();
     return rc;
 }
@@ -1107,6 +1195,12 @@ static int materialise(const char *stages, const char *track_id,
          * reach run_track()'s TRACK_FN table.  Checked before the track_id
          * test, which is the whole reason the branch is here. */
         else if (!strcmp(tok, "eatrax")) rc = run_music(track_id);
+        /* THE DJ VOICE BANKS do the same borrowing, for the same reason: the
+         * unit key is 'T:djbank:<BANK>' and a bank is not a race track, so
+         * this too has to be caught before the track_id test.  A per-track
+         * commentary bank IS named for its track, which makes the ordering
+         * look accidental and is exactly why it is spelled out. */
+        else if (!strcmp(tok, "djbank")) rc = run_djbank(track_id);
         else if (track_id)               rc = run_track(tok, track_id);
         else                             rc = run_global(tok);
         unit_mark(key, rc != 0);
@@ -1133,6 +1227,35 @@ static int materialise(const char *stages, const char *track_id,
 
 /* ------------------------------------------------------------- resolution */
 
+/* IS `p` (n chars, not NUL-terminated) THE NAME OF A DJ VOICE BANK?
+ *
+ * This is the whole of the audio/ interception rule in map_lookup() below, and
+ * it is deliberately a WHITELIST rather than "anything under audio/ that is
+ * not awd_ or rws_".  The banks are exactly two shapes:
+ *
+ *   DJ...                      the twelve global banks -- DJGEN, DJWWW, DJAS,
+ *                              DJEU, DJUS, DJMCR, DJMBL, DJMRR, DJMEL, DJMRA,
+ *                              DJMGP, DJMFO
+ *   <AS|EU|US>_<A-Z><0-9>      the eighteen per-track commentary banks, which
+ *                              name themselves after their track: US_C1,
+ *                              AS_M1, EU_P2 ...
+ *
+ * Everything else under build/audio/ belongs to somebody else -- awd_* to the
+ * awd stage, rws_* to the rws stage, EATrax0/EATrax1 and Movie to the
+ * whole-disc xwb dump the game never runs -- and must fall through to the
+ * GLOBAL_MAP rules that own it. */
+static int is_dj_bank(const char *p, size_t n)
+{
+    if (n >= 2 && p[0] == 'D' && p[1] == 'J')
+        return 1;
+    if (n == 5 && p[2] == '_' &&
+        p[3] >= 'A' && p[3] <= 'Z' && p[4] >= '0' && p[4] <= '9' &&
+        (strncmp(p, "AS", 2) == 0 || strncmp(p, "EU", 2) == 0 ||
+         strncmp(p, "US", 2) == 0))
+        return 1;
+    return 0;
+}
+
 /* `rel` is the path after "build/".  Fills `stages` and, for a per-track
  * path, `track_id`.  Returns 1 when a rule matched. */
 static int map_lookup(const char *rel, const char **stages, char *track_id,
@@ -1153,6 +1276,25 @@ static int map_lookup(const char *rel, const char **stages, char *track_id,
             strcmp(tail, "wav") == 0 && idx < B3_MUSIC_TRACKS) {
             snprintf(track_id, tid_sz, "%u", idx);
             *stages = "eatrax";
+            return 1;
+        }
+    }
+    /* THE DJ VOICE BANKS: one unit per BANK, not per family -- see
+     * run_djbank().  The bank the game is about to play names itself in the
+     * path it opens (build/audio/DJGEN/003.wav), so that bank is extracted
+     * and the other 32 are not.
+     *
+     * The DIRECTORY is the unit, so every file under it takes the rule -- the
+     * .wma the extractor writes beside each .wav included.  is_dj_bank()
+     * above decides which directories those are; anything else under audio/
+     * falls through to the awd/rws rules in GLOBAL_MAP that own it. */
+    if (strncmp(rel, "audio/", 6) == 0) {
+        const char *p = rel + 6, *slash = strchr(p, '/');
+        size_t n = slash ? (size_t)(slash - p) : 0;
+        if (n > 0 && n < tid_sz && is_dj_bank(p, n)) {
+            memcpy(track_id, p, n);
+            track_id[n] = '\0';
+            *stages = "djbank";
             return 1;
         }
     }
@@ -1276,6 +1418,17 @@ static const char *resolve_inner(const char *path, int allow_materialise)
 
     tid = track_id[0] ? track_id : NULL;
 
+    /* THE MATERIALISE LOCK.  Everything below here mutates state that is
+     * global to the process -- g_busy, the stamp files, the absent list --
+     * and since the music module started pre-materialising the next song
+     * on a worker, two threads can arrive.  Only the SLOW path takes it:
+     * a cache hit returned above without ever coming near it, which is
+     * what keeps a 0.5 s decode on the worker from stalling the frame
+     * thread's own resolves. */
+    pthread_mutex_lock(&g_mat_lock);
+    /* Someone may have materialised it while we waited for the lock. */
+    if (path_exists(out)) { pthread_mutex_unlock(&g_mat_lock); return out; }
+
     g_busy  = 1;
     ran     = 0;
     stamped = 0;
@@ -1300,6 +1453,7 @@ static const char *resolve_inner(const char *path, int allow_materialise)
         }
     }
     g_busy = 0;
+    pthread_mutex_unlock(&g_mat_lock);
 
     if (path_exists(out)) return out;
 
@@ -1450,6 +1604,40 @@ int b3_iso_track_available(const char *track_id)
  *
  * Same contract as b3_iso_track_available(): 1 = yes, 0 = no, -1 in build
  * mode, meaning "not my question, probe build/ the way you always did". */
+/* IS IT ALREADY ON DISK?  The question a caller has to be able to ask
+ * before it decides whether resolving a path is free or is a stage.
+ *
+ * b3_iso_resolve() cannot answer it, because asking IS the extraction --
+ * that is the whole design.  This looks only at the cache and never runs
+ * anything, so the music module can tell "open it now, on this frame"
+ * from "hand it to the worker and come back", which is what keeps a
+ * mid-race song change off the frame path. */
+int b3_iso_is_materialised(const char *path)
+{
+    char        out[B3_PATH_MAX];
+    const char *rel, *stages = NULL;
+    char        track_id[64];
+
+    if (!path) return 0;
+    if (g_mode != B3_DATA_ISO) return path_exists(path);
+    if (strncmp(path, "build/", 6) != 0) return path_exists(path);
+    rel = path + 6;
+
+    snprintf(out, sizeof out, "%s/%s", g_cache, rel);
+    if (path_exists(out)) return 1;              /* already in the cache */
+
+    /* IT MUST MIRROR resolve_inner() EXACTLY, and the first version of it
+     * did not: it answered "yes" for anything sitting in a real build/
+     * tree next door.  But resolve_inner does NOT prefer that copy for a
+     * mapped path with an owning stage -- it extracts into the cache
+     * regardless -- so the music module believed a song was free, opened
+     * it on the frame thread, and took the whole 0.45 s decode it was
+     * built to avoid.  Only these two cases resolve without a stage. */
+    if (!map_lookup(rel, &stages, track_id, sizeof track_id))
+        return 1;                                /* not an asset at all  */
+    return (!stages || !*stages) ? 1 : 0;        /* mapped, but unowned  */
+}
+
 int b3_iso_music_available(int song)
 {
     /* -1 = not asked yet, 0/1 = the answer, per bank. */
@@ -1472,6 +1660,61 @@ int b3_iso_music_available(int song)
 #endif
     }
     return memo[bank];
+}
+
+/* AND ONCE MORE, FOR THE DJ.  Crash FM decides which of its banks it can play
+ * the same way b3_music_init() does -- by opening one -- and under
+ * materialise-on-miss that probe IS the extraction.  So the answer comes off
+ * the disc's own directory: a stat of the bank file, memoised.
+ *
+ * THE LIMIT, AND IT IS A REAL ONE.  A bank's source path is not derivable
+ * from its output name in general.  The twelve global banks are
+ * Tracks/<prefix><NAME>.xwb, where the prefix is the LANGUAGE (E_ English,
+ * I_ S_ F_ G_ J_ for the rest) and only the disc knows which of those it
+ * shipped, so all six are tried.  The eighteen per-track banks are all called
+ * E_DJRACE.xwb, one per Tracks/<REGION>/<TRACK>_V1/ -- their output name
+ * ("US_C1") appears nowhere in their path, and finding one means reading
+ * headers, which is cx_extract_xwb_one()'s job and not a probe's.  Those get
+ * -1, "I do not know": the caller then does what it did before, which for a
+ * per-track bank is the right answer anyway, because a track that is loading
+ * has already been resolved.
+ *
+ * Same contract as the two probes above: 1 = yes, 0 = no, -1 = not my
+ * question. */
+int b3_iso_dj_available(const char *bank)
+{
+    static struct { char name[24]; int ok; } memo[32];
+    static int    n_memo = 0;
+    int           i, ok = 0;
+
+    if (g_mode != B3_DATA_ISO) return -1;
+    if (!bank || !*bank) return 0;
+    if (bank[0] != 'D' || bank[1] != 'J') return -1;   /* per-track: unknown */
+    for (i = 0; i < n_memo; i++)
+        if (strcmp(memo[i].name, bank) == 0) return memo[i].ok;
+
+#ifdef B3_HAVE_CX_SRC
+    {
+        /* the six language prefixes retail builds the filename with */
+        static const char PFX[] = "EISFGJ";
+        unsigned long long sz = 0;
+        char               rel[64];
+        size_t             k;
+
+        for (k = 0; !ok && k + 1 < sizeof PFX; k++) {
+            snprintf(rel, sizeof rel, "Tracks/%c_%s.xwb", PFX[k], bank);
+            ok = g_src && cx_src_stat(g_src, rel, &sz) == 0 && sz > 0;
+        }
+    }
+#endif
+
+    if (n_memo < (int)(sizeof memo / sizeof memo[0])
+        && strlen(bank) < sizeof memo[0].name) {
+        snprintf(memo[n_memo].name, sizeof memo[0].name, "%s", bank);
+        memo[n_memo].ok = ok;
+        n_memo++;
+    }
+    return ok;
 }
 
 /* --------------------------------------------------------------- the init */
@@ -1514,6 +1757,9 @@ void b3_iso_init(int argc, char **argv)
     int         from_cli = 0, i;
 
     if (g_inited) return;
+    /* main() calls this as its first statement, so whoever we are IS the
+     * main thread -- the one allowed to run a chdir stage (see run_global). */
+    g_main_thread = pthread_self();
     g_inited = 1;
     g_verbose = (e = getenv("B3_ISO_VERBOSE")) && *e && strcmp(e, "0");
 

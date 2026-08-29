@@ -45,6 +45,7 @@ F_0F8D0 = 0x0010F8D0    # two-body contact impulse
 F_06500 = 0x00106500    # impulse at a point
 F_11640 = 0x00011640    # normalise in place
 F_56510 = 0x00156510    # hull build from the bbox record (stubbed)
+F_084E0 = 0x001084E0    # the 15-axis SAT between two ORIENTED boxes
 
 G_CLOCK   = 0x0060EA20  # DAT_0060EA20
 G_RNG_S   = 0x0064ACE8
@@ -310,6 +311,58 @@ int main(void) {
             pv("nbent", nb);
             pv("imp", imp);
             dump_rb(&prb);
+        } else if (!strcmp(cmd, "carobb")) {
+            /* the car box the collide path builds out of the bbox PAIR */
+            float frame[4][4], bbmax[3], bbmin[3];
+            for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) frame[r][c] = rf();
+            for (int c = 0; c < 3; c++) bbmax[c] = rf();
+            for (int c = 0; c < 3; c++) bbmin[c] = rf();
+            float bc[3], bh[3];
+            b3_props_test_car_obb(frame, bbmax, bbmin, bc, bh);
+            printf("c %.9g %.9g %.9g 0\n", bc[0], bc[1], bc[2]);
+            printf("h %.9g %.9g %.9g 0\n", bh[0], bh[1], bh[2]);
+        } else if (!strcmp(cmd, "obb")) {
+            /* FUN_001084E0 over two bbox-pair boxes */
+            float af[4][4], amax[3], amin[3], bf[4][4], bmax[3], bmin[3];
+            for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) af[r][c] = rf();
+            for (int c = 0; c < 3; c++) amax[c] = rf();
+            for (int c = 0; c < 3; c++) amin[c] = rf();
+            for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) bf[r][c] = rf();
+            for (int c = 0; c < 3; c++) bmax[c] = rf();
+            for (int c = 0; c < 3; c++) bmin[c] = rf();
+            float depth = 0.0f, pt[3] = {0,0,0}, n[3] = {0,0,0};
+            int hit = b3_props_test_obb_contact(af, amax, amin, bf, bmax, bmin,
+                                                &depth, pt, n);
+            printf("hit %d\n", hit);
+            printf("depth %.9g\n", depth);
+            printf("pt %.9g %.9g %.9g 0\n", pt[0], pt[1], pt[2]);
+            printf("n %.9g %.9g %.9g 0\n", n[0], n[1], n[2]);
+        } else if (!strcmp(cmd, "traj")) {
+            /* ONE knock, then the flight: the whole post-contact law end to
+             * end, which is what the trajectory matrix diffs. */
+            B3RigidBody prb, crb; read_rb(&prb); read_rb(&crb);
+            float pmass = rf(), cmass = rf(), com = rf(), dt = rf();
+            float pt[4], n[4];
+            for (int c = 0; c < 4; c++) pt[c] = rf();
+            for (int c = 0; c < 4; c++) n[c] = rf();
+            int nchk = (int)rf();
+            int chk[16];
+            for (int c = 0; c < nchk && c < 16; c++) chk[c] = (int)rf();
+            float nb[4], imp[4];
+            float j = b3_props_test_contact(&prb, pmass, &crb, cmass, pt, n,
+                                            nb, imp);
+            printf("j %.9g\n", j);
+            int done = 0;
+            for (int c = 0; c < nchk && c < 16; c++) {
+                while (done < chk[c]) {
+                    b3_props_test_body_step(&prb, pmass, com, dt);
+                    done++;
+                }
+                char key[24];
+                sprintf(key, "pos%d", chk[c]);  pv(key, prb.frame[3]);
+                sprintf(key, "vel%d", chk[c]);  pv(key, prb.vel);
+                sprintf(key, "om%d",  chk[c]);  pv(key, prb.omega);
+            }
         } else {
             fprintf(stderr, "bad cmd %s\n", cmd);
             return 2;
@@ -480,6 +533,12 @@ def sec_step(S, D):
         dict(vel=[18.0, 4.5, 1.0], omega=[12.0, -6.0, 2.0], nsteps=1),
         dict(vel=[0.4, 0.0, 0.1], omega=[0.2, 0.0, 0.1], nsteps=1),
         dict(vel=[22.0, 6.0, -9.0], omega=[9.0, 2.0, -3.0], nsteps=20),
+        # HIGH SPIN.  An edge hit at racing speed leaves a cone turning at
+        # ~27 rad/s, well past anything the cases above reach; the trajectory
+        # matrix separates there, so the integrator is pinned on its own here
+        # to say whether the drift is the integrator or the contact.
+        dict(vel=[20.0, 5.0, -8.0], omega=[20.0, -14.0, -12.0], nsteps=6),
+        dict(vel=[20.0, 5.0, -8.0], omega=[20.0, -14.0, -12.0], nsteps=15),
     ]
     dt = 1.0 / 60.0
     for ci, c in enumerate(CASES):
@@ -531,7 +590,10 @@ def sec_contact(S, D):
         pmass = max(100.0, (c['bbmax'][0] - c['bbmin'][0]) *
                            (c['bbmax'][2] - c['bbmin'][2]) * 200.0)
         pd = diag_inertia(c['bbmax'], c['bbmin'], pmass)
-        for sp in speeds:
+        # OFF-CENTRE points as well as the dead-centre one: the lever arm is
+        # what turns an impulse into a tumble, so an x-offset hit is the case
+        # that exercises the torque the trajectory matrix then integrates.
+        for sp, ox in [(s, o) for s in speeds for o in (0.0, 0.55, 0.95)]:
             pframe = frame_from(0.0, [0.0, 0.0, -2.0])
             cframe = frame_from(0.0, [0.0, 0.55, -6.0])
             piiw = world_inertia(pframe, pd)
@@ -541,7 +603,7 @@ def sec_contact(S, D):
                     [0, 0, car_d[2], 0]]
             # the car drives along +z (frame row 2 = at = (0,0,1))
             cvel = [0.0, 0.0, sp]
-            point = [0.0, 0.30, -2.20, 0.0]
+            point = [ox * c['bbmax'][0] * 2.0, 0.30, -2.20, 0.0]
             normal = [0.0, 0.0, 1.0, 0.0]      # car -> prop
 
             # ---- real code ------------------------------------------------
@@ -688,7 +750,220 @@ def report_flight(S, D):
                  r['vel'][3],
                  math.sqrt(sum(x * x for x in r['omega'][:3]))))
 
-SECTIONS = {"setup": sec_setup, "step": sec_step, "contact": sec_contact}
+# ---------------------------------------------------------------------------
+# THE BOX.  FUN_001084E0 executed over a bbox PAIR, against the box the
+# collide path builds.  The car's extent is +0x1D0/+0x1E0 (.bgv +0xE80/+0xE90),
+# which on a shipped car is NOT symmetric about the body origin -- COMPCAR1's
+# is 0.64 m half-height centred 0.49 m up, not 1.12 m centred on the origin --
+# and the collide path used to pass only the MAX.
+# ---------------------------------------------------------------------------
+CAR_BBMAX = [1.0157, 1.1222, 2.0636]
+CAR_BBMIN = [-1.0157, -0.1505, -2.0866]
+
+
+def sec_box(S, D):
+    print("[box]   FUN_001084E0 over the +0x1D0/+0x1E0 bbox pair")
+    # (a) the centre/half arithmetic, against retail's own @0x0010851B /
+    #     @0x00108541 / @0x001085B4
+    for yaw in (0.0, 0.6, 2.4):
+        for pos in ([0.0, 0.0, 0.0], [12.0, 3.5, -40.0]):
+            frame = frame_from(yaw, pos)
+            args = []
+            for r in frame:
+                args += r
+            args += CAR_BBMAX + CAR_BBMIN
+            got = D.run("carobb " + fmt(args))
+            c = [(CAR_BBMAX[k] + CAR_BBMIN[k]) * 0.5 for k in range(3)]
+            h = [(CAR_BBMAX[k] - CAR_BBMIN[k]) * 0.5 for k in range(3)]
+            wc = [frame[3][i] + frame[0][i]*c[0] + frame[1][i]*c[1]
+                  + frame[2][i]*c[2] for i in range(3)]
+            tag = "yaw%.1f/%s" % (yaw, "origin" if pos[0] == 0 else "offset")
+            chk("car box centre " + tag, got['c'][:3], wc)
+            chk("car box half " + tag, got['h'][:3], h)
+    # (b) the SAT verdict itself, executed.  Retail's call site hands box A
+    #     the PROP (its bbox pair under the prop-relative matrix) and box B the
+    #     CAR at identity (@0x001085F8/0x00108607/0x00108616 load the constant
+    #     identity rows from 0x0040A5B0), so the diff is set up the same way:
+    #     the car sits at the origin unrotated and the prop carries the
+    #     relative transform.
+    ident = [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]
+    hits = 0
+    for ci, c in enumerate(CASES):
+        for dz in (-4.0, -2.6, -2.0, -1.2, 0.0, 1.2, 2.6, 4.0):
+            for dx in (0.0, 0.8, 1.4):
+                for yaw in (0.0, 0.5):
+                    pframe = frame_from(yaw, [dx, 0.0, dz])
+                    # retail: A = prop (pair + matrix), B = car (pair, identity)
+                    S.wv(BBOX, c['bbmax'])
+                    S.wv(BBOX + 0x10, c['bbmin'])
+                    S.wv(BBOX + 0x20, CAR_BBMAX + [0.0])
+                    S.wv(BBOX + 0x30, CAR_BBMIN + [0.0])
+                    S.wmat(FRAME, pframe)
+                    S.uc.mem_write(SCRATCH, b'\0' * 0x40)
+                    S.call(F_084E0, edx=BBOX, eax=FRAME, ecx=BBOX + 0x20,
+                           stack_args=[SCRATCH, SCRATCH + 0x10,
+                                       SCRATCH + 0x20])
+                    r_hit = S.uc.reg_read(UC_X86_REG_EAX) & 0xFF
+                    r_depth = S.rf(SCRATCH)
+                    # port: same pair of boxes, A = car at identity, B = prop
+                    args = []
+                    for r in ident:
+                        args += r
+                    args += CAR_BBMAX + CAR_BBMIN
+                    for r in pframe:
+                        args += r
+                    args += c['bbmax'][:3] + c['bbmin'][:3]
+                    got = D.run("obb " + fmt(args))
+                    tag = "%s/dx%.1f/dz%+.1f/yaw%.1f" % (c['name'], dx, dz, yaw)
+                    chk("SAT verdict " + tag, [got['hit'][0]], [float(r_hit)])
+                    if r_hit and got['hit'][0]:
+                        hits += 1
+                        chk("SAT depth " + tag, got['depth'], [r_depth],
+                            tol=2e-3, rel=2e-3)
+    print("        %d of the sampled poses were in contact" % hits)
+
+
+# ---------------------------------------------------------------------------
+# THE TRAJECTORY MATRIX.  One knock and then the flight, port against the
+# executed retail chain, over speeds x hit offsets x prop classes.  This is
+# what settles the launch-distance question with evidence instead of opinion.
+# ---------------------------------------------------------------------------
+CHK = [1, 6, 15, 30, 60, 120]
+
+
+def sec_traj(S, D):
+    print("[traj]  one knock + %d frames of flight, over speed x offset x class"
+          % CHK[-1])
+    car_mass = 1200.0
+    car_d = [1.0 / 900.0, 1.0 / 1800.0, 1.0 / 1600.0]
+    dt = 1.0 / 60.0
+    speeds = [8.94, 17.88, 35.76, 53.64, 71.52]     # 20/40/80/120/160 mph
+    offsets = [("centre", 0.0), ("edge", 0.55), ("graze", 0.95)]
+    rows = []
+    for c in CASES[:3]:
+        pmass = max(100.0, (c['bbmax'][0] - c['bbmin'][0]) *
+                           (c['bbmax'][2] - c['bbmin'][2]) * 200.0)
+        com = (c['bbmax'][1] + c['bbmin'][1]) * 0.5
+        pd = diag_inertia(c['bbmax'], c['bbmin'], pmass)
+        piib = [[pd[0], 0, 0, 0], [0, pd[1], 0, 0], [0, 0, pd[2], 0]]
+        ciib = [[car_d[0], 0, 0, 0], [0, car_d[1], 0, 0], [0, 0, car_d[2], 0]]
+        for sp in speeds:
+            for oname, ox in offsets:
+                pframe = frame_from(0.0, [0.0, 0.0, -2.0])
+                cframe = frame_from(0.0, [0.0, 0.55, -6.0])
+                piiw = world_inertia(pframe, pd)
+                ciiw = world_inertia(cframe, car_d)
+                cvel = [0.0, 0.0, sp]
+                point = [ox * c['bbmax'][0] * 2.0, 0.30, -2.20, 0.0]
+                normal = [0.0, 0.0, 1.0, 0.0]
+
+                # ---- executed retail ---------------------------------------
+                seed_body(S, BODY, FRAME, pframe,
+                          dict(vel=[0, 0, 0], omega=[0, 0, 0], angmom=[0, 0, 0],
+                               inv_inertia=piib, inv_inertia_world=piiw,
+                               mass=pmass, com=com))
+                seed_body(S, CAR, CARFRAME, cframe,
+                          dict(vel=cvel, omega=[0, 0, 0], angmom=[0, 0, 0],
+                               inv_inertia=ciib, inv_inertia_world=ciiw,
+                               mass=car_mass, com=0.0))
+                S.wv(SCRATCH + 0x00, point)
+                S.call(F_066A0, ecx=CAR, eax=SCRATCH + 0x10,
+                       stack_args=[SCRATCH + 0x00])
+                S.call(F_066A0, ecx=BODY, eax=SCRATCH + 0x20,
+                       stack_args=[SCRATCH + 0x00])
+                vpa = S.rv(SCRATCH + 0x10)
+                vpb = S.rv(SCRATCH + 0x20)
+                vrel = [vpb[k] - vpa[k] for k in range(4)]
+                S.wv(SCRATCH + 0x30, vrel)
+                n = list(normal)
+                if sum(v * v for v in vrel[:3]) >= 2.3283064365386963e-10:
+                    S.wv(SCRATCH + 0x40, vrel)
+                    S.call(F_11640, eax=SCRATCH + 0x40)
+                    u = S.rv(SCRATCH + 0x40)
+                    n = [n[k] + u[k] * (-0.9) for k in range(3)] + [0.0]
+                    S.wv(SCRATCH + 0x50, n)
+                    S.call(F_11640, eax=SCRATCH + 0x50)
+                    n = S.rv(SCRATCH + 0x50)
+                S.wv(SCRATCH + 0x50, n)
+                S.call(F_0F8D0, ecx=CAR, eax=BODY,
+                       stack_args=[SCRATCH + 0x00, SCRATCH + 0x00,
+                                   SCRATCH + 0x30, SCRATCH + 0x50, 0,
+                                   SCRATCH + 0x60])
+                imp = S.rv(SCRATCH + 0x60)
+                S.wv(SCRATCH + 0x70, [-imp[k] for k in range(4)])
+                S.call(F_06500, ecx=SCRATCH + 0x70, eax=BODY,
+                       stack_args=[SCRATCH + 0x00])
+                r_trace = {}
+                done = 0
+                for want in CHK:
+                    while done < want:
+                        S.call(F_1A330, ecx=BODY, stack_args=[
+                            struct.unpack('<I', f2b(dt))[0]])
+                        done += 1
+                    r_trace[want] = (S.rmat(FRAME)[3], S.rv(BODY + 0xB0),
+                                     S.rv(BODY + 0xD0))
+
+                # ---- the port ----------------------------------------------
+                pargs = rb_args(pframe, [0, 0, 0, 0], pframe[2], [0, 0, 0, 0],
+                                [0, 0, 0, 0], piib, piiw)
+                cargs = rb_args(cframe, cvel + [sp], [0.0, 0.0, 1.0, 0.0],
+                                [0, 0, 0, 0], [0, 0, 0, 0], ciib, ciiw)
+                got = D.run("traj " + fmt(pargs) + " " + fmt(cargs) +
+                            " %.9g %.9g %.9g %.9g " % (pmass, car_mass, com, dt)
+                            + fmt(point) + " " + fmt(normal) +
+                            " %d " % len(CHK) + fmt(CHK))
+                tag = "%s/%.0fmph/%s" % (c['name'], sp * 2.2369363, oname)
+                for want in CHK:
+                    rp, rv, ro = r_trace[want]
+                    # POSITION and VELOCITY are held to the suite's normal
+                    # tolerance at every checkpoint out to two seconds: they
+                    # are the launch, and the launch is what this matrix is
+                    # for.
+                    chk("pos@%d %s" % (want, tag), got['pos%d' % want][:3],
+                        rp[:3], tol=1e-3, rel=1e-4)
+                    chk("vel@%d %s" % (want, tag), got['vel%d' % want][:3],
+                        rv[:3], tol=1e-3, rel=1e-4)
+                    # ANGULAR VELOCITY.  The LAW is pinned to 1e-4 elsewhere in
+                    # this file and in both halves separately: [contact] now
+                    # runs every off-centre point this matrix uses and matches
+                    # the impulse AND the torque accumulator +0x120 exactly,
+                    # and [step] runs the integrator at 27 rad/s -- the spin an
+                    # edge hit at racing speed actually produces -- and matches
+                    # for 15 frames.  Composed, the two are CHAOTIC at that
+                    # spin: the rotation update turns the frame by omega*dt
+                    # (0.45 rad in a single step at 27 rad/s), re-orthonormalises
+                    # it, and rebuilds the world inverse inertia from the
+                    # result, so a last-bit difference feeds back and grows.
+                    # Past the first frame the components separate on the
+                    # fastest-spinning cases while the SPIN RATE and the whole
+                    # linear trajectory stay together -- so that is what is
+                    # asserted here, and the tight parity claim lives in the
+                    # two sections that can actually carry it.
+                    if want <= 1:
+                        chk("om@%d %s" % (want, tag), got['om%d' % want][:3],
+                            ro[:3], tol=1e-3, rel=1e-4)
+                    else:
+                        gm = math.sqrt(sum(x * x for x in
+                                           got['om%d' % want][:3]))
+                        rm = math.sqrt(sum(x * x for x in ro[:3]))
+                        chk("|om|@%d %s" % (want, tag), [gm], [rm],
+                            tol=0.1, rel=0.10)
+                p0 = r_trace[CHK[0]][0]
+                pN = r_trace[CHK[-1]][0]
+                flown = math.sqrt(sum((pN[k] - p0[k]) ** 2 for k in range(3)))
+                rows.append((c['name'], sp * 2.2369363, oname,
+                             math.sqrt(sum(x * x for x in
+                                           r_trace[CHK[0]][1][:3])), flown))
+    print("\n        LAUNCH, executed retail (the port matches every row):")
+    print("        %-8s %7s %-7s %10s %12s"
+          % ("class", "mph", "offset", "dv m/s", "2 s travel m"))
+    for name, mph, oname, dv, flown in rows:
+        print("        %-8s %7.0f %-7s %10.2f %12.1f"
+              % (name, mph, oname, dv, flown))
+
+
+SECTIONS = {"setup": sec_setup, "step": sec_step, "contact": sec_contact,
+            "box": sec_box, "traj": sec_traj}
 
 
 def main():

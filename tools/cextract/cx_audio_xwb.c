@@ -52,12 +52,14 @@
 
 #include "cx_audio_common.h"
 #include "cx_extract.h"
+#include "cx_pool.h"
 #include "b3_wma.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #define TAG_PCM         0
 #define TAG_XBOX_ADPCM  1
@@ -571,6 +573,33 @@ done:
     return rc;
 }
 
+/* Which decoder this run uses, and the two notes it prints when it cannot
+ * have the one it was asked for.  Shared by the two entry points so that
+ * "dump the .wma only" means the same thing whether the whole disc or a
+ * single bank is being extracted.
+ *
+ * CX_NO_FFMPEG kept its name: it is in the python's CLI, in the handoff docs
+ * and in several recipes, and it always meant "dump the .wma and do not
+ * decode".  That is still exactly what it does -- there is simply no longer
+ * an ffmpeg involved in the decoding it is switching off. */
+static void cxf_xwb_decoder(int *decode, int *use_ffmpeg)
+{
+    const char *ff = getenv("B3_FFMPEG");
+
+    *use_ffmpeg = ff && *ff && strcmp(ff, "0") != 0;
+    *decode     = getenv("CX_NO_FFMPEG") ? 0 : 1;
+    if (*decode && *use_ffmpeg && !cxf_have_ffmpeg()) {
+        printf("note: B3_FFMPEG=1 but ffmpeg is not on PATH; "
+               "using the built-in decoder\n");
+        *use_ffmpeg = 0;
+    }
+    if (*decode && !*use_ffmpeg && !b3_wma_available()) {
+        printf("note: no WMA decoder in this build (sh tools/fetch_wma.sh); "
+               "WMA entries will be dumped as .wma only\n");
+        *decode = 0;
+    }
+}
+
 int cx_extract_xwb(const char *game_dir, const char *out_root)
 {
     game_dir = cxf_game_dir(game_dir);
@@ -578,7 +607,6 @@ int cx_extract_xwb(const char *game_dir, const char *out_root)
     cxf_strlist files = { NULL, 0, 0 };
     size_t i;
     int tot_ok = 0, tot_fail = 0, n_err = 0, decode, use_ffmpeg;
-    const char *ff = getenv("B3_FFMPEG");
 
     if (cxf_walk_ext(game_dir, EXTS, 1, &files) != 0) {
         fprintf(stderr, "[cx_audio_xwb] cannot scan %s\n", game_dir);
@@ -587,22 +615,7 @@ int cx_extract_xwb(const char *game_dir, const char *out_root)
     }
     cxf_strlist_sort(&files);
 
-    /* CX_NO_FFMPEG kept its name: it is in the python's CLI, in the handoff
-     * docs and in several recipes, and it always meant "dump the .wma and do
-     * not decode".  That is still exactly what it does -- there is simply no
-     * longer an ffmpeg involved in the decoding it is switching off. */
-    use_ffmpeg = ff && *ff && strcmp(ff, "0") != 0;
-    decode     = getenv("CX_NO_FFMPEG") ? 0 : 1;
-    if (decode && use_ffmpeg && !cxf_have_ffmpeg()) {
-        printf("note: B3_FFMPEG=1 but ffmpeg is not on PATH; "
-               "using the built-in decoder\n");
-        use_ffmpeg = 0;
-    }
-    if (decode && !use_ffmpeg && !b3_wma_available()) {
-        printf("note: no WMA decoder in this build (sh tools/fetch_wma.sh); "
-               "WMA entries will be dumped as .wma only\n");
-        decode = 0;
-    }
+    cxf_xwb_decoder(&decode, &use_ffmpeg);
 
     for (i = 0; i < files.n; i++) {
         char err[8704];
@@ -622,5 +635,156 @@ int cx_extract_xwb(const char *game_dir, const char *out_root)
            tot_ok, tot_fail, files.n);
     cxf_strlist_free(&files);
     /* python: `return 1 if tot_fail else 0` -- see cxf_rc(). */
+    return cxf_rc(n_err, tot_fail);
+}
+
+/* ------------------------------------------------------------- ONE BANK --
+ * THE WALK, REMEMBERED.  Enumerating *.xwb is the expensive half of a
+ * per-bank extraction: 33 files scattered over Tracks/<REGION>/<TRACK>_V1/
+ * and ovid/, found by a full directory traversal of the disc.  The DJ family
+ * asks for a bank at a time and asks up to thirty times in a session, so the
+ * list is walked ONCE per source root and kept for the life of the process --
+ * the disc cannot change underneath us, and the whole cache is 33 paths.
+ *
+ * Guarded with cx_pool_lock() for the reason cx_src.c guards its own caches:
+ * that lock is the source layer's, it is recursive, and cxf_walk_ext() takes
+ * it internally anyway.  Callers get a COPY of the list rather than a pointer
+ * into it, so nothing reads the cache with the lock dropped.  A build that
+ * never calls cx_extract_xwb_one() never touches any of it -- the statics are
+ * zero and no walk is ever run. */
+static char        g_bank_root[4096];
+static cxf_strlist g_bank_files;
+static int         g_bank_walked;
+
+static int cxf_xwb_list(const char *game_dir, cxf_strlist *out)
+{
+    static const char *const EXTS[] = { ".xwb" };
+    size_t i;
+    int    rc = 0;
+
+    cx_pool_lock();
+    if (!g_bank_walked || strcmp(g_bank_root, game_dir) != 0) {
+        cxf_strlist_free(&g_bank_files);
+        g_bank_walked = 0;
+        if (cxf_walk_ext(game_dir, EXTS, 1, &g_bank_files) != 0) {
+            cxf_strlist_free(&g_bank_files);
+            cx_pool_unlock();
+            return -1;
+        }
+        cxf_strlist_sort(&g_bank_files);
+        snprintf(g_bank_root, sizeof g_bank_root, "%s", game_dir);
+        g_bank_walked = 1;
+    }
+    for (i = 0; i < g_bank_files.n; i++)
+        if (cxf_strlist_push(out, g_bank_files.v[i]) != 0) {
+            rc = -1;
+            break;
+        }
+    cx_pool_unlock();
+    return rc;
+}
+
+/* The two _EATraxN.xwb (361 MB each) and ovid/movie.xwb are none of this
+ * entry point's business: no bank a caller can name here lives in them, and
+ * they are the only files in the walk worth refusing to open by NAME rather
+ * than by header.  Everything else is a few hundred KB. */
+static int cxf_xwb_bulk(const char *path)
+{
+    const char *b = strrchr(path, '/');
+
+    b = b ? b + 1 : path;
+    return strncasecmp(b, "_EATrax", 7) == 0 ||
+           strcasecmp(b, "movie.xwb") == 0;
+}
+
+/* The bank's OWN name, out of BANKDATA, without reading its wave data.  64 KB
+ * is the whole header of every bank in this game and then some: BANKDATA sits
+ * at 0x28, ENTRYMETADATA at 0x50 with 24 bytes per entry, and the biggest
+ * bank on the disc has 38 of them; ENTRYWAVEDATA starts at 0x800 and is never
+ * touched.  A bank whose header did not fit would simply not match, which is
+ * the same answer a bank that is not the one asked for gets. */
+static int cxf_xwb_name(const char *path, char *out, size_t outsz)
+{
+    cxf_blob h;
+    cxf_xwb  in;
+    char     err[256];
+    int      rc;
+
+    if (cxf_read_head(path, 65536u, &h) != 0)
+        return -1;
+    rc = cxf_xwb_parse(&h, &in, err, sizeof err);
+    if (rc == 0)
+        snprintf(out, outsz, "%s", in.bank_name);
+    free(in.entries);
+    cxf_blob_free(&h);
+    return rc;
+}
+
+/* ONE BANK, NAMED BY ITS OUTPUT DIRECTORY.  What src/burnout3_isodata.c calls
+ * when the game opens build/audio/<BANK>/NNN.wav in iso mode -- see the block
+ * comment above the definition for why the whole-disc stage is not an option
+ * at the moment Crash FM wants a line.
+ *
+ * `bank_name` is the name the CALLER wants a directory called, which is the
+ * bank's own BANKDATA name -- "DJGEN", "US_C1" -- and NOT its filename: on
+ * disc every one of these carries a language prefix ("E_DJGEN.xwb"), and the
+ * eighteen per-track banks are all called E_DJRACE.xwb and name themselves
+ * after their track.  So the file is found by reading headers, not by
+ * guessing a path.  Compared case-insensitively, which costs nothing and
+ * cannot mis-fire: all 33 names differ in more than case.
+ *
+ * Same success convention as cx_extract_xwb(); a name that matches nothing on
+ * the disc is a failure, because the caller asked for a bank it believed was
+ * there. */
+int cx_extract_xwb_one(const char *game_dir, const char *out_root,
+                       const char *bank_name)
+{
+    cxf_strlist files = { NULL, 0, 0 };
+    size_t i;
+    int tot_ok = 0, tot_fail = 0, n_err = 0, decode, use_ffmpeg, found = 0;
+
+    if (!bank_name || !*bank_name)
+        return 1;
+    game_dir = cxf_game_dir(game_dir);
+
+    if (cxf_xwb_list(game_dir, &files) != 0) {
+        fprintf(stderr, "[cx_audio_xwb] cannot scan %s\n", game_dir);
+        cxf_strlist_free(&files);
+        return 1;
+    }
+
+    cxf_xwb_decoder(&decode, &use_ffmpeg);
+
+    for (i = 0; i < files.n && !found; i++) {
+        char err[8704], name[24];
+        int  ok = 0, fail = 0;
+
+        if (cxf_xwb_bulk(files.v[i]))
+            continue;
+        if (cxf_xwb_name(files.v[i], name, sizeof name) != 0)
+            continue;
+        if (strcasecmp(name, bank_name) != 0)
+            continue;
+
+        found = 1;
+        err[0] = '\0';
+        if (cxf_xwb_bank(files.v[i], out_root, decode, use_ffmpeg, &ok, &fail,
+                         err, sizeof err) != 0) {
+            printf("\n== %s == ERROR: %s\n", files.v[i], err);
+            ok = 0;
+            fail = 1;
+            n_err++;
+        }
+        tot_ok += ok;
+        tot_fail += fail;
+    }
+    cxf_strlist_free(&files);
+
+    if (!found) {
+        fprintf(stderr, "[cx_audio_xwb] no bank named '%s' under %s\n",
+                bank_name, game_dir);
+        return 1;
+    }
+    printf("\nTOTAL: %d waves ok, %d failed, 1 bank\n", tot_ok, tot_fail);
     return cxf_rc(n_err, tot_fail);
 }

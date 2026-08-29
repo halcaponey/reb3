@@ -964,15 +964,56 @@ void b3_hud_draw(float mph, float boost_frac, int lap, int total_laps,
 #define B3HUD_MIX_X      170.0f   /* label column, 640x480 virtual px      */
 #define B3HUD_MIX_BAR_X  260.0f   /* slider bar left edge                  */
 #define B3HUD_MIX_W      300.0f   /* slider bar width                      */
-#define B3HUD_MIX_Y0     200.0f   /* first row top                         */
-#define B3HUD_MIX_DY      46.0f   /* row pitch                             */
+#define B3HUD_MIX_Y0     176.0f   /* first row top                         */
+#define B3HUD_MIX_DY      34.0f   /* row pitch: was 42 for three rows.  The
+                                   * CRASH FM row made four, and 4*42 put
+                                   * the last bar's hit rect through the
+                                   * SETTINGS heading at 306.  34 keeps the
+                                   * whole block above it, so nothing below
+                                   * this point had to move.               */
+#define B3HUD_MIX_ROWS       4    /* engine, sfx, music, crash fm          */
 #define B3HUD_MIX_H       18.0f   /* bar height                            */
 #define B3HUD_MIX_BTN_X  260.0f   /* RESTART RACE button rect              */
-#define B3HUD_MIX_BTN_Y  356.0f
+#define B3HUD_MIX_BTN_Y  424.0f   /* was 356, then 392: the SETTINGS block
+                                   * sits above and has grown a third row.
+                                   * A row's hit rect is Y0 + 2*DY + H = 408
+                                   * and a greyed row's note sits at +13 of
+                                   * its top, so 424 is the first y that
+                                   * clears both. */
 #define B3HUD_MIX_BTN_W  180.0f
 #define B3HUD_MIX_BTN_H   26.0f
-/* vals = three 0..1 slider fractions (engine, sfx, music). */
-void b3_hud_pause_mixer(const float vals[3]);
+/* -- the SETTINGS block, under the sliders and above the button --------
+ * Same 640x480 virtual canvas and the same label column as the mixer, so the
+ * two halves of the overlay read as one screen.  The harness hit-tests
+ * against these, exactly as it does against the slider rects. */
+#define B3HUD_SET_HDR_Y  306.0f   /* the "SETTINGS" heading                */
+#define B3HUD_SET_Y0     336.0f   /* first settings row top                */
+#define B3HUD_SET_DY      26.0f   /* row pitch                             */
+#define B3HUD_SET_H       20.0f   /* row hit height                        */
+#define B3HUD_SET_VAL_X  400.0f   /* the ON/OFF column                     */
+#define B3HUD_SET_W      330.0f   /* row hit width, from B3HUD_MIX_X       */
+#define B3HUD_SET_MAX      8      /* rows the overlay has room for         */
+
+/* One row of the settings block.  `value` is drawn to the right of the label
+ * and is the caller's STRING, not a bool, so a future row can be a number or
+ * a name without this API changing.  `dim` greys the row: the setting exists
+ * but cannot take effect here -- no world to trace, or an env has already
+ * taken the decision -- and greying it with a `note` is the honest
+ * alternative to showing a value the renderer is not using. */
+typedef struct B3HudSetting {
+    const char *label;
+    const char *value;
+    const char *note;    /* short, drawn under a DIM row; NULL otherwise  */
+    int         dim;
+} B3HudSetting;
+
+/* vals = B3HUD_MIX_ROWS 0..1 slider fractions (engine, sfx, music, crash fm).
+ * `cursor` is the KEYBOARD row: -1 none (this overlay was mouse-only until
+ * the settings block arrived, and it stays fully usable that way), 0..ROWS-1
+ * the sliders, ROWS..ROWS+nset-1 the settings, ROWS+nset the RESTART RACE
+ * button. */
+void b3_hud_pause_mixer(const float vals[B3HUD_MIX_ROWS],
+                        const B3HudSetting *set, int nset, int cursor);
 
 /* Individual pieces (kept for the old header's API surface). */
 void b3_hud_draw_quad(GLuint tex, float x, float y, float w, float h,

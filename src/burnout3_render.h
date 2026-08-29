@@ -262,6 +262,72 @@ int  b3r_track_draw_scroll(const TrackMesh* m);
 int  b3r_track_draw_shine(TrackMesh* m, const float eye[3],
                           const float light_dir[3]);
 
+/* ====================================================================== *
+ *  THE SUN SHADOW PASS — INSPIRED, and the photorealism layer's ONLY
+ *  geometry pass.
+ *
+ *  Read the tier-4 block in burnout3_aftereffects.h first: it carries the
+ *  contract, the evidence position (retail has no shadow map of any kind and
+ *  none of this may be cited as game behaviour) and every constant.  What is
+ *  here is the depth-only render target and the matrix that fits it.
+ *
+ *  IT REUSES THE WORLD PROGRAM, deliberately.  A dedicated position-only
+ *  shader would be marginally cheaper per fragment and would have cost this
+ *  file a second program, a second set of attribute bindings and a second
+ *  place for the cut-out ALPHA TEST to be got wrong — and the alpha test is
+ *  not optional here: without it every chain-link fence and every foliage card
+ *  in the game casts a solid rectangle.  So the shadow pass is the ordinary
+ *  world pass with the light's matrices loaded, the fog off and the colour
+ *  mask closed, and the cut-outs keep cutting out for free.
+ *
+ *  THE CASTER LIST IS THE CALLER'S.  This module binds the target and hands
+ *  back the matrix; render_frame() decides what draws into it, because the
+ *  caster list is a scene question (which of the track, the scenery, the
+ *  props, the cars and the traffic are worth their draws) and not a renderer
+ *  one.
+ * ====================================================================== */
+
+/* Fit and bind the shadow target.  `sun_toward` is the GL-world direction
+ * TOWARD the sun, `center` the world point the box is fitted about (the
+ * caller's camera, led forward).  Returns 1 with `out_vp` filled with the
+ * world -> light-clip matrix, or 0 when the target could not be built — in
+ * which case nothing was bound and the caller must not draw.
+ *
+ * The box is SNAPPED to a whole shadow texel, which is what stops the shadow
+ * edges crawling as the camera moves; see b3r_shadow_begin's own note. */
+int  b3r_shadow_begin(const float sun_toward[3], const float center[3],
+                      float extent, float depth_range, int size,
+                      float out_vp[16]);
+
+/* Unbind, restore the colour mask and the viewport.  The caller is
+ * responsible for re-binding whatever framebuffer it was drawing into. */
+void b3r_shadow_end(void);
+
+/* The depth texture, or 0 when there is not one. */
+unsigned b3r_shadow_tex(void);
+
+/* Drop it.  Safe without a context, safe to call twice. */
+void b3r_shadow_free(void);
+
+/* ---- the track's SHINE MASK, for the screen-space reflections ---------- *
+ *
+ * The track already declares which of its surfaces reflect: the class-1/7/10
+ * additive specular groups this file gathers into its shine spans.  Rather
+ * than invent a gloss channel, the reflection pass marches only under those,
+ * and this renders them as a screen-space mask.
+ *
+ * ONE DRAW CALL.  The spans are contiguous in one VBO and a mask wants no
+ * textures and no per-span state, so the whole thing is a single glDrawArrays
+ * over the position buffer with the per-frame shine COLOUR buffer as the
+ * attribute — i.e. the mask carries the specular intensity the shine pass
+ * already computed this frame, for free, rather than a flat coverage bit.
+ *
+ * `depth_tex` is the scene's depth, attached so the mask is depth-TESTED:
+ * without it a shiny road surface behind a car would be marked reflective
+ * through the car.  Returns the mask texture, or 0 if it could not be made. */
+unsigned b3r_shine_mask_render(unsigned depth_tex, int w, int h);
+void     b3r_shine_mask_free(void);
+
 /* ---- instanced static models (scenery, props) -------------------------- */
 /*
  * Both of those passes are the same shape: a small table of models, a large
@@ -396,6 +462,13 @@ void b3r2d_reset_batches(void);
 /* How many merged batches each retained pass issued last frame.  This is the
  * number the call-count table is built from; B3_RENDER_STATS=1 prints it. */
 void b3r_stat_set(int slot, int batches);
+int  b3r_stat_get(int slot);
+/* Is the sun shadow pass owning the frame right now, and how many draws went
+ * into its map?  For the caster-list inspection: a call site that draws
+ * outside b3r_draw (the car mesh does) counts itself with the first, and the
+ * pass' caller checks the second against the passes it MEANT to submit. */
+int  b3r_shadow_active(void);
+long b3r_shadow_draws(void);
 /* B3_RENDER_STATS=<n> prints the per-pass draw counts every n frames.  Call
  * once per rendered frame. */
 void b3r_stats_frame(void);

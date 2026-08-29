@@ -63,6 +63,25 @@ void b3_carfx_shutdown(void);
  * Returns the number of corona lights loaded, 0 if the file is absent. */
 int  b3_carfx_load_car(int slot, const char* cls, const char* base);
 
+/* THE CAR'S OWN LAMPS, of one type, in MODEL space -- the .bgv light table at
+ * model+0x1664 / +0x16AC, 0x30-byte records of {position, normal} per type
+ * (docs/RE_CARFX.md 534-549, [C]), already carrying this harness' Z flip.
+ *
+ * The corona pass has always drawn these as billboards.  What this accessor
+ * exists for is the photorealism layer's tier 7: a headlight record is a
+ * POSITION and a DIRECTION, which is exactly a spotlight, and it is retail's
+ * own number rather than anything this port picked.  `type` 0 is the
+ * headlamps.  Returns how many were written, up to `max`. */
+int  b3_carfx_car_lamps(int slot, int type, float (*pos)[3],
+                        float (*nrm)[3], int max);
+
+/* How many TYPE-0 (head lamp) coronas the last corona pass actually emitted,
+ * i.e. survived FUN_00187BE0's "lamp normal must face the eye" reject.  Read
+ * after b3_carfx_corona_pass_end().  This is diagnostic, and the thing it
+ * diagnoses is that in chase camera the honest answer is ZERO -- see the
+ * comment at the counter in burnout3_carfx.c. */
+int  b3_carfx_corona_head_count(void);
+
 /* ---- environment inputs -- BOTH RECOVERED [C] ---------------------------
  * 1. The nine SH coefficients at modelInstance+0x5C are nine LITERALS in
  *    .rdata, not a runtime projection.  Three sites write the identical set
@@ -86,6 +105,22 @@ int  b3_carfx_env_light_rgb(const char* track, float out_rgb[3]);
 
 void b3_carfx_set_sh(const float L[9]);            /* modelInstance+0x5C [C] */
 void b3_carfx_set_light_rgb(float r, float g, float b);  /* ps c14.xyz   [C] */
+
+/* THE TRACK'S SUN, as this module already resolved it for the paint's glint:
+ * `out_dir_game` is the unit direction TOWARD the sun in the GAME's frame
+ * (enviro.dat env+0x80 negated -- [C] on the field, docs/RE_POSTFX.md 3.4),
+ * and `out_rgb` is the scene light colour (enviro.dat +0x60, [C]).  Returns 0
+ * when the track shipped no sun vector, in which case out_dir_game is a
+ * straight-up default and the caller should stand its own effect down rather
+ * than light the world from nowhere.
+ *
+ * Added for the photorealism layer's shadow pass and atmospherics, which need
+ * the SAME sun the car paint is using -- two modules disagreeing about where
+ * the sun is would show up as a car lit from one side casting a shadow to the
+ * other, and it is exactly the kind of thing that is invisible in review and
+ * obvious in a screenshot.  NOTE the frame: the harness's GL world is the
+ * Z-MIRROR of the game's (RE_NOTES 12), so a GL-space consumer must negate z. */
+int  b3_carfx_sun(float out_dir_game[3], float out_rgb[3]);
 
 /* THE MIRROR.  The SH probe is consumed in WORLD space (RE_CARFX.md 2.7), and
  * this harness's GL world is the Z-mirror of the game world (trackmesh_load
