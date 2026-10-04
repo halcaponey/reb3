@@ -178,6 +178,17 @@ int b3_collision_gather_walls(const float center[3], const float half[3],
 int b3_collision_gather(const float center[3], const float half[3],
                         B3CollisionPoly* out, int cap);
 
+/* Retail's generic rigid-body polygon gather (FUN_00109D20 [C], callback
+ * FUN_00109CE0 [C] @0x00109CE0..0x00109D12): gathers all collision geometry
+ * in the AABB [center-half, center+half], skipping only surface types 0x20
+ * (chevrons), 0x22 (cameras/triggers), 0x23 (reverb boundaries) and 0x24
+ * (cull planes).  Applies NO velocity filter and NO face normal filter.
+ * Used by class-6 props (FUN_0011A490 @0x0011A5FB) and wrecks
+ * (FUN_00122D00 @0x00122D4A). */
+int b3_collision_gather_rigid(const float center[3], const float half[3],
+                              B3CollisionPoly* out, int cap);
+
+
 /* Retail's own per-frame collision query, FUN_0011BC60: a SPHERE centred on
  * the frame translation ([[veh+0x204]+0x30]) whose radius is the vehicle's
  * half-extent magnitude plus one frame of travel --

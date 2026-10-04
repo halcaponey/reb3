@@ -698,10 +698,12 @@ section 10 recorded.
 
 ### 12.9 Open after this pass
 
-* **`FUN_00109D20`**, retail's own soup gather for a class-6 body, is not
-  recovered; the prop pass borrows the car's `b3_collision_gather_walls`. That
-  is the source of the residual one-or-two-in-a-hundred surface escapes
-  (section 12.7), and it is the next thing to pull.
+* **`FUN_00109D20`**, retail's generic rigid-body soup gather with callback
+  `FUN_00109CE0` (@0x00109CE0..0x00109D12), is **PORTED** (`b3_collision_gather_rigid`).
+  It gathers all collision triangles in the body's AABB margin, filtering out only
+  non-collidable surface low bytes `0x20` (chevrons), `0x22` (cameras/triggers),
+  `0x23` (reverb bounds) and `0x24` (cull occluders), with no car velocity or
+  normal-y wall filter. [C]
 * **`FUN_00108240`**, the edge-edge closest point, is **PORTED** (`b3p_edge_edge_closest`
   in `src/burnout3_props.c`); the edge arm now computes the retail segment-segment
   closest point across the decoded axis pair (bi - 6). [C]

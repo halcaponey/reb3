@@ -179,9 +179,8 @@ static B3PropInst*  g_inst;
 static B3PropBody   g_body[B3P_MAX_LIVE];
 
 /* Which of FUN_001084E0's three contact-point arms decided each contact:
- * [0] one of A's face normals, [1] one of B's, [2] an edge cross.  Telemetry
- * only -- the edge arm is the one still standing on GLUE, so its share is
- * worth being able to quote. */
+ * [0] one of A's face normals, [1] one of B's, [2] an edge cross (retail
+ * FUN_00108240 segment-segment closest point [C]).  Telemetry. */
 static unsigned long g_obb_arm[3];
 
 /* Regression telemetry for the two defects section 12 fixed, so neither can
@@ -1296,7 +1295,6 @@ void b3_props_update(float dt) {
                  * until the 16-body pool recycled it 20 s later). */
                 B3CollisionPoly soup[96];
                 float half[3];
-                float velocity[3] = {rb->vel[0], rb->vel[1], rb->vel[2]};
                 /* ONE FRAME OF TRAVEL, retail's own broad-phase margin:
                  * FUN_0011BC60 sizes its query as |box| + speed * dt
                  * (@0x0011BC7A the speed*dt, @0x0011BCD9/@0x0011BD17 the
@@ -1310,8 +1308,10 @@ void b3_props_update(float dt) {
                     float hi = fabsf(b->bbmax[axis]);
                     half[axis] = (lo > hi ? lo : hi) + 0.5f + travel;
                 }
-                nsoup = b3_collision_gather_walls(rb->frame[3], half,
-                                                   velocity, 1.1f, soup,
+                /* FUN_0011A490 @0x0011A5FB -> FUN_00109D20 [C]: retail's generic
+                 * rigid-body soup gather with callback FUN_00109CE0.  No car
+                 * velocity or normal-y filtering. */
+                nsoup = b3_collision_gather_rigid(rb->frame[3], half, soup,
                                                    (int)(sizeof(soup)
                                                          / sizeof(soup[0])));
                 /* ONE narrow phase over the WHOLE soup, ONE resolve -- which

@@ -745,6 +745,48 @@ int b3_collision_gather(const float center[3], const float half[3],
     return count;
 }
 
+int b3_collision_gather_rigid(const float center[3], const float half[3],
+                              B3CollisionPoly* out, int cap) {
+    if (!g_ntris || !g_seen || !out || cap <= 0) return 0;
+    int cx0, cz0, cx1, cz1;
+    cell_of(center[0] - half[0], center[2] - half[2], &cx0, &cz0);
+    cell_of(center[0] + half[0], center[2] + half[2], &cx1, &cz1);
+    if (++g_seen_stamp == 0) {
+        memset(g_seen, 0, (size_t)g_ntris * sizeof(*g_seen));
+        g_seen_stamp = 1;
+    }
+    int count = 0;
+    for (int cz = cz0; cz <= cz1; cz++) for (int cx = cx0; cx <= cx1; cx++) {
+        if (cx < 0 || cz < 0 || cx >= g_gw || cz >= g_gh) continue;
+        int cell = cz * g_gw + cx;
+        for (int k = 0; k < g_cell_count[cell]; k++) {
+            int index = g_cell_idx[g_cell_start[cell] + k];
+            if (g_seen[index] == g_seen_stamp) continue;
+            g_seen[index] = g_seen_stamp;
+            const B3ColTri* tri = &g_tris[index];
+            /* FUN_00109CE0 @0x00109CE0..0x00109D12: skip surface low bytes
+             * 0x20 (chevrons), 0x22 (cameras/triggers), 0x23 (reverb)
+             * and 0x24 (cull occluders). [C] */
+            unsigned char lo = (unsigned char)(tri->type & 0xFF);
+            if (lo == 0x20 || lo == 0x22 || lo == 0x23 || lo == 0x24)
+                continue;
+            float min_y = fminf(tri->v0[1], fminf(tri->v1[1], tri->v2[1]));
+            float max_y = fmaxf(tri->v0[1], fmaxf(tri->v1[1], tri->v2[1]));
+            if (max_y < center[1] - half[1] || min_y > center[1] + half[1])
+                continue;
+            B3CollisionPoly* poly = &out[count++];
+            memcpy(poly->v0, tri->v0, sizeof(poly->v0));
+            memcpy(poly->v1, tri->v1, sizeof(poly->v1));
+            memcpy(poly->v2, tri->v2, sizeof(poly->v2));
+            memcpy(poly->normal, tri->n, sizeof(poly->normal));
+            poly->type = tri->type;
+            if (count == cap) return count;
+        }
+    }
+    return count;
+}
+
+
 int b3_collision_filter_walls(const B3CollisionPoly* input, int input_count,
                               const float center[3], const float half[3],
                               const float* vel, float wall_ny_max,
