@@ -1200,20 +1200,14 @@ now ported (PH-24).  The settle gate is `0.5 [0x003B1684] > speed`
 `veh+0x1354 > 5 [0x003EBF88]` @0x00123595 -> zero every wheel omega and set
 `veh+0x20E = 1`.  **Blocked only on the soup**, same as PH-06.  [C]
 
-### PH-22 — reconstruction glue — **SPLITS: `:173` recovered, `:224` blocked**
+### PH-22 — reconstruction glue — **CLOSED BY DELETION / LANDED**
 
-`:173`'s stated reason ("the harness has no `.bgd` surface record") is wrong.
-Retail's brake-drag direction is `veh+0xC0`, the unit travel direction
-`FUN_000FFC80` maintains inside `FUN_00109560` — no surface record involved.
-`FUN_0011D460` @0x0011DBD7..0x0011DCF7 [C]: `pt = pos + up * veh+0x1368`;
-`s = veh+0x13CC * gate - veh+0x138C * brake * 20000.0 [0x003A35E4]`;
-`s *= (speed + 1)`; `s *= 0.014285714 [0x003B1D8C] = 1/70`; drifting with
-`veh+0x142C < 0.3 [0x003B1750]` zeroes it and moves `pt` to the origin;
-`F = veh+0xC0 * s`; `FUN_001064B0(F at pt)` @0x0011DCF7.  Our
-`b3_brake_drag_scalar` already matches the scalar; what is missing is only the
-APPLICATION as a force at `pos + up*BrakeForceHeight` (which also makes a
-pitch torque).  Portable today.
-`:224` stays blocked on the soup, but "not recoverable" is wrong — the
+Both of the row's GLUE marks lived inside `b3_vehicle_step()`, which was deleted.
+`:173`'s brake drag is `FUN_0011D460` @0x0011DBD7..0x0011DCF7, applied as a force
+at `pos + up*veh+0x1368` with its pitch torque (the `b3_brake_drag_scalar` +
+`b3f_acc_add` + `b3f_torque_at` block in `b3_d460_force_pass` inside
+`src/burnout3_vehicle_sim.c`), and `:224`'s spring relaxation is superseded by the
+ported `FUN_001239C0` + `FUN_00123FD0` ray pass in `b3_vehicle_step_full`. [C]
 builder, the grid and the record layout are all pinned: `veh+0x200` always
 points at the ONE global list `0x005A3AA0` (count there, 0x40-stride records
 via `0x005A3AA4 -> 0x005A3AB0`, u16 types via `0x005A3AA8 -> 0x005A52B0`);
