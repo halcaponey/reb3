@@ -951,10 +951,13 @@ bodies remains the port boundary.
 **Status — partial.** The harness now loads `traffic_paths.bin` from the
 RIDX descriptors, uses its cumulative-distance rows for a persistent cursor,
 samples its pair line with `FUN_0019FFA0`'s verified clamped four-row uniform
-cubic B-spline, and retires/reseeds at a descriptor end. `FUN_001A2B20`'s
-0.45..0.5499 per-agent lateral initialization is retained, but the retail RNG
-sequence, `FUN_0019FEC0` avoidance magnitude, and neighbourhood-pool
-replacement policy remain GLUE.
+cubic B-spline, and retires/reseeds at a descriptor end. The brake horizon /
+trigger distance `S+0x14` is recovered [C]: `FUN_001A3470` @0x001A37E1..0x001A37F8
+seeds both `S+0x08` and `S+0x14` with the agent's half-length (`myhalf`), and
+`FUN_0019F560` @0x0019FAB4 compares `gap` against `S+0x14` directly (no unlocated
+track data). `FUN_001A2B20`'s 0.45..0.5499 per-agent lateral initialization is
+retained, but the retail RNG sequence, `FUN_0019FEC0` avoidance magnitude, and
+neighbourhood-pool replacement policy remain GLUE.
 The manager ordering is now also preserved:
 `FUN_001A20F0` performs speed, cursor, then occupancy for every selected road
 agent before it calls `FUN_001A6B40` for physical bodies and `FUN_001A8640`

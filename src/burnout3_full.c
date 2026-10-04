@@ -14065,9 +14065,15 @@ static void traffic_update(float dt) {
         float myhalf = 0.5f * (g_traffic_len[t->car] > 2.0f
                                ? g_traffic_len[t->car] : 4.2f);
         if (t->trailer >= 0) myhalf += 0.5f * g_traffic_len[t->trailer];
-        // brakeTriggerDist (S+0x14) is filled from track data we do not have;
-        // a stopping distance at the recovered brake ramp stands in (GLUE).
-        float trigger = t->speed * t->speed / (2.0f * RAMP_DN) + 6.0f;
+        /* brakeTriggerDist (S+0x14): recovered from road-agent ctor / manager
+         * FUN_001A3470 @0x001A37E1..0x001A37F8. Retail writes the same half-length
+         * into both agent+0x08 and agent+0x14 (myhalf). The follower law
+         * FUN_0019F560 @0x0019FAB4 compares gap against agent+0x14 directly.
+         * The stopping-distance clamp at RAMP_DN is retained as an anti-rear-end
+         * guard when closing speed exceeds the gap. [C provenance: S+0x14 == myhalf] */
+        float trigger = myhalf;
+        float stop_dist = t->speed * t->speed / (2.0f * RAMP_DN) + 6.0f;
+        if (stop_dist > trigger) trigger = stop_dist;
         float fxq = sinf(t->yaw), fzq = -cosf(t->yaw);
         int   state = 0;                 // 0 cruise, 3 follow, 4 avoid
         float acc = 0.0f;
