@@ -1156,8 +1156,7 @@ Both basis reads sit inside one guard, `cmp esi,2 / jge` @0x0011DE56, with
 @0x001240A6 split the attach height and the spring set the same way.
 **Data check:** over all 78 extracted `build/cars/*.wheels`, retail's `w < 2`
 and the harness's geometric `z > mean(z)` agree **78/78, zero mismatches**.
-**Spec:** replace the geometric test at `src/burnout3_full.c:3326` with
-`w < 2`.  Identical today, correct by construction for any `.bgv`.  [C]
+**Spec / Status:** LANDED. Replaced the geometric test in `load_car_wheels()` (`src/burnout3_full.c`) with `w < 2` and updated `g_car_wheel_front` provenance to `[C]`. Identical today, correct by construction for any `.bgv`. [C]
 
 ### PH-19 — AI aggression producer — **producer LOCATED; the value is `.bgd` payload**
 

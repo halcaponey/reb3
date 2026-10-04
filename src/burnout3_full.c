@@ -884,7 +884,7 @@ static float  g_car_panel_pos[8][B3_PANEL_MAX][3];  // GAME space (.bgv+0xD00)
 static B3PanelSet g_panels[8];
 static float  g_car_wheel_pos[8][6][3];      // attach pos (loader Z-flip applied)
 static int    g_car_wheel_mirror[8][6];      // right row x sign: -1 = mirrored
-static int    g_car_wheel_front[8][6];       // GLUE: steers if on the +Z axle
+static int    g_car_wheel_front[8][6];       // [C] wheel index < 2 steers (FUN_0011DD04/0011DE56)
 static int    g_car_wheel_count[8] = {0};
 static float  g_car_wheel_radius[8] = {0};   // .bgv+0x18, per car
 static float  g_car_wheel_spin[8] = {0};     // visual spin, b3_wheel_spin_update
@@ -9956,7 +9956,6 @@ static int load_car_wheels(int slot, const char* cls, const char* base) {
     if (!f) return 0;
     char line[160];
     int n = 0;
-    float zsum = 0.0f;
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#') continue;
         float x, y, z; int mir;
@@ -9968,7 +9967,6 @@ static int load_car_wheels(int slot, const char* cls, const char* base) {
             g_car_wheel_pos[slot][n][1] = y;
             g_car_wheel_pos[slot][n][2] = -z;    // loader Z-flip
             g_car_wheel_mirror[slot][n] = mir;
-            zsum += z;
             n++;
         } else if (sscanf(line, "ext %f %f %f %f", &g_car_ext[slot][0],
                           &g_car_ext[slot][1], &g_car_ext[slot][2],
@@ -9982,11 +9980,9 @@ static int load_car_wheels(int slot, const char* cls, const char* base) {
     }
     fclose(f);
     g_car_wheel_count[slot] = n;
-    // GLUE: the axle nearer the nose steers. In .bgv space the nose is +Z,
-    // so pre-flip z above the average marks the front pair.
+    // [C] FUN_0011D460 @0x0011DE56: wheel index < 2 steers (fixed 4-wheel loop).
     for (int w = 0; w < n; w++)
-        g_car_wheel_front[slot][w] =
-            (-g_car_wheel_pos[slot][w][2]) > (zsum / (n > 0 ? n : 1));
+        g_car_wheel_front[slot][w] = (w < 2);
     return n;
 }
 
