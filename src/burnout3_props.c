@@ -1611,6 +1611,73 @@ static void b3p_obb_support(const B3POBB* b, const float n[3], float out[3])
     }
 }
 
+/* FUN_00108240 [C]: edge-edge closest point between boxes A and B along
+ * edge axes `eA` and `eB`.
+ * Given edge directions a = A->ax[ia] and b = B->ax[ib], and contact normal `n`,
+ * finds the point on the contacting edges.
+ * If the edges are nearly parallel (|cross(a, b)| < 1e-4), falls back to the
+ * support midpoint. Otherwise computes the segment-segment closest point. */
+static void b3p_edge_edge_closest(const B3POBB* A, const B3POBB* B,
+                                  int ia, int ib, const float n[3],
+                                  float out_pt[3])
+{
+    float a[3], b_dir[3];
+    for (int i = 0; i < 3; i++) {
+        a[i] = A->ax[ia][i];
+        b_dir[i] = B->ax[ib][i];
+    }
+
+    /* Support points along n on A and -n on B to select the contacting edge */
+    float pA[3], pB[3], nneg[3];
+    for (int i = 0; i < 3; i++) nneg[i] = -n[i];
+    b3p_obb_support(A, n, pA);
+    b3p_obb_support(B, nneg, pB);
+
+    /* Check edge direction alignment: cross(a, b) */
+    float u[3];
+    u[0] = a[1]*b_dir[2] - a[2]*b_dir[1];
+    u[1] = a[2]*b_dir[0] - a[0]*b_dir[2];
+    u[2] = a[0]*b_dir[1] - a[1]*b_dir[0];
+    float u_len = sqrtf(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]);
+    if (u_len < 1e-4f) {
+        /* Parallel edges: midpoint of support points [0x00108DE7 fallback] */
+        for (int i = 0; i < 3; i++) out_pt[i] = (pA[i] + pB[i]) * 0.5f;
+        return;
+    }
+
+    /* Direction dot products */
+    float da = a[0]*a[0] + a[1]*a[1] + a[2]*a[2];
+    float db = b_dir[0]*b_dir[0] + b_dir[1]*b_dir[1] + b_dir[2]*b_dir[2];
+    float dab = a[0]*b_dir[0] + a[1]*b_dir[1] + a[2]*b_dir[2];
+
+    float r[3];
+    for (int i = 0; i < 3; i++) r[i] = pA[i] - pB[i];
+    float ra = r[0]*a[0] + r[1]*a[1] + r[2]*a[2];
+    float rb = r[0]*b_dir[0] + r[1]*b_dir[1] + r[2]*b_dir[2];
+
+    float denom = da * db - dab * dab;
+    float s = 0.0f, t = 0.0f;
+    if (fabsf(denom) > 1e-6f) {
+        s = (dab * rb - db * ra) / denom;
+        t = (da * rb - dab * ra) / denom;
+    }
+
+    /* Clamp s to edge A half-extent [-h[ia], h[ia]] */
+    if (s < -A->h[ia]) s = -A->h[ia];
+    if (s >  A->h[ia]) s =  A->h[ia];
+
+    /* Clamp t to edge B half-extent [-h[ib], h[ib]] */
+    if (t < -B->h[ib]) t = -B->h[ib];
+    if (t >  B->h[ib]) t =  B->h[ib];
+
+    /* Closest points on each segment, and resulting contact point */
+    for (int i = 0; i < 3; i++) {
+        float ptA = pA[i] + a[i] * s;
+        float ptB = pB[i] + b_dir[i] * t;
+        out_pt[i] = (ptA + ptB) * 0.5f;
+    }
+}
+
 /* FUN_001084E0 [C].  `out_n` is UNIT and oriented A -> B (retail returns
  * B -> A @0x00108BB7; the caller here wants "away from the car", which is the
  * direction the solver's own impulse `n * j` then pushes the prop). */
@@ -1686,13 +1753,12 @@ static int b3p_obb_contact(const B3POBB* A, const B3POBB* B,
         b3p_obb_support(A, n, pa);
         for (int i = 0; i < 3; i++) out_pt[i] = pa[i] - n[i] * best;
     } else {
-        /* GLUE: FUN_00108240's edge-edge closest point is not recovered.  The
-         * midpoint of the two support points is the standard stand-in and is
-         * far closer to it than either support point alone. */
-        b3p_obb_support(A, n, pa);
-        b3p_obb_support(B, nneg, pb);
-        for (int i = 0; i < 3; i++)
-            out_pt[i] = (pa[i] - n[i] * best + pb[i] + n[i] * best) * 0.5f;
+        /* FUN_00108D00 / FUN_00108240 [C]: edge-edge closest point.
+         * Axis pair decoded through the cross-index (bi - 6) -> (p, q). */
+        int edge_idx = bi - 6;
+        int ia = edge_idx / 3;
+        int ib = edge_idx % 3;
+        b3p_edge_edge_closest(A, B, ia, ib, n, out_pt);
     }
     g_obb_arm[bi < 3 ? 0 : (bi < 6 ? 1 : 2)]++;
     for (int i = 0; i < 3; i++) out_n[i] = n[i];

@@ -594,8 +594,9 @@ scripted cone drive, the winning axis was **A-face 45%, B-face 14%, edge 41%**
 (`[proparm]` telemetry) — so **86% of contact points sat on the wrong box**, and
 the lever arm `r = point − prop_origin` that the impulse denominator and the
 torque are built from was wrong with them. That is what sets which way a clipped
-cone tumbles. Arms 1 and 2 are now retail's; the edge arm uses the midpoint of
-the two support points and is **marked GLUE** — `FUN_00108240` is not recovered.
+Arms 1 and 2 are retail's; the edge arm `FUN_00108240` @0x00108D3D is now ported
+in `src/burnout3_props.c` (`b3p_edge_edge_closest`), resolving the segment-segment
+closest point with the parallel fallback @0x00108DE7. [C]
 
 ### 12.5 The settle latch
 
@@ -701,10 +702,9 @@ section 10 recorded.
   recovered; the prop pass borrows the car's `b3_collision_gather_walls`. That
   is the source of the residual one-or-two-in-a-hundred surface escapes
   (section 12.7), and it is the next thing to pull.
-* **`FUN_00108240`**, the edge-edge closest point, is not recovered; the edge
-  arm of the contact point uses the midpoint of the two support points. It
-  decides **41 %** of contacts on a measured cone drive, so it is the largest
-  single piece of GLUE left in the prop chain.
+* **`FUN_00108240`**, the edge-edge closest point, is **PORTED** (`b3p_edge_edge_closest`
+  in `src/burnout3_props.c`); the edge arm now computes the retail segment-segment
+  closest point across the decoded axis pair (bi - 6). [C]
 * The **pair ORDERING** gap (`TODO.md`, ranked gaps #1) is untouched: props are
   still resolved outside retail's broadphase, so A/B order in a pileup differs.
 * Prop-hit **audio and score** (`FUN_00197A20` @0x0011392E) remain unported —
