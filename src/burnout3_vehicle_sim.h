@@ -861,6 +861,7 @@ typedef struct B3VehicleFull {
     void* soup_user;                          // harness cookie
     int (*soup_freeze)(void* user, struct B3VehicleFull* v);  // FUN_0011BC60
     int (*chassis_resolve)(struct B3VehicleFull* v);          // FUN_0011AEF0
+    void (*live_panels_step)(void* user, struct B3VehicleFull* v, float dt); // FUN_00126D40/FUN_00126520
     void* soup_ground_user;
     /* `wheel_gate` distinguishes retail's TWO rays into the same veh+0x200
      * soup, which are NOT filtered alike:

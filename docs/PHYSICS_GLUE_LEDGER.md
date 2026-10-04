@@ -1310,7 +1310,7 @@ type == 7`, then `[obj+0x211] = 0`) -> **every pair's narrow phase**
 | 2 | AABB refresh, all classes | `carcol_fill_racer`/`_traffic` — cars + traffic only | SPLIT |
 | 3 | sweep-and-prune, all classes | `b3_carcol_broadphase` at frame END; props bolted on as a separate O(n·m) pass | REORDERED + SPLIT |
 | 4 | `vtbl+0x10` world contact, **before every integrator** | props: SAME-ORDER (wave 2); debris: same-order via hunk P1; wreck: **NOW SAME-ORDER** (`b3_wreck_world_contact`, hunk F3); live car: **NOW IN THE SUBSTEP** (B4) | **SAME-ORDER** |
-| 5 | `[obj+0x211] = 0` per body, `[car+0x1353]` clear pass | — | MISSING |
+| 5 | `[obj+0x211] = 0` per body, `[car+0x1353]` clear pass | `b->hit_211` cleared per frame; `v->fsim.flags_1353` re-armed per frame via `b3_td_crash_authority_full` before car update | SAME-ORDER |
 | 6 | pair narrow phase `FUN_00111CD0`, before every integrator | `b3_carcol_resolve` + `b3_props_collide_car`, after | REORDERED + SPLIT |
 | 7 | car `vtbl+0` -> `FUN_0011BE50` | `b3_vehicle_step_full` | SAME-ORDER |
 | 8 | traffic `vtbl+0` -> `FUN_00120F30`, a real rigid body | persistent traffic/trailer bodies, residency/sleep gates and normal tow constraint; lane driver remains harness-controlled | PARTIAL |
@@ -1324,7 +1324,7 @@ type == 7`, then `[obj+0x211] = 0`) -> **every pair's narrow phase**
 | B5 | @0x0011C0E7 `FUN_001239C0` | `b3_prepass` | SAME-ORDER |
 | B6 | @0x0011C0EE `FUN_00123FD0` | `b3_suspension_pass` | SAME-ORDER |
 | B7 | @0x0011C160 `FUN_00109560` | `b3_rigid_body_integrate` | SAME-ORDER (verbatim) |
-| B8 | @0x0011C213 `FUN_00126D40` + @0x0011C21E `FUN_00126520` on a LIVE car | panels only run on the crashed path | MISSING |
+| B8 | @0x0011C213 `FUN_00126D40` + @0x0011C21E `FUN_00126520` on a LIVE car | `v->live_panels_step` hook in `b3_vehicle_step_full` at retail position advances crumpled panels | SAME-ORDER |
 | ACC | `FUN_00109560` consumes and clears `+0x110`/`+0x120` (@0x00109728..0x0010983B) and `+0x130` (@0x00109A27..0x00109A3E); nothing else touches them | `b3_rigid_body_integrate` | **SAME-ORDER (verbatim)** |
 | X | — | AI velocity governor between the integrator and the collision pass (`full.c:2703`). The wreck sphere sweep is demoted to an anti-tunnelling position net (F3) and PH-08's post-step velocity write is deleted (F2d) | EXTRA (PH-07) |
 

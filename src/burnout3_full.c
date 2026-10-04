@@ -5508,6 +5508,28 @@ static int harness_soup_freeze(void* user, B3VehicleFull* fs) {
     return n;
 }
 
+static void harness_live_panels_step(void* user, B3VehicleFull* fs, float dt) {
+    (void)fs;
+    (void)dt;
+    Vehicle* v = (Vehicle*)user;
+    if (!v) return;
+    int slot = (int)(v - g_vehicles);
+    if (slot < 0 || slot >= 8) return;
+    B3PanelSet* ps = &g_panels[slot];
+    if (ps->n <= 0) return;
+    /* FUN_0011BE50 @0x0011C200..0x0011C233: per-crumpled panel update (state == 2).
+     * Only runs when a panel has been dented/crumpled. */
+    int any_crumpled = 0;
+    for (int k = 0; k < ps->n; k++) {
+        if (ps->state[k] == B3_PANEL_CRUMPLED) {
+            any_crumpled = 1;
+            break;
+        }
+    }
+    if (!any_crumpled) return;
+    b3_panels_visual_pass(ps);
+}
+
 static void full_sim_reset(Vehicle* v) {
     int slot = (int)(v - g_vehicles);
     float wxz[4][2] = {{-0.76f, 1.24f}, {0.76f, 1.24f},
@@ -5572,6 +5594,7 @@ static void full_sim_reset(Vehicle* v) {
     v->fsim.soup_user         = v;
     v->fsim.soup_freeze       = harness_soup_freeze;
     v->fsim.chassis_resolve   = b3_vehicle_chassis_contact;
+    v->fsim.live_panels_step  = harness_live_panels_step;
     v->fsim.surface_grip_13A8 = 1.0f;   // veh+0x13A8, the SURFACE GRIP the
                                         // class-0 scrub multiplies; 1.0 is
                                         // tarmac (FUN_00123790 drops it to

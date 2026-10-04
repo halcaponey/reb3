@@ -2658,6 +2658,9 @@ void b3_vehicle_step_full(B3VehicleFull* v, float throttle, float brake,
             v->wheel[i].prev_contact[j] = snap_ct[i][j];
         }
     if (v->timer_152C >= -0.0001f) v->timer_152C -= dt;
+    // BE50 @0x0011C200..0x0011C233: per-crumpled panel update (FUN_00126D40 +
+    // FUN_00126520).  A live car runs its panel collision against the frozen soup here.
+    if (v->live_panels_step) v->live_panels_step(v->soup_user, v, dt);
     // FUN_0011C720 export is the harness accessors (speed/gear/rpm live
     // in the struct); FUN_0018DA00/FUN_0011FFA0 are trajectory-inert
     // (differential ablation, RE_NOTES 14).
