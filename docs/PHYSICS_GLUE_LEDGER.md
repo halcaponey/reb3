@@ -1305,11 +1305,11 @@ type == 7`, then `[obj+0x211] = 0`) -> **every pair's narrow phase**
 | # | retail stage | our equivalent | verdict |
 |---|---|---|---|
 | 1 | `FUN_00110AF0` = one physics call | spread over `full.c` `game_update()` :7164-:7372 in five stages with gameplay code between | **SPLIT** |
-| 2 | AABB refresh, all classes | `carcol_fill_racer`/`_traffic` — cars + traffic only | SPLIT |
-| 3 | sweep-and-prune, all classes | `b3_carcol_broadphase` at frame END; props bolted on as a separate O(n·m) pass | REORDERED + SPLIT |
+| 2 | AABB refresh, all classes | `carcol_fill_racer`/`_traffic`/`_debris` + candidate props | **SAME-ORDER** |
+| 3 | sweep-and-prune, all classes | `b3_carcol_broadphase` with racers, traffic, debris (type 7), and props (types 5, 6) in one unified sweep with `b3_carcol_pair_admitted` filter; separate O(n·m) loop deleted | **SAME-ORDER** |
 | 4 | `vtbl+0x10` world contact, **before every integrator** | props: SAME-ORDER (wave 2); debris: same-order via hunk P1; wreck: **NOW SAME-ORDER** (`b3_wreck_world_contact`, hunk F3); live car: **NOW IN THE SUBSTEP** (B4) | **SAME-ORDER** |
 | 5 | `[obj+0x211] = 0` per body, `[car+0x1353]` clear pass | `b->hit_211` cleared per frame; `v->fsim.flags_1353` re-armed per frame via `b3_td_crash_authority_full` before car update | SAME-ORDER |
-| 6 | pair narrow phase `FUN_00111CD0`, before every integrator | `b3_carcol_resolve` + `b3_props_collide_car`, after | REORDERED + SPLIT |
+| 6 | pair narrow phase `FUN_00111CD0`, before every integrator | `carcol_pass` unified pair loop: `carcol_resolve_pair`, `b3_props_resolve_pair`, debris writeback | **SAME-ORDER** |
 | 7 | car `vtbl+0` -> `FUN_0011BE50` | `b3_vehicle_step_full` | SAME-ORDER |
 | 8 | traffic `vtbl+0` -> `FUN_00120F30`, a real rigid body | persistent traffic/trailer bodies, residency/sleep gates and normal tow constraint; lane driver remains harness-controlled | PARTIAL |
 | 9 | prop `vtbl+0` -> `FUN_0011A330` = drag + `FUN_00109560` | `b3p_body_step` — **now update-only, contact moved out** | SAME-ORDER |
@@ -1334,8 +1334,11 @@ frame at @0x0011BF43's position (B1), the wreck resolves through the shared
 `FUN_00109EA0` before its integrator (4), and the invented 1..8 `mlen/0.6`
 loop and PH-08's velocity write are deleted.  What is left:
 
-1. **Props and debris are not in the broadphase** (3), so pair ordering and
-   the A/B swap differ from retail in pileups.
+1. **Props and debris are unified into the broadphase** (3) — **CLOSED (SAME-ORDER)**:
+   `carcol_pass()` sweeps racers, traffic, flying debris pieces (type 7), and
+   candidate props (types 5, 6) in one unified call to `b3_carcol_broadphase()`.
+   Retail pair filter `FUN_00114610` (`b3_carcol_pair_admitted`) gates admissions;
+   separate O(n·m) prop collision loop in `game_update()` deleted.
 2. **Traffic remains hybrid** (8) — PH-07/PH-13. `FUN_00120F30`'s
    streaming-unit gates, coupled sleep, persistent bodies, full hitch anchors,
    normal tow constraint and kingpin spring are live; the lane-route driver

@@ -17,6 +17,7 @@
 #include <GL/gl.h>
 
 #include "burnout3_props.h"
+#include "burnout3_carcol.h"
 #include "burnout3_collision.h"
 /* RETAINED RENDERER: the resting props draw from one baked world-space buffer
  * instead of a glPushMatrix/glCallList pair per instance.  See
@@ -2213,4 +2214,158 @@ void b3_props_draw(void) {
         batches++;
     }
     b3r_stat_set(B3R_STAT_PROPS, batches);
+}
+
+int b3_props_query_broadphase(const float car_centers_game[][3], int num_cars,
+                              int* out_insts, int max_props) {
+    if (!g_ready || max_props <= 0) return 0;
+    int count = 0;
+    static unsigned char selected[8192];
+    int n = g_ninst < (int)sizeof(selected) ? g_ninst : (int)sizeof(selected);
+    memset(selected, 0, (size_t)n);
+
+    /* 1. All active live knocked props */
+    for (int s = 0; s < B3P_MAX_LIVE && count < max_props; s++) {
+        int inst = g_body[s].owner;
+        if (inst >= 0 && inst < n && !selected[inst]) {
+            selected[inst] = 1;
+            out_insts[count++] = inst;
+        }
+    }
+
+    /* 2. Static props within 40m radius of any active car */
+    const float r2 = 40.0f * 40.0f;
+    for (int i = 0; i < n && count < max_props; i++) {
+        if (selected[i] || g_inst[i].state != B3P_REST) continue;
+        float px = g_inst[i].cur[12];
+        float pz = -g_inst[i].cur[14]; /* game space Z */
+        for (int c = 0; c < num_cars; c++) {
+            float dx = px - car_centers_game[c][0];
+            float dz = pz - car_centers_game[c][2];
+            if (dx * dx + dz * dz < r2) {
+                selected[i] = 1;
+                out_insts[count++] = i;
+                break;
+            }
+        }
+    }
+    return count;
+}
+
+void b3_props_fill_body(int inst, B3CarBody* out_body,
+                        B3RigidBody* out_rb, float frame_store[4][4]) {
+    if (!g_ready || inst < 0 || inst >= g_ninst) return;
+    b3_rigid_body_bind_frame(out_rb, frame_store);
+    memset(out_body, 0, sizeof(*out_body));
+    B3PropInst* p = &g_inst[inst];
+
+    if (p->state == B3P_KNOCKED && p->body >= 0) {
+        B3PropBody* b = &g_body[p->body];
+        b3p_mirror_rb(&b->rb, out_rb);
+        out_body->rb = out_rb;
+        out_body->type = B3_COL_TYPE_PROP_LIVE;
+        out_body->crashed = 1;
+        out_body->asleep = b->frozen;
+        out_body->mass = b->mass;
+        out_body->bbmax[0] = b->bbmax[0]; out_body->bbmin[0] = b->bbmin[0];
+        out_body->bbmax[1] = b->bbmax[1]; out_body->bbmin[1] = b->bbmin[1];
+        out_body->bbmax[2] = -b->bbmin[2]; out_body->bbmin[2] = -b->bbmax[2];
+        out_body->bbmax[3] = 0.0f; out_body->bbmin[3] = 0.0f;
+    } else {
+        const B3PropModel* m = &g_model[p->model];
+        /* Mirror p->cur into game space in out_rb->frame:
+         * row0: (m00, m01, -m02, 0)
+         * row1: (m10, m11, -m12, 0)
+         * row2: (-m20, -m21, m22, 0)
+         * row3: (m30, m31, -m32, 1) */
+        const float* M = p->cur;
+        out_rb->frame[0][0] =  M[0]; out_rb->frame[0][1] =  M[1]; out_rb->frame[0][2] = -M[2]; out_rb->frame[0][3] = 0.0f;
+        out_rb->frame[1][0] =  M[4]; out_rb->frame[1][1] =  M[5]; out_rb->frame[1][2] = -M[6]; out_rb->frame[1][3] = 0.0f;
+        out_rb->frame[2][0] = -M[8]; out_rb->frame[2][1] = -M[9]; out_rb->frame[2][2] =  M[10]; out_rb->frame[2][3] = 0.0f;
+        out_rb->frame[3][0] =  M[12]; out_rb->frame[3][1] =  M[13]; out_rb->frame[3][2] = -M[14]; out_rb->frame[3][3] = 1.0f;
+        b3p_build_inv_frame(out_rb);
+        out_body->rb = out_rb;
+        out_body->type = B3_COL_TYPE_PROP_STATIC;
+        out_body->crashed = 0;
+        out_body->asleep = 0;
+        out_body->mass = b3_props_mass_of(inst);
+        out_body->bbmax[0] = m->bb_max[0]; out_body->bbmin[0] = m->bb_min[0];
+        out_body->bbmax[1] = m->bb_max[1]; out_body->bbmin[1] = m->bb_min[1];
+        out_body->bbmax[2] = -m->bb_min[2]; out_body->bbmin[2] = -m->bb_max[2];
+        out_body->bbmax[3] = 0.0f; out_body->bbmin[3] = 0.0f;
+    }
+}
+
+int b3_props_resolve_pair(int inst, B3RigidBody* car_rb_game, float car_mass,
+                          const float car_bbmax[3], const float car_bbmin[3],
+                          int car_crashed, int car_slot, B3PropHit* out_hit) {
+    b3p_bind_body_frames();
+    if (!g_ready || !car_rb_game || inst < 0 || inst >= g_ninst) return 0;
+    B3PropInst* p = &g_inst[inst];
+    if (p->state == B3P_SETTLED) return 0;
+
+    B3_RIGID_BODY_LOCAL(h_rb);
+    b3p_mirror_rb(car_rb_game, &h_rb);
+
+    const float defmax[3] = { 0.95f, 0.75f, 2.20f };
+    B3POBB carbox;
+    b3p_car_obb((const float (*)[4])h_rb.frame, car_bbmax ? car_bbmax : defmax, car_bbmin, &carbox);
+
+    const B3PropModel* m = &g_model[p->model];
+    B3POBB pb;
+    b3p_inst_obb(p, m, &pb);
+
+    float nw[3], pen, cp[4];
+    if (!b3p_obb_contact(&carbox, &pb, nw, &pen, cp)) return 0;
+    cp[3] = 0.0f;
+
+    if (p->state == B3P_REST) {
+        float vcp[4];
+        b3p_point_vel(&h_rb, cp, vcp);
+        if (v_dot3(vcp, vcp) <= B3P_KNOCK_MIN_SPEED * B3P_KNOCK_MIN_SPEED)
+            return 0;
+        if (b3p_promote(inst) < 0) return 0;
+    }
+    p->aud_hit = 1;
+    B3PropBody* b = &g_body[p->body];
+    B3RigidBody* prb = &b->rb;
+
+    float nbent[4], imp[4], nin[4] = { nw[0], nw[1], nw[2], 0.0f };
+    float j = b3p_contact(prb, b->mass, &h_rb, car_mass, cp, nin,
+                          car_crashed, nbent, imp);
+    b->hit_211 = 1;
+    b->lru_key = g_clock + B3P_LRU_OFFSET;
+    if (pen > 0.0f)
+        for (int k = 0; k < 3; k++) prb->deflection[k] += nw[k] * pen;
+
+    if (car_crashed) {
+        car_rb_game->imp_force[0] += h_rb.imp_force[0];
+        car_rb_game->imp_force[1] += h_rb.imp_force[1];
+        car_rb_game->imp_force[2] -= h_rb.imp_force[2];
+        car_rb_game->imp_torque[0] -= h_rb.imp_torque[0];
+        car_rb_game->imp_torque[1] -= h_rb.imp_torque[1];
+        car_rb_game->imp_torque[2] += h_rb.imp_torque[2];
+    }
+
+    float vpa[4], vpb[4], vrel[4];
+    b3p_point_vel(&h_rb, cp, vpa);
+    b3p_point_vel(prb, cp, vpb);
+    for (int k = 0; k < 4; k++) vrel[k] = vpb[k] - vpa[k];
+    float vnc = -v_dot3(vrel, nbent);
+
+    if (out_hit) {
+        out_hit->instance = inst;
+        out_hit->model = (int)p->model;
+        out_hit->prop_class = (int)p->prop_class;
+        out_hit->car = car_slot;
+        out_hit->obj_class = b3_props_object_class(inst);
+        out_hit->mass = b->mass;
+        out_hit->radius = b->radius;
+        out_hit->point[0] = cp[0]; out_hit->point[1] = cp[1]; out_hit->point[2] = cp[2];
+        out_hit->normal[0] = nbent[0]; out_hit->normal[1] = nbent[1]; out_hit->normal[2] = nbent[2];
+        out_hit->vrel[0] = vrel[0]; out_hit->vrel[1] = vrel[1]; out_hit->vrel[2] = vrel[2];
+        out_hit->closing_mph = fabsf(vnc) * B3P_MS_TO_MPH;
+        out_hit->impulse = j;
+    }
+    return 1;
 }

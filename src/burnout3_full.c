@@ -17968,11 +17968,15 @@ static void race_restart(void) {
 // ============================================================
 typedef struct {
     B3CarBody   body;
-    B3RigidBody rb;          // used only for synthesised bodies
+    B3RigidBody rb;          // used for synthesised, prop, and debris bodies
     float rb_frame_store[4][4];   /* the 4x4 is not inline any more */
+    B3CarHull   hull;        // box hull for debris/props
     Vehicle*    veh;         // racer source, or NULL
     int         traffic;     // traffic index, or -1
     int         synth;       // 1 = write the result back by hand
+    int         prop_inst;   // prop instance index, or -1
+    int         debris_slot; // car slot for debris piece, or -1
+    int         debris_panel;// panel index for debris piece, or -1
 } CarColEntry;
 
 static Vec3 g_carcol_knock[8];        // racer wrecks (GLUE)
@@ -18803,10 +18807,70 @@ static void carcol_synth_rb(B3RigidBody* rb, Vec3 pos_gl, float y_origin,
     rb->inv_inertia_world[2][2] = 0.0013f;
 }
 
+static void carcol_fill_debris(CarColEntry* e, B3PanelPiece* piece, int slot, int panel) {
+    memset(&e->body, 0, sizeof(e->body));
+    e->veh = NULL;
+    e->traffic = -1;
+    e->synth = 1;
+    e->prop_inst = -1;
+    e->debris_slot = slot;
+    e->debris_panel = panel;
+
+    b3_rigid_body_bind_frame(&e->rb, e->rb_frame_store);
+    memcpy(e->rb.frame, piece->frame, sizeof(piece->frame));
+    for (int r = 0; r < 4; r++) e->rb.frame[r][2] = -e->rb.frame[r][2];
+
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) e->rb.inv_frame[i][j] = e->rb.frame[j][i];
+    e->rb.inv_frame[0][3] = e->rb.inv_frame[1][3] = e->rb.inv_frame[2][3] = 0.0f;
+    for (int j = 0; j < 3; j++)
+        e->rb.inv_frame[3][j] = -(e->rb.frame[3][0]*e->rb.inv_frame[0][j]
+                                + e->rb.frame[3][1]*e->rb.inv_frame[1][j]
+                                + e->rb.frame[3][2]*e->rb.inv_frame[2][j]);
+    e->rb.inv_frame[3][3] = 1.0f;
+
+    memcpy(e->rb.vel, piece->vel, sizeof(piece->vel));
+    e->rb.vel[2] = -e->rb.vel[2];
+
+    memcpy(e->rb.omega, piece->omega, sizeof(piece->omega));
+    e->rb.omega[0] = -e->rb.omega[0]; e->rb.omega[1] = -e->rb.omega[1];
+
+    memcpy(e->rb.angmom, piece->angmom, sizeof(piece->angmom));
+    e->rb.angmom[0] = -e->rb.angmom[0]; e->rb.angmom[1] = -e->rb.angmom[1];
+
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            float s = 0.0f;
+            for (int k = 0; k < 3; k++)
+                s += e->rb.frame[k][i] * piece->iinv_body[k][k] * e->rb.frame[k][j];
+            e->rb.inv_inertia_world[i][j] = s;
+        }
+        e->rb.inv_inertia_world[i][3] = 0.0f;
+    }
+    for (int k = 0; k < 3; k++)
+        for (int c = 0; c < 4; c++)
+            e->rb.inv_inertia_body[k][c] = piece->iinv_body[k][c];
+
+    e->body.rb = &e->rb;
+    e->body.mass = piece->mass;
+    e->body.type = B3_COL_TYPE_DEBRIS;
+    e->body.crashed = 1;
+    e->body.asleep = (piece->rest > 0.5f);
+
+    e->body.bbmax[0] = piece->bbmax[0]; e->body.bbmin[0] = piece->bbmin[0];
+    e->body.bbmax[1] = piece->bbmax[1]; e->body.bbmin[1] = piece->bbmin[1];
+    e->body.bbmax[2] = -piece->bbmin[2]; e->body.bbmin[2] = -piece->bbmax[2];
+    e->body.bbmax[3] = 0.0f; e->body.bbmin[3] = 0.0f;
+
+    b3_carcol_hull_from_extents(e->body.bbmax, e->body.bbmin, &e->hull);
+    e->body.hull = &e->hull;
+}
+
 static void carcol_fill_racer(CarColEntry* e, Vehicle* v, int slot) {
     B3CarBody* b = &e->body;
     memset(b, 0, sizeof(*b));
     e->veh = v; e->traffic = -1;
+    e->prop_inst = -1; e->debris_slot = -1; e->debris_panel = -1;
     b->hull = &g_car_hull[slot];
     b->mass = v->fsim.mass;
     for (int k = 0; k < 4; k++) {
@@ -19076,6 +19140,7 @@ static void carcol_fill_traffic(CarColEntry* e, TrafficCar* t, int idx) {
     B3CarBody* b = &e->body;
     memset(b, 0, sizeof(*b));
     e->veh = NULL; e->traffic = idx;
+    e->prop_inst = -1; e->debris_slot = -1; e->debris_panel = -1;
     if (idx >= 0 && t == &g_traffic[idx]) {
         e->synth = 0;
         b->rb = &t->rb;
@@ -19154,6 +19219,20 @@ static void carcol_writeback(CarColEntry* e, float dt) {
     Vec3 d = { rb->deflection[0], 0.0f, -rb->deflection[2] };
     Vec3 k = { (rb->imp_force[0] + rb->force_acc[0] * dt) / m, 0.0f,
                -(rb->imp_force[2] + rb->force_acc[2] * dt) / m };
+    if (e->debris_slot >= 0 && e->debris_panel >= 0) {
+        B3PanelPiece* piece = &g_panels[e->debris_slot].piece[e->debris_panel];
+        piece->frame[3][0] += d.x;
+        piece->frame[3][1] += rb->deflection[1];
+        piece->frame[3][2] += d.z;
+        piece->vel[0] += k.x;
+        piece->vel[1] += rb->imp_force[1] / m;
+        piece->vel[2] += k.z;
+        piece->vel[3] = sqrtf(piece->vel[0]*piece->vel[0] + piece->vel[1]*piece->vel[1] + piece->vel[2]*piece->vel[2]);
+        piece->angmom[0] -= rb->imp_torque[0];
+        piece->angmom[1] -= rb->imp_torque[1];
+        piece->angmom[2] += rb->imp_torque[2];
+        return;
+    }
     if (e->traffic >= 0) {
         TrafficCar* t = &g_traffic[e->traffic];
         t->pos.x += d.x; t->pos.z += d.z;
@@ -19988,7 +20067,7 @@ static void tdr_frame_pass(void) {
         }
 }
 
-#define CARCOL_MAX (8 + B3_TRAFFIC_N * 2)
+#define CARCOL_MAX 256
 
 /* --------------------------------------------------------------------------
  * FUN_00111CD0's TYPE-3 ARM.
@@ -20133,6 +20212,64 @@ static void carcol_pass(void) {
             list[n] = &ent[n].body; n++;
         }
     }
+    /* DEBRIS PIECES (type 7): flying body panels and detached parts.
+     * Retail advances all 64 slots in FUN_00106D00 and feeds them into
+     * FUN_00110AF0's broadphase list. */
+    for (int s = 0; s < 8; s++) {
+        for (int p = 0; p < B3_PANEL_MAX; p++) {
+            B3PanelPiece* piece = &g_panels[s].piece[p];
+            if (piece->active && piece->life > 0.0f && n < CARCOL_MAX) {
+                carcol_fill_debris(&ent[n], piece, s, p);
+                rig[n] = -1;
+                traffic_owner[n] = -1;
+                list[n] = &ent[n].body; n++;
+            }
+        }
+    }
+    /* PROPS (static type 5, live knocked type 6): all 16 live knocked props
+     * plus candidate static props within 40m of active cars in game space. */
+    if (b3_props_ready()) {
+        float car_centers[32][3];
+        int num_cars = 0;
+        for (int i = 0; i < g_num_vehicles && num_cars < 32; i++) {
+            if (g_vehicles[i].active) {
+                car_centers[num_cars][0] = g_vehicles[i].pos.x;
+                car_centers[num_cars][1] = g_vehicles[i].pos.y;
+                car_centers[num_cars][2] = g_vehicles[i].pos.z;
+                num_cars++;
+            }
+        }
+        for (int i = 0; i < g_traffic_n && num_cars < 32; i++) {
+            if (g_traffic[i].active) {
+                car_centers[num_cars][0] = g_traffic[i].pos.x;
+                car_centers[num_cars][1] = g_traffic[i].pos.y;
+                car_centers[num_cars][2] = g_traffic[i].pos.z;
+                num_cars++;
+            }
+        }
+        int prop_insts[CARCOL_MAX];
+        int max_props_to_query = CARCOL_MAX - n;
+        if (max_props_to_query > 128) max_props_to_query = 128;
+        if (max_props_to_query > 0) {
+            int nprops = b3_props_query_broadphase((const float (*)[3])car_centers, num_cars,
+                                                   prop_insts, max_props_to_query);
+            for (int pi = 0; pi < nprops && n < CARCOL_MAX; pi++) {
+                int inst = prop_insts[pi];
+                b3_props_fill_body(inst, &ent[n].body, &ent[n].rb, ent[n].rb_frame_store);
+                b3_carcol_hull_from_extents(ent[n].body.bbmax, ent[n].body.bbmin, &ent[n].hull);
+                ent[n].body.hull = &ent[n].hull;
+                ent[n].veh = NULL;
+                ent[n].traffic = -1;
+                ent[n].synth = 0;
+                ent[n].prop_inst = inst;
+                ent[n].debris_slot = -1;
+                ent[n].debris_panel = -1;
+                rig[n] = -1;
+                traffic_owner[n] = -1;
+                list[n] = &ent[n].body; n++;
+            }
+        }
+    }
     /* PASS-THROUGH DETECTOR (B3_PASSTHRU=1).  The direct test of "I can drive
      * through them": did the PLAYER's swept segment this frame pass through
      * another car's world box without any contact being resolved against it?
@@ -20187,6 +20324,58 @@ static void carcol_pass(void) {
             if (carcol_live_traffic(&ent[i], traffic_owner[i])
                 && carcol_live_traffic(&ent[j], traffic_owner[j]))
                 continue;
+            /* Pair filter: FUN_00114610 rejection matrix */
+            if (!b3_carcol_pair_admitted(list[i]->type, list[j]->type))
+                continue;
+
+            /* PROP PAIR RESOLUTION */
+            if (ent[i].prop_inst >= 0 || ent[j].prop_inst >= 0) {
+                if (ent[i].prop_inst >= 0 && ent[j].prop_inst >= 0) continue;
+                int pi = ent[i].prop_inst >= 0 ? i : j;
+                int ci = ent[i].prop_inst >= 0 ? j : i;
+                if (ent[ci].debris_slot >= 0) continue; /* debris vs prop skipped */
+                CarColEntry* cp = &ent[pi];
+                CarColEntry* cc = &ent[ci];
+                B3PropHit ph;
+                int c_slot = cc->veh ? (int)(cc->veh - g_vehicles)
+                                     : (cc->traffic >= 0 ? 100 + cc->traffic : -1);
+                int r = b3_props_resolve_pair(cp->prop_inst, cc->body.rb, cc->body.mass,
+                                              cc->body.bbmax, cc->body.bbmin,
+                                              cc->body.crashed, c_slot, &ph);
+                if (r) {
+                    if (cc->veh && c_slot >= 0 && c_slot < B3_TDR_MAX_CARS
+                        && cc->veh->fsim_ready && cc->veh->crashed_until <= 0.0f) {
+                        float vr[3] = { ph.vrel[0], ph.vrel[1], -ph.vrel[2] };
+                        float on[3] = { ph.normal[0], ph.normal[1], -ph.normal[2] };
+                        b3_td_object_contact(&g_tdr, c_slot, g_race_time, vr, on,
+                                             cc->veh->fsim.mass, ph.obj_class,
+                                             b3_td_object_class(0, 0),
+                                             g_race_time < cc->veh->immune_until);
+                    }
+                    if (getenv("B3_PROP_TRACE"))
+                        printf("[prop] car %d hit inst %d model %d class %d "
+                               "objcls %d mass %.0f closing %.1f mph J %.0f\n",
+                               ph.car, ph.instance, ph.model,
+                               ph.prop_class, ph.obj_class, ph.mass,
+                               ph.closing_mph, ph.impulse);
+                }
+                continue;
+            }
+
+            /* DEBRIS IMMUNITY CHECK: freshly detached panel does not collide with parent */
+            if (ent[i].debris_slot >= 0 || ent[j].debris_slot >= 0) {
+                int di = ent[i].debris_slot >= 0 ? i : j;
+                int ci = ent[i].debris_slot >= 0 ? j : i;
+                CarColEntry* cd = &ent[di];
+                CarColEntry* cc = &ent[ci];
+                if (cc->veh) {
+                    int c_slot = (int)(cc->veh - g_vehicles);
+                    if (c_slot == cd->debris_slot) {
+                        B3PanelPiece* piece = &g_panels[cd->debris_slot].piece[cd->debris_panel];
+                        if (piece->life < 0.2f) continue;
+                    }
+                }
+            }
             B3CarContact ct;
             /* FUN_00113960's recent-slam window: retail clears the wreck
              * crash flag when this PAIR's slam stamp is younger than 1.5 s
@@ -20338,8 +20527,10 @@ static void carcol_pass(void) {
              * FUN_00197920 for the near-miss cancel and FUN_001979E0 for the
              * rubbing timers, both taking *(racecar+0x13F4)+0x10D0.  That is
              * what makes a takedown a takedown instead of a near miss. */
-            score_contact_pair(ent[i].veh, ent[j].veh,
-                               traffic_owner[i], traffic_owner[j]);
+            if (ent[i].debris_slot < 0 && ent[j].debris_slot < 0) {
+                score_contact_pair(ent[i].veh, ent[j].veh,
+                                   traffic_owner[i], traffic_owner[j]);
+            }
             {   /* B3_PAIR_DUMP=<path>: append the EXACT inputs of a heavy
                  * contact so tools/replay_pair.py can push the same pair
                  * through retail's FUN_001121F0 under Unicorn and diff the
@@ -21009,61 +21200,6 @@ static void game_update(void) {
      * is why you can plough a cone field at 200 mph and keep driving. */
     if (b3_props_ready()) {
         b3_props_update(g_delta_time);
-        for (int i = 0; i < g_num_vehicles; i++) {
-            Vehicle* pv = &g_vehicles[i];
-            if (!pv->active) continue;
-            float ppos[3] = { pv->pos.x, pv->pos.y, pv->pos.z };
-            float pvel[3] = { pv->vel.x, pv->vel.y, pv->vel.z };
-            /* The gate wants the bbox PAIR, not the max alone: retail's
-             * FUN_001084E0 derives the box centre from (MAX+MIN)*0.5 and the
-             * half extents from (MAX-MIN)*0.5, and a shipped car's box is not
-             * symmetric about its origin (COMPCAR1: max y 1.1222, min y
-             * -0.1505, so the true box is 0.64 m half-height centred 0.49 m
-             * up, not 1.12 m half-height centred on the origin). */
-            float pext[3] = { g_car_ext[i][0], g_car_ext[i][1],
-                              g_car_ext[i][2] };
-            float pcen[3] = { g_car_cen[i][0], g_car_cen[i][1],
-                              g_car_cen[i][2] };
-            const float* pminp = (g_car_ext[i][2] > 0.1f) ? pcen : NULL;
-            B3PropHit ph[8];
-            int nph;
-            /* PROP-PHYSICS: the recovered generic solver (FUN_00113960 ->
-             * FUN_0010F8D0) puts BOTH masses and BOTH world inverse inertias
-             * in its denominator and takes the relative velocity at the
-             * contact POINT, so it needs the car's real rigid body -- and
-             * @0x00113B57 an UN-CRASHED car is forced to role 2 (immovable)
-             * while a wreck takes its half back.  Hand it the live body when
-             * the full pipeline owns the car; the pos/vel entry point is the
-             * pre-fsim_ready fallback. */
-            if (pv->fsim_ready)
-                nph = b3_props_collide_rb(i, &pv->fsim.rb, pv->fsim.mass,
-                                          pv->fsim.half_ext,
-                                          pv->fsim.center_off,
-                                          pv->crashed_until > 0.0f ? 1 : 0,
-                                          ph, 8);
-            else
-                nph = b3_props_collide_car(i, ppos, pvel, pv->rot.y,
-                                           pext, pminp, ph, 8);
-            for (int k = 0; k < nph; k++) {
-                /* game space = harness with z negated (RE_NOTES 12) */
-                float vr[3] = { ph[k].vrel[0], ph[k].vrel[1],
-                                -ph[k].vrel[2] };
-                float on[3] = { ph[k].normal[0], ph[k].normal[1],
-                                -ph[k].normal[2] };
-                if (i < B3_TDR_MAX_CARS && pv->fsim_ready
-                    && pv->crashed_until <= 0.0f)
-                    b3_td_object_contact(&g_tdr, i, g_race_time, vr, on,
-                                         pv->fsim.mass, ph[k].obj_class,
-                                         b3_td_object_class(0, 0),
-                                         g_race_time < pv->immune_until);
-                if (getenv("B3_PROP_TRACE"))
-                    printf("[prop] car %d hit inst %d model %d class %d "
-                           "objcls %d mass %.0f closing %.1f mph J %.0f\n",
-                           ph[k].car, ph[k].instance, ph[k].model,
-                           ph[k].prop_class, ph[k].obj_class, ph[k].mass,
-                           ph[k].closing_mph, ph[k].impulse);
-            }
-        }
     }
     panels_pieces_update(g_delta_time);
     // traffic_interact()'s capsule pass would fight the recovered hull

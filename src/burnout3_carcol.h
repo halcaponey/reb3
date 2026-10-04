@@ -92,6 +92,13 @@ _Static_assert(offsetof(B3CarHull, edges) == 0x0480, "edges off retail");
  * one only when FUN_00114910 promotes it (see b3_carcol_resolve_traffic). */
 #define B3_COL_TYPE_OBJECT   3   /* live traffic car / prop (FUN_00111620) */
 #define B3_COL_TYPE_LOOSE    4   /* a PROMOTED traffic car (FUN_00114910) */
+#define B3_COL_TYPE_PROP_STATIC 5 /* static prop (FUN_00110420 @0x00110A19) */
+#define B3_COL_TYPE_PROP_LIVE   6 /* knocked/live prop body (gameworld+0xC4380, FUN_0011A020) */
+#define B3_COL_TYPE_DEBRIS      7 /* flying debris piece (gameworld+0xD3380, FUN_001069C0) */
+#define B3_COL_TYPE_SETTLED     8 /* retired/settled slot (FUN_0011480C, ignored by dispatcher) */
+
+/* Pair filter FUN_00114610: 1 if pair is admitted to collide, 0 if filtered out. */
+int  b3_carcol_pair_admitted(int type_a, int type_b);
 
 /* One participant. Mirrors the live vehicle fields the chain touches. */
 typedef struct B3CarBody {

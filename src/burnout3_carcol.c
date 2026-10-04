@@ -148,10 +148,26 @@ void b3_carcol_world_aabb(const B3CarBody* b, float lo[3], float hi[3]) {
     }
 }
 
+/* FUN_00114610 pair filter */
+int b3_carcol_pair_admitted(int type_a, int type_b) {
+    if (type_a == B3_COL_TYPE_SETTLED || type_b == B3_COL_TYPE_SETTLED) return 0;
+    if (type_a == B3_COL_TYPE_OBJECT && type_b == B3_COL_TYPE_OBJECT) return 0;
+    if (type_a == B3_COL_TYPE_PROP_STATIC && type_b == B3_COL_TYPE_PROP_STATIC) return 0;
+    if (type_a == B3_COL_TYPE_DEBRIS && type_b == B3_COL_TYPE_DEBRIS) return 0;
+    if ((type_a == B3_COL_TYPE_PROP_STATIC && type_b == B3_COL_TYPE_DEBRIS) ||
+        (type_b == B3_COL_TYPE_PROP_STATIC && type_a == B3_COL_TYPE_DEBRIS)) return 0;
+    if ((type_a == B3_COL_TYPE_OBJECT && type_b == B3_COL_TYPE_PROP_STATIC) ||
+        (type_b == B3_COL_TYPE_OBJECT && type_a == B3_COL_TYPE_PROP_STATIC)) return 0;
+    if ((type_a == B3_COL_TYPE_OBJECT && type_b == B3_COL_TYPE_DEBRIS) ||
+        (type_b == B3_COL_TYPE_OBJECT && type_a == B3_COL_TYPE_DEBRIS)) return 0;
+    return 1;
+}
+
 int b3_carcol_aabb_overlap(const B3CarBody* a, const B3CarBody* b) {
     float alo[3], ahi[3], blo[3], bhi[3];
     /* FUN_00114610's pair filter: two sleeping cars never pair. */
     if (a->asleep && b->asleep) return 0;
+    if (!b3_carcol_pair_admitted(a->type, b->type)) return 0;
     b3_carcol_world_aabb(a, alo, ahi);
     b3_carcol_world_aabb(b, blo, bhi);
     for (int i = 0; i < 3; i++)
@@ -783,7 +799,9 @@ int b3_carcol_resolve_wreck(B3CarBody* A, B3CarBody* B, B3CarContact* out) {
     if (A->type <= 2 && !A->crashed && A->type != B3_COL_TYPE_TRAFFIC
         && B->type <= 2 && B->crashed && B->type == B3_COL_TYPE_TRAFFIC)
         thresh = B3_CARCOL_WRECK_IMPACT_TR;
-    if (A->type <= 2 && !A->crashed && out->impact > thresh)
+    int clsA = b3_carcol_class(A->type, A->designated);
+    int clsB = b3_carcol_class(B->type, B->designated);
+    if (A->type <= 2 && !A->crashed && b3_carcol_can_crash(clsB, clsA) && out->impact > thresh)
         out->crash_a = 1;
     if (getenv("B3_WRECK_TRACE"))
         fprintf(stderr, "[wreck] A.type=%d A.crashed=%d B.type=%d B.crashed=%d "

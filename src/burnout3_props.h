@@ -337,4 +337,16 @@ float b3_props_mass_of(int instance);    /* FUN_0011A020's law, kg           */
  * default; see INTEGRATION_NOTE. */
 int   b3_props_object_class(int instance);
 
+struct B3CarBody;
+struct B3CarHull;
+
+/* Unified broadphase adapters for props (static type 5, live knocked type 6). */
+int  b3_props_query_broadphase(const float car_centers_game[][3], int num_cars,
+                               int* out_insts, int max_props);
+void b3_props_fill_body(int inst, struct B3CarBody* out_body,
+                        B3RigidBody* out_rb, float frame_store[4][4]);
+int  b3_props_resolve_pair(int inst, B3RigidBody* car_rb_game, float car_mass,
+                          const float car_bbmax[3], const float car_bbmin[3],
+                          int car_crashed, int car_slot, B3PropHit* out_hit);
+
 #endif /* BURNOUT3_PROPS_H */
