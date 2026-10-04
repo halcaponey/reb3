@@ -92,10 +92,10 @@ access in the image — the only writers are `FUN_00119F40`, `FUN_0011A020` and
 the release vfunc @0x0011A470).  A knocked prop therefore keeps its body until
 a newer knock needs the slot; the timed "settle" is gone.
 
-### PH-02 — `b3_mat_orthonormalize` implements 1 of `FUN_000FF270`'s 3 branches *(recovered here; spec for vehicle_sim)*
+### PH-02 — `b3_mat_orthonormalize` implements `FUN_000FF270` *(src/burnout3_vehicle_sim.c — DONE)*
 
 `src/burnout3_vehicle_sim.c`'s `b3_mat_orthonormalize()` (the re-orthonormalise
-`FUN_00109560` calls @0x00109A22) hard-codes one branch:
+`FUN_00109560` calls @0x00109A22) originally hard-coded one branch:
 `r1 = ^(r2×r0); r0 = ^(r1×r2)`.
 
 The real `FUN_000FF270` @0x000FF27D..0x000FF544 **normalises all three rows,
@@ -112,20 +112,12 @@ b <= a && c > b -> B: r1 = ^(r2 x r0); r0 = ^(r1 x r2)   @0x000FF3D5
 L0 <= 0 -> A @0x000FF4E1   L1 <= 0 -> B @0x000FF47D   L2 <= 0 -> C @0x000FF41B
 ```
 
-Branch **B** is the only one ported, which is why `validate_port.py` is green
-(a racecar's frame, updated by a small omega, always lands in B).  A knocked
-prop tumbling at 5–15 rad/s takes **A and C every few frames**; with only B the
-orientation error was ~3e-3 per step and diverged to a completely different
-attitude after 20 steps (measured: `frame0 = [0.38,-0.81,-0.44]` vs
-`[0.74,-0.55,-0.39]`).
+Branch **B** was the only one ported initially. A knocked prop tumbling at
+5–15 rad/s takes **A and C every few frames**.
 
-**Recovered here** as `b3p_orthonormalize()` in `burnout3_props.c`, together
-with a local `b3p_integrate()` (line-for-line `FUN_00109560`, only so the prop
-path can use the complete orthonormaliser).  **Spec for the vehicle-sim owner:
-replace `b3_mat_orthonormalize`'s body with the four-way form above.**  It also
-affects every fast-rotating body that shares the integrator: wrecks
-(`burnout3_crash.c`) and panel pieces (`burnout3_panels.c`).  Cars are
-unaffected in normal racing but a spinning wreck is not.
+**STATUS — LANDED in `src/burnout3_vehicle_sim.c` (`63e8852`).** All four branches
+are ported and active across live racers, spinning wrecks (`burnout3_crash.c`)
+and panel pieces (`burnout3_panels.c`). [C]
 
 ### PH-03 — the car body handed to the prop solver was in the wrong space *(src/burnout3_props.c + full.c hunk — DONE)*
 

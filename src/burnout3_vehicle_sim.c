@@ -2579,14 +2579,14 @@ static void b3_suspension_pass(B3VehicleFull* v, float dt) {
 }
 
 // ---------------------------------------------------------------------------
-// The per-frame pipeline: FUN_00104D30 input glue + FUN_0011ECF0, then
+// The per-frame pipeline: FUN_00104D30 [C] driver dispatch + FUN_0011ECF0, then
 // FUN_0011BE50's main path (mode 0: two substeps at dt/2).
 // ---------------------------------------------------------------------------
 void b3_vehicle_step_full(B3VehicleFull* v, float throttle, float brake,
                           float steer, int boost, float dt) {
     v->clock += dt;
 
-    // driver-input glue (FUN_00104D30): raw inputs; live throttle =
+    // driver-input stage (FUN_00104D30 [C]): raw inputs; live throttle =
     // raw * accel multiplier (capped); no steering below 0.1 m/s
     v->throttle_raw_1414 = throttle;
     v->brake_1404 = brake;
