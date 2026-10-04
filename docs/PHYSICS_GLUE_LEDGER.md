@@ -1122,13 +1122,14 @@ PH-02 hypothesis above is REFUTED by measurement.**
    `period / divisor`, the same expression bit for bit.  Comment corrected
    to [C]; no behaviour change.
 
-### PH-17 — off-world / stuck watchdogs *(full.c:146-152, 1794-1846, 2602 — 6 marks)*
+### PH-17 — off-world / stuck watchdogs *(full.c:146-152, 1794-1846, 2602 — 5 marks)*
 
-`beach_time`, `stuck_ref`, `unstuck_side/until`, `immune_until`, the wall-grind
-detector and the off-world drop recovery.  Retail's equivalent is the 5 mph
-stuck rule plus the nav-graph re-place.  **Recoverable — partially** (the 5 mph
-rule is known); the rest exists because the harness's road representation is
-two drive lines (full.c:5645).  **Blocked on:** the nav graph (PH-10/PH-12).
+`stuck_ref`, `unstuck_side/until`, `immune_until`, the wall-grind detector and
+the off-world drop recovery (`beach_time` / `beach_ref_prog` were dead and purged).
+Retail's equivalent is the 5 mph stuck rule plus the nav-graph re-place.
+**Recoverable — partially** (the 5 mph rule is known); the rest exists because
+the harness's road representation is two drive lines (full.c:5645).
+**Blocked on:** the nav graph (PH-10/PH-12).
 
 ---
 

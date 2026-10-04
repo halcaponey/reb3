@@ -303,8 +303,6 @@ typedef struct {
     B3AiAggro     aggro;
     B3AiAggroSpeed aggspd;
     int   aggro_ready;
-    float beach_time;           // GLUE no-progress clock -> track reset
-    float beach_ref_prog;       // route progress at last advance
     Vec3  stuck_ref;            // GLUE wall-grind detector: last reference
     float stuck_ref_time;       //   position + when it was taken
     int   unstuck_side;         // GLUE: alternating lateral escape side
