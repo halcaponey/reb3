@@ -814,13 +814,15 @@ world-plane source. The collision gather applies harness streaming filters and
 no-pipeline callers still fall back to a sphere query. Retail's type-3 traffic
 spawn/designation path is also unresolved.
 
-### PH-10 — crash recovery placement *(full.c:2160-2210 — 2 marks)*
+### PH-10 — crash recovery placement *(full.c:6885 `nav_replace_car` — CLOSED)*
 
 Route points stand in for the `.bgd` nav nodes; "~3 nodes back" and the 30 mph
 relaunch are recovered (`FUN_001714F0` place + `FUN_001204C0` speed,
-`0x41569446` = 13.4112 m/s = 30 mph [C]); the *node graph* is the GLUE.
-**Recoverable — yes**, once the `.bgd` nav-node walk (`FUN_00179760`, RE_AI 10)
-is ported.  **Owner:** AI-DRIVE.  **Effort:** part of the nav-graph wave.
+`0x41569446` = 13.4112 m/s = 30 mph [C]).
+**STATUS — CLOSED / LANDED.** The `.bgd` nav-node walk is fully active
+(`route.bin` + `nav_edges.bin`, `B3RtNavSection` / `nav_replace_car` in
+`src/burnout3_full.c`), so PH-10's node-graph GLUE is retired and crash recovery
+uses retail nav-node placement [C].
 
 ### PH-11 — crash recovery bound — **PROVEN NOT RECOVERABLE, and the row's own premise was wrong**
 
@@ -889,12 +891,14 @@ rather than an unfinished search.**  The row's `[C]` claim on the 5 seconds is
 downgraded: the CONSTANT is `[C]` (0x003B1694 = 5.0, written to
 `racecar+0x240C`), the RULE is not.
 
-### PH-12 — AI-wheel handovers *(full.c:130, 1746-1754, 2078, 2205 — 3 marks)*
+### PH-12 — AI-wheel handovers *(full.c:7175-7220, src/burnout3_ai.c:16 — CLOSED)*
 
 The *flag* semantics are `[C]` (`racecar+0x27D8`, `FUN_0018C510` @0x0018C53A →
-`FUN_00170820`, released by `FUN_0018CB60`); the *driver law* and the 1.2 s
-duration are GLUE/[S].  **Recoverable — yes**, by porting `FUN_00170820` (the
-route-following driver).  **Owner:** AI-DRIVE.  **Effort:** ~2 days.
+`FUN_00170820`, released by `FUN_0018CB60`).
+**STATUS — CLOSED / LANDED.** The route-following driver `FUN_00170820` is
+ported in `src/burnout3_ai.c` section 16, transcribed branch for branch.
+AI-wheel handovers and edge triggers are handled via `b3_ai_route_alt` and
+`b3_ai_wheel_set` in `src/burnout3_full.c` [C].
 
 ### PH-13 — traffic mover, braking horizon, follow term *(full.c traffic update — 6 marks)*
 

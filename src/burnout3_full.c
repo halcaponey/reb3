@@ -4583,21 +4583,12 @@ static void tdr_wall_report(Vehicle* v, int slot, const float q[3],
 // carries a TORQUE that straightens a car clipping a barrier.  The old
 // harness response killed the into-wall velocity at the centre of mass and
 // left L/omega untouched, which is why a shallow clip pivoted the car.
-//
-// GLUE, and the only glue here: the linear half is applied to the velocity
-
-        // PH-08 [RECOVERED SHAPE]: retail never writes a velocity here.
-        // FUN_00112E70's object arm accumulates the reaction into the rigid
-        // body's impulse channel +0x110/+0x120 (FUN_00106500) and lets
-        // FUN_00109560 apply it -- v->fsim.rb.imp_force / imp_torque are the
-        // ported equivalents and are cleared by the integrator every frame.
-        // Route this through them instead of v->vel; see
-        // docs/PHYSICS_GLUE_LEDGER.md PH-08.
-// immediately instead of through veh+0x110 (a one-frame ordering difference)
-// so the sweep's second iteration sees the reduced closing speed, exactly as
-// the centre-of-mass kill it replaces did.  The angular half goes into the
-// retail accumulator veh+0x120 and is consumed by the next
-// b3_rigid_body_integrate, which is FUN_00109560's own ordering.
+// PH-08 [RECOVERED SHAPE / RETIRED]: retail never writes a velocity here.
+// FUN_00112E70's object arm accumulates the reaction into the rigid body's
+// impulse channel +0x110/+0x120 (FUN_00106500) and lets FUN_00109560 apply it.
+// Live cars with the full pipeline resolve contacts inside their substep
+// (hunk F2d @line 4875); this fallback response serves only bodies without
+// their own pipeline (pre-fsim / wreck containment).
 // Returns 1 when the ported response was applied.
 static int tdr_wall_scrape(Vehicle* v, const float q[3], float px, float pz,
                            unsigned short surface) {
@@ -7181,9 +7172,9 @@ static void vehicle_update(Vehicle* v, float dt) {
     // entry sets racecar+0x27D8, whose only per-frame consumer routes to
     // the route-following driver (FUN_0018C510 @0x0018C53A -> FUN_00170820),
     // and the camera release restores steering authority (FUN_0018CB60).
-    // [C flag semantics; the driver law below is the harness AI GLUE until
-    // the real FUN_00170820 port lands.] Without this, control returns from
-    // the cinematic with the car ploughed into whatever it drifted toward.
+    // [C flag semantics: FUN_0018C510 @0x0018C53A -> FUN_00170820 and
+    // FUN_0018CB60]. Without this, control returns from the cinematic with
+    // the car ploughed into whatever it drifted toward.
     if (!v->aiw_ready) {
         b3_ai_wheel_init(&v->aiw, (int)v->nav_node);
         v->aiw_ready = 1;
