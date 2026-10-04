@@ -1189,16 +1189,14 @@ exhaustively `FUN_001069C0` (detached parts, via `FUN_00111340`),
 `FUN_00106F20` (detached panels/wheels) and `FUN_0011A020` @0x0011A132 (the
 class-6 prop).  **No car body ever gets a box hull in retail.**  [C]
 
-### PH-21 — wreck ground test — **RECOVERED (was mis-filed)**
+### PH-21 — wreck ground test — **LANDED / CLOSED**
 
-See PH-06 above: the racecar vtable's slot +0x10 (`FUN_0011BE40` ->
-`FUN_00122D00`) resolves a crashed car against the world through
-`FUN_00109D20` + **`FUN_00109EA0`** @0x00122F81 + `FUN_001239C0` @0x00122FD2,
-and `FUN_00123000`'s loop is `FUN_00123FD0` + `FUN_00109560`.  The resolve is
-now ported (PH-24).  The settle gate is `0.5 [0x003B1684] > speed`
-@0x00123518 and `0.25 [0x005A80B8 <- 0x003B1730] > |omega|^2` @0x00123551 and
-`veh+0x1354 > 5 [0x003EBF88]` @0x00123595 -> zero every wheel omega and set
-`veh+0x20E = 1`.  **Blocked only on the soup**, same as PH-06.  [C]
+Landed with PH-06 in `burnout3_crash.c` (hunk F3, `b3_wreck_world_contact_soup` +
+`b3_wreck_update`): the settle gate is ported verbatim in `crash_sleep_gate`
+(`0.5 [0x003B1684] > speed` @0x00123518, `0.25 [0x005A80B8] > |omega|^2`
+@0x00123529, and settle counter `> 5 [0x003EBF88]` @0x0012358F -> sets
+`veh+0x20E = 1` and skips suspension force pass). [C]
+
 
 ### PH-22 — reconstruction glue — **CLOSED BY DELETION / LANDED**
 
