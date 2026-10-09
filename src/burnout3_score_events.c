@@ -72,7 +72,11 @@ void b3_score_params_defaults(B3ScoreParams* p)
         1.0f,                       /* 0x3F7404 Maximum Crash Wait Time      */
         0.5f,                       /* 0x3F7408 Max Crash Wait Time - No Slam*/
         {5, 10, 15},                /* 0x3F74CC Rubbing Category BP          */
-        {0.1f, 4.0f, 8.0f}          /* 0x3F758C rubbing minima (seconds)     */
+        {0.1f, 4.0f, 8.0f},         /* 0x3F758C rubbing minima (seconds)     */
+        /* PROPS (0x3F741C, 0x3F7420, 0x3F7430) */
+        2.0f,                       /* 0x3F741C Prop Hit Chain time (s)      */
+        3.0f,                       /* 0x3F7420 Prop Hit Boost value         */
+        10                          /* 0x3F7430 Prop Hit BP                  */
     };
     *p = d;
 }
@@ -108,7 +112,9 @@ void b3_score_params_vdb(B3ScoreParams* p)
          * Near Miss Category BP already gets above. */
         0.3f, 15.0f, 1.0f, 0.5f,
         {5, 10, 15},
-        {0.1f, 4.0f, 8.0f}
+        {0.1f, 4.0f, 8.0f},
+        /* PROPS: VDB leaves chain time at 2.0s, boost and BP are 0 */
+        2.0f, 0.0f, 0
     };
     *p = v;
 }
@@ -305,6 +311,7 @@ void b3_score_events_crash_reset(B3ScoreEvents* s, float clock)
     for (i = 0; i < B3_SE_NM_SLOTS; i++) s->nm_id[i] = -1;
 
     s->nm_chain = 0;              /* 0x00193AA0  MOV [EDI+0x3d0],ECX(0)   */
+    s->prop_hit_chain = 0;        /* 0x00193AA6  MOV [EDI+0x590],ECX(0)   */
     s->air_scored   = 0;          /* 0x00193AAC  MOV [EDI+0x3c8],CL(0)    */
     s->onc_scored   = 0;          /* 0x00193AB2  MOV [EDI+0x3c9],CL       */
     s->drift_scored = 0;          /* 0x00193AB8  MOV [EDI+0x3ca],CL       */
@@ -348,6 +355,11 @@ void b3_score_events_frame(B3ScoreEvents* s, B3BoostBar* bar,
     if (b3_score_events_suspended(s)) {
         b3_score_events_crash_reset(s, in->clock);
         return;
+    }
+
+    /* 0x00193A5B..0x00193A78: prop chain timeout */
+    if (s->prop_hit_chain > 0 && in->clock > s->prop_hit_last + P->prop_chain_s) {
+        s->prop_hit_chain = 0;
     }
 
     /* FUN_00196940 -- AIR.  No speed gate: the airborne flag alone opens it. */
@@ -865,4 +877,31 @@ void b3_score_events_reset(B3ScoreEvents* s)
     s->nm_last = 0.0f;
     s->nm_chain_end = 0.0f;
     s->callout_id = 0;
+}
+
+/* ===================================================================== *
+ * FUN_00197A20 -- prop-hit score accumulator [C]
+ * ===================================================================== */
+void b3_score_events_prop_hit(B3ScoreEvents* s, B3BoostBar* bar, float clock)
+{
+    if (s->race_finished) return;   /* score+0x27C == 3  */
+    if (s->rc_crashed) return;      /* racecar+0x18FA   */
+
+    s->prop_hit_total++;            /* 0x00197A51 INC [EDI+0x588] */
+    s->prop_hit_chain++;            /* 0x00197A52 INC EDX (chain) */
+    s->prop_hit_last = clock;       /* 0x00197A53 MOV [EDI+0x58c],ECX */
+    if (s->prop_hit_chain > s->prop_hit_max_chain)
+        s->prop_hit_max_chain = s->prop_hit_chain;  /* 0x00197A71 */
+
+    /* 0x00197A77..0x00197A84: award boost [0x3F7420] */
+    if (bar && b3_score_params.prop_boost > 0.0f) {
+        b3_boost_award(bar, b3_score_params.prop_boost);
+    }
+
+    /* 0x00197A89..0x00197ABA: award Burnout Points (chain * [0x3F7430]) */
+    if (b3_score_params.prop_bp > 0) {
+        int bp = s->prop_hit_chain * b3_score_params.prop_bp;
+        s->bp += bp;
+        s->bp_event += bp;
+    }
 }

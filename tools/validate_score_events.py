@@ -1461,6 +1461,51 @@ def case_takedown_vs_nearmiss(results):
                             expect_pay)]))
 
 
+def case_prop_hit(results):
+    # Tests FUN_00197A20 against C port
+    # 1. First hit: total=1, chain=1, max_chain=1, last=clock, boost=3, BP=10
+    img = blank_score(1.5)
+    out_c = run_port(img, ["prophit", 1.5, 0], "default")
+    total = struct.unpack_from('<i', out_c, 0x588)[0]
+    last = struct.unpack_from('<f', out_c, 0x58C)[0]
+    chain = struct.unpack_from('<i', out_c, 0x590)[0]
+    max_c = struct.unpack_from('<i', out_c, 0x594)[0]
+    boost = struct.unpack_from('<f', out_c, 0x104)[0]
+    bp = struct.unpack_from('<i', out_c, 0x4C)[0]
+    ok = (total == 1 and abs(last - 1.5) < 1e-4 and chain == 1 and max_c == 1
+          and abs(boost - 3.0) < 1e-3 and bp == 10)
+    results.append(("prop hit: first hit awards chain=1, boost and BP", ok,
+                    [] if ok else [f"total={total} last={last} chain={chain} max_c={max_c} boost={boost} bp={bp}"]))
+
+    # 2. Second hit on same chain: chain=2, bp grows by 20 -> 30 total
+    out_c2 = run_port(out_c, ["prophit", 2.5, 0], "default")
+    total2 = struct.unpack_from('<i', out_c2, 0x588)[0]
+    last2 = struct.unpack_from('<f', out_c2, 0x58C)[0]
+    chain2 = struct.unpack_from('<i', out_c2, 0x590)[0]
+    max_c2 = struct.unpack_from('<i', out_c2, 0x594)[0]
+    bp2 = struct.unpack_from('<i', out_c2, 0x4C)[0]
+    ok2 = (total2 == 2 and abs(last2 - 2.5) < 1e-4 and chain2 == 2 and max_c2 == 2 and bp2 == 30)
+    results.append(("prop hit: second hit grows chain=2 and awards chain*BP", ok2,
+                    [] if ok2 else [f"total={total2} last={last2} chain={chain2} max_c={max_c2} bp={bp2}"]))
+
+    # 3. Hit while crashed: no-op
+    out_c3 = run_port(out_c2, ["prophit", 3.0, 1], "default")
+    total3 = struct.unpack_from('<i', out_c3, 0x588)[0]
+    chain3 = struct.unpack_from('<i', out_c3, 0x590)[0]
+    ok3 = (total3 == total2 and chain3 == chain2)
+    results.append(("prop hit: hit while crashed is ignored", ok3,
+                    [] if ok3 else [f"total={total3} chain={chain3}"]))
+
+    # 4. Hit when race finished: score+0x27C == 3
+    img_fin = bytearray(out_c2)
+    struct.pack_into('<i', img_fin, 0x27C, 3)
+    out_c4 = run_port(img_fin, ["prophit", 3.0, 0], "default")
+    total4 = struct.unpack_from('<i', out_c4, 0x588)[0]
+    ok4 = (total4 == total2)
+    results.append(("prop hit: hit when race finished is ignored", ok4,
+                    [] if ok4 else [f"total={total4}"]))
+
+
 def _driver_stale():
     """Rebuild when a source is newer than the binary.  The old test was
     `not os.path.exists(DRIVER)`, which silently validated a stale driver
@@ -1510,6 +1555,8 @@ def main():
     case_crash_gate(results)
     case_crash_reset(results)
     case_crash_vs_run(results)
+    print("=== PROP HIT (FUN_00197A20) ===")
+    case_prop_hit(results)
 
     npass = sum(1 for _, ok, _ in results if ok)
     for name, ok, bad in results:

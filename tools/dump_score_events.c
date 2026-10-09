@@ -19,6 +19,34 @@
 #include <string.h>
 #include "burnout3_score_events.h"
 
+#if defined(_WIN32)
+#include <stdint.h>
+static int64_t win_getline(char **lineptr, size_t *n, FILE *stream) {
+    if (!lineptr || !n || !stream) return -1;
+    if (!*lineptr || *n == 0) {
+        *n = 1024;
+        *lineptr = (char*)malloc(*n);
+        if (!*lineptr) return -1;
+    }
+    size_t pos = 0;
+    int c;
+    while ((c = fgetc(stream)) != EOF) {
+        if (pos + 2 >= *n) {
+            *n *= 2;
+            char* p = (char*)realloc(*lineptr, *n);
+            if (!p) return -1;
+            *lineptr = p;
+        }
+        (*lineptr)[pos++] = (char)c;
+        if (c == '\n') break;
+    }
+    if (pos == 0 && c == EOF) return -1;
+    (*lineptr)[pos] = '\0';
+    return (int64_t)pos;
+}
+#define getline win_getline
+#endif
+
 #define SCORE_SZ 0x600
 
 static unsigned char img[SCORE_SZ];
@@ -134,6 +162,10 @@ static void load_state(B3ScoreEvents* s)
     s->rub.count      = (signed char)img[0x577];
     s->rub.active     = img[0x574];
     s->rub_target     = gi(0x580);
+    s->prop_hit_total     = gi(0x588);
+    s->prop_hit_last      = gf(0x58C);
+    s->prop_hit_chain     = gi(0x590);
+    s->prop_hit_max_chain = gi(0x594);
 }
 
 static void store_state(const B3ScoreEvents* s)
@@ -182,6 +214,10 @@ static void store_state(const B3ScoreEvents* s)
     img[0x577] = (unsigned char)s->rub.count;
     img[0x574] = s->rub.active;
     si(0x580, s->rub_target);
+    si(0x588, s->prop_hit_total);
+    sf(0x58C, s->prop_hit_last);
+    si(0x590, s->prop_hit_chain);
+    si(0x594, s->prop_hit_max_chain);
 }
 
 /* ---- hex io ---- */
@@ -402,8 +438,23 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (!strcmp(cmd, "prophit")) {
+        /* argv: prophit <tune> <clock> <crashed> */
+        B3ScoreEvents s;
+        B3BoostBar bar;
+        read_img();
+        load_state(&s);
+        load_bar(&bar);
+        b3_score_events_set_crash(&s, atoi(argv[4]), 0);
+        b3_score_events_prop_hit(&s, &bar, (float)atof(argv[3]));
+        store_state(&s);
+        store_bar(&bar);
+        write_img();
+        return 0;
+    }
+
     fprintf(stderr,
             "usage: dump_score_events "
-            "{cat|nm|obb|gate|frame|contact|mark|rub|frameend} <tune> ...\n");
+            "{cat|nm|obb|gate|frame|contact|mark|rub|frameend|prophit} <tune> ...\n");
     return 1;
 }

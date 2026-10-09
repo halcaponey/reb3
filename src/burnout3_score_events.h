@@ -128,6 +128,10 @@ typedef struct {
     float rub_grace_s;      /* 0x3F7408 Maximum Crash Wait Time - No Slam  */
     int   rub_cat_bp[3];    /* 0x3F74CC Rubbing Category BP (THREE tiers)  */
     float rub_minima[3];    /* 0x3F758C, score+0x570; count 3 @0x001933A2  */
+    /* "Score/Props" (0x3F741C, 0x3F7420, 0x3F7430) -- FUN_00197A20 */
+    float prop_chain_s;     /* 0x3F741C Prop Hit Chain time (Seconds)      */
+    float prop_boost;       /* 0x3F7420 Prop Hit Boost value               */
+    int   prop_bp;          /* 0x3F7430 Prop Hit BP (per chain link)       */
 } B3ScoreParams;
 
 /* Live parameter block; b3_score_events_init() fills it with the VDB tune. */
@@ -252,7 +256,12 @@ typedef struct __attribute__((packed, aligned(4))) B3ScoreEvents {
     unsigned char        rub_touch[B3_SE_RUB_CARS];  /* score+0x55E           */
     B3CatRecord          rub;  /* score+0x564 value / +0x568 clock / */
     int                  rub_target;  /* score+0x580 -- the opponent being rubbed */
-    unsigned char _pad05[0x137C];
+    unsigned char        _pad_prop[4];/* 0x584 */
+    int                  prop_hit_total;     /* score+0x588 total prop hits */
+    float                prop_hit_last;      /* score+0x58C timestamp of last prop hit */
+    int                  prop_hit_chain;     /* score+0x590 active prop hit chain */
+    int                  prop_hit_max_chain; /* score+0x594 max chain recorded */
+    unsigned char _pad05[0x1368];
 
     // ---- HARNESS SIDE, past the retail window: no recovered
     // offset in THIS object, so it must not squat on retail's bytes.
@@ -298,6 +307,10 @@ _Static_assert(offsetof(B3ScoreEvents, rub_prev_touch) == 0x0558, "rub_prev_touc
 _Static_assert(offsetof(B3ScoreEvents, rub_touch) == 0x055E, "rub_touch off retail");
 _Static_assert(offsetof(B3ScoreEvents, rub) == 0x0564, "rub off retail");
 _Static_assert(offsetof(B3ScoreEvents, rub_target) == 0x0580, "rub_target off retail");
+_Static_assert(offsetof(B3ScoreEvents, prop_hit_total) == 0x0588, "prop_hit_total off retail");
+_Static_assert(offsetof(B3ScoreEvents, prop_hit_last) == 0x058C, "prop_hit_last off retail");
+_Static_assert(offsetof(B3ScoreEvents, prop_hit_chain) == 0x0590, "prop_hit_chain off retail");
+_Static_assert(offsetof(B3ScoreEvents, prop_hit_max_chain) == 0x0594, "prop_hit_max_chain off retail");
 
 
 /* Module init: loads b3_score_params with the retail VDB tune. */
@@ -504,6 +517,12 @@ void b3_score_events_set_race_finished(B3ScoreEvents* s, int finished);
  * clearing the pending flag (the score object's +0x134).  Feed straight to
  * b3_hud_boost_event(cat, tier). */
 int b3_score_events_take_callout(B3ScoreEvents* s, int* cat, int* tier);
+
+/* FUN_00197A20 @0x00197A20 -- PROP HIT, called on type-5 prop contact with car.
+ * Increments total prop hits (+0x588), increments active chain (+0x590),
+ * stamps last-hit clock (+0x58C), updates max chain (+0x594), awards boost
+ * (0x3F7420) and awards Burnout Points (chain * 0x3F7430) when mode allows. */
+void b3_score_events_prop_hit(B3ScoreEvents* s, B3BoostBar* bar, float clock);
 
 #ifdef __cplusplus
 }

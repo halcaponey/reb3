@@ -192,9 +192,10 @@ anti-tunnelling/bootstrapping nets, so the systems are not fully unified yet.
    takes `FUN_001084E0`'s A-face and B-face arms instead of always box A's
    support point, and `FUN_00109560`'s `+0x20E`/`+0x211` settle latch is
    ported (`INTEGRATION_NOTE.md` §12). What remains here is the pair
-   ORDERING, not the test — plus `FUN_00108240`, the edge-edge closest point,
-   which is the one arm of the contact point still standing on GLUE (41 % of
-   contacts on a measured cone drive).
+   ORDERING, not the test. `FUN_00108240` (edge-edge closest point `b3p_edge_edge_closest`)
+   and `FUN_00197A20` (@0x0011392E, prop-hit boost/score/chain accumulator
+   `b3_score_events_prop_hit` with `B3_SFX_PANEL_L_PROP` impact audio) are
+   ported, integrated in `full.c`, and verified (164/164 in `validate_score_events.py`).
 2. **Wheel and chassis contact now share one frozen raw-collision snapshot**;
    the chassis view applies `FUN_0011BBE0`'s recovered wall predicate. The
    snapshot still omits retail's appended crash-floor records. This is now a

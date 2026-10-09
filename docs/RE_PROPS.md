@@ -342,9 +342,11 @@ tools/validate_td_rules.py   532/532
   list's model, which is unambiguous. Whether retail has a latent bug here or
   the pointer is only ever used for something that tolerates it (the
   `FUN_00114270` AABB) is unresolved.
-* **[?]** Prop-hit **audio/score** (`FUN_00197A20 @0x0011392E`) is not ported —
-  retail plays a per-class prop-hit sample and scores it. That is an SFX-wave
-  item; the contact reports already carry everything it needs.
+* ~~**[?]** Prop-hit **audio/score** (`FUN_00197A20 @0x0011392E`) is not ported~~
+  **CLOSED:** ported — `FUN_00197A20` is the prop score/boost/chain accumulator
+  (`b3_score_events_prop_hit` in `src/burnout3_score_events.c`), hooked at prop
+  contact resolution with SFX trigger (`B3_SFX_PANEL_L_PROP`) in `src/burnout3_full.c`,
+  and verified by `tools/validate_score_events.py` (164/164).
 * **[?]** LOD1/LOD2 meshes and the `+0x64/+0x68` fade distances are extracted
   but unused; every prop draws LOD0 at any range.
 * ~~**[?]** The generic solver `FUN_00113960` is still unported, so the knock is

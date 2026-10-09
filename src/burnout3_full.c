@@ -20515,6 +20515,12 @@ static void carcol_pass(void) {
                                              cc->veh->fsim.mass, ph.obj_class,
                                              b3_td_object_class(0, 0),
                                              g_race_time < cc->veh->immune_until);
+                        /* Retail FUN_00113890 @0x0011392E: prop score/boost accumulator FUN_00197A20 */
+                        b3_score_events_prop_hit(&cc->veh->sev, &cc->veh->bar, g_race_time);
+                        /* Prop-hit audio: large panel/prop sound at contact point */
+                        float imp = ph.impulse > 800.0f ? ph.impulse : 900.0f;
+                        b3_sfx_event_at(B3_SFX_PANEL_L_PROP, imp,
+                                        ph.point[0], ph.point[1], -ph.point[2]);
                     }
                     if (getenv("B3_PROP_TRACE"))
                         printf("[prop] car %d hit inst %d model %d class %d "
