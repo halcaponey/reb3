@@ -138,13 +138,12 @@ only for the `+0x16A4/+0x16A8` tow anchors in this function.
   bounds. `FUN_001A3470` occupancy-stamps each request, then
   `FUN_001A2B20` pops physical bodies and 0x50-byte road agents from separate
   free lists (`FUN_001A38F0`/`FUN_001A3A10`): physical release appends at the
-  tail (FIFO reuse), while agents return at the head (LIFO reuse). The harness's persistent
-  physical-pool lifecycle remains unported. The recovered roll/jackknife angular-momentum projections, a
-  conservative hitch-separation fallback, and the recovered
-  `dot(Zaxis_a, Zaxis_b) < -0.5` unlink now leave a separately simulated
-  trailer body until recycling.
-* **PH-13** traffic mover / braking horizon — cursor movement and speed law
-  are recovered; interpolation, avoidance and streamer remain.
+  tail (FIFO reuse via `FUN_001A41A0`), while agents return at the head (LIFO reuse via `FUN_001A3A80`).
+  The dual-pool lifecycle, trailer physical allocation recursion (`FUN_001A75A0`/`FUN_001A3970`),
+  agent rollback on starvation (`FUN_001A2B20`), and streaming/sleep gates
+  (`FUN_00120F30`/`FUN_00104840`/`FUN_001213C0`) are fully ported and verified.
+* **PH-13** traffic mover / braking horizon — cursor movement, speed law, and pool
+  lifecycle are recovered; interpolation, avoidance and streamer remain.
 
 ### Blocker C — one wall source / real contact geometry *(closes PH-09's object arm, the `crash_fired` switch, gap 3)*
 

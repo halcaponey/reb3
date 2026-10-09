@@ -30,6 +30,49 @@ void b3_traffic_pool_init(B3TrafficPool* pool, int physical_count,
         pool->agent_next[slot] = slot + 1 < agent_count ? slot + 1 : -1;
 }
 
+int b3_traffic_pool_acquire_physical(B3TrafficPool* pool) {
+    int physical;
+    if (!pool || pool->physical_head < 0) return -1;
+    physical = pool->physical_head;
+    pool->physical_head = pool->physical_next[physical];
+    if (pool->physical_head < 0) pool->physical_tail = -1;
+    pool->physical_next[physical] = -1;
+    pool->physical_live[physical] = 1;
+    return physical;
+}
+
+int b3_traffic_pool_release_physical(B3TrafficPool* pool, int physical_slot) {
+    if (!b3_traffic_pool_valid_physical(pool, physical_slot)
+        || !pool->physical_live[physical_slot])
+        return 0;
+    pool->physical_live[physical_slot] = 0;
+    pool->physical_next[physical_slot] = -1;
+    if (pool->physical_tail < 0) pool->physical_head = physical_slot;
+    else pool->physical_next[pool->physical_tail] = physical_slot;
+    pool->physical_tail = physical_slot;
+    return 1;
+}
+
+int b3_traffic_pool_acquire_agent(B3TrafficPool* pool) {
+    int agent;
+    if (!pool || pool->agent_head < 0) return -1;
+    agent = pool->agent_head;
+    pool->agent_head = pool->agent_next[agent];
+    pool->agent_next[agent] = -1;
+    pool->agent_live[agent] = 1;
+    return agent;
+}
+
+int b3_traffic_pool_release_agent(B3TrafficPool* pool, int agent_slot) {
+    if (!b3_traffic_pool_valid_agent(pool, agent_slot)
+        || !pool->agent_live[agent_slot])
+        return 0;
+    pool->agent_live[agent_slot] = 0;
+    pool->agent_next[agent_slot] = pool->agent_head;
+    pool->agent_head = agent_slot;
+    return 1;
+}
+
 int b3_traffic_pool_acquire(B3TrafficPool* pool, int* physical_slot,
                             int* agent_slot) {
     int physical;
@@ -37,15 +80,14 @@ int b3_traffic_pool_acquire(B3TrafficPool* pool, int* physical_slot,
     if (!pool || !physical_slot || !agent_slot || pool->physical_head < 0
         || pool->agent_head < 0)
         return 0;
-    physical = pool->physical_head;
-    agent = pool->agent_head;
-    pool->physical_head = pool->physical_next[physical];
-    if (pool->physical_head < 0) pool->physical_tail = -1;
-    pool->physical_next[physical] = -1;
-    pool->agent_head = pool->agent_next[agent];
-    pool->agent_next[agent] = -1;
-    pool->physical_live[physical] = 1;
-    pool->agent_live[agent] = 1;
+    physical = b3_traffic_pool_acquire_physical(pool);
+    if (physical < 0) return 0;
+    agent = b3_traffic_pool_acquire_agent(pool);
+    if (agent < 0) {
+        /* FUN_001A2B20 @0x001A2BC5 rollback */
+        b3_traffic_pool_release_physical(pool, physical);
+        return 0;
+    }
     *physical_slot = physical;
     *agent_slot = agent;
     return 1;
@@ -53,17 +95,17 @@ int b3_traffic_pool_acquire(B3TrafficPool* pool, int* physical_slot,
 
 int b3_traffic_pool_release(B3TrafficPool* pool, int physical_slot,
                             int agent_slot) {
-    if (!b3_traffic_pool_valid_physical(pool, physical_slot)
-        || !b3_traffic_pool_valid_agent(pool, agent_slot)
-        || !pool->physical_live[physical_slot] || !pool->agent_live[agent_slot])
+    if (!pool) return 0;
+    if (physical_slot < 0 && agent_slot < 0) return 0;
+    if (physical_slot >= 0 && (!b3_traffic_pool_valid_physical(pool, physical_slot)
+                               || !pool->physical_live[physical_slot]))
         return 0;
-    pool->physical_live[physical_slot] = 0;
-    pool->agent_live[agent_slot] = 0;
-    pool->physical_next[physical_slot] = -1;
-    if (pool->physical_tail < 0) pool->physical_head = physical_slot;
-    else pool->physical_next[pool->physical_tail] = physical_slot;
-    pool->physical_tail = physical_slot;
-    pool->agent_next[agent_slot] = pool->agent_head;
-    pool->agent_head = agent_slot;
+    if (agent_slot >= 0 && (!b3_traffic_pool_valid_agent(pool, agent_slot)
+                            || !pool->agent_live[agent_slot]))
+        return 0;
+    if (physical_slot >= 0)
+        b3_traffic_pool_release_physical(pool, physical_slot);
+    if (agent_slot >= 0)
+        b3_traffic_pool_release_agent(pool, agent_slot);
     return 1;
 }

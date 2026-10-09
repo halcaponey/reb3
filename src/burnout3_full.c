@@ -11702,6 +11702,12 @@ static int traffic_stream_refresh(TrafficCar* t) {
             traffic_pop_log(t, "body-off(stream)");
         t->streamed = 0;
         t->asleep = 1;
+        /* Retail FUN_00120F30 / FUN_00104840: off-unit contact & accumulator reset */
+        memset(t->rb.force_acc, 0, sizeof(t->rb.force_acc));
+        memset(t->rb.torque_acc, 0, sizeof(t->rb.torque_acc));
+        memset(t->rb.imp_force, 0, sizeof(t->rb.imp_force));
+        memset(t->rb.imp_torque, 0, sizeof(t->rb.imp_torque));
+        memset(t->rb.deflection, 0, sizeof(t->rb.deflection));
         return 0;
     }
     if (!t->streamed) {
@@ -11759,7 +11765,13 @@ static void traffic_tow_sleep_refresh(TrafficCar* t) {
     /* FUN_00120F30 writes both body+0x20E bytes together: either partner
      * outside a resident unit sleeps the whole articulated pair. */
     t->asleep = (unit == 0xff);
-    if (was_asleep && !t->asleep) {
+    if (t->asleep) {
+        memset(t->trailer_rb.force_acc, 0, sizeof(t->trailer_rb.force_acc));
+        memset(t->trailer_rb.torque_acc, 0, sizeof(t->trailer_rb.torque_acc));
+        memset(t->trailer_rb.imp_force, 0, sizeof(t->trailer_rb.imp_force));
+        memset(t->trailer_rb.imp_torque, 0, sizeof(t->trailer_rb.imp_torque));
+        memset(t->trailer_rb.deflection, 0, sizeof(t->trailer_rb.deflection));
+    } else if (was_asleep) {
         t->tr_pos = target;
         t->tr_bogie = target;
         t->tr_yaw = t->yaw;
@@ -12323,6 +12335,8 @@ static void traffic_pool_release_slot(int slot) {
     if (traffic->pool_request >= 0 && traffic->pool_agent >= 0)
         (void)b3_traffic_pool_release(&g_traffic_pool, slot,
                                       traffic->pool_agent);
+    else if (traffic->active)
+        (void)b3_traffic_pool_release_physical(&g_traffic_pool, slot);
     traffic->active = 0;
     traffic->pool_request = -1;
     traffic->pool_owner = -1;
@@ -12330,6 +12344,7 @@ static void traffic_pool_release_slot(int slot) {
     traffic->pool_seen = 0;
     traffic->trailer_ready = 0;
     traffic->trailer_linked = 0;
+    traffic->trailer = -1;
     g_pool_release_why = "?";      /* so the next site cannot inherit a tag */
 }
 

@@ -746,22 +746,23 @@ cannot be deleted in isolation:
 0012138e  jmp FUN_00123000                       the base vehicle update
 ```
 
-**Status — partly retired.** `TrafficCar` now retains a `B3RigidBody` through
+**Status — RETIRED / LANDED.** `TrafficCar` now retains a `B3RigidBody` through
 the generic car-contact pass and the shared `FUN_00109560` integrator; the
-invented knock write-back and `1 − 4·dt` decay are gone. Residency gates and
-the coupled sleep byte run from collision-unit ownership. Towed rigs retain a
+invented knock write-back and `1 − 4·dt` decay are gone. Residency gates,
+accumulator clearing (`FUN_001213C0`), off-unit park/reset (`FUN_00104840`), and
+the coupled sleep byte run from collision-unit ownership per `FUN_00120F30`
+(@0x00120F30..0x00121044). Dual-pool lifecycle (`FUN_001A38F0` physical pop,
+`FUN_001A41A0` physical FIFO append, `FUN_001A3A10` agent LIFO pop, `FUN_001A3A80`
+agent LIFO push), rollback on starvation (`FUN_001A2B20`), and trailer partner
+unlinking / physical recursion (`FUN_001A75A0`/`FUN_001A3970`) are fully ported
+and verified across `burnout3_traffic_pool.[ch]` and `burnout3_full.c`. Towed rigs retain a
 second body, use the full raw `+0x16A8/+0x16A4` vectors at spawn and at the
 constraint, and use `FUN_0010F8D0` for the opposing normal deflections.
 The detachment handler `FUN_00121400` (speed transfer and unlinking) is wired,
 with retail triggers on non-kingpin `dot(Z_a, Z_b) < -0.5`, vertical displacement
 `|dy| > 1.0 m` (@0x00121378), and horizontal separation `|d| > 1.0 m` (@0x00121350).
 The retail jackknife and roll angular-momentum projections and vertical kingpin
-spring are live. `FUN_00104840`, incidentally, is
-called HERE (@0x00120F7B /
-@0x00120FB7) rather than per frame: it zeroes
-`+0x160..+0x1BF`, `+0x212` **and sets `+0x1353 |= 4`** @0x00104848 — the bit
-that DISABLES `FUN_0011AEF0` — so it is a park/reset path, not the per-frame
-contact-scratch clear it was taken for.
+spring are live.
 
 ### PH-08 — object-crash knock write-back *(full.c:964-1000 — 1 mark)*
 
@@ -1423,9 +1424,9 @@ stands at **18 recovered / 3 proven-unrecoverable / 6 blocked**:
   never a physics invention) and **PH-11** (no timed crash releaser exists:
   the named field is a load latch and the 5-second stamp has no reader —
   all-segment sweeps, wave 3)
-* **recoverable, specced, remaining: 3** —
-  PH-07 and PH-13 (both need the remaining `FUN_00120F30` road-agent branches
-  ported into `full.c`'s traffic section), and PH-09's type-3 traffic lifecycle.
+* **recoverable, specced, remaining: 2** —
+  PH-13 (remaining interpolation and avoidance terms) and PH-09's type-3 traffic lifecycle.
+  PH-07 (traffic streaming/sleep gates, accumulator resets, and dual-pool lifecycle),
   PH-10, PH-12, and PH-17 are CLOSED (nav-graph replacement `FUN_001714F0`,
   autopilot follower `FUN_00170820`, 5 mph stuck countdown `FUN_00105340`,
   and `FUN_0010DD20` crash latch).

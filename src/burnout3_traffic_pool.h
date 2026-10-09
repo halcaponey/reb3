@@ -23,8 +23,18 @@ typedef struct {
 
 void b3_traffic_pool_init(B3TrafficPool* pool, int physical_count,
                           int agent_count);
+/* Retail FUN_001A38F0: singly linked list pop from manager+0x36364 */
+int b3_traffic_pool_acquire_physical(B3TrafficPool* pool);
+/* Retail FUN_001A41A0: singly linked FIFO queue append to manager+0x36368 */
+int b3_traffic_pool_release_physical(B3TrafficPool* pool, int physical_slot);
+/* Retail FUN_001A3A10: singly linked LIFO pop from manager+0x3636C */
+int b3_traffic_pool_acquire_agent(B3TrafficPool* pool);
+/* Retail FUN_001A3A80: singly linked LIFO push to manager+0x3636C */
+int b3_traffic_pool_release_agent(B3TrafficPool* pool, int agent_slot);
+/* Retail FUN_001A2B20: dual acquisition with rollback on agent failure */
 int b3_traffic_pool_acquire(B3TrafficPool* pool, int* physical_slot,
                             int* agent_slot);
+/* Retail FUN_001A75A0 / FUN_001A3970: release physical body and/or road agent */
 int b3_traffic_pool_release(B3TrafficPool* pool, int physical_slot,
                             int agent_slot);
 
