@@ -1305,7 +1305,7 @@ type == 7`, then `[obj+0x211] = 0`) -> **every pair's narrow phase**
 
 | # | retail stage | our equivalent | verdict |
 |---|---|---|---|
-| 1 | `FUN_00110AF0` = one physics call | spread over `full.c` `game_update()` :7164-:7372 in five stages with gameplay code between | **SPLIT** |
+| 1 | `FUN_00110AF0` = one physics call | `b3_physics_step(dt)` in `full.c` executes director zones (@0x001AA84A), `carcol_pass` (AABB/SAP/world/narrow), traffic proximity (0x00110EB9), car updates (0x00110EE7), traffic updates (0x00110F45), prop updates (0x00110FBB), debris updates (0x00111011), and `tdr_frame_pass` (0x001110E2) in monolithic calling order | **SAME-ORDER** |
 | 2 | AABB refresh, all classes | `carcol_fill_racer`/`_traffic`/`_debris` + candidate props | **SAME-ORDER** |
 | 3 | sweep-and-prune, all classes | `b3_carcol_broadphase` with racers, traffic, debris (type 7), and props (types 5, 6) in one unified sweep with `b3_carcol_pair_admitted` filter; separate O(n·m) loop deleted | **SAME-ORDER** |
 | 4 | `vtbl+0x10` world contact, **before every integrator** | props: SAME-ORDER (wave 2); debris: same-order via hunk P1; wreck: **NOW SAME-ORDER** (`b3_wreck_world_contact`, hunk F3); live car: **NOW IN THE SUBSTEP** (B4) | **SAME-ORDER** |
@@ -1315,7 +1315,7 @@ type == 7`, then `[obj+0x211] = 0`) -> **every pair's narrow phase**
 | 8 | traffic `vtbl+0` -> `FUN_00120F30`, a real rigid body | persistent traffic/trailer bodies, residency/sleep gates and normal tow constraint; lane driver remains harness-controlled | PARTIAL |
 | 9 | prop `vtbl+0` -> `FUN_0011A330` = drag + `FUN_00109560` | `b3p_body_step` — **now update-only, contact moved out** | SAME-ORDER |
 | 10 | debris `vtbl+0` -> `FUN_00106D00`, all 64 slots every frame | `panels_pieces_update` advances every detached panel once after vehicle, traffic, and prop passes; slot +0x10 `FUN_001072A0` gathers local polygon soup via `b3_collision_gather_rigid` and runs `b3_rigid_body_obb_soup_contact` (FUN_00107950) with sleep latch @0x001072AC | **SAME-ORDER** |
-| 11 | `FUN_0012FA40` inside the physics call | `tdr_frame_pass` at frame end | REORDERED |
+| 11 | `FUN_0012FA40` inside the physics call | `tdr_frame_pass` runs inside `b3_physics_step` immediately following debris updates (@0x001110E2) | **SAME-ORDER** |
 | B1 | `FUN_0011BE50` @0x0011BF43 `FUN_0011BC60` — soup gathered ONCE per frame, outside the substeps | **SAME-ORDER**: `v->soup_freeze` takes one raw local collision snapshot; rays use it directly and the chassis view applies the recovered `FUN_0011BBE0` wall predicate. The crash-floor append mechanism is ported: `b3_vehicle_set_crash_floor` (`FUN_00125790`, verified against retail x86 across 8 cases in `validate_port.py`) stages 6 boundary polygons at `veh+0x11D0` and sets `+0x1351`, and `harness_soup_freeze` (`FUN_0011BC60` @0x0011BDA0) appends them with surfaces 0x26/0x1A gated on capacity (< 90). | **SAME-ORDER** |
 | B2 | @0x0011C048 `dt *= 0.5`, n = 2 (gate `[[veh+0x13F4]+0x1920] == 0`) | `vehicle_sim.c` always 2 | SAME-ORDER (race path); n=1 mode unmodelled |
 | B3 | @0x0011C0A2 `FUN_0011D460` | `b3_d460_force_pass` | SAME-ORDER |
@@ -1390,6 +1390,13 @@ loop and PH-08's velocity write are deleted.  What is left:
    - Live vehicle collision latch at `0x0011BF0C..0x0011BF38`: tests byte `veh+0x153F` (`latch_153F`). While `g_race_time - stamp_1538 <= 0.6f`, asserts `flags_1353 |= 0x10` (the retail bit4 crash veto). Clears `latch_153F = 0` when elapsed > 0.6 s.
    - Contact hit trigger: `carcol_pass` arms `latch_153F = 1`, `stamp_1538 = g_race_time`, and `flags_1353 |= 2` matching retail `0x00026AA0`.
    - Remaining ctx `+0x58` HUD block is visual presentation.
+7. **Physics frame call cadence & `FUN_0012FA40` unified (Stages 1 & 11) — CLOSED (SAME-ORDER)**:
+   `b3_physics_step()` encapsulates the entire retail `FUN_00110AF0` sequence in exact order:
+   director zones (`FUN_0018BC90` @0x001AA84A) -> `carcol_pass()` (AABB refresh, SAP, world contact, narrow phase) ->
+   traffic proximity (`FUN_00114E60` @0x00110EB9) -> vehicle updates (`FUN_0011BE50` @0x00110EE7) ->
+   traffic updates (`FUN_00120F30` @0x00110F45) -> prop updates (`FUN_0011A330` @0x00110FBB) ->
+   debris updates (`FUN_00106D00` @0x00111011) -> `tdr_frame_pass()` (`FUN_0012FA40` @0x001110E2).
+   Eliminates the 1-frame latency between collision force generation and vehicle integrator consumption.
 
 ---
 

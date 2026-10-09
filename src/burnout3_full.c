@@ -21143,6 +21143,49 @@ static const B3NearTraffic* b3_collision_manager_get_near_traffic(int racer_slot
     return &g_near_traffic[racer_slot];
 }
 
+/* FUN_00110AF0 [C]: The monolithic physics frame pipeline.
+ * Runs in exact retail calling order (@0x001AA85A):
+ *  0. FUN_0018BC90: Crash director zone evaluation (@0x001AA84A)
+ *  1-5. carcol_pass(): AABB refresh, sweep-and-prune, vtbl+0x10 world contact,
+ *       and pair narrow phase (FUN_00110AF0 head @0x00110DC4..0x00110DF4)
+ *  6. FUN_00114E60: Near-traffic proximity cache update (@0x00110EB9)
+ *  7. FUN_0011BE50: Car rigid body updates (@0x00110EE7)
+ *  8. FUN_00120F30: Traffic rigid body updates (@0x00110F45)
+ *  9. FUN_0011A330: Prop updates (@0x00110FBB)
+ * 10. FUN_00106D00: Detached debris updates (@0x00111011)
+ * 11. FUN_0012FA40: Takedown, psyche-out & scoring frame pass (@0x001110E2)
+ */
+static void b3_physics_step(float dt) {
+    static B3CrashDirectorZone s_active_crash_zones[32];
+    static int s_num_active_crash_zones = 0;
+    B3VehicleFull* active_fsim_vehs[8];
+    int num_fsim_vehs = 0;
+    for (int i = 0; i < g_num_vehicles && num_fsim_vehs < 8; i++) {
+        if (g_vehicles[i].active && g_vehicles[i].fsim_ready)
+            active_fsim_vehs[num_fsim_vehs++] = &g_vehicles[i].fsim;
+    }
+    b3_crash_director_update_zones(active_fsim_vehs, num_fsim_vehs,
+                                   s_active_crash_zones, s_num_active_crash_zones);
+
+    carcol_pass();
+
+    b3_collision_manager_update_traffic_proximity();
+
+    for (int i = 0; i < g_num_vehicles; i++) {
+        vehicle_update(&g_vehicles[i], dt);
+    }
+
+    traffic_update(dt);
+
+    if (b3_props_ready()) {
+        b3_props_update(dt);
+    }
+
+    panels_pieces_update(dt);
+
+    tdr_frame_pass();
+}
+
 static void game_update(void) {
     b3_bind_vehicle_frames();
     // Update race timer
@@ -21181,11 +21224,6 @@ static void game_update(void) {
         float dy = g_vehicles[i].pos.y - g_player.pos.y;
         float dz = g_vehicles[i].pos.z - g_player.pos.z;
         g_tdr.car[i].view_dist2 = dx * dx + dy * dy + dz * dz;
-    }
-    /* FUN_00114E60: update near-traffic proximity list before vehicle updates */
-    b3_collision_manager_update_traffic_proximity();
-    for (int i = 0; i < g_num_vehicles; i++) {
-        vehicle_update(&g_vehicles[i], g_delta_time);
     }
 
     /* ------------------------------------------------------------------
@@ -21439,23 +21477,8 @@ static void game_update(void) {
         }
     }
 
-    // Traffic: drive the oncoming line; carcol_pass() resolves its contacts.
-    traffic_update(g_delta_time);
-    /* PROPS: integrate the knocked props, then collide every racer against
-     * them.  Retail routes a (car-ish, world-slot-type-5) pair through
-     * FUN_00111CD0's third branch @0x00111DEB to FUN_00113890, which
-     * promotes the prop into one of the 16 class-6 rigid bodies
-     * (FUN_00114730) and resolves the contact with the generic solver;
-     * b3_props_collide_car() is that boundary.  Each contact is then handed
-     * to FUN_00112E70's port with the RECOVERED object class -- 6 for every
-     * static.dat prop (FUN_0010FBC0's jump table @0x0010FC04 sends handle
-     * types 5 and 6 there), and DAT_0039AE50 row 6 is all zeros, so the
-     * table itself returns the verdict `a prop never crashes a car`.  That
-     * is why you can plough a cone field at 200 mph and keep driving. */
-    if (b3_props_ready()) {
-        b3_props_update(g_delta_time);
-    }
-    panels_pieces_update(g_delta_time);
+    /* Monolithic physics frame pipeline (FUN_00110AF0 @0x001AA85A) */
+    b3_physics_step(g_delta_time);
     // traffic_interact()'s capsule pass would fight the recovered hull
     // separation, so it remains disabled.  carcol_pass() is authoritative;
     // the reference is retained only to keep this change focused.
@@ -21570,27 +21593,6 @@ static void game_update(void) {
         g_sfx_scrape_hit = 0;
     }
 
-    // Vehicle collision -- the RECOVERED car-vs-car chain
-    // (src/burnout3_carcol.c: FUN_00110AF0 broad phase + FUN_0010AC20 convex
-    // hull narrow phase + FUN_001121F0 / FUN_00113960 response and slam
-    // classification; tools/validate_carcol.py 730/730).  The separation
-    // lands in +0x130 and the impulses/forces in +0x110/+0x120 and
-    // +0xF0/+0x100, which the next b3_vehicle_step_full consumes -- the same
-    // frame order the game itself uses (FUN_0018BC90 at @0x001AA84A,
-    // FUN_00110AF0 once at @0x001AA85A, FUN_0011BE50's two substeps after it).
-    static B3CrashDirectorZone s_active_crash_zones[32];
-    static int s_num_active_crash_zones = 0;
-    B3VehicleFull* active_fsim_vehs[8];
-    int num_fsim_vehs = 0;
-    for (int i = 0; i < g_num_vehicles && num_fsim_vehs < 8; i++) {
-        if (g_vehicles[i].active && g_vehicles[i].fsim_ready)
-            active_fsim_vehs[num_fsim_vehs++] = &g_vehicles[i].fsim;
-    }
-    b3_crash_director_update_zones(active_fsim_vehs, num_fsim_vehs,
-                                   s_active_crash_zones, s_num_active_crash_zones);
-
-    carcol_pass();
-    tdr_frame_pass();
     b3_raceflow_update();                                   /* race flow (agent) */
 }
 
