@@ -44,7 +44,7 @@ MIN_CLEAR = -3.0
 def run_track(track, seconds, jobs):
     env = dict(os.environ)
     env.update({
-        "SDL_VIDEODRIVER": "offscreen",
+        "SDL_VIDEODRIVER": "windows" if os.name == "nt" else "offscreen",
         # THE PHOTOREALISM WAVE IS PINNED OFF HERE.
         # src/burnout3_aftereffects.h ships six INSPIRED screen-space
         # effects on by default.  This suite verifies RECOVERED pixel
@@ -67,10 +67,22 @@ def run_track(track, seconds, jobs):
     # concurrent runs contend for wall clock; the cap scales with the
     # fleet so a slow neighbour cannot turn into a fake "0 cars reported"
     cap = max(180, seconds * 8) * (1 if jobs <= 1 else 2 + jobs // 4)
-    p = subprocess.run(["timeout", str(cap), "./burnout3"],
-                       cwd=ROOT, env=env,
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    return p.stdout.decode("utf-8", "replace")
+    exe = "./burnout3"
+    if os.name == "nt":
+        if os.path.exists(os.path.join(ROOT, "build-win", "burnout3.exe")):
+            exe = os.path.join(ROOT, "build-win", "burnout3.exe")
+        elif os.path.exists(os.path.join(ROOT, "burnout3.exe")):
+            exe = os.path.join(ROOT, "burnout3.exe")
+        cmd = [exe]
+    else:
+        cmd = ["timeout", str(cap), exe]
+    try:
+        p = subprocess.run(cmd, cwd=ROOT, env=env, timeout=cap,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        return p.stdout.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout.decode("utf-8", "replace") if e.stdout else ""
+        return out + "\nTIMEOUT after %d seconds\n" % cap
 
 
 def evaluate(track, seconds, log):
