@@ -20057,12 +20057,24 @@ static void crash_trace_tick(void) {
 
 static void tdr_frame_pass(void) {
     static float pos[B3_TDR_MAX_CARS][3];
+    static float fwd[B3_TDR_MAX_CARS][3];
     for (int i = 0; i < g_num_vehicles && i < B3_TDR_MAX_CARS; i++) {
         pos[i][0] = g_vehicles[i].pos.x;
         pos[i][1] = g_vehicles[i].pos.y;
         pos[i][2] = g_vehicles[i].pos.z;
+        fwd[i][0] = sinf(g_vehicles[i].rot.y);
+        fwd[i][1] = 0.0f;
+        fwd[i][2] = -cosf(g_vehicles[i].rot.y);
         g_tdr.car[i].crashed  = g_vehicles[i].crashed_until > 0.0f;
         g_tdr.car[i].speed_ms = g_vehicles[i].sim.speed;
+    }
+    /* Score/Tailgating (FUN_001959A0): update tailgating & Psyche Out arming */
+    b3_td_tailgate_update(&g_tdr, g_race_time, g_delta_time, pos, fwd);
+    for (int i = 0; i < g_num_vehicles && i < B3_TDR_MAX_CARS; i++) {
+        if (g_tdr.car[i].tailgate_time >= B3_TDR_TAILGATE_ARM_TIME
+            && g_tdr.car[i].psyche_target >= 0) {
+            b3_boost_award(&g_vehicles[i].bar, B3_TDR_TAILGATE_BOOST_PER_S * g_delta_time);
+        }
     }
     /* per-pair contact timers (FUN_001979E0 / score+0x528) and the
      * game-context +0x54 contact notify that arms DENIED / LUCKY ESCAPE */

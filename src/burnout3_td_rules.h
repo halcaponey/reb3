@@ -170,6 +170,16 @@ int b3_td_slam_type(const float am[4][4], const float vm[4][4]);
 #define B3_TDR_WALL_SHUNT_MIN_MPH   40.0f
 #define B3_TDR_MPH                 2.2369363f  /* 0x0038994C */
 
+/* Score/Tailgating (FUN_001959A0) parameters */
+#define B3_TDR_TAILGATE_MAX_DIST     15.0f       /* 0x003F75B4: Max distance behind (m) */
+#define B3_TDR_TAILGATE_MIN_DIST      1.5f       /* 0x003B1870: Min distance behind (m) */
+#define B3_TDR_TAILGATE_CONE_DEG     15.0f       /* 0x003F75BC: Cone angle behind (deg) */
+#define B3_TDR_TAILGATE_COS_CONE      0.9659258f /* cos(15 deg) */
+#define B3_TDR_TAILGATE_MIN_MPH      60.0f       /* 0x003B17E8: Min speed in mph */
+#define B3_TDR_TAILGATE_ARM_TIME      0.5f       /* 0x003F75C4: Min time to arm (s) */
+#define B3_TDR_TAILGATE_GRACE_S       0.3f       /* 0x003B1750: Grace time before disarm (s) */
+#define B3_TDR_TAILGATE_BOOST_PER_S  15.0f       /* 0x003F75C0: Extra boost per second */
+
 /* ---------------------------------------------------------------------------
  * 2. The slam kinds the game-context virtual +0x64 receives.
  *    FUN_00029F30 (the race-mode +0x64 entry, vtable index 25) switches on
@@ -374,6 +384,8 @@ typedef struct __attribute__((packed)) B3TdCar {
     float                frame[4][4];
     int                  frame_valid;
     B3TdCause cause;            /* +0x13D8 stored crash cause                */
+    float                tailgate_time;  /* tailgating duration (FUN_001959A0)        */
+    float                tailgate_grace; /* grace timer before disarming target       */
 } B3TdCar;
 
 #define B3TDCAR_RETAIL_SPAN 0x2410u
@@ -867,6 +879,11 @@ int  b3_td_object_contact(B3TdRules* R, int slot, float clock,
 
 /* Take (and clear) this frame's strongest object contact.  Returns fire. */
 int  b3_td_object_take(B3TdRules* R, int slot, B3TdObjectHit* out);
+
+/* FUN_001959A0: tailgating tracker & psyche-out arming / disarming.
+ * `pos` is [ncars][3] world positions, `fwd` is [ncars][3] forward unit vectors. */
+void b3_td_tailgate_update(B3TdRules* R, float clock, float dt,
+                           const float (*pos)[3], const float (*fwd)[3]);
 
 #ifdef __cplusplus
 }

@@ -113,6 +113,8 @@ void b3_td_reset(B3TdRules* R, int ncars)
         c->td_by = -1;
         c->last_victim = -1;
         c->psyche_target = -1;                /* +0x1684     */
+        c->tailgate_time = 0.0f;
+        c->tailgate_grace = 0.0f;
         c->dbl_window = -1.0f;
         c->spree_window = -1.0f;
         c->recover_at = -1.0f;
@@ -1211,4 +1213,140 @@ int b3_td_object_take(B3TdRules* R, int slot, B3TdObjectHit* out)
     memset(&R->obj[slot], 0, sizeof(R->obj[slot]));
     if (out) *out = o;
     return o.valid && o.fire;
+}
+
+/* ---------------------------------------------------------------------------
+ * FUN_001959A0: tailgating tracker & psyche-out arming / disarming.
+ * ------------------------------------------------------------------------- */
+void b3_td_tailgate_update(B3TdRules* R, float clock, float dt,
+                           const float (*pos)[3], const float (*fwd)[3])
+{
+    int i, j, k;
+    (void)clock;
+    if (!R || dt <= 0.0f) return;
+
+    for (i = 0; i < R->ncars; i++) {
+        B3TdCar* stalker = &R->car[i];
+        if (stalker->race_state == 3 || stalker->crashed) {
+            if (stalker->psyche_target >= 0) {
+                for (k = 0; k < R->ncars; k++) {
+                    if (R->car[k].grid == stalker->psyche_target) {
+                        R->car[k].psyche_armed = 0;
+                        break;
+                    }
+                }
+                stalker->psyche_target = -1;
+                stalker->tailgate_time = 0.0f;
+                stalker->tailgate_grace = 0.0f;
+            }
+            continue;
+        }
+
+        int best_target = -1;
+        float best_dist = B3_TDR_TAILGATE_MAX_DIST;
+
+        if (pos) {
+            for (j = 0; j < R->ncars; j++) {
+                if (j == i) continue;
+                B3TdCar* cand = &R->car[j];
+                if (cand->race_state == 3 || cand->crashed) continue;
+
+                /* Candidate speed check: retail 0x001959fb (edx+0xbc * 2.2369363 >= 60.0) */
+                if (cand->speed_ms * B3_TDR_MPH < B3_TDR_TAILGATE_MIN_MPH) continue;
+
+                float dx = pos[j][0] - pos[i][0];
+                float dy = pos[j][1] - pos[i][1];
+                float dz = pos[j][2] - pos[i][2];
+                float d2 = dx * dx + dy * dy + dz * dz;
+
+                /* Distance must be in [1.5m, 15.0m] and closer than previous best */
+                if (d2 < B3_TDR_TAILGATE_MIN_DIST * B3_TDR_TAILGATE_MIN_DIST) continue;
+                if (d2 > best_dist * best_dist) continue;
+
+                float dist = sqrtf(d2);
+                if (dist <= 0.0f) continue;
+
+                /* Cone angle check (retail 0x00195a4b..0x00195a62):
+                 * Stalker must be in a 15-degree cone behind the candidate.
+                 * cand_fwd . (cand_pos - stalker_pos) / dist >= cos(15 deg). */
+                if (fwd) {
+                    float fx = fwd[j][0], fy = fwd[j][1], fz = fwd[j][2];
+                    float flen2 = fx * fx + fy * fy + fz * fz;
+                    if (flen2 > 1e-4f) {
+                        float inv = 1.0f / sqrtf(flen2);
+                        fx *= inv; fy *= inv; fz *= inv;
+                        float cos_theta = (dx * fx + dy * fy + dz * fz) / dist;
+                        if (cos_theta < B3_TDR_TAILGATE_COS_CONE) continue;
+                    }
+                }
+
+                best_dist = dist;
+                best_target = cand->grid;
+            }
+        }
+
+        /* Target tracking state update (retail 0x00195a92..0x00195bd5) */
+        if (best_target == stalker->psyche_target) {
+            if (best_target >= 0) {
+                stalker->tailgate_time += dt;
+                stalker->tailgate_grace = 0.0f;
+                if (stalker->tailgate_time >= B3_TDR_TAILGATE_ARM_TIME) {
+                    /* Arm AI target */
+                    for (k = 0; k < R->ncars; k++) {
+                        if (R->car[k].grid == best_target) {
+                            if (R->car[k].cls != 0) {
+                                R->car[k].psyche_armed = 1;
+                            }
+                            break;
+                        }
+                    }
+                    /* Boost award per second */
+                    float gb = B3_TDR_TAILGATE_BOOST_PER_S * dt;
+                    stalker->boost_earned += gb;
+                    stalker->boost_meter += gb;
+                    if (stalker->boost_meter > stalker->boost_size) {
+                        stalker->boost_meter = stalker->boost_size;
+                    }
+                }
+            } else {
+                stalker->tailgate_time = 0.0f;
+                stalker->tailgate_grace = 0.0f;
+            }
+        } else {
+            /* Target changed or lost: grace period before disarming */
+            if (stalker->psyche_target >= 0) {
+                stalker->tailgate_grace += dt;
+                if (stalker->tailgate_grace > B3_TDR_TAILGATE_GRACE_S) {
+                    /* Grace expired: clear psyche_armed on old target */
+                    for (k = 0; k < R->ncars; k++) {
+                        if (R->car[k].grid == stalker->psyche_target) {
+                            R->car[k].psyche_armed = 0;
+                            break;
+                        }
+                    }
+                    stalker->psyche_target = best_target;
+                    stalker->tailgate_time = 0.0f;
+                    stalker->tailgate_grace = 0.0f;
+                }
+            } else {
+                stalker->psyche_target = best_target;
+                stalker->tailgate_time = 0.0f;
+                stalker->tailgate_grace = 0.0f;
+            }
+        }
+
+        /* Target crashed check: reset tracking if locked target wrecked (retail 0x00195c65) */
+        if (stalker->psyche_target >= 0) {
+            for (k = 0; k < R->ncars; k++) {
+                if (R->car[k].grid == stalker->psyche_target) {
+                    if (R->car[k].crashed) {
+                        stalker->psyche_target = -1;
+                        stalker->tailgate_time = 0.0f;
+                        stalker->tailgate_grace = 0.0f;
+                    }
+                    break;
+                }
+            }
+        }
+    }
 }
