@@ -409,10 +409,23 @@ CRASH_AT = 8.0          # B3_TEST_CRASH_AT -- the deterministic player crash
 EXIT_AT = 20.0
 
 
+def get_binary():
+    b = os.environ.get("B3_AT_BIN")
+    if b:
+        return b
+    if os.name == "nt":
+        for cand in (os.path.join(_root, "build-win", "burnout3.exe"),
+                     os.path.join(_root, "burnout3.exe")):
+            if os.path.exists(cand):
+                return cand
+        return os.path.join(_root, "build-win", "burnout3.exe")
+    return os.path.join(_root, "burnout3")
+
+
 def run_game(rundir, binary, extra):
     env = dict(os.environ)
     env.update({
-        "SDL_VIDEODRIVER": "offscreen",
+        "SDL_VIDEODRIVER": "windows" if os.name == "nt" else "offscreen",
         # THE PHOTOREALISM WAVE IS PINNED OFF HERE.
         # src/burnout3_aftereffects.h ships six INSPIRED screen-space
         # effects on by default.  This suite verifies RECOVERED pixel
@@ -425,6 +438,8 @@ def run_game(rundir, binary, extra):
         # it says it measures.
         "B3_PHOTO": "0",
         "SDL_AUDIODRIVER": "dummy",
+        "B3_TRACK": "US_C3_V1",
+        "B3_NO_VSYNC": "1",
         "B3_AUTODRIVE": "1",
         "B3_FIXED_DT": "0.0166667",
         "B3_PACE_MAX_TICKS": "1",
@@ -445,10 +460,15 @@ def run_game(rundir, binary, extra):
             p = os.path.join(rundir, "build", f)
             if not os.path.islink(p):
                 os.remove(p)
-    p = subprocess.run(["timeout", "400", binary], cwd=rundir, env=env,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    log = (p.stdout.decode("utf-8", "replace")
-           + p.stderr.decode("utf-8", "replace"))
+    cmd = [binary] if os.name == "nt" else ["timeout", "400", binary]
+    try:
+        p = subprocess.run(cmd, cwd=rundir, env=env, timeout=400,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        log = (p.stdout.decode("utf-8", "replace")
+               + p.stderr.decode("utf-8", "replace"))
+    except subprocess.TimeoutExpired as e:
+        log = ((e.stdout.decode("utf-8", "replace") if e.stdout else "")
+               + (e.stderr.decode("utf-8", "replace") if e.stderr else ""))
     tp = os.path.join(rundir, "build", "crash_trace_001.log")
     rows = []
     if os.path.exists(tp):
@@ -468,7 +488,7 @@ def run_game(rundir, binary, extra):
 
 
 def section_runtime():
-    binary = os.environ.get("B3_AT_BIN", os.path.join(_root, "burnout3"))
+    binary = get_binary()
     rundir = os.environ.get("B3_AT_RUNDIR", _root)
     print("\n4. runtime: the scripted crash, Impact Time held vs released")
     print("   binary %s" % binary)
@@ -655,7 +675,7 @@ def section_real_input():
     print("\n5b. the REAL input path -- runtime")
 
     # -- (b) runtime: hold the button through the real local ---------------
-    binary = os.environ.get("B3_AT_BIN", os.path.join(_root, "burnout3"))
+    binary = get_binary()
     rundir = os.environ.get("B3_AT_RUNDIR", _root)
     if not os.path.exists(binary):
         C.ok("the game binary exists", False,

@@ -24240,6 +24240,8 @@ int main(int argc, char* argv[]) {
      * because those runs are deliberately free-running and deterministic. */
     if (!getenv("B3_NO_VSYNC") && !getenv("B3_FIXED_DT"))
         SDL_GL_SetSwapInterval(1);
+    else
+        SDL_GL_SetSwapInterval(0);
 #ifdef __ANDROID__
     /* ANDROID PORT: gl4es is built with NO_INIT_CONSTRUCTOR -- bring it up
      * now that the ES context is current, before the first gl* call.  Then
