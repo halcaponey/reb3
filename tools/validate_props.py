@@ -379,11 +379,42 @@ def build_driver():
     d = tempfile.mkdtemp(prefix="b3props_")
     src = os.path.join(d, "drv.c")
     open(src, 'w').write(DRIVER)
-    exe = os.path.join(d, "drv")
-    sdl = subprocess.run(["pkg-config", "--cflags", "--libs", "sdl2",
-                          "SDL2_image"], capture_output=True, text=True)
-    cmd = (["gcc", "-O2", "-std=c11", "-I" + os.path.join(ROOT, "src"),
-            "-o", exe, src,
+    exe = os.path.join(d, "drv.exe" if os.name == 'nt' else "drv")
+    if os.name == 'nt':
+        scoop = os.path.expanduser("~/scoop/apps")
+        sdl2_inc = os.path.join(scoop, "sdl2", "current", "include")
+        sdl2_inc2 = os.path.join(scoop, "sdl2", "current", "include", "SDL2")
+        sdl2_lib = os.path.join(scoop, "sdl2", "current", "lib")
+        sdl2_img_inc = os.path.join(scoop, "sdl2-image", "current", "include")
+        sdl2_img_inc2 = os.path.join(scoop, "sdl2-image", "current", "include", "SDL2_image")
+        sdl2_img_lib = os.path.join(scoop, "sdl2-image", "current", "lib")
+        import shutil
+        for dll in ["SDL2.dll", "SDL2_image.dll"]:
+            for sdir in [os.path.join(ROOT, "build-win"), sdl2_lib, sdl2_img_lib]:
+                dll_path = os.path.join(sdir, dll)
+                if os.path.exists(dll_path):
+                    shutil.copy2(dll_path, d)
+                    break
+        cflags = [
+            "-I" + os.path.join(ROOT, "src"),
+            "-I" + os.path.join(ROOT, "src", "compat"),
+            "-I" + os.path.join(ROOT, "build-win", "gen_include"),
+            "-I" + sdl2_inc, "-I" + sdl2_inc2,
+            "-I" + sdl2_img_inc, "-I" + sdl2_img_inc2,
+            "-include", os.path.join(ROOT, "src", "compat", "win_posix_compat.h"),
+        ]
+        ldflags = [
+            "-L" + sdl2_lib, "-L" + sdl2_img_lib,
+            "-lSDL2", "-lSDL2_image", "-lopengl32", "-lm"
+        ]
+    else:
+        sdl = subprocess.run(["pkg-config", "--cflags", "--libs", "sdl2",
+                              "SDL2_image"], capture_output=True, text=True)
+        cflags = ["-I" + os.path.join(ROOT, "src")] + sdl.stdout.split()
+        ldflags = ["-lGL", "-lm"]
+
+    cmd = (["gcc", "-O2", "-std=c11"] + cflags +
+           ["-o", exe, src,
             os.path.join(ROOT, "src", "burnout3_props.c"),
             os.path.join(ROOT, "src", "burnout3_vehicle_sim.c"),
             os.path.join(ROOT, "src", "burnout3_collision.c"),
@@ -391,7 +422,7 @@ def build_driver():
             # never draws, but it links the whole module
             os.path.join(ROOT, "src", "burnout3_render.c"),
             os.path.join(ROOT, "src", "burnout3_trackmesh.c")]
-           + sdl.stdout.split() + ["-lGL", "-lm"])
+           + ldflags)
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode:
         print(r.stderr)

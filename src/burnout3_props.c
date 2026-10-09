@@ -16,6 +16,11 @@
 #include <SDL2/SDL_image.h>
 #include <GL/gl.h>
 
+#ifdef _WIN32
+#undef near
+#undef far
+#endif
+
 #include "burnout3_props.h"
 #include "burnout3_carcol.h"
 #include "burnout3_collision.h"
