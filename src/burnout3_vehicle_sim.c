@@ -2584,7 +2584,28 @@ static void b3_suspension_pass(B3VehicleFull* v, float dt) {
 // ---------------------------------------------------------------------------
 void b3_vehicle_step_full(B3VehicleFull* v, float throttle, float brake,
                           float steer, int boost, float dt) {
+    // 0x0011BE5F..0x0011BE6F: pipeline gate racecar+0x19A8
+    if (v->racecar_active_19A8 == 0) return;
+
+    // 0x0011BE75..0x0011BF09: crashed vehicle path (+0x210 != 0)
+    if (v->crashed_0210) {
+        v->crash_clock_1530 += dt;
+        if (v->trans.gear != 0) {
+            v->trans.gear = 0;
+        }
+        return;
+    }
+
     v->clock += dt;
+
+    // 0x0011BF0C..0x0011BF3F: live vehicle collision latch
+    if (v->latch_153F) {
+        if (v->clock - v->stamp_1538 <= 0.6f) {
+            v->flags_1353 |= 0x10;
+        } else {
+            v->latch_153F = 0;
+        }
+    }
 
     // driver-input stage (FUN_00104D30 [C]): raw inputs; live throttle =
     // raw * accel multiplier (capped); no steering below 0.1 m/s
@@ -2794,6 +2815,11 @@ void b3_vehicle_full_init(B3VehicleFull* v, const B3PhysicsConfig* cfg,
     v->slide_prev_1430 = cfg->slide_max;
     v->slide_1440 = cfg->slide_max;
     v->timer_152C = -1.0f;
+    v->crashed_0210 = 0;
+    v->crash_clock_1530 = 0.0f;
+    v->stamp_1538 = 0.0f;
+    v->latch_153F = 0;
+    v->racecar_active_19A8 = 1;
     v->grip_scalar = 1.2f;
     v->ground_clear = 10000.0f;
 

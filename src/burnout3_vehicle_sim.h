@@ -699,7 +699,8 @@ typedef struct B3VehicleFull {
     // The sleep flag FUN_0011AEF0 and the suspension pass both consult. It
     // lived only in B3CrashVehicle, the fourth partial view of this object.
     unsigned char          asleep_020E;  // +0x20E (FUN_00125100 clears it)
-    unsigned char _pad04b[0x2];
+    unsigned char          _pad04b;      // +0x20F
+    unsigned char          crashed_0210; // +0x210 1 = crashed / wreck path, 0 = live racing
     unsigned char          landed_211;  // +0x211 "landed on a car" (tail unported)
     unsigned char          contact_212;  // +0x0212
     unsigned char          contact_213;  // +0x0213
@@ -791,13 +792,14 @@ typedef struct B3VehicleFull {
     int                    drift_state_1524;  // +0x1524
     unsigned char _pad16[0x4];
     float                  timer_152C;  // +0x152C
-    unsigned char _pad17[0x4];
+    float                  crash_clock_1530; // +0x1530 crash clock (advanced in FUN_0011BE83)
     float                  authority_1534;  // +0x1534 driver authority (crash thresholds)
-    unsigned char _pad18[0x4];
+    float                  stamp_1538;      // +0x1538 hit clock (FUN_00026AA0)
     unsigned char          hit_side_153C;  // +0x153C
     unsigned char          byte_153D;  // +0x153D
     unsigned char          no_scrub_153E;  // +0x153E non-class-0: skip the 0.99 scrub
-    unsigned char _pad19[0x11];
+    unsigned char          latch_153F;     // +0x153F crash veto latch (FUN_00026AA0 / FUN_0011BF0C)
+    unsigned char          _pad19[0x10];
     // The AI driver's LSDM gate. A BYTE: validate_ai.py seeds it with wb()
     // (s.wb(VEH+0x1550, 0/1)), and B3AiCar carried it as an int -- the same
     // type defect found 14 times elsewhere. Modelled here because it is the
@@ -865,6 +867,7 @@ typedef struct B3VehicleFull {
     float                  clock;  // DAT_0060EA20 mirror
     float                  boost_elapsed;  
     int                    boost_ramp_done;  
+    unsigned char          racecar_active_19A8; // racecar+0x19A8 pipeline gate (1 = active)
     // shapes the generator does not model (function pointers etc.):
     B3ChassisSoup soup;                       // veh+0x200
     void* soup_user;                          // harness cookie
@@ -899,6 +902,7 @@ _Static_assert(offsetof(B3VehicleFull, center_off) == 0x01E0, "center_off off re
 _Static_assert(offsetof(B3VehicleFull, mass) == 0x01F0, "mass off retail");
 _Static_assert(offsetof(B3VehicleFull, com_height) == 0x01F4, "com_height off retail");
 _Static_assert(offsetof(B3VehicleFull, asleep_020E) == 0x020E, "asleep_020E off retail");
+_Static_assert(offsetof(B3VehicleFull, crashed_0210) == 0x0210, "crashed_0210 off retail");
 _Static_assert(offsetof(B3VehicleFull, landed_211) == 0x0211, "landed_211 off retail");
 _Static_assert(offsetof(B3VehicleFull, contact_212) == 0x0212, "contact_212 off retail");
 _Static_assert(offsetof(B3VehicleFull, contact_213) == 0x0213, "contact_213 off retail");
@@ -970,10 +974,13 @@ _Static_assert(offsetof(B3VehicleFull, trans) == 0x1448, "trans off retail");
 _Static_assert(offsetof(B3VehicleFull, drive_torque_1520) == 0x1520, "drive_torque_1520 off retail");
 _Static_assert(offsetof(B3VehicleFull, drift_state_1524) == 0x1524, "drift_state_1524 off retail");
 _Static_assert(offsetof(B3VehicleFull, timer_152C) == 0x152C, "timer_152C off retail");
+_Static_assert(offsetof(B3VehicleFull, crash_clock_1530) == 0x1530, "crash_clock_1530 off retail");
 _Static_assert(offsetof(B3VehicleFull, authority_1534) == 0x1534, "authority_1534 off retail");
+_Static_assert(offsetof(B3VehicleFull, stamp_1538) == 0x1538, "stamp_1538 off retail");
 _Static_assert(offsetof(B3VehicleFull, hit_side_153C) == 0x153C, "hit_side_153C off retail");
 _Static_assert(offsetof(B3VehicleFull, byte_153D) == 0x153D, "byte_153D off retail");
 _Static_assert(offsetof(B3VehicleFull, no_scrub_153E) == 0x153E, "no_scrub_153E off retail");
+_Static_assert(offsetof(B3VehicleFull, latch_153F) == 0x153F, "latch_153F off retail");
 _Static_assert(offsetof(B3VehicleFull, prev_throttle_156C) == 0x156C, "prev_throttle_156C off retail");
 _Static_assert(offsetof(B3VehicleFull, brake_hold_1570) == 0x1570, "brake_hold_1570 off retail");
 _Static_assert(offsetof(B3VehicleFull, dither_1574) == 0x1574, "dither_1574 off retail");

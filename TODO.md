@@ -204,7 +204,8 @@ anti-tunnelling/bootstrapping nets, so the systems are not fully unified yet.
 3. **Four manager stages audited — PROVEN NON-PHYSICS / PRESENTATION & MEMORY (CLOSED)**:
    `FUN_00114E60` (16 m proximity cache ported), `FUN_0010D1C0` (crash cooldown & camera tracker),
    `FUN_00164FB0` x2 (viewport/listener presentation), `FUN_00111850` (dead entity recycling).
-4. **`FUN_0011BE50`'s own head is not run** (0x0011BE5F..0x0011BF43).
+4. **`FUN_0011BE50`'s own head is ported (0x0011BE5F..0x0011BF43) — CLOSED (SAME-ORDER)**:
+   Pipeline gate `racecar+0x19A8`, crashed branch `veh+0x210` / `crash_clock_1530`, and collision hit latch `veh+0x153F` / `stamp_1538` (`flags_1353 |= 0x10`).
 
 ### Open `[?]` questions — highest value first (`docs/RE_NOTES.md`)
 

@@ -1381,9 +1381,12 @@ loop and PH-08's velocity write are deleted.  What is left:
      for views `+0x128D10` and `+0x129D60`. Pure presentation.
    - `FUN_00111850` @0x001AA907: Collision world dead-entity garbage collection (unlinks objects
      marked with `[obj-0xB] == 1` from `manager+0x1CB70`). Memory management, no body moves.
-6. **`FUN_0011BE50`'s own head is not run** (0x0011BE5F..0x0011BF43: the
-   `+0x19A8` pipeline gate, the `+0x153F`/`+0x1353 |= 0x10` latch, the ctx
-   `+0x58` HUD-flag block) — presentation and gating, no body moves.
+6. **`FUN_0011BE50`'s head flags and pipeline gate** (0x0011BE5F..0x0011BF43) — **CLOSED (SAME-ORDER)**:
+   - Pipeline gate at `0x0011BE65`: gated on `racecar+0x19A8` (`racecar_active_19A8`), returns immediately (`ret 4`) if inactive.
+   - Crashed vehicle path at `0x0011BE75`: tests `veh+0x210` (`crashed_0210`). Advances `crash_clock_1530` by `dt` and resets `gear` to 0.
+   - Live vehicle collision latch at `0x0011BF0C..0x0011BF38`: tests byte `veh+0x153F` (`latch_153F`). While `g_race_time - stamp_1538 <= 0.6f`, asserts `flags_1353 |= 0x10` (the retail bit4 crash veto). Clears `latch_153F = 0` when elapsed > 0.6 s.
+   - Contact hit trigger: `carcol_pass` arms `latch_153F = 1`, `stamp_1538 = g_race_time`, and `flags_1353 |= 2` matching retail `0x00026AA0`.
+   - Remaining ctx `+0x58` HUD block is visual presentation.
 
 ---
 

@@ -5610,6 +5610,11 @@ static void full_sim_reset(Vehicle* v) {
     v->fsim.is_class0         = 1;
     v->fsim.party_mode        = 0;
     v->fsim.flags_1353        = 0;
+    v->fsim.latch_153F        = 0;
+    v->fsim.stamp_1538        = 0.0f;
+    v->fsim.crashed_0210      = 0;
+    v->fsim.crash_clock_1530  = 0.0f;
+    v->fsim.racecar_active_19A8 = 1;
     // ...and the wreck's world pass (PH-06, hunk F3).  Same reason it is
     // installed rather than linked: burnout3_crash.c is built WITHOUT
     // burnout3_vehicle_sim.c by tools/validate_td_rules.py.
@@ -8189,6 +8194,8 @@ static void vehicle_update(Vehicle* v, float dt) {
             boost = 0;
         } else {
             v->crashed_until = 0.0f;
+            v->fsim.crashed_0210 = 0;
+            v->fsim.crash_clock_1530 = 0.0f;
             // Recovery: FUN_001714F0 places the car back ON THE ROAD a few
             // nodes behind (RE_AI 10: set node, re-walk links, zero the
             // accumulators; FUN_00179760 places ~3 nodes back). The old
@@ -8385,6 +8392,8 @@ static void vehicle_update(Vehicle* v, float dt) {
         int slot = (int)(v - g_vehicles);
         if (v->crashed_until > 0.0f && slot >= 0 && slot < 8
             && g_wrecks[slot].active) {
+            v->fsim.crashed_0210 = 1;
+            v->fsim.crash_clock_1530 += dt;
             B3WreckState* wk = &g_wrecks[slot];
             // Road height under the wreck: the game's own collision world
             // via the down-probe; route line as the fallback.
@@ -20687,6 +20696,10 @@ static void carcol_pass(void) {
                 CarColEntry* ot = side ? &ent[i] : &ent[j];
                 int slot = me->veh ? (int)(me->veh - g_vehicles) : -1;
                 if (slot < 0 || slot >= 8) continue;
+                /* Retail 0x00026AA0: collision hit arms latch +0x153F, stamp +0x1538, flags_1353 |= 2 */
+                me->veh->fsim.latch_153F = 1;
+                me->veh->fsim.stamp_1538 = g_race_time;
+                me->veh->fsim.flags_1353 |= 2;
                 g_carcol_dbg[slot].t = g_race_time;
                 g_carcol_dbg[slot].vn = ct.vn_mph;
                 g_carcol_dbg[slot].impact = ct.impact;
