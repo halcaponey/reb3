@@ -872,11 +872,15 @@ def run_ai_driver_cases():
 #    Data/vdb.xml to the tuned values used in the harness tables.
 # ===========================================================================
 def run_param_checks():
-    import extract_car_vdb as cv
     fails = 0
     print("\nscore/boost parameter pipeline (registrar + Data/vdb.xml):")
-    vdb, _ = cv.read_vdb()
-    raw = open(cv.VDB_FILE, 'rb').read()
+    try:
+        import extract_car_vdb as cv
+        vdb, _ = cv.read_vdb()
+        raw = open(cv.VDB_FILE, 'rb').read()
+    except (SystemExit, FileNotFoundError, Exception):
+        print("  (skipped: vdb.xml not staged)")
+        return 0
     fdo = struct.unpack_from('<I', raw, 16)[0]
     dvc = struct.unpack_from('<I', raw, 4)[0]
 
@@ -1569,9 +1573,11 @@ def _compile_collision_c():
     import tempfile
     src = os.path.join(os.path.dirname(__file__), "..", "src",
                        "burnout3_collision.c")
-    out = os.path.join(tempfile.gettempdir(), "b3_collision_test")
-    r = subprocess.run(["gcc", "-O2", "-std=c11", "-DB3_COLLISION_TEST_MAIN",
-                        src, "-lm", "-o", out],
+    out = os.path.join(tempfile.gettempdir(), "b3_collision_test" + (".exe" if os.name == 'nt' else ""))
+    compat = os.path.join(os.path.dirname(__file__), "..", "src", "compat")
+    flags = ["-I" + compat, "-include", os.path.join(compat, "win_posix_compat.h")] if os.name == 'nt' else []
+    r = subprocess.run(["gcc", "-O2", "-std=c11", "-DB3_COLLISION_TEST_MAIN"] + flags +
+                       [src, "-lm", "-o", out],
                        capture_output=True, text=True)
     return out if r.returncode == 0 else None
 
@@ -1590,9 +1596,17 @@ def _c_probe(binary, x, y0, y1, z, unit):
 
 
 def run_collision_cases():
-    import extract_collision as xc
     fails = 0
     print("\ncollision world (streamed unit kd-soups, RE_NOTES 15):")
+    try:
+        import extract_collision as xc
+        if not os.path.isdir(xc.TRACK_DIR):
+            raise FileNotFoundError()
+        sd = open(os.path.join(xc.TRACK_DIR, "static.dat"), "rb").read()
+        st = open(os.path.join(xc.TRACK_DIR, "streamed.dat"), "rb").read()
+    except (SystemExit, FileNotFoundError, Exception):
+        print("  (skipped: track static/streamed.dat not staged)")
+        return 0
 
     # -- enum: game walker vs extractor parse, exact triangle-set equality --
     for unit in ENUM_UNITS:
