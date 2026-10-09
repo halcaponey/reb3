@@ -32,7 +32,7 @@ from unicorn.x86_const import UC_X86_REG_ESI                   # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
 PROBE_C = os.path.join(BUILD, "avoid_probe.c")
-PROBE = os.path.join(BUILD, "avoid_probe")
+PROBE = os.path.join(BUILD, "avoid_probe.exe" if os.name == "nt" else "avoid_probe")
 
 TOL = 2e-4
 F_CHOOSE = 0x0016C4B0
@@ -144,7 +144,8 @@ def build_probe():
         os.makedirs(BUILD)
     with open(PROBE_C, 'w') as f:
         f.write(PROBE_SRC)
-    r = subprocess.run(["cc", "-O1", "-g", "-o", PROBE, PROBE_C, "-lm"],
+    cc = "gcc" if os.name == "nt" else os.environ.get("CC", "cc")
+    r = subprocess.run([cc, "-O1", "-g", "-o", PROBE, PROBE_C, "-lm"],
                        capture_output=True, text=True)
     if r.returncode:
         sys.stderr.write(r.stdout + r.stderr)
