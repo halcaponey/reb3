@@ -17,7 +17,9 @@
 #include <signal.h>
 #include <errno.h>
 #include <time.h>
+#ifndef _WIN32
 #include <sys/wait.h>
+#endif
 
 static pid_t  g_pid  = -1;
 static FILE*  g_out;              // -> sidecar stdin
@@ -68,6 +70,7 @@ static void emu_fail(const char* why)
          * the wait status distinguishes it from a clean exit. */
         int st = 0;
         fprintf(stderr, "[emu] sidecar lost: %s", why);
+#ifndef _WIN32
         if (g_pid > 0 && waitpid(g_pid, &st, WNOHANG) == g_pid) {
             if (WIFSIGNALED(st))
                 fprintf(stderr, " -- child killed by signal %d", WTERMSIG(st));
@@ -77,6 +80,7 @@ static void emu_fail(const char* why)
         } else {
             fprintf(stderr, " -- child still running");
         }
+#endif
         fputc('\n', stderr);
     }
     g_ready = 0;
@@ -100,6 +104,10 @@ int b3_emu_init(void)
     if (g_tried) return g_ready;
     g_tried = 1;
 
+#ifdef _WIN32
+    fprintf(stderr, "[emu] retail sidecar (Unicorn x86 bridge) is currently disabled on Windows native\n");
+    return 0;
+#else
     if (access("build/burnout3.elf", R_OK) != 0) {
         fprintf(stderr, "[emu] build/burnout3.elf is missing -- retail backends need it\n"
                "      (python3 tools/xbe2elf.py \"$B3_GAME_ROOT/default.xbe\" "
@@ -146,18 +154,21 @@ int b3_emu_init(void)
     b3_emu_ranges_forget(-1);       /* a new sidecar knows no range tables */
     fprintf(stderr, "[emu] retail sidecar up: %s", line);
     return 1;
+#endif
 }
 
 void b3_emu_shutdown(void)
 {
     if (g_out) { fputs("bye\n", g_out); fflush(g_out); fclose(g_out); g_out = NULL; }
     if (g_in)  { fclose(g_in); g_in = NULL; }
+#ifndef _WIN32
     if (g_pid > 0) {
         int st;
         kill(g_pid, SIGTERM);
         waitpid(g_pid, &st, 0);
         g_pid = -1;
     }
+#endif
     g_ready = 0;
 }
 

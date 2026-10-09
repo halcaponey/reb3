@@ -16,7 +16,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#ifndef _WIN32
 #include <sys/wait.h>
+#endif
 #include <unistd.h>
 
 /* ------------------------------------------------------------------ blob */
@@ -540,6 +542,10 @@ int cxf_have_ffmpeg(void)
 
 int cxf_run(const char *const argv[])
 {
+#ifdef _WIN32
+    (void)argv;
+    return -1;
+#else
     pid_t pid = fork();
     int st;
 
@@ -562,6 +568,7 @@ int cxf_run(const char *const argv[])
     if (WIFEXITED(st))
         return WEXITSTATUS(st);
     return -1;
+#endif
 }
 
 /* ------------------------------------------------------------------ sha1 */

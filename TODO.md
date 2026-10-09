@@ -250,14 +250,10 @@ anti-tunnelling/bootstrapping nets, so the systems are not fully unified yet.
 
 Targeting native Windows execution (`burnout3.exe`) without requiring WSL or emulation.
 
-* **Root CMake configuration** — add a top-level `CMakeLists.txt` supporting native
-  Windows toolchains (MSVC / MinGW GCC via Scoop).
-* **Dependencies integration** — resolve native Windows `SDL2` and `SDL2_image`
-  (FetchContent, vcpkg, or prebuilt development libraries).
-* **Platform & Path compatibility** — audit path separators, `pthread`, and POSIX
-  calls (`sys/mman.h`, `unistd.h`, `dprintf`, etc.) across `src/*.c` and `tools/cextract/`.
-* **Native GL & Audio pipeline** — test native Win32 WGL / OpenGL 2.1+ context and
-  SDL2 audio device initialization on Windows.
+* [x] **Root CMake configuration** — `CMakeLists.txt` supporting native Windows MinGW-w64 and MSVC toolchains, defining `burnout3.exe`, `cxtract.exe`, and object libraries `cextract_obj` and `isodata_obj`.
+* [x] **Dependencies integration** — native 64-bit Windows `SDL2`, `SDL2_image`, and `zlib` located automatically (via Scoop or system paths) with automatic post-build DLL deployment into the binary directory.
+* [x] **Platform & Path compatibility** — minimal POSIX compatibility layer in `src/compat/win_posix_compat.h` providing Windows implementations of `mmap`/`munmap`, `setenv`, `realpath`, `symlink`, `mkdir`, `lstat`, `sysconf`, and `fmemopen`, plus missing OpenGL 2.0 tokens and undefining legacy 16-bit `near`/`far` macros.
+* [x] **Native GL & Audio pipeline** — native Windows OpenGL context (`WGL` via SDL2 video driver) with AMD Radeon RX 9070 XT, MSAA 4x, retained shader program, and SDL2 audio. `burnout3.exe` builds and runs cleanly out of the box on Windows.
 
 ---
 

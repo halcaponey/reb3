@@ -8,8 +8,10 @@
 
 # Build output
 /burnout3
+*.exe
 *.o
 /dist/
+/build-win/
 
 # The corrected ELF and every materialised asset: geometry, textures, audio,
 # music, collision, the per-track binaries and the ISO cache. Several GB once a

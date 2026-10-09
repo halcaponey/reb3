@@ -62,6 +62,9 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#ifdef _WIN32
+#include "compat/win_posix_compat.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>

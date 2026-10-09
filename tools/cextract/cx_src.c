@@ -21,6 +21,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#ifdef _WIN32
+#include "compat/win_posix_compat.h"
+#endif
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>

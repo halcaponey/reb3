@@ -64,6 +64,9 @@
 
 #include <stdio.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include "compat/win_posix_compat.h"
+#endif
 #include <SDL2/SDL_image.h>
 
 #include "burnout3_isodata.h"

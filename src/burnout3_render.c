@@ -197,6 +197,8 @@ static void     (*p_glDeleteBuffers)(int, const unsigned*);
 static void     (*p_glBindBuffer)(unsigned, unsigned);
 static void     (*p_glBufferData)(unsigned, long, const void*, unsigned);
 static void     (*p_glBufferSubData)(unsigned, long, long, const void*);
+static void     (*p_glActiveTexture)(unsigned);
+static void     (*p_glBlendEquation)(unsigned);
 
 /* ---- module state ------------------------------------------------------ */
 
@@ -340,6 +342,7 @@ int b3r_init(void) {
     B3R_GET(glGenBuffers);     B3R_GET(glDeleteBuffers);
     B3R_GET(glBindBuffer);     B3R_GET(glBufferData);
     B3R_GET(glBufferSubData);
+    B3R_GET(glActiveTexture);  B3R_GET(glBlendEquation);
 #undef B3R_GET
 
     unsigned vs = compile_one(GL_VERTEX_SHADER, B3R_VS, "vertex");
@@ -746,7 +749,9 @@ void b3r_gl_active_texture_via(void (*act)(unsigned), unsigned unit) {
     act(unit);
 }
 
-static void b3r_act_core(unsigned unit) { glActiveTexture((GLenum)unit); }
+static void b3r_act_core(unsigned unit) {
+    if (p_glActiveTexture) p_glActiveTexture(unit);
+}
 
 void b3r_gl_active_texture(unsigned unit) {
     b3r_gl_active_texture_via(b3r_act_core, unit);
@@ -833,7 +838,7 @@ void b3r_gl_blend_equation(unsigned mode) {
     audit_push();
     if (g_gl.blend_eq == mode && !nofilter()) return;
     g_gl.blend_eq = mode;
-    glBlendEquation((GLenum)mode);
+    if (p_glBlendEquation) p_glBlendEquation(mode);
 }
 
 void b3r_gl_depth_mask(unsigned char on) {
