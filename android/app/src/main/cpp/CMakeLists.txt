@@ -116,15 +116,22 @@ set(B3_SRCS
     ${B3_SRC}/burnout3_td_rules.c
     ${B3_SRC}/burnout3_sfx.c
     ${B3_SRC}/burnout3_ai.c
+    ${B3_SRC}/burnout3_ai_avoid.c
     ${B3_SRC}/burnout3_carfx.c
     ${B3_SRC}/burnout3_postfx.c
+    ${B3_SRC}/burnout3_aftereffects.c
     ${B3_SRC}/burnout3_music.c
+    ${B3_SRC}/burnout3_dj.c
     ${B3_SRC}/burnout3_boostfx.c
     ${B3_SRC}/burnout3_particlefx.c
     ${B3_SRC}/burnout3_panels.c
     ${B3_SRC}/burnout3_props.c
+    ${B3_SRC}/burnout3_scenery.c
+    ${B3_SRC}/burnout3_rt.c
     ${B3_SRC}/burnout3_traffic_reservations.c
     ${B3_SRC}/burnout3_traffic_pool.c
+    ${B3_SRC}/burnout3_backend.c
+    ${B3_SRC}/burnout3_emu.c
 )
 
 add_library(main SHARED

@@ -272,12 +272,10 @@ Runs and renders on the Pixel (Mali, Android 16). See `docs/ANDROID_PORT.md`.
 
 * **Release signing config** — `assembleRelease` still has no `signingConfigs`;
   the APK is hand-signed with the debug keystore in the build loop.
-* **The packer drops files the runtime now needs.** `pack_assets.sh` omits
-  `route.bin` / `grid.bin` / `traffic.bin` on the grounds that they were baked
-  into `src/burnout3_track_paths.h`, `burnout3_start_grid.h` and
-  `burnout3_traffic_data.h`. **All three headers are gone** and the runtime
-  loaders open those files directly — so the packed build is missing data it
-  will ask for. Fix the packer.
+* **The packer drops files the runtime now needs — RESOLVED.** `pack_assets.sh`
+  now bundles all runtime per-track data files (`envmap.png`, `light_probes.bin`,
+  `props.bin`, `route.bin`, `grid.bin`, `traffic.bin`, `nav_edges.bin`,
+  `traffic_paths.bin`, `pace.bin`).
 * **Asset diet** — `build/cars/` is 133 MiB of the 143 MiB payload. Restricting
   it to the roster slots plus the `.bgd` traffic set should drop the APK under
   60 MiB. The packer used to read the tables out of the two generated headers;
@@ -295,14 +293,12 @@ Runs and renders on the Pixel (Mali, Android 16). See `docs/ANDROID_PORT.md`.
 
 **Process**
 
-* **Keep the two source lists in lockstep**: a module added to the Makefile's
-  `SRCS` must also be added to `android/app/src/main/cpp/CMakeLists.txt`.
-  **They have drifted (2026-08-22).** CMake has 21 entries, the Makefile 25.
-  Missing from the Android build: `burnout3_ai_avoid.c`, `burnout3_scenery.c`,
-  `burnout3_backend.c`, `burnout3_emu.c`. (`burnout3_isodata.c` is absent by
-  design — Android does not take the ISO path.) The web target does **not** have
-  this failure mode: `make wasm` builds from the same `SRCS` variable, on
-  purpose.
+* **Keep the two source lists in lockstep — RESOLVED.**
+  `android/app/src/main/cpp/CMakeLists.txt` `B3_SRCS` is synced in lockstep with
+  the Makefile's `SRCS` (including `burnout3_ai_avoid.c`, `burnout3_aftereffects.c`,
+  `burnout3_dj.c`, `burnout3_scenery.c`, `burnout3_rt.c`, `burnout3_backend.c`,
+  and `burnout3_emu.c`). (`burnout3_isodata.c` is absent by design — Android does
+  not take the ISO path.) The web target builds from the same `SRCS` variable.
 
 ---
 

@@ -71,9 +71,7 @@ link "$tdir/textures"       textures
 [ -e "$b/textures" ]      || link "$src/textures"      textures
 
 # -- 2. per-track data the code reads out of build/tracks/<ID>/ by name.
-#       (route.bin / grid.bin / traffic.bin are extractor outputs baked into
-#       src/burnout3_*_data.h at build time -- not opened at runtime.)
-for f in envmap.png light_probes.bin props.bin; do
+for f in envmap.png light_probes.bin props.bin route.bin grid.bin traffic.bin nav_edges.bin traffic_paths.bin pace.bin; do
     link "$tdir/$f" "tracks/$track/$f"
 done
 

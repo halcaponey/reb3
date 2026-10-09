@@ -19941,14 +19941,16 @@ static void crash_trace_tick(void) {
     int active = (v->crashed_until > 0.0f)
               || (st.active && st.victim_slot == 0);
     if (active && !g_crash_trace) {
+        static int next_n = 1;
         char path[128];
-        int n = 1;
+        int n = next_n;
         for (; n < 1000; n++) {
             snprintf(path, sizeof path, "build/crash_trace_%03d.log", n);
             FILE* t = fopen(path, "r");
             if (!t) break;
             fclose(t);
         }
+        next_n = n + 1;
         g_crash_trace = fopen(path, "w");
         if (!g_crash_trace) return;
         g_crash_trace_frames = 0;
