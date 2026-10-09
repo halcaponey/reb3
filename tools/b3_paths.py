@@ -69,6 +69,17 @@ def game_path(*parts):
     case-insensitive, so dumps differ on GLOBAL/ vs global/ and Tracks/ vs
     tracks/, and a tool cannot know which spelling a given dump used.
     """
+    root = os.environ.get(ENV, "").strip()
+    if not root or not os.path.isdir(os.path.expanduser(root)):
+        for base in (os.path.join(repo_root(), "build"),
+                     os.path.join(repo_root(), "build", ".isocache")):
+            cand = os.path.join(base, *parts)
+            if os.path.exists(cand):
+                return cand
+            tail = os.path.basename(str(parts[-1]).replace("\\", "/"))
+            cand = os.path.join(base, tail)
+            if os.path.exists(cand):
+                return cand
     cur = game_root()
     for part in parts:
         # split so callers may pass "GLOBAL/GLOBALUS.BGD" as a single argument

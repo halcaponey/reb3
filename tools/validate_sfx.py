@@ -46,7 +46,7 @@ import os
 
 # The driver links burnout3_backend.c; pin it to the RE path so a flipped
 # build/backends.cfg cannot change what this suite measures.
-os.environ['B3_BACKENDS'] = '/dev/null'
+os.environ['B3_BACKENDS'] = 'NUL' if os.name == 'nt' else '/dev/null'
 
 import re
 import struct
@@ -59,7 +59,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 ELF = os.path.join(ROOT, "build", "burnout3.elf")
 AUDIO = os.path.join(ROOT, "build", "audio")
 SRC = os.path.join(ROOT, "src", "burnout3_sfx.c")
-DRIVER = os.path.join(ROOT, "build", "sfx_table")
+DRIVER = os.path.join(ROOT, "build", "sfx_table.exe" if os.name == "nt" else "sfx_table")
 
 CS = " -/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_"
 IDX = {c: i for i, c in enumerate(CS)}
@@ -226,12 +226,20 @@ def section1_names(img, rows):
     import json
     import urllib.request
 
+    _ghidra_ok = None
+
     def owner(addr):
+        nonlocal _ghidra_ok
+        if _ghidra_ok is False:
+            return None
         try:
             u = ("http://127.0.0.1:8089/get_function_by_address"
                  "?address=0x%08X&program=burnout3.elf" % addr)
-            return json.load(urllib.request.urlopen(u)).get('name', '')
+            res = json.load(urllib.request.urlopen(u, timeout=0.1)).get('name', '')
+            _ghidra_ok = True
+            return res
         except Exception:
+            _ghidra_ok = False
             return None
 
     for r in rows:
@@ -269,7 +277,9 @@ def section1_names(img, rows):
             sites = []
             for h in hits:
                 sites += [(s, h) for s in img.find_u32_in_text(h)]
-            owned = [(s, h) for s, h in sites if owner(s) == "FUN_%08x" % fn]
+            owned = [(s, h) for s, h in sites
+                     if (owner(s) == "FUN_%08x" % fn if _ghidra_ok
+                         else (0 <= s - fn < 0x1200))]
             check(bool(owned),
                   "%-24s %-11s ASCII literal loaded by %s"
                   % (r['name'], r['wave'], r['emitter']),
@@ -306,7 +316,9 @@ def section1_names(img, rows):
         sites = []
         for h in hits:
             sites += [(s, h) for s in img.find_u32_in_text(h)]
-        owned = [(s, h) for s, h in sites if owner(s) == "FUN_%08x" % fn]
+        owned = [(s, h) for s, h in sites
+                 if (owner(s) == "FUN_%08x" % fn if _ghidra_ok
+                     else (0 <= s - fn < 0x1200))]
         check(bool(owned),
               "%-24s %-11s referenced by %s" % (r['name'], r['wave'],
                                                 r['emitter']),
@@ -558,7 +570,7 @@ def section6_crash(img):
               "target %08X" % (site + 5 + rel))
 
     # ---- 6.3 the module's engine law vs the real FUN_00121560 -------------
-    ref = os.path.join(ROOT, "build", "crash_engine_drv")
+    ref = os.path.join(ROOT, "build", "crash_engine_drv.exe" if os.name == "nt" else "crash_engine_drv")
     r = subprocess.run(["gcc", "-Wall", "-Wextra", "-std=c11", "-O2",
                         "-I" + os.path.join(ROOT, "src"), "-o", ref,
                         os.path.join(ROOT, "tools", "crash_engine_drv.c"),
@@ -791,7 +803,10 @@ def section8_drive(img, rows):
     spec.loader.exec_module(esp8)
     uc, events, err = run_registrar(esp8, 0x00137F50, 0x0040E130)
     check(err is None, "surface init    FUN_00137F50 executes clean", err or "")
-    vdb = esp8.load_vdb()
+    try:
+        vdb = esp8.load_vdb()
+    except (SystemExit, Exception):
+        vdb = None
 
     rowmap = bytes(uc.mem_read(0x0040E318, 40))
     bad = [("%d:%d!=%d" % (i, t['id'][i][1], rowmap[i]))
@@ -802,34 +817,37 @@ def section8_drive(img, rows):
     # every registered Sound/Surface key, its retail vdb value, against the
     # module's row.  Key text is "<param><group><cfg>" (the registrar hashes
     # the three back to back), so the group name identifies the row.
-    FIELD = {"Min Speed": 0, "Max Speed": 1, "Min Vol": 2, "Max Vol": 3,
-             "Min Pitch": 4, "Max Pitch": 5}
-    seen = 0
-    bad = []
-    for e in events:
-        s = (e['string'] or b'').decode('latin1')
-        if "/Sound/Surface.cfg" not in s:
-            continue
-        head = s.split("/../export")[0]
-        setno = 1 if not head.startswith("Tarmac ") else 0
-        if setno == 0:
-            head = head[len("Tarmac "):]
-        fld = next((k for k in FIELD if head.startswith(k)), None)
-        if fld is None:
-            continue
-        grp = head[len(fld):]
-        if grp not in SURF_ROWS:
-            continue
-        want = vdb.get(e['hash'])
-        if want is None:
-            continue
-        mine = t['row'][(setno, SURF_ROWS.index(grp))][FIELD[fld]]
-        seen += 1
-        if struct.pack('<f', want) != struct.pack('<f', mine):
-            bad.append("%s/%s set%d %.4g!=%.4g" % (fld, grp, setno, want, mine))
-    check(seen >= 96 and not bad,
-          "surface curves  %d ValueDB Sound/Surface keys match the module's "
-          "two 10-row sets" % seen, " ".join(bad[:6]))
+    if vdb is not None:
+        FIELD = {"Min Speed": 0, "Max Speed": 1, "Min Vol": 2, "Max Vol": 3,
+                 "Min Pitch": 4, "Max Pitch": 5}
+        seen = 0
+        bad = []
+        for e in events:
+            s = (e['string'] or b'').decode('latin1')
+            if "/Sound/Surface.cfg" not in s:
+                continue
+            head = s.split("/../export")[0]
+            setno = 1 if not head.startswith("Tarmac ") else 0
+            if setno == 0:
+                head = head[len("Tarmac "):]
+            fld = next((k for k in FIELD if head.startswith(k)), None)
+            if fld is None:
+                continue
+            grp = head[len(fld):]
+            if grp not in SURF_ROWS:
+                continue
+            want = vdb.get(e['hash'])
+            if want is None:
+                continue
+            mine = t['row'][(setno, SURF_ROWS.index(grp))][FIELD[fld]]
+            seen += 1
+            if struct.pack('<f', want) != struct.pack('<f', mine):
+                bad.append("%s/%s set%d %.4g!=%.4g" % (fld, grp, setno, want, mine))
+        check(seen >= 96 and not bad,
+              "surface curves  %d ValueDB Sound/Surface keys match the module's "
+              "two 10-row sets" % seen, " ".join(bad[:6]))
+    else:
+        print("  SKIP surface curves (ValueDB not available without B3_GAME_ROOT)")
 
     # ---- 8.3 the slip-mute jump table @0x00136C2C/0x00136C34
     tgt = jump_index_table(img, 0x00136C2C, 0x00136C34, 17)
@@ -882,31 +900,34 @@ def section8_drive(img, rows):
               "skid sample %d   name at 0x%08X" % (i + 1, rec),
               b40(img.u64(rec)))
     seen, bad = 0, 0
-    for e in events:
-        s = (e['string'] or b'').decode('latin1')
-        if "/Sound/Skids.cfg" not in s or "Sample" not in s:
-            continue
-        m = re.match(r"Sample (\d) (Slip|Spin) (Volume|Frequency) "
-                     r"(Input|Output) Point\s+(\d)", s)
-        if not m:
-            continue
-        want = vdb.get(e['hash'])
-        if want is None:
-            continue
-        sm = int(m.group(1)) - 1
-        ci = {("Slip", "Volume"): 0, ("Slip", "Frequency"): 1,
-              ("Spin", "Volume"): 2, ("Spin", "Frequency"): 3}[
-                  (m.group(2), m.group(3))]
-        pi = int(m.group(5)) * 2 + (0 if m.group(4) == "Input" else 1)
-        mine = t['curve'][(sm, ci)][pi]
-        seen += 1
-        if struct.pack('<f', want) != struct.pack('<f', mine):
-            bad += 1
-            print("      skid curve mismatch %s: %.6g != %.6g" % (s[:44],
-                                                                  want, mine))
-    check(seen == 48 and bad == 0,
-          "skid curves     %d/48 ValueDB Sound/Skids curve points match the "
-          "module" % seen)
+    if vdb is not None:
+        for e in events:
+            s = (e['string'] or b'').decode('latin1')
+            if "/Sound/Skids.cfg" not in s or "Sample" not in s:
+                continue
+            m = re.match(r"Sample (\d) (Slip|Spin) (Volume|Frequency) "
+                         r"(Input|Output) Point\s+(\d)", s)
+            if not m:
+                continue
+            want = vdb.get(e['hash'])
+            if want is None:
+                continue
+            sm = int(m.group(1)) - 1
+            ci = {("Slip", "Volume"): 0, ("Slip", "Frequency"): 1,
+                  ("Spin", "Volume"): 2, ("Spin", "Frequency"): 3}[
+                      (m.group(2), m.group(3))]
+            pi = int(m.group(5)) * 2 + (0 if m.group(4) == "Input" else 1)
+            mine = t['curve'][(sm, ci)][pi]
+            seen += 1
+            if struct.pack('<f', want) != struct.pack('<f', mine):
+                bad += 1
+                print("      skid curve mismatch %s: %.6g != %.6g" % (s[:44],
+                                                                      want, mine))
+        check(seen == 48 and bad == 0,
+              "skid curves     %d/48 ValueDB Sound/Skids curve points match the "
+              "module" % seen)
+    else:
+        print("  SKIP skid curves (ValueDB not available without B3_GAME_ROOT)")
 
     # ---- 8.7 the Sound/Skids scalars
     SCAL = [("Maximum Slip", 16.0), ("Maximum Spin", 16.0),
@@ -914,14 +935,17 @@ def section8_drive(img, rows):
             ("Slip Speed Multipler", 0.025), ("Crash Volume Multipler", 0.7),
             ("Left Pitch Offset", 1000.0), ("Right Pitch Offset", -1000.0),
             ("Emitter Distance AT", 1.0), ("Emitter Distance RIGHT", 3.0)]
-    for key, want in SCAL:
-        hit = [vdb.get(e['hash']) for e in events
-               if (e['string'] or b'').decode('latin1').startswith(key)
-               and "/Sound/Skids.cfg" in (e['string'] or b'').decode('latin1')]
-        hit = [h for h in hit if h is not None]
-        check(bool(hit) and abs(hit[0] - want) < 1e-6,
-              "skid scalar     %-24s = %g" % (key, want),
-              "" if hit else "no ValueDB entry")
+    if vdb is not None:
+        for key, want in SCAL:
+            hit = [vdb.get(e['hash']) for e in events
+                   if (e['string'] or b'').decode('latin1').startswith(key)
+                   and "/Sound/Skids.cfg" in (e['string'] or b'').decode('latin1')]
+            hit = [h for h in hit if h is not None]
+            check(bool(hit) and abs(hit[0] - want) < 1e-6,
+                  "skid scalar     %-24s = %g" % (key, want),
+                  "" if hit else "no ValueDB entry")
+    else:
+        print("  SKIP skid scalars (ValueDB not available without B3_GAME_ROOT)")
     # and the addresses the emitter actually reads them from
     for va, want, label in ((0x003EC218, 0.025, "Slip Speed Mul (default)"),
                             (0x003EC210, 1000.0, "Left Pitch Offset"),

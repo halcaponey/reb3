@@ -45,11 +45,6 @@ _spec = importlib.util.spec_from_file_location(
 ev = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ev)
 
-_spec2 = importlib.util.spec_from_file_location(
-    "cv", os.path.join(_here, "extract_car_vdb.py"))
-cv = importlib.util.module_from_spec(_spec2)
-_spec2.loader.exec_module(cv)
-
 INIT_AUDIO = 0x0014A710        # racecar-audio parameter initialiser  [C]
 INITS = (0x0014A710, 0x0014B600)   # both halves of the registration chain
 REG_ENTRY = 0x001AEE20         # per-parameter registration entry
@@ -160,6 +155,10 @@ def f32(blob, off):
 
 def load_vdb():
     """hash -> f32 value, straight out of the retail ValueDB."""
+    _spec2 = importlib.util.spec_from_file_location(
+        "cv", os.path.join(_here, "extract_car_vdb.py"))
+    cv = importlib.util.module_from_spec(_spec2)
+    _spec2.loader.exec_module(cv)
     raw, _filedefs = cv.read_vdb()
     return {h: cv.f32(v) for h, v in raw.items()}
 
