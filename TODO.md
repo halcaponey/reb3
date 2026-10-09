@@ -8,8 +8,9 @@ has been traced far enough to name what unlocks it.
 Ground rules that apply to all of it: physics/collision/triggers/control flow
 are strict 1:1 with retail (`[C]`/`[S]`/`[?]` provenance with addresses, GLUE
 marks on harness inventions); rendering LOOK is explicitly relaxed. Keep the
-suites green — 39 `tools/validate_*.py` plus three C ones — and build **all
-three** targets: `make -j4` (desktop), `make wasm` (web), and `android/`.
+suites green — 44 `tools/validate_*.py` plus three C ones — and build the
+active targets: `make -j4` (desktop Linux / WSL) and native Windows (`burnout3.exe`).
+Web (`make wasm`) and Android (`android/`) are suspended for now.
 
 Two standing gates that are not optional:
 
@@ -245,7 +246,22 @@ anti-tunnelling/bootstrapping nets, so the systems are not fully unified yet.
 
 ---
 
-## 2. Android
+## 2. Windows Native Target (Active)
+
+Targeting native Windows execution (`burnout3.exe`) without requiring WSL or emulation.
+
+* **Root CMake configuration** — add a top-level `CMakeLists.txt` supporting native
+  Windows toolchains (MSVC / MinGW GCC via Scoop).
+* **Dependencies integration** — resolve native Windows `SDL2` and `SDL2_image`
+  (FetchContent, vcpkg, or prebuilt development libraries).
+* **Platform & Path compatibility** — audit path separators, `pthread`, and POSIX
+  calls (`sys/mman.h`, `unistd.h`, `dprintf`, etc.) across `src/*.c` and `tools/cextract/`.
+* **Native GL & Audio pipeline** — test native Win32 WGL / OpenGL 2.1+ context and
+  SDL2 audio device initialization on Windows.
+
+---
+
+## 3. Android Target (Suspended for now)
 
 Runs and renders on the Pixel (Mali, Android 16). See `docs/ANDROID_PORT.md`.
 
@@ -303,7 +319,7 @@ Runs and renders on the Pixel (Mali, Android 16). See `docs/ANDROID_PORT.md`.
 
 ---
 
-## 3. Validation & tooling
+## 4. Validation & tooling
 
 ### The archived collision extractor's containment self-check fails `[?]`
 
@@ -418,7 +434,7 @@ track id defaults to `US_C3_V1`. At minimum the label is stale.
 
 ---
 
-## 3b. Web (WASM / WebGL — "Reb3")
+## 5. Web Target (Suspended for now)
 
 Design and the measured constraints behind it: `web/README.md`. Build with
 `make wasm`, serve with `make serve`, gate with `make test-web` (headless
@@ -505,7 +521,7 @@ Chromium over CDP — never a visible browser).
 
 ---
 
-## 4. Process notes for agent waves
+## 6. Process notes for agent waves
 
 * Agents work in their own worktree (`git worktree add --detach
   .claude/worktrees/agent-<name> master`), never commit, and never edit
