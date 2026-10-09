@@ -27,7 +27,10 @@ from b3_paths import game_path, game_root  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_ELF = os.path.join(REPO, "build", "burnout3.elf")
-XBE = game_path('default.xbe')
+try:
+    XBE = game_path('default.xbe')
+except (SystemExit, Exception):
+    XBE = ""
 HDR = os.path.join(REPO, "src", "burnout3_hud.h")
 SRC = os.path.join(REPO, "src", "burnout3_hud.c")
 
