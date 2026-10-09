@@ -14222,7 +14222,7 @@ static void traffic_tow_constraint(TrafficCar* t, float dt) {
         traffic_remove_angmom_axis(&t->rb, 2, 1.5f);
         traffic_remove_angmom_axis(&t->trailer_rb, 2, 1.5f);
     }
-    if (sqrtf(d2) > 1.0f || fabsf(dy) > 1.0f) {
+    if (sqrtf(d2) > 1.0f || fabsf(dy) > 1.0f || j > 5.0f) {
         traffic_detach_trailer(t);
         return;
     }

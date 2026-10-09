@@ -90,16 +90,18 @@ re-seed the target cursor and nav latch cleanly across all re-place paths.
   (`FUN_0010DD20`), and obsolete watchdogs (`beach_time`, `unstuck_side`)
   are purged.
 
-### Blocker B — the traffic body update *(closes PH-07, PH-13, gap 2)*
+### Blocker B — the traffic body update *(CLOSED — closes PH-07, PH-13, gap 2)*
 
-Port **`FUN_00120F30`** (traffic vtable `0x003B11EC` slot +0, ~0x460 bytes)
+**`FUN_00120F30`** (traffic vtable `0x003B11EC` slot +0, ~0x460 bytes) is ported
 into `full.c`'s traffic section: streaming-unit gates on `+0x216`/`+0x242C`,
-then the towed-body link `+0x2424` (both bodies share the `+0x20E` sleep
-byte, @0x00120FE6..0x00121032). Direct disassembly refutes the former
+the towed-body link `+0x2424` (both bodies share the `+0x20E` sleep
+byte, @0x00120FE6..0x00121032), the full two-rigid-body tow constraint with
+spring, jackknife/rollover angular momentum removal, and breakaway detachment
+(`FUN_00121400`). Direct disassembly refutes the former
 ``route driver behind +0x13A0`` wording: that field is the model pointer used
 only for the `+0x16A4/+0x16A8` tow anchors in this function.
 
-* **PH-07** is partly landed: traffic now carries a persistent `B3RigidBody`
+* **PH-07** is LANDED: traffic carries a persistent `B3RigidBody`
   through the generic car-contact pass and shared `FUN_00109560` integrator;
   the synthetic knock write-back and `1-4·dt` decay are gone. Its `+0x216`
   residency identity now comes from the streamed collision unit owning the

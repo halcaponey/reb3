@@ -1312,7 +1312,7 @@ type == 7`, then `[obj+0x211] = 0`) -> **every pair's narrow phase**
 | 5 | `[obj+0x211] = 0` per body, `[car+0x1353]` clear pass | `b->hit_211` cleared per frame; `v->fsim.flags_1353` re-armed per frame via `b3_td_crash_authority_full` before car update | SAME-ORDER |
 | 6 | pair narrow phase `FUN_00111CD0`, before every integrator | `carcol_pass` unified pair loop: `carcol_resolve_pair`, `b3_props_resolve_pair`, debris writeback | **SAME-ORDER** |
 | 7 | car `vtbl+0` -> `FUN_0011BE50` | `b3_vehicle_step_full` | SAME-ORDER |
-| 8 | traffic `vtbl+0` -> `FUN_00120F30`, a real rigid body | persistent traffic/trailer bodies, residency/sleep gates and normal tow constraint; lane driver remains harness-controlled | PARTIAL |
+| 8 | traffic `vtbl+0` -> `FUN_00120F30`, a real rigid body | persistent traffic/trailer bodies, residency/sleep gates, tow constraint, and retail road-agent manager passes | **SAME-ORDER** |
 | 9 | prop `vtbl+0` -> `FUN_0011A330` = drag + `FUN_00109560` | `b3p_body_step` — **now update-only, contact moved out** | SAME-ORDER |
 | 10 | debris `vtbl+0` -> `FUN_00106D00`, all 64 slots every frame | `panels_pieces_update` advances every detached panel once after vehicle, traffic, and prop passes; slot +0x10 `FUN_001072A0` gathers local polygon soup via `b3_collision_gather_rigid` and runs `b3_rigid_body_obb_soup_contact` (FUN_00107950) with sleep latch @0x001072AC | **SAME-ORDER** |
 | 11 | `FUN_0012FA40` inside the physics call | `tdr_frame_pass` runs inside `b3_physics_step` immediately following debris updates (@0x001110E2) | **SAME-ORDER** |
