@@ -68,9 +68,47 @@ def test_retail_pool_windows():
     assert retail_pool_windows(windows, 40) is None
 
 
+def retail_avoid_nudge(cur_nudge, random_u):
+    """FUN_0019FEC0: persistent avoidance nudge law."""
+    if cur_nudge < -0.10 or cur_nudge > 0.10:
+        return cur_nudge
+    val = random_u * 5.0 - 2.0
+    val = max(-0.15, min(0.12, val))
+    return val
+
+
+def test_retail_avoid_nudge():
+    assert retail_avoid_nudge(-0.14, 0.99) == -0.14
+    assert retail_avoid_nudge(0.11, 0.01) == 0.11
+    assert abs(retail_avoid_nudge(0.0, 0.0) - (-0.15)) < 1e-6
+    assert abs(retail_avoid_nudge(0.0, 1.0) - 0.12) < 1e-6
+    assert abs(retail_avoid_nudge(0.0, 0.4) - 0.0) < 1e-6
+
+
+def retail_bspline_basis(u):
+    """FUN_0019FFA0 uniform cubic B-spline matrix M @0x00417390."""
+    b0 = (1.0 - u) ** 3 / 6.0
+    b1 = (3.0 * u ** 3 - 6.0 * u ** 2 + 4.0) / 6.0
+    b2 = (-3.0 * u ** 3 + 3.0 * u ** 2 + 3.0 * u + 1.0) / 6.0
+    b3 = u ** 3 / 6.0
+    return b0, b1, b2, b3
+
+
+def test_retail_bspline():
+    for step in range(101):
+        u = step / 100.0
+        b0, b1, b2, b3 = retail_bspline_basis(u)
+        assert abs(b0 + b1 + b2 + b3 - 1.0) < 1e-6
+        assert b0 >= -1e-7 and b1 >= -1e-7 and b2 >= -1e-7 and b3 >= -1e-7
+    assert retail_bspline_basis(0.0) == (1.0 / 6.0, 4.0 / 6.0, 1.0 / 6.0, 0.0)
+    assert retail_bspline_basis(1.0) == (0.0, 1.0 / 6.0, 4.0 / 6.0, 1.0 / 6.0)
+
+
 def main():
     test_retail_branch_selector()
     test_retail_pool_windows()
+    test_retail_avoid_nudge()
+    test_retail_bspline()
     track = os.environ.get('B3_TRACK', os.environ.get('B3_POSTFX_TRACK',
                                                         'US_C3_V1'))
     path = pathlib.Path('build/tracks') / track / 'traffic_paths.bin'

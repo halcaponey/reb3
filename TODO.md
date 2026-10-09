@@ -142,8 +142,9 @@ only for the `+0x16A4/+0x16A8` tow anchors in this function.
   The dual-pool lifecycle, trailer physical allocation recursion (`FUN_001A75A0`/`FUN_001A3970`),
   agent rollback on starvation (`FUN_001A2B20`), and streaming/sleep gates
   (`FUN_00120F30`/`FUN_00104840`/`FUN_001213C0`) are fully ported and verified.
-* **PH-13** traffic mover / braking horizon — cursor movement, speed law, and pool
-  lifecycle are recovered; interpolation, avoidance and streamer remain.
+* **PH-13** traffic mover / braking horizon — CLOSED. Cursor movement, speed
+  law, four-knot clamped cubic B-spline pose (`FUN_0019FFA0`), avoidance nudge
+  (`FUN_0019FEC0`), and dual-pool lifecycle are ported and verified.
 
 ### Blocker C — one wall source / real contact geometry *(closes PH-09's object arm, the `crash_fired` switch, gap 3)*
 

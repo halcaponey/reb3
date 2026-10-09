@@ -10830,6 +10830,7 @@ static void traffic_path_sample(unsigned int path_id, float cursor,
                                 float lateral,
                                 Vec3* out_pos, Vec3* out_tangent) {
     const B3TrafficPath* path = &g_traffic_paths.paths[path_id];
+    if (cursor < 0.0f) cursor = 0.0f;
     int row = (int)floorf(cursor);
     float u;
     Vec3 knot[4];
@@ -14217,15 +14218,16 @@ static void traffic_update(float dt) {
                  * whole jam.  The draw uses the recovered traffic RNG, so
                  * the distribution is retail's even though the sequence
                  * cannot be (its seed is global). */
-                if (!t->avoid_active) {
-                    t->avoid_nudge = traffic_avoid_nudge(t->avoid_nudge);
-                    t->avoid_active = 1;
-                }
+                t->avoid_nudge = traffic_avoid_nudge(t->avoid_nudge);
+                t->avoid_active = 1;
                 state = 4;
                 acc = t->avoid_nudge;
             }
         }
-        if (state != 4) t->avoid_active = 0;
+        if (state != 4) {
+            t->avoid_active = 0;
+            t->avoid_nudge = 0.0f;
+        }
 
         // (2) follow the traffic car ahead in the same lane
         {

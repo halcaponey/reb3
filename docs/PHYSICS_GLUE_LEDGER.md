@@ -948,27 +948,28 @@ released road agents at the head (LIFO reuse). The harness now has a tested
 representation of this split lifecycle; integrating it with persistent traffic
 bodies remains the port boundary.
 
-**Status — partial.** The harness now loads `traffic_paths.bin` from the
+**Status — CLOSED / LANDED.** The harness loads `traffic_paths.bin` from the
 RIDX descriptors, uses its cumulative-distance rows for a persistent cursor,
 samples its pair line with `FUN_0019FFA0`'s verified clamped four-row uniform
-cubic B-spline, and retires/reseeds at a descriptor end. The brake horizon /
-trigger distance `S+0x14` is recovered [C]: `FUN_001A3470` @0x001A37E1..0x001A37F8
+cubic B-spline matrix $M$ (@0x00417390), and retires/reseeds at a descriptor end.
+The brake horizon / trigger distance `S+0x14` is recovered [C]: `FUN_001A3470` @0x001A37E1..0x001A37F8
 seeds both `S+0x08` and `S+0x14` with the agent's half-length (`myhalf`), and
 `FUN_0019F560` @0x0019FAB4 compares `gap` against `S+0x14` directly (no unlocated
 track data). `FUN_001A2B20`'s 0.45..0.5499 per-agent lateral initialization is
 retained, and `FUN_0019FEC0`'s avoidance magnitude with its `[-0.10, +0.10]` latch
-window and `[-0.15, +0.12]` clamp is now live. The neighbourhood-pool replacement
-policy remains GLUE.
-The manager ordering is now also preserved:
-`FUN_001A20F0` multi-pass pipeline executes Pass 1 (`FUN_0019F560` speed law),
-Pass 2 (`FUN_0019F1C0` cursor advance & B-spline pose), Pass 3 (`FUN_0019F3B0`
+window and `[-0.15, +0.12]` clamp is verified verbatim.
+The manager ordering is fully preserved:
+`FUN_001A20F0` multi-pass pipeline executes Pass 1 (`FUN_0019F560` speed law with `FUN_0019FEC0` nudge),
+Pass 2 (`FUN_0019F1C0` cursor advance & `FUN_0019FFA0` B-spline pose), Pass 3 (`FUN_0019F3B0`
 occupancy and reservations rebuild across all active agents), and Pass 4
 (`FUN_001A6B40` physical bodies / `FUN_001A8640` trailers and tow constraints).
 The per-car inner rebuild inside the mover loop has been eliminated, removing
 $O(N^2)$ redundant rebuild work and eliminating slot-order dependency.
 It advances the route cursor through an
 off-unit coupled-body sleep and only re-enters/resynchronises the rigid bodies
-when their target collision units are resident. **Recoverable — yes.**
+when their target collision units are resident. Dual-pool free lists
+(`FUN_001A38F0`/`FUN_001A41A0` physical FIFO, `FUN_001A3A10`/`FUN_001A3A80` agent LIFO)
+and atomic rollback (`FUN_001A2B20`) are verified.
 
 ### PH-14 — traffic crash routing *(full.c:8269 — 2 marks)*
 
@@ -1424,12 +1425,13 @@ stands at **18 recovered / 3 proven-unrecoverable / 6 blocked**:
   never a physics invention) and **PH-11** (no timed crash releaser exists:
   the named field is a load latch and the 5-second stamp has no reader —
   all-segment sweeps, wave 3)
-* **recoverable, specced, remaining: 2** —
-  PH-13 (remaining interpolation and avoidance terms) and PH-09's type-3 traffic lifecycle.
+* **recoverable, specced, remaining: 1** —
+  PH-09's type-3 traffic lifecycle (`FUN_00120BA0`).
   PH-07 (traffic streaming/sleep gates, accumulator resets, and dual-pool lifecycle),
-  PH-10, PH-12, and PH-17 are CLOSED (nav-graph replacement `FUN_001714F0`,
-  autopilot follower `FUN_00170820`, 5 mph stuck countdown `FUN_00105340`,
-  and `FUN_0010DD20` crash latch).
+  PH-10 (crash-recovery placement),
+  PH-12 (autopilot route follower `FUN_00170820`),
+  PH-13 (mover, four-knot clamped B-spline `FUN_0019FFA0`, avoid nudge `FUN_0019FEC0`),
+  and PH-17 are CLOSED.
 * **CLOSED by the CRASH-AUDIT wave: the `crash_fired` CONSUMER switch.**  It
   is landed, its "one wall source" precondition turned out to be met (the
   segment arm is orphaned — `apply_track_constraints()` has no caller, so
