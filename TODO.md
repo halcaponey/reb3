@@ -70,15 +70,14 @@ state** and **recovery-state timing**. Owner: the AI-DRIVE lane of work.
   `FUN_00173C60`'s one-node type-5 gate and `FUN_00178310`'s separate
   eight-node selector span belong to `FUN_00176290`; the live `+0x27D8`
   cursor follows `FUN_00174960` →
-  `FUN_00175570` without that gate. The remaining navigator work is the
-  target follower's mutable route-selection state and recovery-state timing.
+  `FUN_00175570` without that gate.
   `racecar+0x1920` is the selector's mode gate (not a route-object pointer);
-  the reset-state selector now carries a
+  the reset-state selector carries a
   separate target cursor through type-5 entry (including its recovered
   two-successor vector tie-break) and type-4 lookahead branches.
-  `FUN_00178310`'s complete span mask is differential-tested under Unicorn
-  (including the open-row clamp and its unusual wrapped mode-zero tail); its
-  higher-level state writers are still unmapped.
+  `FUN_00178310`'s complete span mask model is differential-tested under Unicorn
+  (including the open-row clamp and wrapped mode-zero tail) and is now ported
+  1:1 into the runtime via `nav_target_span_mask_ex`.
 
 * **PH-10** — closed. Crash-recovery placement uses retail nav-node placement
   and heading. The surrounding retail reset state is the residue.

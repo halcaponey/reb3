@@ -2757,45 +2757,58 @@ static Vec3 nav_forward(unsigned int section, unsigned int node);
  * and type-3 nodes can contribute at all. */
 #define B3_NAV_STATE_1FC  2
 
-static int nav_span_type_ok(unsigned int type, int route_alt, int slamming) {
-    /* FUN_00178310 under the racing-mode gate racecar+0x1920 != 0:
-     *   type 4      contributes bit 1 while AI+0x1F1 == 0
-     *   type 1 / 3  contribute bit 1 only when AI+0x1F0 == 0 && AI+0x1FC != 0
-     * AI+0x1F1 is the aggression machine's slam byte (state 4 sets it,
-     * FUN_00179760 clears it) and AI+0x1F0 is FUN_00170820's 50 s / 50 s
-     * square wave -- so retail's junction policy is not static: type-1/type-3
-     * options open for fifty seconds out of every hundred, and every option
-     * closes while the car is committed to a slam. */
-    if (type == 4) return !slamming;
-    if (type == 1 || type == 3)
-        return route_alt == 0 && B3_NAV_STATE_1FC != 0;
-    return 0;
+static unsigned int nav_target_span_mask_ex(unsigned int section,
+                                             unsigned int node, int route_alt,
+                                             int slamming, int racing_mode,
+                                             int type4_allowed,
+                                             int type13_allowed) {
+    const B3RtNavSection* row = &g_nav.sections[section];
+    if (nav_node_type(section, node) == 5) return 4;
+
+    unsigned int end = node + 8;
+    unsigned int mask = 0;
+    if (end >= row->node_count) {
+        if (row->flags & 0xff) end -= row->node_count;
+        else { end = row->node_count - 1; mask = 2; }
+    }
+
+    int type4_blocked = slamming;
+    int type13_enabled = (route_alt == 0 && B3_NAV_STATE_1FC != 0);
+
+    #define APPLY_GATE(scan_node) do { \
+        unsigned int kind = nav_node_type(section, (scan_node)); \
+        if (!racing_mode) { \
+            if (kind == 4) mask |= 1; \
+        } else { \
+            if (!type4_blocked && kind == 4) \
+                mask |= type4_allowed ? 1 : 4; \
+            if (type13_enabled && (kind == 1 || kind == 3)) \
+                mask |= type13_allowed ? 1 : 4; \
+        } \
+    } while (0)
+
+    if (node <= end) {
+        for (unsigned int scan = node; scan <= end; scan++)
+            APPLY_GATE(scan);
+    } else {
+        for (unsigned int scan = node; scan < row->node_count; scan++)
+            APPLY_GATE(scan);
+        if (!racing_mode) {
+            mask |= 1;
+        } else {
+            for (unsigned int scan = 0; scan <= end; scan++)
+                APPLY_GATE(scan);
+        }
+    }
+    #undef APPLY_GATE
+    return mask;
 }
 
 static unsigned int nav_target_span_mask(unsigned int section,
                                          unsigned int node, int route_alt,
                                          int slamming) {
-    const B3RtNavSection* row = &g_nav.sections[section];
-    unsigned int end = node + 8;
-    unsigned int mask = 0;
-    if (nav_node_type(section, node) == 5) return 4;
-    if (end >= row->node_count) {
-        if (row->flags & 0xff) end -= row->node_count;
-        else { end = row->node_count - 1; mask = 2; }
-    }
-    if (node <= end) {
-        for (unsigned int scan = node; scan <= end; scan++)
-            if (nav_span_type_ok(nav_node_type(section, scan), route_alt,
-                                 slamming)) mask |= 1;
-    } else {
-        for (unsigned int scan = node; scan < row->node_count; scan++)
-            if (nav_span_type_ok(nav_node_type(section, scan), route_alt,
-                                 slamming)) mask |= 1;
-        for (unsigned int scan = 0; scan <= end; scan++)
-            if (nav_span_type_ok(nav_node_type(section, scan), route_alt,
-                                 slamming)) mask |= 1;
-    }
-    return mask;
+    /* Retail racing mode defaults: racecar+0x1920 != 0, AI+0x291=1, AI+0x292=1 */
+    return nav_target_span_mask_ex(section, node, route_alt, slamming, 1, 1, 1);
 }
 
 /* FUN_00176290's branch probe after its eight-node selector span reports a
