@@ -5267,11 +5267,17 @@ static float crash_latch_for(Vehicle* v) {
 // consequence sites classify the crash into WALL / CAR / ROLLOVER.
 static void wreck_begin_for(Vehicle* v, Vec3 contact_pt, Vec3 contact_n,
                             Vec3 rel_vel, B3WreckEntryKind kind);
+static void tdr_trace_claims(const char* how, int slot);
 
 static void wreck_begin_for(Vehicle* v, Vec3 contact_pt, Vec3 contact_n,
                             Vec3 rel_vel, B3WreckEntryKind kind) {
     int slot = (int)(v - g_vehicles);
     if (slot < 0 || slot >= 8) return;
+    /* If the vehicle is inverted (up.y < 0.0f) upon entering a wreck, promote
+     * to ROLLOVER so the retail launch (0.65 linear up) + corner spin (0.90) fires. */
+    if (v->fsim_ready && v->fsim.rb.frame && v->fsim.rb.frame[1][1] < 0.0f) {
+        kind = B3_WRECK_ENTRY_ROLLOVER;
+    }
     ai_crash_note(v, slot);
     awl_wreck(v, slot, contact_pt, contact_n, rel_vel, (int)kind); /* --- ai wreck log (agent) --- */
     // TAKEDOWN-FX: retail's crash presentation (divisor 5 on player wreck,
@@ -9084,6 +9090,49 @@ static void vehicle_update(Vehicle* v, float dt) {
                               -v->fsim.contact_n_170[2]};
         v->last_hit_vin = vin > 0.0f ? vin : 0.0f;
         v->last_hit_time = g_race_time;
+    }
+
+    /* Rollover Crash Trigger: FUN_0011BE50 @0x0011C421..0x0011C439.
+     * Fires when a vehicle is inverted (up.y < 0.0f) while making contact with
+     * ground or world geometry (roof dragging / tumbling on ground). */
+    if (v->crashed_until <= 0.0f && g_race_time >= v->immune_until
+        && rb->frame && rb->frame[1][1] < 0.0f) {
+        float gh = -999.0f, gn[3] = {0, 1, 0};
+        int s = harness_ground_probe(rb->frame[3][0], rb->frame[3][1],
+                                     rb->frame[3][2], &gh, gn);
+        int ground_contact = (s >= 0 && rb->frame[3][1] <= gh + 0.85f);
+        int chassis_contact = (v->fsim.contact_state_198 == 1);
+        if (ground_contact || chassis_contact) {
+            Vec3 cp = v->pos;
+            Vec3 cn = (Vec3){0.0f, 1.0f, 0.0f};
+            if (s >= 0) {
+                cn = (Vec3){gn[0], gn[1], -gn[2]};
+            }
+            v->crashed_until = g_race_time + 5.0f;
+            v->immune_until  = g_race_time + crash_latch_for(v);
+            wreck_begin_for(v, cp, cn, v->vel, B3_WRECK_ENTRY_ROLLOVER);
+            b3_sfx_event_at(B3_SFX_IMPACT_WORLD, rb->vel[3], v->pos.x, v->pos.y, v->pos.z);
+            b3_sfx_event_at(B3_SFX_GLASS_FRONT, 0.02f, v->pos.x, v->pos.y, v->pos.z);
+            b3_sfx_event_at(B3_SFX_PANEL_L_DEFORM, 0.4f, v->pos.x, v->pos.y, v->pos.z);
+            if (slot >= 0 && slot < B3_TDR_MAX_CARS) {
+                b3_td_on_crash(&g_tdr, g_race_time, slot, NULL, NULL);
+                tdr_trace_claims("rollover", slot);
+            }
+            printf("[Burnout3] t=%.2f car %d ROLLOVER CRASH (up.y=%.2f < 0, "
+                   "ground=%d, chassis=%d)\n",
+                   g_race_time, slot, rb->frame[1][1], ground_contact, chassis_contact);
+            if (slot >= 0 && slot < 8) {
+                B3WreckState* wk = &g_wrecks[slot];
+                v->rot.y = wk->yaw;
+                v->rot.x = wk->pitch;
+                v->rot.z = wk->roll;
+                v->sim.speed = 0.0f;
+                v->speed = wk->vel[3];
+                v->track_progress = vehicle_track_progress(v);
+                v->prev_progress = v->track_progress;
+                return;
+            }
+        }
     }
 
     {

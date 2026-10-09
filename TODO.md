@@ -231,8 +231,10 @@ anti-tunnelling/bootstrapping nets, so the systems are not fully unified yet.
   corner, 0.90 spin, 0.65 launch, WALL = null kick (0/0/0). The wall crash's
   real answer is "neither — only `FUN_0011AEF0`'s impulse", and that is what
   the null WALL row produces. The old `b3_wreck_begin(` wrapper has zero
-  remaining callers. ROLLOVER has no caller today (an inverted car is not
-  detected), so the 0.65/0.90 row is dormant but correct.
+  remaining callers. ROLLOVER detection is active and wired (`src/burnout3_full.c`):
+  inverted vehicles (`rb->frame[1][1] < 0.0f`) during ground or world contact trigger
+  `B3_WRECK_ENTRY_ROLLOVER`, and crash entries occurring while inverted are promoted to
+  ROLLOVER, firing retail's 0.65 linear launch (`0x0011C421`) and 0.90 spin (`0x0011C439`).
 * **The alternate type-3 request lifecycle — RESOLVED / AUDITED.**
   TDESC `+0xB4 & 0x04` selects the `FUN_001A5C70` queue. `FUN_001A3AE0` state 6 maps
   TDESC schedule row `+0x38/+0x3C` 0x0C descriptors into `manager+0x30+slot*4`;
