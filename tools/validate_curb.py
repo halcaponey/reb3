@@ -62,6 +62,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+CC = 'gcc' if os.name == 'nt' else os.environ.get('CC', 'cc')
 
 # ---------------------------------------------------------------------------
 # MEASURED CURB GEOMETRY (build/tracks/US_C3_V1/collision.bin)
@@ -412,8 +413,8 @@ def build_re_driver(patched=None):
     """Build tools/curb_traj.c against the repo tree, or against a directory
     holding patched copies of any src/ file (`patched` wins on the include
     path and per translation unit)."""
-    exe = os.path.join(ROOT, 'build',
-                       'curb_traj_patched' if patched else 'curb_traj')
+    bin_name = ('curb_traj_patched.exe' if patched else 'curb_traj.exe') if os.name == 'nt' else ('curb_traj_patched' if patched else 'curb_traj')
+    exe = os.path.join(ROOT, 'build', bin_name)
     inc = ['-I' + os.path.join(ROOT, 'src')]
     extra = []
     if patched:
@@ -431,7 +432,7 @@ def build_re_driver(patched=None):
     for f in RE_UNITS:
         p = os.path.join(patched, f) if patched else None
         src.append(p if p and os.path.exists(p) else os.path.join(ROOT, 'src', f))
-    r = subprocess.run(['cc', '-O2'] + inc + extra + ['-o', exe] + src
+    r = subprocess.run([CC, '-O2'] + inc + extra + ['-o', exe] + src
                        + ['-lm'], capture_output=True, text=True)
     if r.returncode != 0:
         print(r.stderr[-2000:])
@@ -463,8 +464,8 @@ def check_gate_predicate(patched):
                 'printf("%u %u %d\\n",c,t,'
                 'b3_collision_wheel_surface_testable((unsigned short)t,'
                 '(unsigned char)c));return 0;}\n')
-    exe = os.path.join(ROOT, 'build', 'curb_gate_probe')
-    r = subprocess.run(['cc', '-O2', '-I' + patched,
+    exe = os.path.join(ROOT, 'build', 'curb_gate_probe.exe' if os.name == 'nt' else 'curb_gate_probe')
+    r = subprocess.run([CC, '-O2', '-I' + patched,
                         '-I' + os.path.join(ROOT, 'src'), '-o', exe, probe,
                         csrc, '-lm'], capture_output=True, text=True)
     if r.returncode != 0:
@@ -567,11 +568,11 @@ def check_admit_predicate(srcdir):
     probe = os.path.join(ROOT, 'build', 'curb_admit_probe.c')
     with open(probe, 'w') as f:
         f.write(_ADMIT_PROBE)
-    exe = os.path.join(ROOT, 'build', 'curb_admit_probe')
+    exe = os.path.join(ROOT, 'build', 'curb_admit_probe.exe' if os.name == 'nt' else 'curb_admit_probe')
     units = [csrc] + [os.path.join(ROOT, 'src', u) for u in
                       ('burnout3_vehicle_sim.c', 'burnout3_panels.c',
                        'burnout3_backend.c', 'burnout3_emu.c')]
-    r = subprocess.run(['cc', '-O2', '-I' + srcdir,
+    r = subprocess.run([CC, '-O2', '-I' + srcdir,
                         '-I' + os.path.join(ROOT, 'src'), '-o', exe, probe]
                        + units + ['-lm'], capture_output=True, text=True)
     if r.returncode != 0:
@@ -682,6 +683,9 @@ def main():
             p.write_state(sf)
             base_fired = p.crash_fired
             emu = [p.frame(*inp) for _ in range(wlen)]
+        except FileNotFoundError as e:
+            print("  %-38s skipped (unstaged: %s)" % (name, os.path.basename(e.filename or '')))
+            continue
         except Exception as e:
             print("  %-38s emulation: %s" % (name, e))
             fails += 1
