@@ -38,10 +38,10 @@ but a value is inferred, `[?]` = not located.
 >   / `nav_replace_car` in `src/burnout3_full.c`), so **PH-10**'s node-graph GLUE
 >   is retired and crash recovery uses retail nav placement. **PH-12**'s route
 >   driver `FUN_00170820` is ported (`src/burnout3_ai.c`, section 16, transcribed
->   branch for branch). **PH-17** is therefore no longer blocked on PH-10/PH-12 —
->   its own `beach_time` / `stuck_ref` / `unstuck_side` / `immune_until` marks
->   are genuinely still GLUE, which is a different statement. The HEADLINE
->   rollup naming all three as waiting on `FUN_00179760` is stale.
+>   branch for branch). **PH-17** is CLOSED (5 mph rule recovered [C], rescue
+>   placement via `nav_replace_car` recovered [C], `immune_until` mapped to
+>   `crash_latch_for` [C], and dead watchdogs `beach_time`/`unstuck_side` purged).
+>   The HEADLINE rollup naming all three as waiting on `FUN_00179760` is stale.
 > * **PH-26's harness hunk landed.** `src/burnout3_panels.c` calls
 >   `b3_rigid_body_world_contact` and `b3_rigid_body_class7_update` directly;
 >   the "ships as idempotent hunk P1" wording is historical.

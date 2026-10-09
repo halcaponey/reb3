@@ -5261,13 +5261,11 @@ static void wreck_begin_for(Vehicle* v, Vec3 contact_pt, Vec3 contact_n,
     if (slot < 0 || slot >= 8) return;
     ai_crash_note(v, slot);
     awl_wreck(v, slot, contact_pt, contact_n, rel_vel, (int)kind); /* --- ai wreck log (agent) --- */
-    // TAKEDOWN-FX: the big-hit IMPACT slow-down (divisor 6 for 0.35 s,
-    // FUN_00026050's window [C]). Retail's raiser of the impact flag is
-    // [?]; firing it at the player's own wreck moment is the GLUE trigger
-    // for the recovered mechanism.
-    // The impact window's only retail arm is the designated big-hit
-    // TRAFFIC vehicle (FUN_00026A70, +0x174 & 8 -- RE_NOTES 16.3); a
-    // plain crash keeps its own divisor-5 presentation.
+    // TAKEDOWN-FX: retail's crash presentation (divisor 5 on player wreck,
+    // FUN_00025CC0 @0x00025D5C). The big-hit impact slowdown (divisor 6 for
+    // 0.35 s, FUN_00026050 [C]) is reserved for the designated type-3 traffic
+    // vehicle (FUN_00026A70, +0x174 & 8 -- RE_NOTES 16.3); a standard crash
+    // spends one crash presentation credit via b3_tdfx_crash_begin().
     if (v == &g_player) b3_tdfx_crash_begin();
     float wr = g_car_wheel_radius[slot] > 0.05f ? g_car_wheel_radius[slot]
                                                 : 0.35f;

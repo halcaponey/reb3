@@ -45,9 +45,11 @@ branch for branch. The nav graph itself is loaded and walked at run time from
 as `nav_replace_car`. `FUN_00179760` is the reset helper it invokes, not the
 walker.
 
-Consequently **PH-10 and PH-12 are closed** and **PH-17 is no longer blocked on
-them** — its own watchdog marks (`beach_time`, `stuck_ref`, `unstuck_side`,
-`immune_until`) are still GLUE, which is a different and smaller problem.
+Consequently **PH-10, PH-12, and PH-17 are closed** — the 5 mph stuck rule
+is recovered [C] (`FUN_00105340 @0x001054AF`), rescue placement uses retail
+`nav_replace_car` (`FUN_001714F0` / `FUN_00179760`), `immune_until` maps to
+`crash_latch_for` [C], and obsolete watchdogs (`beach_time`, `unstuck_side`)
+are purged.
 
 What genuinely remains here: the target follower's **mutable route-selection
 state** and **recovery-state timing**. Owner: the AI-DRIVE lane of work.
@@ -83,10 +85,11 @@ state** and **recovery-state timing**. Owner: the AI-DRIVE lane of work.
 * **PH-12** — closed. The route driver is ported; AI-wheel handovers go through
   it.
 * **PH-17** off-world / stuck watchdogs (`full.c`, `FUN_001712E0`) —
-  **still open, but no longer blocked.** `beach_time`, `stuck_ref`, wall-grind
-  detector, off-world drop recovery. Retail's 5 mph stuck rule is already
-  known; the rest exists only because the harness road model is two drive
-  lines. This is now the AI-DRIVE lane's next item rather than a dependency.
+  **CLOSED / RECOVERED.** Retail's 5 mph stuck rule is ported in
+  `burnout3_ai.c` (`FUN_00105340 @0x001054AF`), rescue placement uses retail
+  `nav_replace_car` (`FUN_001714F0`), `immune_until` maps to `crash_latch_for`
+  (`FUN_0010DD20`), and obsolete watchdogs (`beach_time`, `unstuck_side`)
+  are purged.
 
 ### Blocker B — the traffic body update *(closes PH-07, PH-13, gap 2)*
 
