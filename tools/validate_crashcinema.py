@@ -513,10 +513,11 @@ def sec45(ck):
     print("\n[4] b3_wreck_aftertouch_steer vs FUN_00118410's consume block")
     tmp = tempfile.mkdtemp(prefix="cc_")
     src = os.path.join(tmp, "drv.c")
-    exe = os.path.join(tmp, "drv")
+    exe = os.path.join(tmp, "drv.exe" if os.name == "nt" else "drv")
     open(src, "w").write(DRIVER)
+    cc_bin = "gcc" if (os.name == "nt" or "CC" not in os.environ) else os.environ.get("CC", "cc")
     r = subprocess.run(
-        ["cc", "-O2", "-I" + os.path.join(_root, "src"), "-o", exe, src,
+        [cc_bin, "-O2", "-I" + os.path.join(_root, "src"), "-o", exe, src,
          os.path.join(_root, "src", "burnout3_crash.c"),
          os.path.join(_root, "src", "burnout3_td_rules.c"),
          # burnout3_td_rules.c consults the backend selector; the driver
