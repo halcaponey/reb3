@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define TEST_COLLISION_PATH "build/validate_frozen_soup_collision.bin"
+#define TEST_COLLISION_PATH "validate_frozen_soup_collision.bin"
 
 typedef struct SoupRayContext {
     const B3CollisionPoly* polys;

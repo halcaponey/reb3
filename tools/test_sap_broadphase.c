@@ -8,6 +8,26 @@ int b3_ground_probe(float x, float y, float z, float* h, float n[3]) {
     (void)x; (void)y; (void)z; (void)h; (void)n; return -1;
 }
 
+#include "burnout3_backend.h"
+#include "burnout3_emu.h"
+
+B3Backend b3_backend_get(B3Feature f) {
+    (void)f;
+    return (B3Backend)0;
+}
+
+int b3_emu_carcol(const void* rbA, const void* extraA, const void* hullA,
+                   const float frameA[4][4], int crashedA, int typeA,
+                   const void* rbB, const void* extraB, const void* hullB,
+                   const float frameB[4][4], int crashedB, int typeB,
+                   void* out_contact, void* out_rbA, void* out_rbB,
+                   int* out_crash_a, int* out_crash_b) {
+    (void)rbA; (void)extraA; (void)hullA; (void)frameA; (void)crashedA; (void)typeA;
+    (void)rbB; (void)extraB; (void)hullB; (void)frameB; (void)crashedB; (void)typeB;
+    (void)out_contact; (void)out_rbA; (void)out_rbB; (void)out_crash_a; (void)out_crash_b;
+    return 0;
+}
+
 static void init_box(B3CarBody* b, B3RigidBody* rb, float frame[4][4],
                      float x, float y, float z,
                      float hx, float hy, float hz,
