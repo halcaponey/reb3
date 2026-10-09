@@ -20,9 +20,8 @@ files** at the time of writing (master `0334fcf` + this wave).
     at its own call site), the signed FUN_00106720 return it exposed, the
     wreck's world pass, the deletion of the retired scalar reconstruction and
     the trailer attach record.  Section E's gaps 1, 2 and 5 are closed.
-  * **6 recoverable, specced, blocked on another agent's files** — the retail
-    function is identified with addresses in every case; none is waiting on
-    information from the executable.
+  * **0 recoverable, specced items remaining** — all 6 former blocker items
+    (PH-07, PH-09, PH-10, PH-12, PH-13, PH-17) are fully CLOSED / RECOVERED.
   * **3 proven not recoverable from the image** (PH-19, PH-20, **PH-11**);
     four of the original six fell under wave 2's re-audit — see section C.
 
