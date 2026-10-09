@@ -45,7 +45,10 @@ from b3_paths import game_path, game_root  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 ELF = os.path.join(ROOT, "build", "burnout3.elf")
-GAME = game_root()
+try:
+    GAME = game_root()
+except SystemExit:
+    GAME = None
 
 PAGE = 0x1000
 
@@ -558,20 +561,45 @@ def extract_hulls(outdir=None):
 
 
 def load_hull(cls, car):
-    p = os.path.join(GAME, "pveh", cls, car + ".bgv")
-    if not os.path.exists(p):
-        p = os.path.join(GAME, "pveh", cls, car + ".btv")
-    d = open(p, 'rb').read()
-    return d[BGV_HULL_OFF:BGV_HULL_OFF + HULL_SZ]
+    p = os.path.join(ROOT, "build", "cars", "%s_%s.hull" % (cls, car))
+    if os.path.exists(p):
+        return open(p, 'rb').read()
+    if GAME:
+        p = os.path.join(GAME, "pveh", cls, car + ".bgv")
+        if not os.path.exists(p):
+            p = os.path.join(GAME, "pveh", cls, car + ".btv")
+        if os.path.exists(p):
+            d = open(p, 'rb').read()
+            return d[BGV_HULL_OFF:BGV_HULL_OFF + HULL_SZ]
+    return b'\0' * HULL_SZ
 
 
 def bbox(cls, car):
-    p = os.path.join(GAME, "pveh", cls, car + ".bgv")
-    if not os.path.exists(p):
-        p = os.path.join(GAME, "pveh", cls, car + ".btv")
-    d = open(p, 'rb').read()
-    return (list(struct.unpack_from('<4f', d, 0xE80)),
-            list(struct.unpack_from('<4f', d, 0xE90)))
+    if GAME:
+        p = os.path.join(GAME, "pveh", cls, car + ".bgv")
+        if not os.path.exists(p):
+            p = os.path.join(GAME, "pveh", cls, car + ".btv")
+        if os.path.exists(p):
+            d = open(p, 'rb').read()
+            return (list(struct.unpack_from('<4f', d, 0xE80)),
+                    list(struct.unpack_from('<4f', d, 0xE90)))
+    p = os.path.join(ROOT, "build", "cars", "%s_%s.wheels" % (cls, car))
+    if not os.path.exists(p) and cls == "HEVY":
+        fallback_car = "Car36" if car in ("Car23", "Car24", "Car25") else "Car1"
+        p = os.path.join(ROOT, "build", "cars", "%s_%s.wheels" % (cls, fallback_car))
+    if os.path.exists(p):
+        ext, center = None, None
+        for line in open(p):
+            f = line.split()
+            if not f:
+                continue
+            if f[0] == "ext":
+                ext = [float(x) for x in f[1:5]]
+            elif f[0] == "center":
+                center = [float(x) for x in f[1:5]]
+        if ext is not None and center is not None:
+            return ext, center
+    return [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]
 
 
 if __name__ == '__main__':

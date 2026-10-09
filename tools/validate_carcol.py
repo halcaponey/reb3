@@ -29,7 +29,7 @@ import os
 
 # The driver links burnout3_backend.c; pin it to the RE path so this
 # differential test is unaffected by whatever build/backends.cfg says.
-os.environ['B3_BACKENDS'] = '/dev/null'
+os.environ['B3_BACKENDS'] = 'NUL' if os.name == 'nt' else '/dev/null'
 
 import struct
 import subprocess
@@ -331,7 +331,7 @@ def build_driver():
     d = tempfile.mkdtemp(prefix="carcol_")
     src = os.path.join(d, "carcol_drv.c")
     open(src, "w").write(DRIVER)
-    exe = os.path.join(d, "carcol_drv")
+    exe = os.path.join(d, "carcol_drv.exe" if os.name == 'nt' else "carcol_drv")
     cmd = ["gcc", "-std=c11", "-O2", "-I", os.path.join(ROOT, "src"),
            "-o", exe, src, os.path.join(ROOT, "src", "burnout3_carcol.c"),
            # burnout3_carcol.c consults build/backends.cfg (and the emulation
