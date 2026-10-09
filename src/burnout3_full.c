@@ -13925,6 +13925,25 @@ static void traffic_remove_angmom_axis(B3RigidBody* rb, int axis,
         rb->angmom[component] -= rb->frame[axis][component] * projected * scale;
 }
 
+/* FUN_00121400: trailer detachment handler.
+ * Transfers velocity to tractor if trailer is moving faster, then unlinks
+ * the bodies so the trailer becomes an independently simulated rigid body. */
+static void traffic_detach_trailer(TrafficCar* t) {
+    if (!t->trailer_linked) return;
+    t->trailer_linked = 0;
+    t->asleep = 0;
+    if (t->trailer_ready && t->trailer >= 0) {
+        float tr_speed = t->trailer_rb.vel[3];
+        if (tr_speed * 0.25f > t->speed) {
+            t->speed = tr_speed * 0.25f;
+            t->rb.vel[0] = sinf(t->yaw) * t->speed;
+            t->rb.vel[1] = 0.0f;
+            t->rb.vel[2] = -cosf(t->yaw) * t->speed;
+            t->rb.vel[3] = t->speed;
+        }
+    }
+}
+
 /* FUN_00120F30's articulated-body constraint: point velocities at the
  * trailer kingpin and tractor fifth wheel feed FUN_0010F8D0. Its returned
  * normal vector is written with opposite signs into the two +0x130
@@ -13950,8 +13969,8 @@ static void traffic_tow_constraint(TrafficCar* t, float dt) {
 
     b3_carcol_point_velocity(&t->rb, master_pt, master_v);
     b3_carcol_point_velocity(&t->trailer_rb, trailer_pt, trailer_v);
+    float dy = trailer_pt[1] - (master_pt[1] + 0.5f);
     if (B3_TRAFFIC_CARS[t->trailer].kingpin_spring && dt > 1e-6f) {
-        float dy = trailer_pt[1] - (master_pt[1] + 0.5f);
         float force[4] = {0.0f,
                           trailer_v[1] / dt * -1000.0f
                               + (dy - 0.3f) * -80000.0f,
@@ -13977,6 +13996,11 @@ static void traffic_tow_constraint(TrafficCar* t, float dt) {
         traffic_remove_angmom_axis(&t->rb, 1, 2.0f);
         traffic_remove_angmom_axis(&t->trailer_rb, 1, 2.0f);
     }
+    int kingpin = B3_TRAFFIC_CARS[t->trailer].kingpin_spring;
+    if (!kingpin && forward_dot < -0.5f) {
+        traffic_detach_trailer(t);
+        return;
+    }
     float up_dot = t->rb.frame[1][0] * t->trailer_rb.frame[1][0]
                  + t->rb.frame[1][1] * t->trailer_rb.frame[1][1]
                  + t->rb.frame[1][2] * t->trailer_rb.frame[1][2];
@@ -13986,10 +14010,25 @@ static void traffic_tow_constraint(TrafficCar* t, float dt) {
         traffic_remove_angmom_axis(&t->rb, 2, 1.5f);
         traffic_remove_angmom_axis(&t->trailer_rb, 2, 1.5f);
     }
-    if (sqrtf(d2) > 1.0f || forward_dot < -0.5f) {
-        t->trailer_linked = 0;
-        t->asleep = 0;
+    if (sqrtf(d2) > 1.0f || fabsf(dy) > 1.0f) {
+        traffic_detach_trailer(t);
+        return;
     }
+}
+
+/* FUN_0019FEC0: persistent avoidance nudge law.
+ * If current nudge is outside [-0.10, +0.10] m/s/frame, keeps it;
+ * otherwise draws a new random nudge in [-0.15, +0.12] m/s/frame,
+ * converted to m/s^2 for the harness. */
+static float traffic_avoid_nudge(float cur_nudge_ps) {
+    float cur_pf = cur_nudge_ps / 60.0f;
+    if (cur_pf < -0.10f || cur_pf > 0.10f)
+        return cur_nudge_ps;
+    float u = traffic_rng_f();
+    float val = u * 5.0f - 2.0f;
+    if (val < -0.15f) val = -0.15f;
+    if (val >  0.12f) val =  0.12f;
+    return val * 60.0f;
 }
 
 // FUN_0019F1C0 advances the retail road agent's persistent path cursor by
@@ -14136,8 +14175,7 @@ static void traffic_update(float dt) {
                  * the distribution is retail's even though the sequence
                  * cannot be (its seed is global). */
                 if (!t->avoid_active) {
-                    float u = traffic_rng_f();          /* [0,1) */
-                    t->avoid_nudge = (-0.15f + u * 0.27f) * 60.0f;
+                    t->avoid_nudge = traffic_avoid_nudge(t->avoid_nudge);
                     t->avoid_active = 1;
                 }
                 state = 4;

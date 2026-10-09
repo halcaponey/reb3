@@ -752,11 +752,11 @@ invented knock write-back and `1 − 4·dt` decay are gone. Residency gates and
 the coupled sleep byte run from collision-unit ownership. Towed rigs retain a
 second body, use the full raw `+0x16A8/+0x16A4` vectors at spawn and at the
 constraint, and use `FUN_0010F8D0` for the opposing normal deflections.
-The route driver is still missing. The recovered jackknife and roll
-angular-momentum projections, a conservative hitch-separation fallback, and
-the recovered `dot(Zaxis_a, Zaxis_b) < -0.5` unlink keep a separately
-simulated trailer body until the pool recycler reattaches it, and the retail
-vertical kingpin spring is now live. `FUN_00104840`, incidentally, is
+The detachment handler `FUN_00121400` (speed transfer and unlinking) is wired,
+with retail triggers on non-kingpin `dot(Z_a, Z_b) < -0.5`, vertical displacement
+`|dy| > 1.0 m` (@0x00121378), and horizontal separation `|d| > 1.0 m` (@0x00121350).
+The retail jackknife and roll angular-momentum projections and vertical kingpin
+spring are live. `FUN_00104840`, incidentally, is
 called HERE (@0x00120F7B /
 @0x00120FB7) rather than per frame: it zeroes
 `+0x160..+0x1BF`, `+0x212` **and sets `+0x1353 |= 4`** @0x00104848 — the bit
@@ -956,8 +956,9 @@ trigger distance `S+0x14` is recovered [C]: `FUN_001A3470` @0x001A37E1..0x001A37
 seeds both `S+0x08` and `S+0x14` with the agent's half-length (`myhalf`), and
 `FUN_0019F560` @0x0019FAB4 compares `gap` against `S+0x14` directly (no unlocated
 track data). `FUN_001A2B20`'s 0.45..0.5499 per-agent lateral initialization is
-retained, but the retail RNG sequence, `FUN_0019FEC0` avoidance magnitude, and
-neighbourhood-pool replacement policy remain GLUE.
+retained, and `FUN_0019FEC0`'s avoidance magnitude with its `[-0.10, +0.10]` latch
+window and `[-0.15, +0.12]` clamp is now live. The neighbourhood-pool replacement
+policy remains GLUE.
 The manager ordering is now also preserved:
 `FUN_001A20F0` performs speed, cursor, then occupancy for every selected road
 agent before it calls `FUN_001A6B40` for physical bodies and `FUN_001A8640`
