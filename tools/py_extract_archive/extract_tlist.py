@@ -77,9 +77,10 @@ _sys.path[:0] = [_os.path.dirname(_os.path.abspath(__file__)),
                  _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))]
 from b3_paths import game_path, game_root  # noqa: E402
 
-GAME_DIR = os.environ.get(
-    "B3_GAME_DIR",
-    game_root())
+try:
+    GAME_DIR = os.environ.get("B3_GAME_DIR", game_root())
+except (SystemExit, Exception):
+    GAME_DIR = ""
 TRACKS_DIR = os.path.join(GAME_DIR, "Tracks")
 TLIST = os.path.join(TRACKS_DIR, "tlist.bin")
 GLOBALUS = os.path.join(GAME_DIR, "Data", "Globalus.bin")

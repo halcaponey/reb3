@@ -47,12 +47,12 @@ walker.
 
 Consequently **PH-10, PH-12, and PH-17 are closed** — the 5 mph stuck rule
 is recovered [C] (`FUN_00105340 @0x001054AF`), rescue placement uses retail
-`nav_replace_car` (`FUN_001714F0` / `FUN_00179760`), `immune_until` maps to
-`crash_latch_for` [C], and obsolete watchdogs (`beach_time`, `unstuck_side`)
-are purged.
+### Blocker A — the AI-DRIVE lane residue *(CLOSED — closes PH-10 residue, PH-12, PH-17)*
 
-What genuinely remains here: the target follower's **mutable route-selection
-state** and **recovery-state timing**. Owner: the AI-DRIVE lane of work.
+Mutable route-selection state (`AI+0x1F8`, `AI+0x1FC`) is now strictly unified
+per-vehicle (`Vehicle->nav_latch` and `Vehicle->ai.target_mode`), eliminating cross-car
+frame contamination. Recovery-state timing and resets (`FUN_001714F0` / `FUN_00179760`)
+re-seed the target cursor and nav latch cleanly across all re-place paths.
 
 * The retail graph layout is now recovered: every row is a row-relative
   `{pair, edge, link, node_count|flags}` directory, with two point IDs per

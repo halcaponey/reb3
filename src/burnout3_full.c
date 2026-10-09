@@ -3700,7 +3700,8 @@ static int nav_latch_target(Vehicle* v, Vec3* target, float* corner_speed,
     if (brake_dist)
         *brake_dist = nav_plan_arclen(section, v->nav_node, L->win[0])
                     - nav_approach_dist(section, v->nav_node, v->pos);
-    g_nav_target_mode = L->latch;        /* AI+0x1F8 */
+    v->ai.target_mode = L->latch;        /* AI+0x1F8 */
+    g_nav_target_mode = L->latch;        /* mirror of caller vehicle */
     g_nav_mode_1fc    = L->mode_1fc;     /* AI+0x1FC */
     if (out_section) *out_section = section;
     if (out_node) *out_node = L->pub_node;
@@ -3720,11 +3721,17 @@ static int nav_plan_target(Vehicle* vehicle, Vec3* target,
     unsigned int node = vehicle->nav_target_node;
     if (vehicle->nav_target_ready
         && nav_plan_target_at(vehicle, section, node, target, corner_speed,
-                              brake_dist, out_section, out_node))
+                              brake_dist, out_section, out_node)) {
+        vehicle->ai.target_mode = g_nav_target_mode;
         return 1;
-    return nav_plan_target_at(vehicle, vehicle->nav_section, vehicle->nav_node,
-                              target, corner_speed, brake_dist, out_section,
-                              out_node);
+    }
+    if (nav_plan_target_at(vehicle, vehicle->nav_section, vehicle->nav_node,
+                           target, corner_speed, brake_dist, out_section,
+                           out_node)) {
+        vehicle->ai.target_mode = g_nav_target_mode;
+        return 1;
+    }
+    return 0;
 }
 
 static int nav_step_node(unsigned int* section, unsigned int* node, int dir) {
@@ -7024,6 +7031,8 @@ static int nav_replace_car(Vehicle* v, unsigned int section, unsigned int node,
     /* FUN_00179760: navigator +0x1D8 = 0xFFFF and the aggression sub-object
      * back to idle; FUN_0018CB60's take path zeroes the direction block. */
     v->nav_target_ready = 0;
+    nav_latch_reset(v);
+    v->ai.target_mode = v->nav_latch.latch;
     memset(v->ai.des_dir, 0, sizeof v->ai.des_dir);
     memset(v->ai.des_dir_n, 0, sizeof v->ai.des_dir_n);
     if (v->aggro_ready) b3_aggro_init(&v->aggro, g_race_time);
@@ -7091,6 +7100,8 @@ static int route_replace_car(Vehicle* v, int back, float speed_ms) {
     b3_emu_drop_car(v);
     /* FUN_00179760's navigator reset applies whichever placement is used. */
     v->nav_target_ready = 0;
+    nav_latch_reset(v);
+    v->ai.target_mode = v->nav_latch.latch;
     memset(v->ai.des_dir, 0, sizeof v->ai.des_dir);
     memset(v->ai.des_dir_n, 0, sizeof v->ai.des_dir_n);
     if (v->aggro_ready) b3_aggro_init(&v->aggro, g_race_time);
@@ -7466,8 +7477,8 @@ static void vehicle_update(Vehicle* v, float dt) {
         if (nav_aim_legacy() || nav_aim2_enabled()) {
             if (nav_plan_target(v, &target, &nav_corner_speed,
                                 &nav_brake_dist, &aim_section, &aim_node)) {
-                nav_target_mode = g_nav_target_mode;   /* AI+0x1F8 */
-                nav_mode_1fc    = g_nav_mode_1fc;      /* AI+0x1FC */
+                nav_target_mode = nav_aim2_enabled() ? v->nav_latch.latch : v->ai.target_mode; /* AI+0x1F8 */
+                nav_mode_1fc    = nav_aim2_enabled() ? v->nav_latch.mode_1fc : g_nav_mode_1fc; /* AI+0x1FC */
             }
         } else if (nav_plan_speed_ceiling()) {
             /* the planner's SPEED without the planner's AIM: the throwaway
@@ -7476,8 +7487,8 @@ static void vehicle_update(Vehicle* v, float dt) {
             Vec3 plan_aim_unused = target;
             if (nav_plan_target(v, &plan_aim_unused, &nav_corner_speed,
                                 &nav_brake_dist, &aim_section, &aim_node)) {
-                nav_target_mode = g_nav_target_mode;   /* AI+0x1F8 */
-                nav_mode_1fc    = g_nav_mode_1fc;      /* AI+0x1FC */
+                nav_target_mode = nav_aim2_enabled() ? v->nav_latch.latch : v->ai.target_mode; /* AI+0x1F8 */
+                nav_mode_1fc    = nav_aim2_enabled() ? v->nav_latch.mode_1fc : g_nav_mode_1fc; /* AI+0x1FC */
             }
         }
 
