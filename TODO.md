@@ -189,14 +189,18 @@ anti-tunnelling/bootstrapping nets, so the systems are not fully unified yet.
    active list interval tracking, Z/Y interval overlap gates, `(min, max)` index ordering,
    cap 0x100), and `b3_carcol_resolve` ports retail `FUN_00111CD0` Arm 4 car priority
    for secondary/crashed bodies. Verified in `tools/test_sap_broadphase.c`.
-2. **Wheel and chassis contact now share one frozen raw-collision snapshot**;
-   the chassis view applies `FUN_0011BBE0`'s recovered wall predicate. The
-   snapshot still omits retail's appended crash-floor records. This is now a
-   narrow source-data gap rather than an unknown algorithm: `FUN_00125790`
-   creates six transformed 0x40-byte records at `veh+0x11D0` and sets
-   `+0x1351`; `FUN_0011BC60` appends them as `0x26,0x26,0x1A,0x1A,0x1A,0x1A`.
-   Their sole caller, `FUN_0017D0F0`, receives a crash-director basis that the
-   harness does not yet model, so the records must not be synthesized.
+2. **Crash-floor & barrier staging caller integration — CLOSED (2026-10-09)**:
+   Wheel and chassis contact share one frozen raw-collision snapshot; the chassis view
+   applies `FUN_0011BBE0`'s recovered wall predicate.
+   Retail's crash-floor & barrier staging caller (`FUN_0017D0F0` @0x0017D0F0) is ported
+   as `b3_crash_director_stage_zone`: tests vehicle rigid body distance against zone center,
+   stages the closest zone's 6 boundary polygons into `veh+0x11D0` via `b3_vehicle_set_crash_floor`
+   (`FUN_00125790`), and sets `flags_1351 = 1`.
+   `FUN_0018BC90` is ported as `b3_crash_director_update_zones`: loops over active vehicles and
+   zones (initial `min_dist = 100000.0f` matching retail float `0x003A7950`).
+   Connected into the engine frame update at `0x001AA84A` right before `carcol_pass`.
+   When no zones are present (`num_zones == 0`), `flags_1351` is untouched without synthesizing
+   artificial records. Verified in `tools/test_crash_director_zones.c`.
 3. **Four manager stages audited — PROVEN NON-PHYSICS / PRESENTATION & MEMORY (CLOSED)**:
    `FUN_00114E60` (16 m proximity cache ported), `FUN_0010D1C0` (crash cooldown & camera tracker),
    `FUN_00164FB0` x2 (viewport/listener presentation), `FUN_00111850` (dead entity recycling).

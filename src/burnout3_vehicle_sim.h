@@ -1065,4 +1065,24 @@ void b3_vehicle_set_crash_floor(B3VehicleFull* v, const float points[6][4],
                                 const float basis[3][4], int mode);
 void b3_vehicle_clear_crash_floor(B3VehicleFull* v);
 
+/* Retail crash director zone descriptor (stride 0x70 in director table +0x140) */
+typedef struct B3CrashDirectorZone {
+    float points[6][4];  /* 6 boundary vertices (+0x00..+0x5F) */
+    float basis[3][4];   /* 3 orientation basis vectors (+0x00..+0x2F in basis rec) */
+    float center[4];     /* zone center position (+0x30..+0x3F in basis rec) */
+    int   zone_type;     /* 2 => mode 1, else mode 0 (+0x40 in basis rec) */
+} B3CrashDirectorZone;
+
+/* FUN_0017D0F0: evaluate one vehicle against one zone and stage if closer */
+int  b3_crash_director_stage_zone(B3VehicleFull* veh,
+                                 const float points[6][4],
+                                 const float basis[3][4],
+                                 const float center[4],
+                                 int zone_type,
+                                 float* min_dist);
+
+/* FUN_0018BC90: update crash zones for all active vehicles */
+void b3_crash_director_update_zones(B3VehicleFull** vehs, int num_vehs,
+                                    const B3CrashDirectorZone* zones, int num_zones);
+
 #endif // BURNOUT3_VEHICLE_SIM_H

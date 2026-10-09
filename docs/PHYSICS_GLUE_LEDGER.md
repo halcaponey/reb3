@@ -1362,10 +1362,16 @@ loop and PH-08's velocity write are deleted.  What is left:
    retail type-3 collision routing is aligned with recovered `carcol_pass`
    (`b3_props_resolve_pair` -> `b3_td_object_contact`). Sphere sweeps remain only
    as anti-tunnelling position containment nets.
-4. **The crash-floor append mechanism is landed** (B1) — **SAME-ORDER**:
+4. **The crash-floor append and director zone staging are landed** (B1) — **SAME-ORDER**:
    `b3_vehicle_set_crash_floor()` implements retail `FUN_00125790` (verified 8/8
    against Unicorn in `validate_port.py`); `harness_soup_freeze()` ports the
    `FUN_0011BC60 @0x0011BDA0` append with surfaces 0x26/0x1A and capacity guard (< 90).
+   The retail crash-director caller `FUN_0017D0F0` (`b3_crash_director_stage_zone`) and
+   multi-vehicle loop `FUN_0018BC90` (`b3_crash_director_update_zones`) are ported,
+   hooked at `FUN_001AA720 @0x001AA84A` before `carcol_pass`. Evaluates vehicle rigid body
+   distance against zone centers, stages the closest zone's 6 boundary polygons, and sets
+   `flags_1351 = 1`. If `num_zones == 0`, preserves `flags_1351` without synthesizing fake records.
+   Verified in `tools/test_crash_director_zones.c` (5/5 PASS).
 5. **Four manager stages audited — PROVEN NON-PHYSICS / PRESENTATION & MEMORY (SAME-ORDER)**:
    - `FUN_00114E60` @0x00110EB9: Ported as `b3_collision_manager_update_traffic_proximity()`
      (gathers up to 16 traffic indices within 16 m / 256.0 m^2 per racer slot).

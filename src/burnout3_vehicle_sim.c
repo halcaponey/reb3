@@ -2937,3 +2937,55 @@ void b3_vehicle_set_crash_floor(B3VehicleFull* v, const float points[6][4],
 void b3_vehicle_clear_crash_floor(B3VehicleFull* v) {
     if (v) v->flags_1351 = 0;
 }
+
+/* FUN_0017D0F0: crash director zone distance check and floor staging.
+ * Evaluates car against zone record. If closer than *min_dist, stages
+ * the 6 boundary polygons via b3_vehicle_set_crash_floor (FUN_00125790). */
+int b3_crash_director_stage_zone(B3VehicleFull* veh,
+                                const float points[6][4],
+                                const float basis[3][4],
+                                const float center[4],
+                                int zone_type,
+                                float* min_dist) {
+    if (!veh || !points || !basis || !center || !min_dist) return 0;
+    if (!veh->rb.frame) return 0;
+
+    /* Distance from vehicle center/frame origin (row 3) to zone center */
+    const float* vpos = veh->rb.frame[3];
+    float dx = vpos[0] - center[0];
+    float dy = vpos[1] - center[1];
+    float dz = vpos[2] - center[2];
+    float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+
+    if (dist < *min_dist) {
+        int mode = (zone_type == 2) ? 1 : 0;
+        b3_vehicle_set_crash_floor(veh, points, basis, mode);
+        *min_dist = dist;
+        return 1;
+    }
+    return 0;
+}
+
+/* FUN_0018BC90: update crash zones for all active vehicles.
+ * Scans all zones and stages the closest zone's crash-floor polygons
+ * into veh+0x11D0, setting flags_1351 = 1. If num_zones == 0, leaves
+ * flags_1351 untouched without synthesizing artificial records. */
+void b3_crash_director_update_zones(B3VehicleFull** vehs, int num_vehs,
+                                    const B3CrashDirectorZone* zones, int num_zones) {
+    if (!vehs || num_vehs <= 0 || !zones || num_zones <= 0) return;
+
+    /* Initial distance seed matching retail 0x003A7950 (100000.0f) */
+    float min_dist[32];
+    int n = num_vehs < 32 ? num_vehs : 32;
+    for (int i = 0; i < n; i++) min_dist[i] = 100000.0f;
+
+    for (int z = 0; z < num_zones; z++) {
+        const B3CrashDirectorZone* zone = &zones[z];
+        for (int i = 0; i < n; i++) {
+            if (!vehs[i]) continue;
+            b3_crash_director_stage_zone(vehs[i], zone->points, zone->basis,
+                                         zone->center, zone->zone_type, &min_dist[i]);
+        }
+    }
+}
+
