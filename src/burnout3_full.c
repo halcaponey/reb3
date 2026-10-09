@@ -5530,6 +5530,34 @@ static void harness_live_panels_step(void* user, B3VehicleFull* fs, float dt) {
     b3_panels_visual_pass(ps);
 }
 
+static int panels_soup_gather(const float center[3], const float half[3],
+                              B3WorldPoly* out_polys, int max_polys) {
+    if (!b3_collision_ready() || !out_polys || max_polys <= 0) return 0;
+    B3CollisionPoly soup[64];
+    int cap = max_polys < 64 ? max_polys : 64;
+    int nsoup = b3_collision_gather_rigid(center, half, soup, cap);
+    if (nsoup <= 0) return 0;
+    /* Chirality: harness -> game (negate Z on vertices and normal) */
+    for (int i = 0; i < nsoup; i++) {
+        out_polys[i].v[0][0] =  soup[i].v0[0];
+        out_polys[i].v[0][1] =  soup[i].v0[1];
+        out_polys[i].v[0][2] = -soup[i].v0[2];
+
+        out_polys[i].v[1][0] =  soup[i].v1[0];
+        out_polys[i].v[1][1] =  soup[i].v1[1];
+        out_polys[i].v[1][2] = -soup[i].v1[2];
+
+        out_polys[i].v[2][0] =  soup[i].v2[0];
+        out_polys[i].v[2][1] =  soup[i].v2[1];
+        out_polys[i].v[2][2] = -soup[i].v2[2];
+
+        out_polys[i].n[0]    =  soup[i].normal[0];
+        out_polys[i].n[1]    =  soup[i].normal[1];
+        out_polys[i].n[2]    = -soup[i].normal[2];
+    }
+    return nsoup;
+}
+
 static void full_sim_reset(Vehicle* v) {
     int slot = (int)(v - g_vehicles);
     float wxz[4][2] = {{-0.76f, 1.24f}, {0.76f, 1.24f},
@@ -5624,6 +5652,13 @@ static void full_sim_reset(Vehicle* v) {
     // pass uses (see the loop in vehicle_update).  The plane form above is
     // kept for the single-plane fallback callers.
     b3_wreck_set_world_soup(b3_rigid_body_obb_soup_contact);
+
+    // FUN_001072A0: detached panel / debris world contact soup gatherer
+    static int s_panels_gather_installed = 0;
+    if (!s_panels_gather_installed) {
+        s_panels_gather_installed = 1;
+        b3_panels_set_soup_gather(panels_soup_gather);
+    }
     // Seed the body's velocity from the harness pose (harness -> game:
     // z negated) so relaunches happen AT SPEED -- the retail relaunch
     // places the car then sets speed via FUN_001204C0 (the constants at

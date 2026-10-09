@@ -424,6 +424,13 @@ void b3_panels_health(B3PanelSet* s, float health, const B3WreckState* w);
 // b3_wreck_update runs first in the harness frame.
 void b3_panels_crash_frame(B3PanelSet* s, B3WreckState* w);
 
+// FUN_001072A0: optional gathered soup callback for retail 3D world polygon contact.
+// When installed, b3_panels_pieces_update gathers candidate polygons and runs
+// b3_rigid_body_obb_soup_contact (FUN_00107950) instead of a single ground plane.
+typedef int (*B3PanelsSoupGatherFn)(const float center[3], const float half[3],
+                                    B3WorldPoly* out_polys, int max_polys);
+void b3_panels_set_soup_gather(B3PanelsSoupGatherFn fn);
+
 // Piece flight only (gravity, ground contact, rest). `ground_y[k]` is the
 // collision height under detached piece k; exposed for the frame manager.
 void b3_panels_pieces_update(B3PanelSet* s,

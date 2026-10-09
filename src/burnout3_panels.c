@@ -499,11 +499,20 @@ void b3_panels_health(B3PanelSet* s, float health, const B3WreckState* w) {
 // 0.1 (FUN_00109270 @0x001094C5).
 #define B3_PIECE_RESTITUTION 0.1f     /* [0x003A69C4] @0x001094C5      [C] */
 
+static B3PanelsSoupGatherFn s_panels_soup_gather = NULL;
+
+void b3_panels_set_soup_gather(B3PanelsSoupGatherFn fn) {
+    s_panels_soup_gather = fn;
+}
+
 void b3_panels_pieces_update(B3PanelSet* s,
                              const float ground_y[B3_PANEL_MAX], float dt) {
     for (int k = 0; k < s->n; k++) {
         B3PanelPiece* p = &s->piece[k];
         if (!p->active) continue;
+        // Retail FUN_001072A0 @0x001072AC: if asleep (+0x20E != 0), skip
+        // world contact and integrator.
+        if (p->rest >= 1.0f) continue;
         p->life += dt;
 
         // ---- into GAME space (b3_mat_orthonormalize is chirality-bound;
@@ -548,17 +557,44 @@ void b3_panels_pieces_update(B3PanelSet* s,
         {
             const float* bbmin = p->bbmin;
             const float* bbmax = p->bbmax;
-            const float ppt[3] = { rb.frame[3][0], ground_y[k], rb.frame[3][2] };
-            const float pn[3] = { 0.0f, 1.0f, 0.0f };
             B3WorldContact ct;
             B3WorldContactResult res;
-            const int hit = b3_rigid_body_obb_plane_contact(
-                &rb, bbmin, bbmax, ppt, pn, &ct);
+            int hit = 0;
+
+            /* FUN_001072A0: if polygon soup gatherer is installed, gather
+             * candidate triangles within OBB + velocity travel and run
+             * FUN_00107950 (b3_rigid_body_obb_soup_contact). */
+            if (s_panels_soup_gather) {
+                const float travel = rb.vel[3] * dt;
+                float half[3];
+                for (int axis = 0; axis < 3; axis++) {
+                    float lo = fabsf(bbmin[axis]);
+                    float hi = fabsf(bbmax[axis]);
+                    half[axis] = (lo > hi ? lo : hi) + 0.5f + travel;
+                }
+                B3WorldPoly wp[32];
+                int nsoup = s_panels_soup_gather(p->frame[3], half, wp, 32);
+                if (nsoup > 0) {
+                    hit = b3_rigid_body_obb_soup_contact(&rb, bbmin, bbmax,
+                                                         wp, nsoup, &ct);
+                }
+            }
+
+            /* Fallback to single ground plane if no soup gathered or no mesh hit */
+            if (!hit) {
+                const float ppt[3] = { rb.frame[3][0], ground_y[k], rb.frame[3][2] };
+                const float pn[3] = { 0.0f, 1.0f, 0.0f };
+                hit = b3_rigid_body_obb_plane_contact(
+                    &rb, bbmin, bbmax, ppt, pn, &ct);
+            }
+
             b3_rigid_body_world_contact(&rb, p->mass, 7, c7.attach_2ba,
                                         B3_PIECE_RESTITUTION,
                                         hit ? &ct : NULL, &res);
             c7.grounded_212 = res.grounded;
-            for (int i = 0; i < 4; i++) c7.normal[i] = ct.normal[i];
+            if (hit) {
+                for (int i = 0; i < 4; i++) c7.normal[i] = ct.normal[i];
+            }
             if (res.sleep) p->rest = 1.0f; else p->rest = 0.0f;
         }
 
