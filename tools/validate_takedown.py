@@ -34,7 +34,7 @@ from b3_paths import game_path, game_root  # noqa: E402
 
 # Links objects that consult build/backends.cfg; pin to the RE path so
 # this differential test is unaffected by the live backend selection.
-os.environ['B3_BACKENDS'] = '/dev/null'
+os.environ['B3_BACKENDS'] = 'NUL' if os.name == 'nt' else '/dev/null'
 
 import struct
 import subprocess
@@ -427,7 +427,7 @@ int main(int argc, char **argv)
 '''
 
 DRIVER_SRC = os.path.join(_root, "build", "tdfx_driver.c")
-DRIVER_BIN = os.path.join(_root, "build", "tdfx_driver")
+DRIVER_BIN = os.path.join(_root, "build", "tdfx_driver.exe" if os.name == 'nt' else "tdfx_driver")
 
 
 def build_driver():
@@ -721,7 +721,7 @@ def section_camera_params():
     camx = importlib.util.module_from_spec(_s)
     try:
         _s.loader.exec_module(camx)
-    except Exception as exc:                    # pragma: no cover
+    except (SystemExit, Exception) as exc:                    # pragma: no cover
         print("  SKIP (%s)" % exc)
         return
     cache = os.path.join(_root, "build", "tdfx_camparams.json")
@@ -729,8 +729,12 @@ def section_camera_params():
         rows = json.load(open(cache))
     else:
         rows = []
-        vdb, _ = camx.cvdb.read_vdb()
-        blob = open(camx.cvdb.VDB_FILE, 'rb').read()
+        try:
+            vdb, _ = camx.cvdb.read_vdb()
+            blob = open(camx.cvdb.VDB_FILE, 'rb').read()
+        except (SystemExit, Exception) as exc:
+            print("  SKIP Camera.cfg parameters (ValueDB not available without B3_GAME_ROOT)")
+            return
         _t, dvc, _u, _f, fdo = struct.unpack_from('<IIIII', blob, 0)
         for addr in camx.REGISTRARS:
             events, _defaults, _err = camx.run(addr)

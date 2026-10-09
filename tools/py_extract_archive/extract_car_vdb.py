@@ -64,9 +64,14 @@ _spec = importlib.util.spec_from_file_location(
 ev = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ev)
 
-GAME_DIR = game_root()
-PVEH = os.path.join(GAME_DIR, "pveh")
-VDB_FILE = os.path.join(GAME_DIR, "Data", "vdb.xml")
+try:
+    GAME_DIR = game_root()
+    PVEH = os.path.join(GAME_DIR, "pveh")
+    VDB_FILE = os.path.join(GAME_DIR, "Data", "vdb.xml")
+except SystemExit:
+    GAME_DIR = None
+    PVEH = None
+    VDB_FILE = None
 
 REGISTRAR_64 = 0x00132D10      # player-car physics config, 64 params
 REGISTRAR_9 = 0x00134AC0       # reduced (traffic) config, 9 params
@@ -297,6 +302,9 @@ def known_param_offsets():
 # VDBParser.cs, confirmed against the file itself.
 # --------------------------------------------------------------------------
 def read_vdb():
+    global VDB_FILE
+    if not VDB_FILE or not os.path.exists(VDB_FILE):
+        VDB_FILE = game_path("Data", "vdb.xml")
     data = open(VDB_FILE, 'rb').read()
     t, dvc, unk1, fdc, fdo = struct.unpack_from('<IIIII', data, 0)
     assert t == 2, t
