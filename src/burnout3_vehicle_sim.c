@@ -894,7 +894,7 @@ void b3_mat_orthonormalize(float m[4][4]) {
 
 // FUN_00040ae0: invert a rigid transform in place (transpose the 3x3,
 // pos = -(pos . new rows)).
-static void b3_mat_invert_rigid(float m[4][4]) {
+void b3_mat_invert_rigid(float m[4][4]) {
     float t;
     t = m[0][1]; m[0][1] = m[1][0]; m[1][0] = t;
     t = m[0][2]; m[0][2] = m[2][0]; m[2][0] = t;

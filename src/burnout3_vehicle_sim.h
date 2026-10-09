@@ -444,6 +444,10 @@ _Static_assert(offsetof(B3RigidBody, frame)             == 0x140, "rb frame slot
 void b3_rigid_body_integrate(B3RigidBody* rb, float mass_kg, float com_height,
                              int in_race, int state6, float dt);
 
+// FUN_00040AE0: invert a rigid transform in place (transpose the 3x3,
+// pos = -(pos . new rows)).
+void b3_mat_invert_rigid(float m[4][4]);
+
 // Contact impulse (FUN_00106720): given a contact normal, the point and the
 // point's velocity, returns the SIGNED impulse magnitude j and writes n*|j|
 // into out_imp. FUN_00123FD0's suspension bottom-out block acts on j > 0.

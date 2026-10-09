@@ -153,11 +153,12 @@ collision triangles into their recovered contact solvers. Wreck containment
 and no-pipeline fallbacks still use sphere queries only as
 anti-tunnelling/bootstrapping nets, so the systems are not fully unified yet.
 
-* **PH-09 OBJECT arm** (`full.c:1412-1426`) — the wall arm is recovered. The
-  retail object arm is for collision-handle type-3 entities, including the
-  designated big-hit traffic vehicle, not generic scenery triangles. Static
-  props now report their recovered class through `b3_props`; the remaining
-  traffic type-3 lifecycle and designation flag are unknown.
+* **PH-09 OBJECT arm** (`full.c:1412-1426`) — CLOSED / LANDED. The wall arm
+  is recovered. Static props report their recovered class through `b3_props`.
+  Type-3 traffic promotion lifecycle is ported from retail `FUN_00114910` and
+  `FUN_00120BA0` (type 3 -> 4 promotion, `FUN_00040AE0` inverse frame,
+  `dir * speed` velocity, COM height `(half_ext.y - center_off.y) * 0.1f`,
+  designation byte, streamed flag, trailer promotion, and `FUN_00113960` wreck response).
 * **`crash_fired` consumer switch — landed for live racers.** `crash_fired`
   is the retail-faithful decision and now starts the existing wall-crash
   consequence path using its contact record. Retail's latch/cooldown is

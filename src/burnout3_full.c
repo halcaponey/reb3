@@ -10435,6 +10435,7 @@ static int        g_traffic_hull_ok[B3_TRAFFIC_CAR_MAX] = {0};
 static B3SfxPassState g_pass_state[B3_TRAFFIC_N];
 static B3CarMesh* g_traffic_lists[B3_TRAFFIC_CAR_MAX];
 static float g_traffic_ymin[B3_TRAFFIC_CAR_MAX] = {0};
+static float g_traffic_com_height[B3_TRAFFIC_CAR_MAX] = {0};
 // Traffic wheels (same .bgv-family records, shared relinker [C]; their
 // omission left traffic wheel-less and sunk to the body skirt, dump 023).
 static B3CarMesh* g_traffic_wheel_lists[B3_TRAFFIC_CAR_MAX];
@@ -11782,6 +11783,53 @@ static void traffic_tow_sleep_refresh(TrafficCar* t) {
                          (Vec3){sinf(t->yaw) * t->speed, 0.0f,
                                 -cosf(t->yaw) * t->speed});
         t->trailer_ready = 1;
+    }
+}
+
+/* FUN_00114910 -> FUN_00120BA0: Promote traffic object from type 3 to type 4 wreck.
+ * In retail, the collision object has its type stamped to 4 (@0x0011491D), a vehicle
+ * slot is claimed from gameworld+0x33780 (@0x0011497A), and FUN_00120BA0 binds the
+ * frame, inverts it via FUN_00040AE0, seeds forward direction from frame.at, seeds
+ * linear velocity as dir * speed, sets COM height from (half_ext.y - center_off.y)*0.1f,
+ * marks designation byte (+0x242B) and streamed (+0x242C), and recursively promotes
+ * any attached trailer. */
+static void traffic_promote(TrafficCar* t) {
+    if (!t || t->crashed_until > g_race_time) return;
+    t->crashed_until = g_race_time + 5.0f;
+    t->streamed = 1;
+
+    /* Rebuild inverse frame @0x00120D81 (FUN_00040AE0) */
+    b3_mat_invert_rigid(t->rb.inv_frame);
+
+    /* Dir and linear velocity from frame.at * speed @0x00120DE3..0x00120E3C */
+    float sy = sinf(t->yaw), cy = cosf(t->yaw);
+    t->rb.dir[0] = sy;
+    t->rb.dir[1] = 0.0f;
+    t->rb.dir[2] = cy;
+    t->rb.dir[3] = 0.0f;
+
+    t->rb.vel[0] = sy * t->speed;
+    t->rb.vel[1] = 0.0f;
+    t->rb.vel[2] = cy * t->speed;
+    t->rb.vel[3] = t->speed;
+
+    float orig_speed = t->speed;
+    t->speed = 0.0f;
+
+    /* Recursive trailer promotion @0x00114A6A */
+    if (t->trailer >= 0 && g_traffic_hull_ok[t->trailer]) {
+        t->trailer_ready = 1;
+        b3_mat_invert_rigid(t->trailer_rb.inv_frame);
+        float tsy = sinf(t->tr_yaw), tcy = cosf(t->tr_yaw);
+        t->trailer_rb.dir[0] = tsy;
+        t->trailer_rb.dir[1] = 0.0f;
+        t->trailer_rb.dir[2] = tcy;
+        t->trailer_rb.dir[3] = 0.0f;
+
+        t->trailer_rb.vel[0] = tsy * orig_speed;
+        t->trailer_rb.vel[1] = 0.0f;
+        t->trailer_rb.vel[2] = tcy * orig_speed;
+        t->trailer_rb.vel[3] = orig_speed;
     }
 }
 
@@ -14667,12 +14715,10 @@ static void traffic_interact(void) {
                     // driving into a pileup -- it wrecks, whatever the
                     // masses (GLUE; stops recovery chain-wrecking at
                     // junction mouths the oncoming line threads).
-                    t->crashed_until = g_race_time + 5.0f;
-                    t->speed = 0.0f;
+                    traffic_promote(t);
                 } else if (v->cfg.mass_kg >= t->mass_kg) {
                     // Traffic car is the smaller: it gets wrecked.
-                    t->crashed_until = g_race_time + 5.0f;
-                    t->speed = 0.0f;
+                    traffic_promote(t);
                     v->sim.speed *= 0.92f;
                     if (v == &g_player)
                         printf("[Burnout3] traffic hit: wrecked %s "
@@ -18911,13 +18957,7 @@ static void carcol_synth_rb(B3RigidBody* rb, Vec3 pos_gl, float y_origin,
     rb->vel[3] = sqrtf(rb->vel[0]*rb->vel[0] + rb->vel[2]*rb->vel[2]);
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++) rb->inv_frame[i][j] = rb->frame[i][j];
-    { float tt, (*m)[4] = rb->inv_frame, p[4];
-      tt = m[0][1]; m[0][1] = m[1][0]; m[1][0] = tt;
-      tt = m[0][2]; m[0][2] = m[2][0]; m[2][0] = tt;
-      tt = m[1][2]; m[1][2] = m[2][1]; m[2][1] = tt;
-      for (int c = 0; c < 4; c++)
-          p[c] = m[3][0]*m[0][c] + m[3][1]*m[1][c] + m[3][2]*m[2][c];
-      for (int c = 0; c < 4; c++) m[3][c] = -p[c]; }
+    b3_mat_invert_rigid(rb->inv_frame);
     rb->inv_inertia_body[0][0] = 0.0008f;
     rb->inv_inertia_body[1][1] = 0.0011f;
     rb->inv_inertia_body[2][2] = 0.0013f;
@@ -19309,6 +19349,9 @@ static void carcol_fill_traffic(CarColEntry* e, TrafficCar* t, int idx) {
                 bmax[c][0] =  1.0f; bmax[c][1] =  1.2f; bmax[c][2] =  hz;
                 bmin[c][0] = -1.0f; bmin[c][1] = -0.2f; bmin[c][2] = -hz;
             }
+            float half_ext_y = 0.5f * (bmax[c][1] - bmin[c][1]);
+            float center_off_y = 0.5f * (bmax[c][1] + bmin[c][1]);
+            g_traffic_com_height[c] = (half_ext_y - center_off_y) * 0.1f;
             have[c] = 1;
         }
         for (int k = 0; k < 3; k++) {
@@ -20770,17 +20813,14 @@ static void carcol_pass(void) {
                      * position. */
                     if (!ca && !cb) {
                         if (ct.crash_a) {
-                            ta->crashed_until = g_race_time + 5.0f;
-                            ta->speed = 0.0f;
+                            traffic_promote(ta);
                         }
                         if (ct.crash_b) {
-                            tb->crashed_until = g_race_time + 5.0f;
-                            tb->speed = 0.0f;
+                            traffic_promote(tb);
                         }
                     } else if (ca != cb && ct.crash_a) {
                         TrafficCar* fresh = ca ? tb : ta;
-                        fresh->crashed_until = g_race_time + 5.0f;
-                        fresh->speed = 0.0f;
+                        traffic_promote(fresh);
                     }
                 }
                 if (v && ti >= 0) {
@@ -20806,15 +20846,8 @@ static void carcol_pass(void) {
                          * VELOCITY of frame.at * that speed
                          * (@0x00120E20/0x00120E2E/0x00120E3C), and the
                          * traffic-manager slot plus its lane cursor are
-                         * destroyed (@0x00114BAC..).  Here the lane cursor
-                         * simply stops being read -- traffic_update() skips
-                         * a crashed car -- so the body only needs seeding. */
-                        t->rb.vel[0] =  sinf(t->yaw) * t->speed;
-                        t->rb.vel[1] =  0.0f;
-                        t->rb.vel[2] =  cosf(t->yaw) * t->speed;
-                        t->rb.vel[3] =  t->speed;
-                        t->crashed_until = g_race_time + 5.0f;
-                        t->speed = 0.0f;
+                         * destroyed (@0x00114BAC..). */
+                        traffic_promote(t);
                         carcol_wreck_racer_from_traffic(v, t, &ct);
                     } else if (ct.crash_a
                                && t->crashed_until > g_race_time) {
@@ -20952,11 +20985,16 @@ static void carcol_pass(void) {
                 for (int k = 0; k < 4; k++) t->trailer_rb.angmom[k] *= d;
             }
         }
-        b3_rigid_body_integrate(&t->rb, t->mass_kg, 0.0f, 0, 0,
+        float com_h = (t->car >= 0 && t->car < B3_TRAFFIC_CAR_MAX)
+            ? g_traffic_com_height[t->car] : 0.0f;
+        b3_rigid_body_integrate(&t->rb, t->mass_kg, com_h, wrecked, 0,
                                 g_delta_time);
-        if (t->trailer_ready)
+        if (t->trailer_ready) {
+            float tr_com_h = (t->trailer >= 0 && t->trailer < B3_TRAFFIC_CAR_MAX)
+                ? g_traffic_com_height[t->trailer] : 0.0f;
             b3_rigid_body_integrate(&t->trailer_rb, t->trailer_mass_kg,
-                                    0.0f, 0, 0, g_delta_time);
+                                    tr_com_h, wrecked, 0, g_delta_time);
+        }
         if (wrecked) {
             t->rb.frame[3][1] = keep_y;
             if (t->trailer_ready) t->trailer_rb.frame[3][1] = keep_ty;

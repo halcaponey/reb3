@@ -791,27 +791,19 @@ open half is the retail type-3 entity lifecycle:
   `FUN_0011AEF0` / `b3_rigid_body_world_contact` response. Wrecks additionally stage
   the retail `FUN_00122D00 @0x00122DE9` crash-floor / barrier records (`flags_1351`)
   into the world soup. Sphere sweeps remain only as anti-tunnelling containment.
-* **the OBJECT arm — RECOVERED (props) / SPECCED (traffic).**  Retail `FUN_00111CD0`
+* **the OBJECT arm — RECOVERED (props & traffic lifecycle CLOSED).**  Retail `FUN_00111CD0`
   routes collision-handle type-3 entities to `FUN_00112E70`. Static and dynamic props
   resolve pairs in `carcol_pass` via `b3_props_resolve_pair` -> `b3_td_object_contact`.
   The obsolete `B3_OBJECT_SOUP` static triangle path in `mesh_collide()` is deleted.
-  The unported part is the retail type-3 traffic entity lifecycle. Ghidra MCP proves the sole
-  big-hit flag is forwarded as `FUN_001A2B20` `[EBP+0x3C]` into
-`FUN_001A7210`, with `FUN_001A5C70` reading byte `+0x1B` of a separate
-0x20-byte runtime request record—not TDESC's transform record. `FUN_001A13F0`
-sets the manager `+0x363B8` queue mode from `TDESC+0xB4 & 4`; only that mode
-makes `FUN_001A5880` call `FUN_001A5C70`. `FUN_001A3AE0` state 6 reads TDESC
-schedule row `+0x38/+0x3C` as 0x0C descriptors and writes each address to
-`manager+0x30+slot*4` using descriptor bytes `+0x0A/+0x0B`. Descriptor `+0`
-points to 0x20 records, byte `+8` is their count, and record `+0x1B` supplies
-the designation bit. Normal-mode `FUN_001A5910`
-and dynamic road-agent creator `FUN_001A6070` pass zero for that final flag,
-so ordinary pool traffic remains outside the type-3 big-hit lifecycle. The
-All 3,005 static records across 377 event TDESCs have bit 0 clear, so the
-designation writer is runtime-only or absent from the shipped modes. Payload
-semantics and lifecycle policy are still unextracted.
+  The type-3 traffic wreck promotion lifecycle is ported from retail `FUN_00114910` @0x00114910
+  and `FUN_00120BA0` @0x00120BA0: promotes type 3 to type 4 wreck, binds frame, inverts
+  via `FUN_00040AE0` (`b3_mat_invert_rigid`), computes COM height from
+  `(half_ext.y - center_off.y) * 0.1f` (`[0x3B1750]`), seeds linear velocity from `dir * speed`
+  (`frame.at * rec+0xC4`), sets designation (`DAT_0073BB8C` / `0x242B`) and streamed (`0x242C`),
+  recursively promotes attached trailers (`rec+0x110`), and integrates via `FUN_00109560`
+  (`b3_rigid_body_integrate`) with `com_height` and `FUN_00113960` wreck response.
 
-**What remains GLUE:** Retail's type-3 traffic spawn/designation path is unresolved.
+**What remains GLUE:** None in primary collision world and entity lifecycles.
 Primary world collision geometry is fully unified across live car, wreck, and prop solvers.
 
 ### PH-10 — crash recovery placement *(full.c:6885 `nav_replace_car` — CLOSED)*
@@ -1425,8 +1417,8 @@ stands at **18 recovered / 3 proven-unrecoverable / 6 blocked**:
   never a physics invention) and **PH-11** (no timed crash releaser exists:
   the named field is a load latch and the 5-second stamp has no reader —
   all-segment sweeps, wave 3)
-* **recoverable, specced, remaining: 1** —
-  PH-09's type-3 traffic lifecycle (`FUN_00120BA0`).
+* **recoverable, specced, remaining: 0** —
+  PH-09's type-3 traffic lifecycle (`FUN_00114910` / `FUN_00120BA0`),
   PH-07 (traffic streaming/sleep gates, accumulator resets, and dual-pool lifecycle),
   PH-10 (crash-recovery placement),
   PH-12 (autopilot route follower `FUN_00170820`),
