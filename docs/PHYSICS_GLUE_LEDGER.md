@@ -784,16 +784,17 @@ that produces `contact_n`.  **SPLIT (this wave).**  Collision triangles now
 feed the live-racer, wreck, and knocked-prop world resolvers; the remaining
 open half is the retail type-3 entity lifecycle:
 
-* **the WALL arm — RECOVERED.**  `b3_collision_gather_walls` supplies nearby
-  collision triangles to the frozen live-car soup and to wrecks; each polygon
-  reaches the recovered box clip and `FUN_0011AEF0` response. Knocked props
-  use that same soup with `b3_rigid_body_world_contact`. Sphere sweeps remain
-  only as anti-tunnelling containment or no-pipeline fallback.
-* **the OBJECT arm — PARTLY RECOVERED.**  It is not a generic scenery-hull
-  path: `FUN_00111CD0` routes collision-handle type-3 entities here. Static
-  props report their recovered object class through `b3_props`, and
-  `b3_td_object_contact` ports the narrow phase/trigger. The unported part is
-  the retail type-3 traffic entity lifecycle. Ghidra MCP proves the sole
+* **the WALL arm — RECOVERED.**  `b3_collision_gather_walls` / `b3_collision_gather_rigid`
+  supplies nearby collision triangles to the frozen live-car soup, to wrecks,
+  and to knocked props; each polygon reaches the recovered box clip and
+  `FUN_0011AEF0` / `b3_rigid_body_world_contact` response. Wrecks additionally stage
+  the retail `FUN_00122D00 @0x00122DE9` crash-floor / barrier records (`flags_1351`)
+  into the world soup. Sphere sweeps remain only as anti-tunnelling containment.
+* **the OBJECT arm — RECOVERED (props) / SPECCED (traffic).**  Retail `FUN_00111CD0`
+  routes collision-handle type-3 entities to `FUN_00112E70`. Static and dynamic props
+  resolve pairs in `carcol_pass` via `b3_props_resolve_pair` -> `b3_td_object_contact`.
+  The obsolete `B3_OBJECT_SOUP` static triangle path in `mesh_collide()` is deleted.
+  The unported part is the retail type-3 traffic entity lifecycle. Ghidra MCP proves the sole
   big-hit flag is forwarded as `FUN_001A2B20` `[EBP+0x3C]` into
 `FUN_001A7210`, with `FUN_001A5C70` reading byte `+0x1B` of a separate
 0x20-byte runtime request record—not TDESC's transform record. `FUN_001A13F0`
@@ -809,10 +810,8 @@ All 3,005 static records across 377 event TDESCs have bit 0 clear, so the
 designation writer is runtime-only or absent from the shipped modes. Payload
 semantics and lifecycle policy are still unextracted.
 
-**What remains GLUE:** caller coverage and entity lifecycle, not the primary
-world-plane source. The collision gather applies harness streaming filters and
-no-pipeline callers still fall back to a sphere query. Retail's type-3 traffic
-spawn/designation path is also unresolved.
+**What remains GLUE:** Retail's type-3 traffic spawn/designation path is unresolved.
+Primary world collision geometry is fully unified across live car, wreck, and prop solvers.
 
 ### PH-10 — crash recovery placement *(full.c:6885 `nav_replace_car` — CLOSED)*
 
@@ -1351,10 +1350,15 @@ loop and PH-08's velocity write are deleted.  What is left:
    triggers (jackknife > 120°, separation > 1.0 m, dy > 1.0 m) are ported.
    Redundant $O(N^2)$ inner reservation rebuilds eliminated.
    Neighborhood-pool replacement policy remains GLUE.
-3. **The contact GEOMETRY is partly unified** (PH-09). Live-car, wreck, and
-   knocked-prop response receive gathered collision triangles. Sphere sweeps
-   remain only as anti-tunnelling containment and no-pipeline fallbacks; the
-   retail type-3 traffic lifecycle remains outside the shared path.
+3. **The contact GEOMETRY is unified** (PH-09) — **SAME-ORDER**:
+   Live-car, wreck, and knocked-prop response receive gathered collision
+   triangles (`b3_collision_gather_rigid` / `b3_collision_gather_walls`).
+   Wreck contact staging implements retail `FUN_00122D00 @0x00122DE9` crash-floor
+   and barrier append (`wp` from `v->fsim.crash_floor_poly` when `flags_1351` is set).
+   Obsolete `B3_OBJECT_SOUP` static triangle routing in `mesh_collide()` is cleaned up;
+   retail type-3 collision routing is aligned with recovered `carcol_pass`
+   (`b3_props_resolve_pair` -> `b3_td_object_contact`). Sphere sweeps remain only
+   as anti-tunnelling position containment nets.
 4. **The crash-floor append mechanism is landed** (B1) — **SAME-ORDER**:
    `b3_vehicle_set_crash_floor()` implements retail `FUN_00125790` (verified 8/8
    against Unicorn in `validate_port.py`); `harness_soup_freeze()` ports the

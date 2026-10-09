@@ -4784,29 +4784,13 @@ static void mesh_collide(Vehicle* v) {
                      * burnout3_td_rules.h section 10).  v_rel is the object's
                      * point velocity minus the car's; a soup triangle is
                      * static, so it is -v.  Game space: z negated. */
-                    /* DEFAULT OFF (B3_OBJECT_SOUP=1 re-enables): mapping the
-                     * soup's structure band onto the object trigger misfired
-                     * in live play -- retail's object path fires ONLY
-                     * against type-3 PROP ENTITIES (and the designated
-                     * big-hit traffic vehicle); static world geometry never
-                     * routes through it, only through the wall test with
-                     * its dv + head-on gates.  A 160 mph brush against a
-                     * structure-typed SURFACE cleared the 75 mph closing
-                     * bar with no head-on requirement and wrecked the user
-                     * out of nowhere ("my car randomly stopped moving").
-                     * The real consumer is the props system's entities. */
-                    static int soup_obj = -1;
-                    if (soup_obj < 0)
-                        soup_obj = getenv("B3_OBJECT_SOUP") != NULL;
-                    if (soup_obj && b3_collision_is_structure(stype)) {
-                        float vr[3] = {-v->vel.x, -v->vel.y, v->vel.z};
-                        float on[3] = {px, 0.0f, -pz};
-                        b3_td_object_contact(
-                            &g_tdr, sl, g_race_time, vr, on, v->fsim.mass,
-                            b3_td_object_class(3, 0),   /* prop  -> class 2 */
-                            b3_td_object_class(0, 0),   /* racer -> class 0 */
-                            g_race_time < v->immune_until);
-                    }
+                    /* PH-09 TYPE-3 OBJECT ROUTING: Retail's object collision
+                     * path (FUN_00111CD0 @0x00111D77 -> FUN_00112E70) fires
+                     * strictly against type-3 entity pairs (props and designated
+                     * big-hit traffic), not static world geometry. Static world
+                     * triangles route solely through wall contact (FUN_0011AEF0).
+                     * Prop pairs are resolved in carcol_pass via
+                     * b3_props_resolve_pair() -> b3_td_object_contact(). */
                     // veh+0x212: FUN_0011AEF0 sets it when it resolves a
                     // chassis contact; FUN_0011ECF0 vetoes the steer-away
                     // envelope for that frame.
@@ -8598,6 +8582,34 @@ static void vehicle_update(Vehicle* v, float dt) {
                     memcpy(wp[poly].v[1], soup[poly].v1, sizeof wp[poly].v[1]);
                     memcpy(wp[poly].v[2], soup[poly].v2, sizeof wp[poly].v[2]);
                     memcpy(wp[poly].n,    soup[poly].normal, sizeof wp[poly].n);
+                }
+                /* FUN_00122D00 @0x00122DE9: if byte veh+0x1351 is set, append the
+                 * 6 crash-floor / barrier records staged at veh+0x11D0.
+                 * The crash-floor polys are stored in GAME space, so mirror Z
+                 * to convert them to HARNESS space (which b3_wreck_world_contact_soup
+                 * reflects back to GAME space).
+                 * If nsoup >= 90 (0x5A), clear flags_1351 and skip the append. */
+                if (v->fsim_ready && v->fsim.flags_1351) {
+                    if (nsoup < 0x5A && nsoup + 6 <= B3_CHASSIS_SOUP_MAX) {
+                        for (int k = 0; k < 6; k++) {
+                            const B3CrashPoly* cp = &v->fsim.crash_floor_poly[k];
+                            wp[nsoup].v[0][0] =  cp->p0[0];
+                            wp[nsoup].v[0][1] =  cp->p0[1];
+                            wp[nsoup].v[0][2] = -cp->p0[2];
+                            wp[nsoup].v[1][0] =  cp->p1[0];
+                            wp[nsoup].v[1][1] =  cp->p1[1];
+                            wp[nsoup].v[1][2] = -cp->p1[2];
+                            wp[nsoup].v[2][0] =  cp->p2[0];
+                            wp[nsoup].v[2][1] =  cp->p2[1];
+                            wp[nsoup].v[2][2] = -cp->p2[2];
+                            wp[nsoup].n[0]    =  cp->n[0];
+                            wp[nsoup].n[1]    =  cp->n[1];
+                            wp[nsoup].n[2]    = -cp->n[2];
+                            nsoup++;
+                        }
+                    } else {
+                        v->fsim.flags_1351 = 0;
+                    }
                 }
                 b3_wreck_world_contact_soup(wk, wp, nsoup);
             }
