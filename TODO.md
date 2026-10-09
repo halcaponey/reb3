@@ -276,11 +276,12 @@ Runs and renders on the Pixel (Mali, Android 16). See `docs/ANDROID_PORT.md`.
   now bundles all runtime per-track data files (`envmap.png`, `light_probes.bin`,
   `props.bin`, `route.bin`, `grid.bin`, `traffic.bin`, `nav_edges.bin`,
   `traffic_paths.bin`, `pace.bin`).
-* **Asset diet** — `build/cars/` is 133 MiB of the 143 MiB payload. Restricting
-  it to the roster slots plus the `.bgd` traffic set should drop the APK under
-  60 MiB. The packer used to read the tables out of the two generated headers;
-  it now has to read the same data from the runtime sources
-  (`build/cars/roster.bin` and the per-track `traffic.bin`).
+* **Asset diet — RESOLVED.** `pack_assets.sh` restricts `build/cars/`
+  to the 8 roster slots (`roster.bin`) plus the active track's `.bgd` traffic
+  set (`traffic.bin`) when `B3_PACK_ALL_CARS` is 0 (default). This drops the
+  staged car payload from 133 MiB down to 39 MiB and the packed asset zip down
+  to 55 MiB (< 60 MiB target). `B3_PACK_ALL_CARS=1` remains available to pack
+  the full fleet.
 * **Crash audio beds are not packed** (`B3_PACK_CRASH_AUDIO=1`, ~147 MiB), so
   the phone logs "no crash beds" and crashes are quiet.
 * **On-device asset sideload** so another track can be `adb push`ed without a
@@ -493,10 +494,10 @@ Chromium over CDP — never a visible browser).
   about 100–150×, and that is measured against a nearly idle headless main
   thread — the old path's *best* case, since its cost is a queue round trip
   that grows with whatever else the main thread is doing.
-* **Still open, same area:** the crash-trace *open* probes up to 1 000
-  candidate paths with `fopen(..., "r")` to pick its number
-  (`crash_trace_tick`, `burnout3_full.c`) — one expensive frame per crash, on
-  both targets. A remembered counter would do.
+* **The crash-trace open probe — RESOLVED.** `crash_trace_tick` in
+  `src/burnout3_full.c` now maintains a persistent `static int next_n = 1`
+  counter across crashes, eliminating the O(N) probe loop of `fopen(..., "r")`
+  on every crash start.
 * **The menu frame loop is 69–135 ms with `sim`/`render` near zero** and is
   unexplained. It is NOT the frame-limiter defect fixed in the sixth wave — the
   menu screens use their own throttle (`if (now - last < 16) SDL_Delay(...)`),

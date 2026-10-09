@@ -45,13 +45,10 @@ mkdir -p "$b"
 link() {  # link <src-file-or-dir> <dest-path-under-build/>
     local s="$1" d="$b/$2"
     [ -e "$s" ] || { echo "  (skip, absent) $s"; return 0; }
+    s=$(readlink -f "$s" 2>/dev/null || echo "$s")
     mkdir -p "$(dirname "$d")"
-    # The staging dir usually sits on tmpfs while build/ is on ext4, so the
-    # hard-link attempt fails cross-filesystem AFTER creating the directory
-    # skeleton; a bare `cp -a dir existing-dir` would then nest (dir/dir/...).
-    # Scrub the destination before each attempt so both paths copy TO $d.
     rm -rf "$d"
-    cp -al "$s" "$d" 2>/dev/null || { rm -rf "$d"; cp -a "$s" "$d"; }
+    cp -al "$s" "$d" 2>/dev/null || { rm -rf "$d"; cp -aL "$s" "$d"; }
 }
 
 echo "== packing track $track =="
@@ -76,7 +73,66 @@ for f in envmap.png light_probes.bin props.bin route.bin grid.bin traffic.bin na
 done
 
 # -- 3. art banks
-link "$src/cars"        cars
+if [ "${B3_PACK_ALL_CARS:-0}" = "1" ]; then
+    link "$src/cars"        cars
+else
+    # Asset diet: shared metadata + 8 roster slots + track traffic cars
+    for f in roster.bin car_physics.bin carbvh.bin; do
+        [ -e "$src/cars/$f" ] && link "$src/cars/$f" "cars/$f"
+    done
+    python3 -c "
+import os, struct, sys
+
+track, src = sys.argv[1], sys.argv[2]
+roster_path = os.path.join(src, 'cars', 'roster.bin')
+traffic_path = os.path.join(src, 'tracks', track, 'traffic.bin')
+
+cars = set()
+if os.path.exists(roster_path):
+    with open(roster_path, 'rb') as f:
+        f.seek(8)
+        n = struct.unpack('<I', f.read(4))[0]
+        f.seek(24)
+        seen = 0
+        for _ in range(n):
+            rec = f.read(64)
+            fn = rec[:16].split(b'\x00')[0].decode()
+            cls = rec[16:24].split(b'\x00')[0].decode()
+            kind = struct.unpack('<I', rec[40:44])[0]
+            if kind == 0:
+                base = fn.split('.')[0]
+                cars.add(f'{cls}_{base}')
+                seen += 1
+                if seen >= 8:
+                    break
+
+player_env = os.environ.get('B3_PLAYER_CAR')
+if player_env:
+    cars.add(player_env)
+
+if os.path.exists(traffic_path):
+    with open(traffic_path, 'rb') as f:
+        f.seek(8)
+        ntraf = struct.unpack('<I', f.read(4))[0]
+        f.seek(28)
+        for _ in range(ntraf):
+            rec = f.read(72)
+            cls = rec[16:24].split(b'\x00')[0].decode()
+            car = rec[24:40].split(b'\x00')[0].decode()
+            cars.add(f'{cls}_{car}')
+
+for c in sorted(cars):
+    print(c)
+" "$track" "$src" | while read -r car_prefix; do
+        [ -n "$car_prefix" ] || continue
+        for cf in "$src/cars/${car_prefix}"*; do
+            [ -e "$cf" ] && link "$cf" "cars/$(basename "$cf")"
+        done
+        if [ -d "$src/cars/parts/${car_prefix}" ]; then
+            link "$src/cars/parts/${car_prefix}" "cars/parts/${car_prefix}"
+        fi
+    done
+fi
 link "$src/frontend"    frontend
 link "$src/carfx"       carfx
 link "$src/particlefx"  particlefx
@@ -133,7 +189,22 @@ fi
 
 mkdir -p "$(dirname "$out")"
 rm -f "$out"
-( cd "$stage" && zip -qr -"$zip_level" -X "$out" build )
+if command -v zip >/dev/null 2>&1; then
+    ( cd "$stage" && zip -qr -"$zip_level" -X "$out" build )
+else
+    python3 -c "
+import os, sys, zipfile
+
+out_path, stage_dir, comp_level = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with zipfile.ZipFile(out_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=comp_level) as zf:
+    for root, dirs, files in os.walk(os.path.join(stage_dir, 'build'), followlinks=True):
+        for file in files:
+            full = os.path.join(root, file)
+            if os.path.isfile(full):
+                rel = os.path.relpath(full, stage_dir)
+                zf.write(full, rel)
+" "$out" "$stage" "$zip_level"
+fi
 
 echo
 echo "staged (uncompressed): $(du -sh "$stage" | cut -f1)"
