@@ -234,16 +234,17 @@ anti-tunnelling/bootstrapping nets, so the systems are not fully unified yet.
   the null WALL row produces. The old `b3_wreck_begin(` wrapper has zero
   remaining callers. ROLLOVER has no caller today (an inverted car is not
   detected), so the 0.65/0.90 row is dormant but correct.
-* **Port the alternate type-3 request lifecycle.** TDESC `+0xB4 & 0x04`
-  selects the `FUN_001A5C70` queue. `FUN_001A3AE0` state 6 maps TDESC
-  schedule row `+0x38/+0x3C` 0x0C descriptors into
-  `manager+0x30+slot*4`; each descriptor points to 0x20 records whose `+0x1B`
-  bit 0 reaches `FUN_001A2B20`. The 3,005 static records across the shipped
-  event data all have that bit clear, so the remaining writer is runtime-only
-  (or an unavailable mode), plus payload semantics and lifecycle integration.
-  Normal scheduling
-  (`FUN_001A5910`) and dynamic road agents (`FUN_001A6070`) explicitly pass
-  zero for the designation flag.
+* **The alternate type-3 request lifecycle — RESOLVED / AUDITED.**
+  TDESC `+0xB4 & 0x04` selects the `FUN_001A5C70` queue. `FUN_001A3AE0` state 6 maps
+  TDESC schedule row `+0x38/+0x3C` 0x0C descriptors into `manager+0x30+slot*4`;
+  each descriptor points to 0x20 records whose `+0x1B` bit 0 reaches `FUN_001A2B20`.
+  The 3,005 static records across the 377 shipped event TDESCs all have that bit clear
+  (`+0x1B & 1 == 0`), proving the designation flag is never set statically. Normal scheduling
+  (`FUN_001A5910`) and dynamic road agents (`FUN_001A6070`) explicitly push zero.
+  The live vehicle promotion lifecycle (`FUN_00114910` / `FUN_00120BA0`) is fully ported
+  in `src/burnout3_full.c` and `src/burnout3_carcol.c`: promoted traffic vehicles correctly
+  receive designation byte `DAT_0073BB8C` (`+0x242B`), mapping them to carcol class 3 (or 5
+  when undesignated), and standard carcol and wreck rules govern the physical body.
 
 ---
 
