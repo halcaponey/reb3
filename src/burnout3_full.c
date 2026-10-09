@@ -303,12 +303,10 @@ typedef struct {
     B3AiAggro     aggro;
     B3AiAggroSpeed aggspd;
     int   aggro_ready;
-    Vec3  stuck_ref;            // GLUE wall-grind detector: last reference
+    Vec3  stuck_ref;            // fallback pinned detector: last reference
     float stuck_ref_time;       //   position + when it was taken
-    int   unstuck_side;         // GLUE: alternating lateral escape side
-    float unstuck_until;        // GLUE: aim-offset active until this clock
-    float immune_until;         // GLUE post-recovery grace so a parked car is
-                                // not endlessly re-wrecked by passing traffic
+    float immune_until;         // [C] FUN_0010DD20 crash latch (rec+0x130 via
+                                // crash_latch_for), prevents immediate re-crash
     unsigned char taken_down_by[8]; // revenge flags (score+0x5B9 semantics)
     float tick_acc;           // fixed-step accumulator for the pipeline
 
@@ -15033,8 +15031,6 @@ static void reset_gameplay_state(Vehicle* v) {
     v->immune_until = 0.0f;
     v->stuck_ref = (Vec3){0, 0, 0};    // far off-track: re-referenced at once
     v->stuck_ref_time = 0.0f;
-    v->unstuck_side = 0;
-    v->unstuck_until = 0.0f;
     memset(v->taken_down_by, 0, sizeof v->taken_down_by);
     if (!g_tdr_ready) {
         b3_td_reset(&g_tdr, g_num_vehicles);

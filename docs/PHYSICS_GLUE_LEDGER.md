@@ -1123,14 +1123,20 @@ PH-02 hypothesis above is REFUTED by measurement.**
    `period / divisor`, the same expression bit for bit.  Comment corrected
    to [C]; no behaviour change.
 
-### PH-17 — off-world / stuck watchdogs *(full.c:146-152, 1794-1846, 2602 — 5 marks)*
+### PH-17 — off-world / stuck watchdogs — **RECOVERED & CLOSED**
 
-`stuck_ref`, `unstuck_side/until`, `immune_until`, the wall-grind detector and
-the off-world drop recovery (`beach_time` / `beach_ref_prog` were dead and purged).
-Retail's equivalent is the 5 mph stuck rule plus the nav-graph re-place.
-**Recoverable — partially** (the 5 mph rule is known); the rest exists because
-the harness's road representation is two drive lines (full.c:5645).
-**Blocked on:** the nav graph (PH-10/PH-12).
+* **The 5 mph stuck rule — RECOVERED [C].** Retail driver `FUN_00105340 @0x001054AF`:
+  when car speed drops below 5.0 mph (`[0x003B1694]`), arms `veh+0x1578` (`stuck_arm_1578`)
+  to 1.0 s; upon zeroing, triggers a 2.0 s reverse burst via `veh+0x157C` (`reverse_timer_157C`).
+  Ported in `src/burnout3_ai.c:641-648`.
+* **The rescue placement — RECOVERED [C].** Retail `FUN_001714F0` (`nav_replace_car`)
+  plus reset helper `FUN_00179760` places stalled/off-world cars ~3 nodes back along the `.bgd`
+  ribbon at relaunch speed 30 mph (`FUN_001204C0`). Ported in `src/burnout3_full.c:6935`.
+* **`immune_until` — RECOVERED [C].** Proven to be retail `FUN_0010DD20` per-slot crash latch
+  at `crash_record+0x130` via `crash_latch_for(v)` (`burnout3_crash.h:653-670`). Not GLUE.
+* **Dead watchdogs purged.** Obsolete `beach_time`, `beach_ref_prog`, `unstuck_side`, and
+  `unstuck_until` are purged from `Vehicle`. The remaining `stuck_ref` is only a fallback pinned
+  guard triggering `nav_replace_car`.
 
 ---
 
@@ -1414,13 +1420,12 @@ stands at **18 recovered / 3 proven-unrecoverable / 6 blocked**:
   never a physics invention) and **PH-11** (no timed crash releaser exists:
   the named field is a load latch and the 5-second stamp has no reader —
   all-segment sweeps, wave 3)
-* **recoverable, specced, and BLOCKED ON ANOTHER AGENT'S FILES: 6** —
+* **recoverable, specced, remaining: 3** —
   PH-07 and PH-13 (both need the remaining `FUN_00120F30` road-agent branches
-  ported into `full.c`'s traffic section), PH-09's type-3 traffic lifecycle,
-  PH-10, PH-12 and
-  PH-17 (all three need the `.bgd` nav-node walk `FUN_00179760`, AI-DRIVE's
-  wave).  Every one of them names the retail function and the blocker; none
-  of them is waiting on information from the executable.
+  ported into `full.c`'s traffic section), and PH-09's type-3 traffic lifecycle.
+  PH-10, PH-12, and PH-17 are CLOSED (nav-graph replacement `FUN_001714F0`,
+  autopilot follower `FUN_00170820`, 5 mph stuck countdown `FUN_00105340`,
+  and `FUN_0010DD20` crash latch).
 * **CLOSED by the CRASH-AUDIT wave: the `crash_fired` CONSUMER switch.**  It
   is landed, its "one wall source" precondition turned out to be met (the
   segment arm is orphaned — `apply_track_constraints()` has no caller, so
