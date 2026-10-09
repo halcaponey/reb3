@@ -14031,99 +14031,91 @@ static float traffic_avoid_nudge(float cur_nudge_ps) {
     return val * 60.0f;
 }
 
-// FUN_0019F1C0 advances the retail road agent's persistent path cursor by
-// speed * frame time, then FUN_0019FFA0 turns that cursor into its target
-// transform through the recovered clamped four-knot sampler.
+// FUN_001A20F0: retail road-agent manager multi-pass per-frame update.
+//   Pass 1 (0x001A250E): FUN_0019F560 speed law (cruise ramp, avoid nudge, follower)
+//   Pass 2 (0x001A2540): FUN_0019F1C0 mover (advance cursor, FUN_0019FFA0 B-spline, branching)
+//   Pass 3 (0x001A255D): FUN_0019F3B0 occupancy & reservations update
+//   Pass 4 (0x001A2610 / 0x001A2641): FUN_001A6B40 / FUN_001A8640 rigid bodies & articulated units
 static void traffic_update(float dt) {
     traffic_pool_refresh();
-    traffic_reservations_rebuild();
+
+    /* Wreck maintenance: parked wrecks stay parked while visible; off-camera
+     * expired wrecks are returned to the pool (or reseeded in legacy mode). */
     for (int i = 0; i < g_traffic_n; i++) {
         TrafficCar* t = &g_traffic[i];
-        if (!t->active) continue;
-        Vec3 body_pos = {t->rb.frame[3][0],
-                         t->rb.frame[3][1] + 0.5f + g_traffic_ymin[t->car],
-                        -t->rb.frame[3][2]};
-        int raw_path = traffic_paths_active();
-        if (t->crashed_until > 0.0f) {
-            /* THE WRECK DOES NOT VANISH WHILE YOU ARE LOOKING AT IT.
-             *
-             * Retail's answer to a wrecked traffic car is PROMOTION, not
-             * deletion: FUN_00114910 stamps the collision object's type to 4
-             * (@0x0011491D `MOV byte [EDI],4`), takes a free 0x2430-byte
-             * articulated-vehicle record out of the pool at manager+0x33780
-             * (@0x0011497A), rebinds the object to it (@0x00114999) and seeds
-             * it from the traffic record through FUN_00120BA0 (@0x001149AB) --
-             * and only THEN frees the traffic agent, @0x00114CE0 `CALL
-             * FUN_001A75A0` on body+0x110, whose teardown ends in the pure
-             * free-list push FUN_001A41A0 (no distance, no view, just
-             * head/tail relink and `DEC byte [EAX+0x363AC]`).  The BODY
-             * survives that as a normal vehicle; retail never deletes a wreck
-             * on a timer.                                                 [C]
-             *
-             * This harness has no promoted-vehicle record for traffic -- the
-             * wreck IS the TrafficCar slot -- so releasing the slot when the
-             * 5 s park expires deletes the wreck wherever it stands.
-             * Measured before this arm existed: 2-3 releases per 175 s race
-             * inside retail's own 160 m gate, the nearest 4.0 m and 7.0 m from
-             * the player, one of them dead ahead.  That is the user's
-             * "cars disappear in front of me", exactly.
-             *
-             * Keep the wreck parked while it is on the player's screen.  The
-             * slot returns to the pool the moment the player has driven past,
-             * so the pool cost is a few extra body-seconds against a 254-deep
-             * free list that measures a 60-67 high-water. */
-            if (g_race_time < t->crashed_until
-                || (t->pool_request >= 0 && traffic_on_camera(t))) {
-                traffic_trailer_update(t);
-                continue;                                   // parked wreck
-            }
-            if (raw_path) {
-                if (t->pool_request >= 0) {
-                    /* off camera now: FUN_001A75A0 -> FUN_001A41A0 returns the
-                     * agent to the free list and the next FUN_001A28B0 pass
-                     * re-fills the request with a freshly drawn
-                     * class/model/paint -- it never re-seeds in place */
-                    g_pool_release_why = "raw-path-reseed";
-                    traffic_pool_release_slot(i);
-                    continue;
-                }
-                g_tpl_seed_why = "crash-recover";  /* traffic pop log (agent) */
-                if (!traffic_path_seed(t, t->spawn + 1 + i))
-                    traffic_place(t, t->lane + 1, &g_player.pos, 320.0f, +1);
-            } else {
-                g_tpl_seed_why = "crash-recover";  /* traffic pop log (agent) */
-                traffic_place(t, t->lane + 1, &g_player.pos, 320.0f, +1);
-            }
+        if (!t->active || t->crashed_until <= 0.0f) continue;
+        /* THE WRECK DOES NOT VANISH WHILE YOU ARE LOOKING AT IT.
+         *
+         * Retail's answer to a wrecked traffic car is PROMOTION, not
+         * deletion: FUN_00114910 stamps the collision object's type to 4
+         * (@0x0011491D `MOV byte [EDI],4`), takes a free 0x2430-byte
+         * articulated-vehicle record out of the pool at manager+0x33780
+         * (@0x0011497A), rebinds the object to it (@0x00114999) and seeds
+         * it from the traffic record through FUN_00120BA0 (@0x001149AB) --
+         * and only THEN frees the traffic agent, @0x00114CE0 `CALL
+         * FUN_001A75A0` on body+0x110, whose teardown ends in the pure
+         * free-list push FUN_001A41A0 (no distance, no view, just
+         * head/tail relink and `DEC byte [EAX+0x363AC]`).  The BODY
+         * survives that as a normal vehicle; retail never deletes a wreck
+         * on a timer.                                                 [C]
+         *
+         * This harness has no promoted-vehicle record for traffic -- the
+         * wreck IS the TrafficCar slot -- so releasing the slot when the
+         * 5 s park expires deletes the wreck wherever it stands.
+         * Measured before this arm existed: 2-3 releases per 175 s race
+         * inside retail's own 160 m gate, the nearest 4.0 m and 7.0 m from
+         * the player, one of them dead ahead.  That is the user's
+         * "cars disappear in front of me", exactly.
+         *
+         * Keep the wreck parked while it is on the player's screen.  The
+         * slot returns to the pool the moment the player has driven past,
+         * so the pool cost is a few extra body-seconds against a 254-deep
+         * free list that measures a 60-67 high-water. */
+        if (g_race_time < t->crashed_until
+            || (t->pool_request >= 0 && traffic_on_camera(t))) {
+            continue;                                   // parked wreck
         }
+        int raw_path = traffic_paths_active();
+        if (raw_path) {
+            if (t->pool_request >= 0) {
+                /* off camera now: FUN_001A75A0 -> FUN_001A41A0 returns the
+                 * agent to the free list and the next FUN_001A28B0 pass
+                 * re-fills the request with a freshly drawn
+                 * class/model/paint -- it never re-seeds in place */
+                g_pool_release_why = "raw-path-reseed";
+                traffic_pool_release_slot(i);
+                continue;
+            }
+            g_tpl_seed_why = "crash-recover";  /* traffic pop log (agent) */
+            if (!traffic_path_seed(t, t->spawn + 1 + i))
+                traffic_place(t, t->lane + 1, &g_player.pos, 320.0f, +1);
+        } else {
+            g_tpl_seed_why = "crash-recover";  /* traffic pop log (agent) */
+            traffic_place(t, t->lane + 1, &g_player.pos, 320.0f, +1);
+        }
+    }
 
-        // Keep the public road position only for diagnostics.  The retail
-        // agent never reprojects this from its body every frame: +0x30 is a
-        // persistent distance cursor, so a contact cannot snap it across a
-        // nearby fold in the loop.
-        int seg = t->seg;
-        float u = t->seg_t, lat = 0.0f;
-        if (!raw_path)
-            route_project(body_pos.x, body_pos.z, seg, 24, NULL, NULL, &lat);
-        float lat_err = raw_path ? 0.0f : lat - t->lane_lat;
-        if (fabsf(lat_err) > t->max_lat_err) t->max_lat_err = fabsf(lat_err);
-
-        // ================= SPEED: the retail traffic agent law ============
-        // Ported from FUN_0019F560, the per-frame update of the game's own
-        // traffic road agents (the 0x50-byte S records at 0x0063DCB0, driven
-        // by FUN_001A20F0).  That -- not FUN_00105150, which is the AI-RIVAL
-        // RACER's input generator (vtable 0x3B1240 slot +0x64) -- is what
-        // moves traffic in retail.  Constants [C]:
-        //   K   = 1/6.5   = 0.15384616  approach gain, PER FRAME
-        //   dv  in [-0.1, +0.08] m/s    cruise ramp clamp, PER FRAME
-        //                               (= -6.0 / +4.8 m/s^2 at 60 Hz)
-        //   R   = 35.0 m (30.0 in dense traffic)  racecar detect radius
-        //   the car-ahead gap subtracts both half-lengths and 2.5 m
-        // The per-frame numbers are converted to per-second here and scaled
-        // by dt, so they hold at any harness step.
-        const float K_PS   = (1.0f / 6.5f) * 60.0f;   // approach gain / s
-        const float RAMP_UP = 0.08f * 60.0f;          // +4.8 m/s^2
-        const float RAMP_DN = 0.10f * 60.0f;          // -6.0 m/s^2
-        const float AVOID_R = 35.0f;
+    // ================= PASS 1: SPEED (FUN_0019F560) ====================
+    // Ported from FUN_0019F560, the per-frame update of the game's own
+    // traffic road agents (the 0x50-byte S records at 0x0063DCB0, driven
+    // by FUN_001A20F0 @0x001A250E).  That -- not FUN_00105150, which is the
+    // AI-RIVAL RACER's input generator (vtable 0x3B1240 slot +0x64) -- is what
+    // moves traffic in retail.  Constants [C]:
+    //   K   = 1/6.5   = 0.15384616  approach gain, PER FRAME
+    //   dv  in [-0.1, +0.08] m/s    cruise ramp clamp, PER FRAME
+    //                               (= -6.0 / +4.8 m/s^2 at 60 Hz)
+    //   R   = 35.0 m (30.0 in dense traffic)  racecar detect radius
+    //   the car-ahead gap subtracts both half-lengths and 2.5 m
+    // The per-frame numbers are converted to per-second here and scaled
+    // by dt, so they hold at any harness step.
+    const float K_PS   = (1.0f / 6.5f) * 60.0f;   // approach gain / s
+    const float RAMP_UP = 0.08f * 60.0f;          // +4.8 m/s^2
+    const float RAMP_DN = 0.10f * 60.0f;          // -6.0 m/s^2
+    const float AVOID_R = 35.0f;
+    for (int i = 0; i < g_traffic_n; i++) {
+        TrafficCar* t = &g_traffic[i];
+        if (!t->active || t->crashed_until > 0.0f) continue;
+        int raw_path = traffic_paths_active();
         float myhalf = 0.5f * (g_traffic_len[t->car] > 2.0f
                                ? g_traffic_len[t->car] : 4.2f);
         if (t->trailer >= 0) myhalf += 0.5f * g_traffic_len[t->trailer];
@@ -14149,8 +14141,7 @@ static void traffic_update(float dt) {
         // The avoid ACC is retail's persisted nudge: at the fresh trigger
         // state=4 and FUN_0019FEC0 stores a traffic-LCG random (~[-0.15,0.12]
         // m/s/frame) into agent+0x1C; state 4 (JT[4]=0x0019fd78) reuses that
-        // saved value each frame. That is a global-seed RNG, so the harness
-        // uses a deterministic drive-down toward gap/2 as a GLUE stand-in.
+        // saved value each frame.
         for (int j = 0; j < g_num_vehicles; j++) {
             const Vehicle* rv = &g_vehicles[j];
             if (!rv->active) continue;
@@ -14271,7 +14262,16 @@ static void traffic_update(float dt) {
         if (t->speed < 0.0f) t->speed = 0.0f;
         if (t->speed > cruise * 1.05f)
             t->speed = cruise * 1.05f;
+    }
 
+    // ================= PASS 2: MOVER (FUN_0019F1C0) ====================
+    // FUN_0019F1C0 advances the retail road agent's persistent path cursor by
+    // speed * frame time, then FUN_0019FFA0 turns that cursor into its target
+    // transform through the recovered clamped four-knot sampler.
+    for (int i = 0; i < g_traffic_n; i++) {
+        TrafficCar* t = &g_traffic[i];
+        if (!t->active || t->crashed_until > 0.0f) continue;
+        int raw_path = traffic_paths_active();
         Vec3 lp, tangent;
         if (raw_path) {
             /* FUN_001A8EE0 runs BEFORE the mover's end test: pick a
@@ -14326,10 +14326,11 @@ static void traffic_update(float dt) {
                                     t->path_lateral, &lp, &tangent);
                 t->pos = (Vec3){lp.x, lp.y + 0.5f, lp.z};
                 t->yaw = atan2f(tangent.x, -tangent.z);
-                traffic_reservations_rebuild();
             }
         }
         if (!raw_path) {
+            int seg = t->seg;
+            float u = t->seg_t;
             route_advance(seg, u, t->lane_dir, t->speed * dt, &seg, &u);
             t->seg = seg;
             t->seg_t = u;
@@ -14341,6 +14342,24 @@ static void traffic_update(float dt) {
             t->pos = (Vec3){lp.x, lp.y + 0.5f, lp.z};
             t->yaw = atan2f(ahead.x - lp.x, -(ahead.z - lp.z));
         }
+    }
+
+    // ================= PASS 3: RESERVATIONS (FUN_0019F3B0) =============
+    // Update descriptor occupancy and agent reservations across all active
+    // agents. Called once per frame after all agents have updated cursors.
+    traffic_reservations_rebuild();
+
+    // ================= PASS 4: RIGID BODIES, TOW & WATCHDOGS ===========
+    // Retail FUN_001A6B40 & FUN_001A8640: stream refresh, articulated tow
+    // constraints, rigid-body kinematic pose sync, trailer updates and recycling.
+    for (int i = 0; i < g_traffic_n; i++) {
+        TrafficCar* t = &g_traffic[i];
+        if (!t->active) continue;
+        if (t->crashed_until > 0.0f) {
+            traffic_trailer_update(t);
+            continue;                                   // parked wreck
+        }
+        int raw_path = traffic_paths_active();
         int body_ready = traffic_stream_refresh(t);
         if (body_ready) {
             traffic_tow_sleep_refresh(t);
@@ -14400,6 +14419,17 @@ static void traffic_update(float dt) {
         // neighbourhood and recycles the rest, so a car can neither wander
         // off the map nor sit wedged for a whole lap.
         int recycle = 0;
+        float lat_err = 0.0f;
+        if (!raw_path) {
+            Vec3 body_pos = {t->rb.frame[3][0],
+                             t->rb.frame[3][1] + 0.5f + g_traffic_ymin[t->car],
+                            -t->rb.frame[3][2]};
+            int seg = t->seg;
+            float lat = 0.0f;
+            route_project(body_pos.x, body_pos.z, seg, 24, NULL, NULL, &lat);
+            lat_err = lat - t->lane_lat;
+            if (fabsf(lat_err) > t->max_lat_err) t->max_lat_err = fabsf(lat_err);
+        }
         if (!raw_path && fabsf(lat_err) > 9.0f) {
             t->off_time += dt;
             // 9 m off lane is already the next lane over; 22 m is off the
@@ -14470,7 +14500,6 @@ static void traffic_update(float dt) {
             }
         }
     }
-    traffic_reservations_rebuild();
     // ------------------------------------------------------- telemetry
     // B3_TRAFFIC_TELEM=<period_s>: per-car lane error / stall / off-road
     // census, plus running worst-case counters (headless lap diagnosis).

@@ -960,11 +960,13 @@ retained, and `FUN_0019FEC0`'s avoidance magnitude with its `[-0.10, +0.10]` lat
 window and `[-0.15, +0.12]` clamp is now live. The neighbourhood-pool replacement
 policy remains GLUE.
 The manager ordering is now also preserved:
-`FUN_001A20F0` performs speed, cursor, then occupancy for every selected road
-agent before it calls `FUN_001A6B40` for physical bodies and `FUN_001A8640`
-for trailers. The harness rebuilds the same-descriptor owner map immediately
-after each cursor commit, so later agents see the current-frame advance. It
-therefore advances the route cursor through an
+`FUN_001A20F0` multi-pass pipeline executes Pass 1 (`FUN_0019F560` speed law),
+Pass 2 (`FUN_0019F1C0` cursor advance & B-spline pose), Pass 3 (`FUN_0019F3B0`
+occupancy and reservations rebuild across all active agents), and Pass 4
+(`FUN_001A6B40` physical bodies / `FUN_001A8640` trailers and tow constraints).
+The per-car inner rebuild inside the mover loop has been eliminated, removing
+$O(N^2)$ redundant rebuild work and eliminating slot-order dependency.
+It advances the route cursor through an
 off-unit coupled-body sleep and only re-enters/resynchronises the rigid bodies
 when their target collision units are resident. **Recoverable — yes.**
 
@@ -1340,11 +1342,15 @@ loop and PH-08's velocity write are deleted.  What is left:
    candidate props (types 5, 6) in one unified call to `b3_carcol_broadphase()`.
    Retail pair filter `FUN_00114610` (`b3_carcol_pair_admitted`) gates admissions;
    separate O(n·m) prop collision loop in `game_update()` deleted.
-2. **Traffic remains hybrid** (8) — PH-07/PH-13. `FUN_00120F30`'s
-   streaming-unit gates, coupled sleep, persistent bodies, full hitch anchors,
-   normal tow constraint and kingpin spring are live; the lane-route driver
-   and detachment branches still differ from retail. `+0x13A0` is the model
-   pointer for the attach records, not a route driver.
+2. **Traffic road-agent manager order and detachment** (8) — **SAME-ORDER (PH-07/PH-13)**:
+   `FUN_001A20F0`'s multi-pass execution is live across 4 synchronous passes
+   (Pass 1: `FUN_0019F560` speed law with `FUN_0019FEC0` nudge; Pass 2: `FUN_0019F1C0`
+   mover with clamped B-spline `FUN_0019FFA0` and branching; Pass 3: `FUN_0019F3B0`
+   reservations; Pass 4: `FUN_001A6B40` / `FUN_001A8640` bodies and trailers).
+   Trailer detachment `FUN_00121400` (speed transfer and unlinking) and its retail
+   triggers (jackknife > 120°, separation > 1.0 m, dy > 1.0 m) are ported.
+   Redundant $O(N^2)$ inner reservation rebuilds eliminated.
+   Neighborhood-pool replacement policy remains GLUE.
 3. **The contact GEOMETRY is partly unified** (PH-09). Live-car, wreck, and
    knocked-prop response receive gathered collision triangles. Sphere sweeps
    remain only as anti-tunnelling containment and no-pipeline fallbacks; the
