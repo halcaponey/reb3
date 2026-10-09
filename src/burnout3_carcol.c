@@ -12,6 +12,7 @@
 #include "burnout3_emu.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -175,21 +176,111 @@ int b3_carcol_aabb_overlap(const B3CarBody* a, const B3CarBody* b) {
     return 1;
 }
 
+typedef struct {
+    float    x;
+    uint16_t obj;
+    uint8_t  is_start;
+} B3SapEndpoint;
+
+/* Retail FUN_00110AD0: endpoint ascending sort comparator along X axis. */
+static int b3_sap_cmp(const void* p1, const void* p2) {
+    const B3SapEndpoint* a = (const B3SapEndpoint*)p1;
+    const B3SapEndpoint* b = (const B3SapEndpoint*)p2;
+    if (a->x < b->x) return -1;
+    if (a->x > b->x) return 1;
+    if (a->is_start != b->is_start)
+        return a->is_start ? -1 : 1;
+    return (int)a->obj - (int)b->obj;
+}
+
 int b3_carcol_broadphase(B3CarBody* const* bodies, int n,
                          int (*pairs)[2], int max_pairs) {
-    int c = 0;
-    /* The game runs a sort + sweep on the x interval (record +0x10/+0x20)
-     * with y/z overlap tests inside; the emitted set is exactly the set of
-     * AABB-overlapping pairs, so the sweep is replaced by the direct test
-     * (docs/RE_CARCOL.md "broad phase").  Cap 0x100 is the game's. */
-    if (max_pairs > 0x100) max_pairs = 0x100;
-    for (int i = 0; i < n && c < max_pairs; i++) {
-        if (!bodies[i]) continue;
-        for (int j = i + 1; j < n && c < max_pairs; j++) {
-            if (!bodies[j]) continue;
-            if (!b3_carcol_aabb_overlap(bodies[i], bodies[j])) continue;
-            pairs[c][0] = i; pairs[c][1] = j; c++;
+    if (n < 2 || max_pairs <= 0) return 0;
+    if (max_pairs > B3_CARCOL_MAX_PAIRS) max_pairs = B3_CARCOL_MAX_PAIRS;
+
+    /* Retail FUN_00110AF0: sweep-and-prune along X axis (record +0x10/+0x20)
+     * with Y/Z interval tests and FUN_00114610 pair filter. */
+    float lo_buf[B3_CARCOL_MAX_BODIES][3];
+    float hi_buf[B3_CARCOL_MAX_BODIES][3];
+    B3SapEndpoint ep_buf[B3_CARCOL_MAX_BODIES * 2];
+    uint16_t active_buf[B3_CARCOL_MAX_BODIES];
+
+    float (*lo)[3] = lo_buf;
+    float (*hi)[3] = hi_buf;
+    B3SapEndpoint* eps = ep_buf;
+    uint16_t* active = active_buf;
+
+    int dyn = (n > B3_CARCOL_MAX_BODIES);
+    if (dyn) {
+        lo = (float (*)[3])malloc(n * sizeof(*lo));
+        hi = (float (*)[3])malloc(n * sizeof(*hi));
+        eps = (B3SapEndpoint*)malloc(2 * n * sizeof(*eps));
+        active = (uint16_t*)malloc(n * sizeof(*active));
+        if (!lo || !hi || !eps || !active) {
+            free(lo); free(hi); free(eps); free(active);
+            return 0;
         }
+    }
+
+    int ep_count = 0;
+    for (int i = 0; i < n; i++) {
+        if (!bodies[i]) continue;
+        b3_carcol_world_aabb(bodies[i], lo[i], hi[i]);
+        eps[ep_count].x = lo[i][0];
+        eps[ep_count].obj = (uint16_t)i;
+        eps[ep_count].is_start = 1;
+        ep_count++;
+        eps[ep_count].x = hi[i][0];
+        eps[ep_count].obj = (uint16_t)i;
+        eps[ep_count].is_start = 0;
+        ep_count++;
+    }
+
+    qsort(eps, ep_count, sizeof(B3SapEndpoint), b3_sap_cmp);
+
+    int nactive = 0;
+    int c = 0;
+
+    for (int k = 0; k < ep_count && c < max_pairs; k++) {
+        uint16_t cur = eps[k].obj;
+        if (eps[k].is_start) {
+            for (int a = 0; a < nactive && c < max_pairs; a++) {
+                uint16_t other = active[a];
+                /* Retail FUN_00114610: two sleeping cars never pair */
+                if (bodies[cur]->asleep && bodies[other]->asleep) continue;
+                if (!b3_carcol_pair_admitted(bodies[cur]->type, bodies[other]->type)) continue;
+                /* Retail tests Z interval first (@0x00110c13 / 0x00110c32) */
+                if (!(lo[other][2] < hi[cur][2] && lo[cur][2] < hi[other][2])) continue;
+                /* Retail tests Y interval next (@0x00110c66 / 0x00110c77) */
+                if (!(lo[other][1] < hi[cur][1] && lo[cur][1] < hi[other][1])) continue;
+
+                /* Emit pair in retail index order (min, max) @0x00110c92 / 0x00110cb6 */
+                int p0 = cur < other ? cur : other;
+                int p1 = cur < other ? other : cur;
+                pairs[c][0] = p0;
+                pairs[c][1] = p1;
+                c++;
+            }
+            if (nactive < n) {
+                active[nactive++] = cur;
+            }
+        } else {
+            /* Remove cur from active list (shift down, matching retail rep movsw @0x00110d46) */
+            for (int a = 0; a < nactive; a++) {
+                if (active[a] == cur) {
+                    memmove(&active[a], &active[a + 1], (nactive - a - 1) * sizeof(uint16_t));
+                    nactive--;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (dyn) {
+        free(lo);
+        free(hi);
+        free(eps);
+        free(active);
     }
     return c;
 }
@@ -841,10 +932,22 @@ int b3_carcol_resolve(B3CarBody* a, B3CarBody* b, B3CarContact* out) {
         b->rb->frame = kb;
     }
 
-    /* FUN_00111CD0's ordering + dispatch. */
+    /* FUN_00111CD0's ordering + dispatch:
+     * - If both cars un-crashed, take alive response.
+     * - If one un-crashed, swap so A is the un-crashed car (@0x00111DD4).
+     * - If both crashed / secondary (debris/props), ensure a vehicle/car body
+     *   stays in A over non-car debris/props (Arm 4 @0x00111E38). */
     if (!a->crashed && !b->crashed)
         return b3_carcol_resolve_alive(a, b, out);
-    if (!b->crashed) { B3CarBody* t = a; a = b; b = t; }
+    if (!b->crashed && a->crashed) {
+        B3CarBody* t = a; a = b; b = t;
+    } else if (a->crashed && b->crashed) {
+        int a_car = (a->type <= 2 || a->type == 4);
+        int b_car = (b->type <= 2 || b->type == 4);
+        if (!a_car && b_car) {
+            B3CarBody* t = a; a = b; b = t;
+        }
+    }
     return b3_carcol_resolve_wreck(a, b, out);
 }
 

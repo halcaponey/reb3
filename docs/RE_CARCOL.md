@@ -96,11 +96,10 @@ an active set and testing each new object against it with
 b.hi.y` plus `FUN_00114610`. Emitted pairs are ordered
 (`FUN_00011510`/`FUN_000114E0` = max/min index).
 
-The port keeps the predicate exactly and replaces the sort+sweep with the
-direct O(n²) test: **the emitted set is identical** (SAP is an acceleration
-structure over the same 3-axis AABB overlap), and the harness has 18 bodies.
-`b3_carcol_broadphase()`; documented as an equivalence, not a behaviour
-change.
+`b3_carcol_broadphase()` implements retail `FUN_00110AF0`'s exact sweep-and-prune
+chain: interval endpoint generation, ascending X sort (`b3_sap_cmp` matching `LAB_00110AD0`),
+active-set interval tracking, Z and Y interval overlap tests, pair emission in `(min, max)`
+index order along the spatial X sweep, and cap `0x100` (256). Verified in `tools/test_sap_broadphase.c`.
 
 `FUN_00114610` [S]: rejects type-3 vs type-3, type-5 vs type-5, and any car
 pair where **both** have `veh+0x20E == 1` (asleep).

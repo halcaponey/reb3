@@ -1340,6 +1340,10 @@ loop and PH-08's velocity write are deleted.  What is left:
    candidate props (types 5, 6) in one unified call to `b3_carcol_broadphase()`.
    Retail pair filter `FUN_00114610` (`b3_carcol_pair_admitted`) gates admissions;
    separate O(n·m) prop collision loop in `game_update()` deleted.
+   Pair ORDERING and A/B dispatch: `b3_carcol_broadphase` ports retail `FUN_00110AF0`'s
+   X-axis sweep-and-prune (`b3_sap_cmp` ascending sort, active list interval tracking,
+   Z/Y interval overlap tests, `(min, max)` index ordering, cap 0x100), and
+   `b3_carcol_resolve` ports retail `FUN_00111CD0` Arm 4 car priority for secondary/crashed bodies.
 2. **Traffic road-agent manager order and detachment** (8) — **SAME-ORDER (PH-07/PH-13)**:
    `FUN_001A20F0`'s multi-pass execution is live across 4 synchronous passes
    (Pass 1: `FUN_0019F560` speed law with `FUN_0019FEC0` nudge; Pass 2: `FUN_0019F1C0`

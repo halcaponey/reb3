@@ -177,25 +177,18 @@ anti-tunnelling/bootstrapping nets, so the systems are not fully unified yet.
 
 ### Remaining call-graph gaps (`PHYSICS_GLUE_LEDGER.md` "gaps, ranked")
 
-1. **Props and debris are not in the broadphase** — pair ordering and the A/B
-   swap differ from retail in pileups. NARROWED (2026-08-27): the prop
-   *narrow* phase is now retail's own — `FUN_001084E0`'s 15-axis OBB
-   separating-axis test, recovered in full and ported
-   (`INTEGRATION_NOTE.md` §11, `b3p_obb_contact` in `src/burnout3_props.c`),
-   which is what fixed the un-hittable signposts and the 23 % of cones a
-   drive passed through and left standing. NARROWED AGAIN (2026-08-28): the
-   post-contact side is now retail's too — the world pass runs ONE
-   `b3_rigid_body_obb_soup_contact` over the whole soup and one resolve
-   instead of the single-plane form once per polygon (which was dropping
-   props through the road and levitating the rest), the car's box is the
-   `+0x1D0/+0x1E0` bbox PAIR rather than the MAX alone, the contact point
-   takes `FUN_001084E0`'s A-face and B-face arms instead of always box A's
-   support point, and `FUN_00109560`'s `+0x20E`/`+0x211` settle latch is
-   ported (`INTEGRATION_NOTE.md` §12). What remains here is the pair
-   ORDERING, not the test. `FUN_00108240` (edge-edge closest point `b3p_edge_edge_closest`)
-   and `FUN_00197A20` (@0x0011392E, prop-hit boost/score/chain accumulator
-   `b3_score_events_prop_hit` with `B3_SFX_PANEL_L_PROP` impact audio) are
-   ported, integrated in `full.c`, and verified (164/164 in `validate_score_events.py`).
+1. **Props and debris broadphase pair ordering and A/B dispatch — CLOSED (2026-10-09)**:
+   The prop *narrow* phase is retail's own (`FUN_001084E0`'s 15-axis OBB SAT,
+   `b3p_obb_contact` in `src/burnout3_props.c`), post-contact world pass runs
+   `b3_rigid_body_obb_soup_contact` with `+0x1D0/+0x1E0` bbox pair and `+0x20E/+0x211`
+   settle latch. Edge-edge closest point `FUN_00108240` (`b3p_edge_edge_closest`) and
+   prop-hit boost/score/chain accumulator `FUN_00197A20` (@0x0011392E, `b3_score_events_prop_hit`
+   with `B3_SFX_PANEL_L_PROP` impact audio) are ported and verified.
+   Broadphase pair ORDERING and A/B dispatch: `b3_carcol_broadphase` in `src/burnout3_carcol.c`
+   ports retail `FUN_00110AF0`'s X-axis sweep-and-prune (`b3_sap_cmp` ascending sort,
+   active list interval tracking, Z/Y interval overlap gates, `(min, max)` index ordering,
+   cap 0x100), and `b3_carcol_resolve` ports retail `FUN_00111CD0` Arm 4 car priority
+   for secondary/crashed bodies. Verified in `tools/test_sap_broadphase.c`.
 2. **Wheel and chassis contact now share one frozen raw-collision snapshot**;
    the chassis view applies `FUN_0011BBE0`'s recovered wall predicate. The
    snapshot still omits retail's appended crash-floor records. This is now a

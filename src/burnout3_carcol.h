@@ -219,10 +219,12 @@ void b3_carcol_hull_from_extents(const float bbmax[4], const float bbmin[4],
 
 /* Broad phase: world AABB of a body's collision box (FUN_00114270), and the
  * overlap predicate the sweep-and-prune in FUN_00110AF0 applies. */
+#define B3_CARCOL_MAX_BODIES 256
+#define B3_CARCOL_MAX_PAIRS  0x100
 void b3_carcol_world_aabb(const B3CarBody* b, float lo[3], float hi[3]);
 int  b3_carcol_aabb_overlap(const B3CarBody* a, const B3CarBody* b);
-/* Fills pairs[][2] with the indices the game's sweep would emit (same set;
- * the SAP sort is an acceleration, see docs/RE_CARCOL.md). */
+/* Fills pairs[][2] with the indices the game's sweep would emit in retail
+ * sweep-and-prune spatial order (FUN_00110AF0, cap 0x100). */
 int  b3_carcol_broadphase(B3CarBody* const* bodies, int n,
                           int (*pairs)[2], int max_pairs);
 
