@@ -4901,7 +4901,7 @@ static void mesh_collide(Vehicle* v) {
 }
 
 static void generate_track(void) {
-    // Real circuit: center line recovered from Gamedata.bgd (Bangkok, C1_V1),
+    // Real circuit: center line recovered from Gamedata.bgd,
     // see tools/extract_bgd_paths.py and build/bgd_walls.png for verification.
     int num_points = g_route_n;
     g_track.points = malloc(num_points * sizeof(Vec3));
@@ -4911,7 +4911,12 @@ static void generate_track(void) {
 
     // Mean corridor width measured from the recovered wall strip.
     g_track.width = 14.5f;
-    strcpy(g_track.name, "Bangkok (Tracks/AS/C1_V1)");
+    {
+        const char *tid = getenv("B3_TRACK");
+        if (!tid) tid = getenv("B3_POSTFX_TRACK");
+        if (!tid) tid = "US_C3_V1";
+        snprintf(g_track.name, sizeof(g_track.name), "%s", tid);
+    }
 
     printf("[Burnout3] REAL circuit from Gamedata.bgd: %s (%d points)\n",
            g_track.name, num_points);

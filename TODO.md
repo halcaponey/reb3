@@ -315,30 +315,22 @@ Runs and renders on the Pixel (Mali, Android 16). See `docs/ANDROID_PORT.md`.
 
 ## 4. Validation & tooling
 
-### The archived collision extractor's containment self-check fails `[?]`
+### The archived collision extractor's containment self-check — RESOLVED (2026-10-09)
 
-`tools/py_extract_archive/extract_collision.py` writes a correct
-`collision.bin` — 60373 triangles, which the game loads and drives on, and
-byte-identical across runs and against the C `collision` stage — and then
-exits 1, because its own sanity check does not hold:
-
+The mystery of `tools/py_extract_archive/extract_collision.py`'s failing check:
 ```
 [extract_collision] route XZ bounds x[4015..5812] z[1285..3137]
                     NOT CONTAINED IN (FAIL) collision bounds
 ```
-
-So either the check's premise is wrong (the route legitimately leaves the
-collision world's AABB), or the route and the collision world are being taken
-from two different things and it is luck that the game plays. Worth settling,
-because a wrong pairing here would be invisible until something fell through
-the floor. The check exists only in the archive — `tools/cextract/cx_collision.c`
-does not carry it — so nothing in the live path notices either way, which is
-the other half of why it is still open.
-
-Related, and possibly the same thread: `generate_track()` in
-`src/burnout3_full.c` (the synthetic fallback used when no real geometry
-resolves) hardcodes the label `"Bangkok (Tracks/AS/C1_V1)"` while the runtime
-track id defaults to `US_C3_V1`. At minimum the label is stale.
+is fully resolved:
+1. **The premise of the legacy check was testing against the full nav graph**, not the driving route. The old `route_bounds()` inspected the purged `burnout3_track_paths.h`, whose points spanned all 7,015 `.bgd` navigation points (`B3_NAV_POINTS`). On US_C3_V1, nine nodes of section 7 (nodes 956..964) form a hairpin envelope out to `x=4014.59` (`z=1507.95`), whereas the streamed unit collision bounding box for that zone starts at `x=4032.53`.
+2. **The actual DRIVING ROUTE (`b3_route` / `route.bin`) is fully contained**:
+   - Driving route XZ bounds: `x[4070.0 .. 5760.6]`, `z[1339.9 .. 3083.8]`
+   - Road strand / wall A & B bounds: `x[4062.8 .. 5767.8]`, `z[1332.7 .. 3090.9]`
+   - Collision world bounds: `x[4032.5 .. 5970.4]`, `z[1262.0 .. 3265.1]`
+   Every drivable route point and wall point lies well within the collision mesh with >30m margin on all sides. No vehicles fall through.
+3. The modern C pipeline `tools/cextract/cx_collision.c` correctly extracts all collision triangles without referencing the stale header.
+4. `generate_track()` in `src/burnout3_full.c` now dynamically formats `g_track.name` from the active track selection (`B3_TRACK` / `US_C3_V1`) instead of the hardcoded `"Bangkok (Tracks/AS/C1_V1)"` label.
 
 * **`tools/validate_gameplay.py` — green (91/91)**. Its collision-world
   section now compares the shared u16 source grid rather than float32/float64
