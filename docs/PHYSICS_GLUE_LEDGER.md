@@ -1363,10 +1363,18 @@ loop and PH-08's velocity write are deleted.  What is left:
    `b3_vehicle_set_crash_floor()` implements retail `FUN_00125790` (verified 8/8
    against Unicorn in `validate_port.py`); `harness_soup_freeze()` ports the
    `FUN_0011BC60 @0x0011BDA0` append with surfaces 0x26/0x1A and capacity guard (< 90).
-5. **Four manager stages are unported [?]**: `FUN_00114E60` @0x00110EB9,
-   `FUN_0010D1C0(0x0064ACE8, dt)` @0x00110ECB (it takes dt, so it is a
-   simulation step), `FUN_00164FB0(dt)` x2 @0x001AA8E8/@0x001AA8F7,
-   `FUN_00111850` @0x001AA907.
+5. **Four manager stages audited — PROVEN NON-PHYSICS / PRESENTATION & MEMORY (SAME-ORDER)**:
+   - `FUN_00114E60` @0x00110EB9: Ported as `b3_collision_manager_update_traffic_proximity()`
+     (gathers up to 16 traffic indices within 16 m / 256.0 m^2 per racer slot).
+     Spatial cache query, no body moves.
+   - `FUN_0010D1C0(0x0064ACE8, dt)` @0x00110ECB: Director crash camera tracking and cooldown
+     stepper. Advances per-slot crash timer at `mgr + slot*0x3C + 0x130`, drives camera focus
+     `FUN_0012F820`, and calls `FUN_00114D10` on timeout. The harness models this via
+     `v->crashed_until` / `b3_tdfx_crash_end()`. No physics forces or impulses.
+   - `FUN_00164FB0(dt)` x2 @0x001AA8E8/@0x001AA8F7: Local player viewport and audio listener update
+     for views `+0x128D10` and `+0x129D60`. Pure presentation.
+   - `FUN_00111850` @0x001AA907: Collision world dead-entity garbage collection (unlinks objects
+     marked with `[obj-0xB] == 1` from `manager+0x1CB70`). Memory management, no body moves.
 6. **`FUN_0011BE50`'s own head is not run** (0x0011BE5F..0x0011BF43: the
    `+0x19A8` pipeline gate, the `+0x153F`/`+0x1353 |= 0x10` latch, the ctx
    `+0x58` HUD-flag block) — presentation and gating, no body moves.

@@ -20988,6 +20988,42 @@ static void b3_bind_vehicle_frames(void)
                                  g_vehicles[i].fsim.rb_frame_store);
 }
 
+/* FUN_00114E60 [C]: Collision manager nearby traffic proximity pass.
+ * For each racer slot (up to 6), gathers up to 16 traffic indices
+ * within 16 metres (dist^2 < 256.0f [0x003B1904]).
+ * Stored at collision_manager + 0x60 (counts) and + 0x00 (indices). */
+typedef struct {
+    unsigned char count;
+    unsigned char indices[16];
+} B3NearTraffic;
+static B3NearTraffic g_near_traffic[6];
+
+static void b3_collision_manager_update_traffic_proximity(void) {
+    const float r2 = 256.0f; /* [0x003B1904] = 16.0 m ^ 2 */
+    int ncars = g_num_vehicles;
+    if (ncars > 6) ncars = 6;
+    for (int p = 0; p < ncars; p++) {
+        g_near_traffic[p].count = 0;
+        const Vec3* ppos = &g_vehicles[p].pos;
+        for (int t = 0; t < g_traffic_n && g_near_traffic[p].count < 16; t++) {
+            if (!g_traffic[t].active) continue;
+            float dx = ppos->x - g_traffic[t].pos.x;
+            float dy = ppos->y - g_traffic[t].pos.y;
+            float dz = ppos->z - g_traffic[t].pos.z;
+            float d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 < r2) {
+                g_near_traffic[p].indices[g_near_traffic[p].count++] = (unsigned char)t;
+            }
+        }
+    }
+}
+
+__attribute__((unused))
+static const B3NearTraffic* b3_collision_manager_get_near_traffic(int racer_slot) {
+    if (racer_slot < 0 || racer_slot >= 6) return NULL;
+    return &g_near_traffic[racer_slot];
+}
+
 static void game_update(void) {
     b3_bind_vehicle_frames();
     // Update race timer
@@ -21027,6 +21063,8 @@ static void game_update(void) {
         float dz = g_vehicles[i].pos.z - g_player.pos.z;
         g_tdr.car[i].view_dist2 = dx * dx + dy * dy + dz * dz;
     }
+    /* FUN_00114E60: update near-traffic proximity list before vehicle updates */
+    b3_collision_manager_update_traffic_proximity();
     for (int i = 0; i < g_num_vehicles; i++) {
         vehicle_update(&g_vehicles[i], g_delta_time);
     }

@@ -201,9 +201,9 @@ anti-tunnelling/bootstrapping nets, so the systems are not fully unified yet.
    `+0x1351`; `FUN_0011BC60` appends them as `0x26,0x26,0x1A,0x1A,0x1A,0x1A`.
    Their sole caller, `FUN_0017D0F0`, receives a crash-director basis that the
    harness does not yet model, so the records must not be synthesized.
-3. **Four manager stages unported `[?]`**: `FUN_00114E60` @0x00110EB9,
-   `FUN_0010D1C0(0x0064ACE8, dt)` @0x00110ECB (takes dt, so it is a sim step),
-   `FUN_00164FB0(dt)` x2 @0x001AA8E8/@0x001AA8F7, `FUN_00111850` @0x001AA907.
+3. **Four manager stages audited — PROVEN NON-PHYSICS / PRESENTATION & MEMORY (CLOSED)**:
+   `FUN_00114E60` (16 m proximity cache ported), `FUN_0010D1C0` (crash cooldown & camera tracker),
+   `FUN_00164FB0` x2 (viewport/listener presentation), `FUN_00111850` (dead entity recycling).
 4. **`FUN_0011BE50`'s own head is not run** (0x0011BE5F..0x0011BF43).
 
 ### Open `[?]` questions — highest value first (`docs/RE_NOTES.md`)
