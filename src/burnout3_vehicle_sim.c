@@ -2817,3 +2817,97 @@ void b3_vehicle_full_refresh_derived(B3VehicleFull* v) {
     b3_mat_mul3(rb->inv_inertia_body, Rt, tmp);
     b3_mat_mul3(rb->frame, tmp, rb->inv_inertia_world);
 }
+
+/* FUN_00125790: build 6 crash-floor / barrier polygons from 6 points and 3 basis vectors,
+ * write them into veh+0x11D0..0x134F, and set veh+0x1351 = 1.
+ * Mode is 1 if director zone type == 2, else 0. */
+void b3_vehicle_set_crash_floor(B3VehicleFull* v, const float points[6][4],
+                                const float basis[3][4], int mode) {
+    if (!v) return;
+    B3CrashPoly* p = v->crash_floor_poly;
+
+    if (mode) {
+        // Record 0: p0 = P5, p1 = P2, p2 = P4; n = normalize((P5 - P2) x (P5 - P4))
+        float v1[3] = { points[5][0] - points[4][0], points[5][1] - points[4][1], points[5][2] - points[4][2] };
+        float v0[3] = { points[5][0] - points[2][0], points[5][1] - points[2][1], points[5][2] - points[2][2] };
+        float n[3]  = { v0[1]*v1[2] - v0[2]*v1[1], v0[2]*v1[0] - v0[0]*v1[2], v0[0]*v1[1] - v0[1]*v1[0] };
+        float len = sqrtf(n[0]*n[0] + n[1]*n[1] + n[2]*n[2]);
+        if (len > 1e-6f) { n[0] /= len; n[1] /= len; n[2] /= len; }
+        memcpy(p[0].p0, points[5], 4 * sizeof(float));
+        memcpy(p[0].p1, points[2], 4 * sizeof(float));
+        memcpy(p[0].p2, points[4], 4 * sizeof(float));
+        p[0].n[0] = n[0]; p[0].n[1] = n[1]; p[0].n[2] = n[2]; p[0].n[3] = 0.0f;
+
+        // Record 1: p0 = P5, p1 = P3, p2 = P2; n = normalize((P5 - P3) x (P5 - P2))
+        float v1b[3] = { points[5][0] - points[2][0], points[5][1] - points[2][1], points[5][2] - points[2][2] };
+        float v0b[3] = { points[5][0] - points[3][0], points[5][1] - points[3][1], points[5][2] - points[3][2] };
+        float nb[3]  = { v0b[1]*v1b[2] - v0b[2]*v1b[1], v0b[2]*v1b[0] - v0b[0]*v1b[2], v0b[0]*v1b[1] - v0b[1]*v1b[0] };
+        len = sqrtf(nb[0]*nb[0] + nb[1]*nb[1] + nb[2]*nb[2]);
+        if (len > 1e-6f) { nb[0] /= len; nb[1] /= len; nb[2] /= len; }
+        memcpy(p[1].p0, points[5], 4 * sizeof(float));
+        memcpy(p[1].p1, points[3], 4 * sizeof(float));
+        memcpy(p[1].p2, points[2], 4 * sizeof(float));
+        p[1].n[0] = nb[0]; p[1].n[1] = nb[1]; p[1].n[2] = nb[2]; p[1].n[3] = 0.0f;
+    } else {
+        // Record 0: p0 = P4, p1 = P5, p2 = P3; n = normalize((P4 - P5) x (P4 - P3))
+        float v1[3] = { points[4][0] - points[3][0], points[4][1] - points[3][1], points[4][2] - points[3][2] };
+        float v0[3] = { points[4][0] - points[5][0], points[4][1] - points[5][1], points[4][2] - points[5][2] };
+        float n[3]  = { v0[1]*v1[2] - v0[2]*v1[1], v0[2]*v1[0] - v0[0]*v1[2], v0[0]*v1[1] - v0[1]*v1[0] };
+        float len = sqrtf(n[0]*n[0] + n[1]*n[1] + n[2]*n[2]);
+        if (len > 1e-6f) { n[0] /= len; n[1] /= len; n[2] /= len; }
+        memcpy(p[0].p0, points[4], 4 * sizeof(float));
+        memcpy(p[0].p1, points[5], 4 * sizeof(float));
+        memcpy(p[0].p2, points[3], 4 * sizeof(float));
+        p[0].n[0] = n[0]; p[0].n[1] = n[1]; p[0].n[2] = n[2]; p[0].n[3] = 0.0f;
+
+        // Record 1: p0 = P4, p1 = P3, p2 = P2; n = normalize((P4 - P3) x (P4 - P2))
+        float v1b[3] = { points[4][0] - points[2][0], points[4][1] - points[2][1], points[4][2] - points[2][2] };
+        float v0b[3] = { points[4][0] - points[3][0], points[4][1] - points[3][1], points[4][2] - points[3][2] };
+        float nb[3]  = { v0b[1]*v1b[2] - v0b[2]*v1b[1], v0b[2]*v1b[0] - v0b[0]*v1b[2], v0b[0]*v1b[1] - v0b[1]*v1b[0] };
+        len = sqrtf(nb[0]*nb[0] + nb[1]*nb[1] + nb[2]*nb[2]);
+        if (len > 1e-6f) { nb[0] /= len; nb[1] /= len; nb[2] /= len; }
+        memcpy(p[1].p0, points[4], 4 * sizeof(float));
+        memcpy(p[1].p1, points[3], 4 * sizeof(float));
+        memcpy(p[1].p2, points[2], 4 * sizeof(float));
+        p[1].n[0] = nb[0]; p[1].n[1] = nb[1]; p[1].n[2] = nb[2]; p[1].n[3] = 0.0f;
+    }
+
+    // Record 2: p0 = P4, p1 = P2, p2 = P0; n = normalize(-basis[0])
+    float n2[3] = { -basis[0][0], -basis[0][1], -basis[0][2] };
+    float len2 = sqrtf(n2[0]*n2[0] + n2[1]*n2[1] + n2[2]*n2[2]);
+    if (len2 > 1e-6f) { n2[0] /= len2; n2[1] /= len2; n2[2] /= len2; }
+    memcpy(p[2].p0, points[4], 4 * sizeof(float));
+    memcpy(p[2].p1, points[2], 4 * sizeof(float));
+    memcpy(p[2].p2, points[0], 4 * sizeof(float));
+    p[2].n[0] = n2[0]; p[2].n[1] = n2[1]; p[2].n[2] = n2[2]; p[2].n[3] = 0.0f;
+
+    // Record 3: p0 = P5, p1 = P3, p2 = P1; n = normalize(basis[0])
+    float n3[3] = { basis[0][0], basis[0][1], basis[0][2] };
+    float len3 = sqrtf(n3[0]*n3[0] + n3[1]*n3[1] + n3[2]*n3[2]);
+    if (len3 > 1e-6f) { n3[0] /= len3; n3[1] /= len3; n3[2] /= len3; }
+    memcpy(p[3].p0, points[5], 4 * sizeof(float));
+    memcpy(p[3].p1, points[3], 4 * sizeof(float));
+    memcpy(p[3].p2, points[1], 4 * sizeof(float));
+    p[3].n[0] = n3[0]; p[3].n[1] = n3[1]; p[3].n[2] = n3[2]; p[3].n[3] = 0.0f;
+
+    // Record 4: p0 = P5, p1 = P1, p2 = P0; n = normalize(basis[2])
+    float n4[3] = { basis[2][0], basis[2][1], basis[2][2] };
+    float len4 = sqrtf(n4[0]*n4[0] + n4[1]*n4[1] + n4[2]*n4[2]);
+    if (len4 > 1e-6f) { n4[0] /= len4; n4[1] /= len4; n4[2] /= len4; }
+    memcpy(p[4].p0, points[5], 4 * sizeof(float));
+    memcpy(p[4].p1, points[1], 4 * sizeof(float));
+    memcpy(p[4].p2, points[0], 4 * sizeof(float));
+    p[4].n[0] = n4[0]; p[4].n[1] = n4[1]; p[4].n[2] = n4[2]; p[4].n[3] = 0.0f;
+
+    // Record 5: p0 = P5, p1 = P0, p2 = P4; n = normalize(basis[2])
+    memcpy(p[5].p0, points[5], 4 * sizeof(float));
+    memcpy(p[5].p1, points[0], 4 * sizeof(float));
+    memcpy(p[5].p2, points[4], 4 * sizeof(float));
+    p[5].n[0] = n4[0]; p[5].n[1] = n4[1]; p[5].n[2] = n4[2]; p[5].n[3] = 0.0f;
+
+    v->flags_1351 = 1;
+}
+
+void b3_vehicle_clear_crash_floor(B3VehicleFull* v) {
+    if (v) v->flags_1351 = 0;
+}

@@ -1318,7 +1318,7 @@ type == 7`, then `[obj+0x211] = 0`) -> **every pair's narrow phase**
 | 9 | prop `vtbl+0` -> `FUN_0011A330` = drag + `FUN_00109560` | `b3p_body_step` — **now update-only, contact moved out** | SAME-ORDER |
 | 10 | debris `vtbl+0` -> `FUN_00106D00`, all 64 slots every frame | `panels_pieces_update` advances every detached panel once after the vehicle, traffic, and prop passes; each piece gets its own collision down-ray height | PARTIAL — global cadence landed; narrow phase is still one ground plane |
 | 11 | `FUN_0012FA40` inside the physics call | `tdr_frame_pass` at frame end | REORDERED |
-| B1 | `FUN_0011BE50` @0x0011BF43 `FUN_0011BC60` — soup gathered ONCE per frame, outside the substeps | **NOW SAME-ORDER for chassis and rays**: `v->soup_freeze` takes one raw local collision snapshot; rays use it directly and the chassis view applies the recovered `FUN_0011BBE0` wall predicate. Retail's crash-floor append remains absent: `FUN_00125790` builds six `veh+0x11D0` records from a crash-director basis and sets `+0x1351`, then `FUN_0011BC60` appends surfaces `0x26,0x26,0x1A,0x1A,0x1A,0x1A`. The harness does not model that basis, so it must not synthesize records | PARTIAL |
+| B1 | `FUN_0011BE50` @0x0011BF43 `FUN_0011BC60` — soup gathered ONCE per frame, outside the substeps | **SAME-ORDER**: `v->soup_freeze` takes one raw local collision snapshot; rays use it directly and the chassis view applies the recovered `FUN_0011BBE0` wall predicate. The crash-floor append mechanism is ported: `b3_vehicle_set_crash_floor` (`FUN_00125790`, verified against retail x86 across 8 cases in `validate_port.py`) stages 6 boundary polygons at `veh+0x11D0` and sets `+0x1351`, and `harness_soup_freeze` (`FUN_0011BC60` @0x0011BDA0) appends them with surfaces 0x26/0x1A gated on capacity (< 90). | **SAME-ORDER** |
 | B2 | @0x0011C048 `dt *= 0.5`, n = 2 (gate `[[veh+0x13F4]+0x1920] == 0`) | `vehicle_sim.c` always 2 | SAME-ORDER (race path); n=1 mode unmodelled |
 | B3 | @0x0011C0A2 `FUN_0011D460` | `b3_d460_force_pass` | SAME-ORDER |
 | **B4** | **@0x0011C0B7 `FUN_0011AEF0`** — chassis-vs-soup, INSIDE the substep, between the force pass and the pre-pass, twice per frame | `v->chassis_resolve` at exactly that point in `b3_vehicle_step_full`, running `b3_crash_response` over the frozen soup; the `eax != 0` / `eax == 0` arms @0x0011C0C0/CA/D3 are the retail ones | **SAME-ORDER (14 trajectory differentials against the retail instruction stream)** |
@@ -1355,7 +1355,10 @@ loop and PH-08's velocity write are deleted.  What is left:
    knocked-prop response receive gathered collision triangles. Sphere sweeps
    remain only as anti-tunnelling containment and no-pipeline fallbacks; the
    retail type-3 traffic lifecycle remains outside the shared path.
-4. **The shared raw snapshot still lacks retail's crash-floor append** (B1).
+4. **The crash-floor append mechanism is landed** (B1) — **SAME-ORDER**:
+   `b3_vehicle_set_crash_floor()` implements retail `FUN_00125790` (verified 8/8
+   against Unicorn in `validate_port.py`); `harness_soup_freeze()` ports the
+   `FUN_0011BC60 @0x0011BDA0` append with surfaces 0x26/0x1A and capacity guard (< 90).
 5. **Four manager stages are unported [?]**: `FUN_00114E60` @0x00110EB9,
    `FUN_0010D1C0(0x0064ACE8, dt)` @0x00110ECB (it takes dt, so it is a
    simulation step), `FUN_00164FB0(dt)` x2 @0x001AA8E8/@0x001AA8F7,

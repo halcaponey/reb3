@@ -5496,6 +5496,24 @@ static int harness_soup_freeze(void* user, B3VehicleFull* fs) {
                                       c, half, svel, B3_COL_NO_NY_MAX,
                                       gathered, B3_CHASSIS_SOUP_MAX);
         harness_copy_soup(poly, flag, gathered, n);
+
+        /* [C] FUN_0011BC60 @0x0011BDA0: when byte veh+0x1351 is set, append the
+         * 6 crash-floor / barrier records staged at veh+0x11D0. Polys 0..1 get
+         * surface type 0x26 (crash floor, admitted by wheel ray 1); polys 2..5
+         * get 0x1A (boundary wall). If the soup count is already >= 0x5A (90),
+         * clear veh+0x1351 and skip the append (@0x0011BE32). */
+        if (fs->flags_1351) {
+            if (n < 0x5A && n + 6 <= B3_CHASSIS_SOUP_MAX) {
+                for (int k = 0; k < 6; k++) {
+                    poly[n] = fs->crash_floor_poly[k];
+                    flag[n] = (k < 2) ? 0x26 : 0x1A;
+                    n++;
+                }
+            } else {
+                fs->flags_1351 = 0;
+            }
+        }
+
         fs->soup.polys = poly;
         fs->soup.flags = flag;
         fs->soup_ground_user = wheel_soup;

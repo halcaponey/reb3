@@ -663,7 +663,12 @@ _Static_assert(offsetof(B3WheelSim, contact)  == 0xB3, "wheel contact");
 // the "no world" configuration (the resolve returns 0 -- FUN_0011BE50's own
 // eax == 0 arm) and leaves the pipeline byte-identical to a soup-less run.
 // ---------------------------------------------------------------------------
-struct B3CrashPoly;
+#ifndef B3_CRASH_POLY_DEFINED
+#define B3_CRASH_POLY_DEFINED
+typedef struct B3CrashPoly {
+    float p0[4], p1[4], p2[4], n[4];
+} B3CrashPoly;
+#endif
 
 typedef struct {
     int count;                          // veh+0x200 -> [+0x00]
@@ -713,7 +718,11 @@ typedef struct B3VehicleFull {
     unsigned char _pad0B[0x1];
     unsigned char          wheel_count;  // +0x1169  BYTE in retail, not int:
                                          // an int here is unaligned at 0x1169
-    unsigned char _pad0C[0x1E9];
+    unsigned char _pad0C_head[0x66];     // +0x116A .. 0x11D0
+    B3CrashPoly            crash_floor_poly[6]; // +0x11D0 (6 x 0x40 = 0x180: 0x11D0 .. 0x1350)
+    unsigned char          flags_1350;   // +0x1350 (extra barrier count gate)
+    unsigned char          flags_1351;   // +0x1351 (crash-floor active flag)
+    unsigned char _pad0C_tail[1];        // +0x1352
     unsigned char          flags_1353;  // +0x1353 bit0|bit2 disable, bit3 blocks crash
     unsigned char _pad0D[0xC];
     float                  resist_1360;  // +0x1360
@@ -900,6 +909,9 @@ _Static_assert(offsetof(B3VehicleFull, wheel) == 0x0820, "wheel off retail");
 _Static_assert(offsetof(B3VehicleFull, surface_1160) == 0x1160, "surface_1160 off retail");
 _Static_assert(offsetof(B3VehicleFull, steer_deg_1164) == 0x1164, "steer_deg_1164 off retail");
 _Static_assert(offsetof(B3VehicleFull, wheel_count) == 0x1169, "wheel_count off retail");
+_Static_assert(offsetof(B3VehicleFull, crash_floor_poly) == 0x11D0, "crash_floor_poly off retail");
+_Static_assert(offsetof(B3VehicleFull, flags_1350) == 0x1350, "flags_1350 off retail");
+_Static_assert(offsetof(B3VehicleFull, flags_1351) == 0x1351, "flags_1351 off retail");
 _Static_assert(offsetof(B3VehicleFull, flags_1353) == 0x1353, "flags_1353 off retail");
 _Static_assert(offsetof(B3VehicleFull, resist_1360) == 0x1360, "resist_1360 off retail");
 _Static_assert(offsetof(B3VehicleFull, downforce_1364) == 0x1364, "downforce_1364 off retail");
@@ -1035,5 +1047,11 @@ static inline void b3_rigid_body_bind_frame(B3RigidBody* rb, float (*store)[4])
 #define B3_RIGID_BODY_LOCAL(name) \
     B3RigidBody name; float name##__frame_store[4][4]; \
     b3_rigid_body_bind_frame(&(name), name##__frame_store)
+
+// FUN_00125790: build 6 crash-floor / barrier polygons at veh+0x11D0 and set +0x1351.
+// mode is 1 if director zone type == 2, else 0.
+void b3_vehicle_set_crash_floor(B3VehicleFull* v, const float points[6][4],
+                                const float basis[3][4], int mode);
+void b3_vehicle_clear_crash_floor(B3VehicleFull* v);
 
 #endif // BURNOUT3_VEHICLE_SIM_H

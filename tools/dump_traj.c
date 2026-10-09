@@ -472,7 +472,55 @@ static int pieceseed_mode(const char* path) {
     return 0;
 }
 
+static int crashfloor_mode(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "crashfloor: cannot open %s\n", path); return 1; }
+    double d;
+    float b[37];
+    int n = 0;
+    while (n < 37 && fscanf(f, "%lf", &d) == 1) b[n++] = (float)d;
+    fclose(f);
+    if (n < 37) { fprintf(stderr, "crashfloor: need 37 numbers\n"); return 1; }
+    int mode = (int)b[0];
+    float pts[6][4];
+    for (int i = 0; i < 6; i++) {
+        for (int j = 0; j < 4; j++) {
+            pts[i][j] = b[1 + i * 4 + j];
+        }
+    }
+    float basis[3][4];
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 4; j++) {
+            basis[i][j] = b[25 + i * 4 + j];
+        }
+    }
+    B3VehicleFull v;
+    memset(&v, 0, sizeof(v));
+    b3_vehicle_set_crash_floor(&v, pts, basis, mode);
+
+    printf("{\"flag_1351\":%d,\"polys\":[", (int)v.flags_1351);
+    for (int i = 0; i < 6; i++) {
+        printf("%s{\"p0\":[%.9g,%.9g,%.9g,%.9g],"
+               "\"p1\":[%.9g,%.9g,%.9g,%.9g],"
+               "\"p2\":[%.9g,%.9g,%.9g,%.9g],"
+               "\"n\":[%.9g,%.9g,%.9g,%.9g]}",
+               i ? "," : "",
+               v.crash_floor_poly[i].p0[0], v.crash_floor_poly[i].p0[1],
+               v.crash_floor_poly[i].p0[2], v.crash_floor_poly[i].p0[3],
+               v.crash_floor_poly[i].p1[0], v.crash_floor_poly[i].p1[1],
+               v.crash_floor_poly[i].p1[2], v.crash_floor_poly[i].p1[3],
+               v.crash_floor_poly[i].p2[0], v.crash_floor_poly[i].p2[1],
+               v.crash_floor_poly[i].p2[2], v.crash_floor_poly[i].p2[3],
+               v.crash_floor_poly[i].n[0], v.crash_floor_poly[i].n[1],
+               v.crash_floor_poly[i].n[2], v.crash_floor_poly[i].n[3]);
+    }
+    printf("]}\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc >= 3 && !strcmp(argv[1], "--crashfloor"))
+        return crashfloor_mode(argv[2]);
     if (argc >= 3 && !strcmp(argv[1], "--wcontact"))
         return wcontact_mode(argv[2]);
     if (argc >= 3 && !strcmp(argv[1], "--class7"))

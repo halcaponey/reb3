@@ -3406,6 +3406,176 @@ def run_relocation_cases():
     return fails
 
 
+# ===========================================================================
+# CRASH-FLOOR / BARRIER STAGING -- FUN_00125790
+# (docs/PHYSICS_GLUE_LEDGER.md section B1, gap #4)
+#
+# Builds 6 crash-floor / barrier polygons at veh+0x11D0..0x134F and sets
+# byte veh+0x1351 = 1.
+# Calling convention:
+#   ESI = vehicle pointer
+#   EDI = pointer to 6 Vec4 points
+#   AL  = mode (1 if zone type == 2, else 0)
+#   [ESP+4] = pointer to 3 Vec4 basis vectors (callee pops: ret 4)
+# ===========================================================================
+CF_ENTRY = 0x00125790
+CF_STACK = 0x20000000
+CF_VEH   = 0x30000000
+CF_PTS   = 0x40000000
+CF_BASIS = 0x40001000
+CF_MAGIC = 0x50000000
+
+
+def cf_emulate(pts, basis, mode):
+    from unicorn import Uc, UC_ARCH_X86, UC_MODE_32, UC_PROT_ALL, UcError
+    from unicorn.x86_const import (UC_X86_REG_ESP, UC_X86_REG_EAX,
+                                   UC_X86_REG_ESI, UC_X86_REG_EDI)
+    uc = Uc(UC_ARCH_X86, UC_MODE_32)
+    ev.load_elf(uc, ev.ELF)
+    uc.mem_map(CF_STACK, 0x10000, UC_PROT_ALL)
+    uc.mem_map(CF_VEH, 0x10000, UC_PROT_ALL)
+    uc.mem_map(CF_PTS, 0x10000, UC_PROT_ALL)
+    uc.mem_map(CF_MAGIC, 0x1000, UC_PROT_ALL)
+
+    pts_data = bytearray(6 * 16)
+    for i in range(6):
+        struct.pack_into('<4f', pts_data, i * 16, *pts[i])
+    uc.mem_write(CF_PTS, bytes(pts_data))
+
+    basis_data = bytearray(3 * 16)
+    for i in range(3):
+        struct.pack_into('<4f', basis_data, i * 16, *basis[i])
+    uc.mem_write(CF_BASIS, bytes(basis_data))
+
+    sp = CF_STACK + 0x8000
+    uc.mem_write(sp, struct.pack('<II', CF_MAGIC, CF_BASIS))
+
+    uc.reg_write(UC_X86_REG_ESP, sp)
+    uc.reg_write(UC_X86_REG_ESI, CF_VEH)
+    uc.reg_write(UC_X86_REG_EDI, CF_PTS)
+    uc.reg_write(UC_X86_REG_EAX, mode & 0xFF)
+
+    uc.emu_start(CF_ENTRY, CF_MAGIC, count=1000000)
+
+    flag_1351 = uc.mem_read(CF_VEH + 0x1351, 1)[0]
+    raw_polys = uc.mem_read(CF_VEH + 0x11D0, 6 * 0x40)
+    polys = []
+    for i in range(6):
+        p = struct.unpack('<16f', raw_polys[i * 64:(i + 1) * 64])
+        polys.append({
+            'p0': list(p[0:4]),
+            'p1': list(p[4:8]),
+            'p2': list(p[8:12]),
+            'n':  list(p[12:16]),
+        })
+    return {'flag_1351': flag_1351, 'polys': polys}
+
+
+def cf_port(pts, basis, mode):
+    import json
+    import os
+    import subprocess
+    import tempfile
+    vals = [float(mode)]
+    for p in pts:
+        vals += list(p)
+    for b in basis:
+        vals += list(b)
+    fd, path = tempfile.mkstemp(suffix=".cf")
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(' '.join(repr(float(x)) for x in vals))
+        out = subprocess.run(['build/dump_traj', '--crashfloor', path],
+                             capture_output=True, text=True, check=True)
+    finally:
+        os.unlink(path)
+    return json.loads(out.stdout)
+
+
+CF_CASES = [
+    ("straight road, zone type 2",
+     [[-2.0, 0.0, -10.0, 0.0], [ 2.0, 0.0, -10.0, 0.0],
+      [-2.0, 0.0,  10.0, 0.0], [ 2.0, 0.0,  10.0, 0.0],
+      [-2.5, 0.0,  15.0, 0.0], [ 2.5, 0.0,  15.0, 0.0]],
+     [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+     1),
+    ("straight road, default mode",
+     [[-2.0, 0.0, -10.0, 0.0], [ 2.0, 0.0, -10.0, 0.0],
+      [-2.0, 0.0,  10.0, 0.0], [ 2.0, 0.0,  10.0, 0.0],
+      [-2.5, 0.0,  15.0, 0.0], [ 2.5, 0.0,  15.0, 0.0]],
+     [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+     0),
+    ("sloped uphill road (mode 1)",
+     [[-3.0, 0.0, -20.0, 0.0], [ 3.0, 0.0, -20.0, 0.0],
+      [-3.0, 5.0,  20.0, 0.0], [ 3.0, 5.0,  20.0, 0.0],
+      [-3.5, 7.0,  30.0, 0.0], [ 3.5, 7.0,  30.0, 0.0]],
+     [[1.0, 0.0, 0.0, 0.0], [0.0, 0.992278, -0.124035, 0.0], [0.0, 0.124035, 0.992278, 0.0]],
+     1),
+    ("sloped uphill road (mode 0)",
+     [[-3.0, 0.0, -20.0, 0.0], [ 3.0, 0.0, -20.0, 0.0],
+      [-3.0, 5.0,  20.0, 0.0], [ 3.0, 5.0,  20.0, 0.0],
+      [-3.5, 7.0,  30.0, 0.0], [ 3.5, 7.0,  30.0, 0.0]],
+     [[1.0, 0.0, 0.0, 0.0], [0.0, 0.992278, -0.124035, 0.0], [0.0, 0.124035, 0.992278, 0.0]],
+     0),
+    ("angled road 45 deg yaw (mode 1)",
+     [[-8.485, 0.0, -5.657, 0.0], [-5.657, 0.0, -8.485, 0.0],
+      [ 5.657, 0.0,  8.485, 0.0], [ 8.485, 0.0,  5.657, 0.0],
+      [ 8.839, 0.0, 12.374, 0.0], [12.374, 0.0,  8.839, 0.0]],
+     [[0.7071068, 0.0, -0.7071068, 0.0], [0.0, 1.0, 0.0, 0.0], [0.7071068, 0.0, 0.7071068, 0.0]],
+     1),
+    ("angled road 45 deg yaw (mode 0)",
+     [[-8.485, 0.0, -5.657, 0.0], [-5.657, 0.0, -8.485, 0.0],
+      [ 5.657, 0.0,  8.485, 0.0], [ 8.485, 0.0,  5.657, 0.0],
+      [ 8.839, 0.0, 12.374, 0.0], [12.374, 0.0,  8.839, 0.0]],
+     [[0.7071068, 0.0, -0.7071068, 0.0], [0.0, 1.0, 0.0, 0.0], [0.7071068, 0.0, 0.7071068, 0.0]],
+     0),
+    ("cambered road (mode 1)",
+     [[-2.5,  0.5, -10.0, 0.0], [ 2.5, -0.5, -10.0, 0.0],
+      [-2.5,  0.5,  10.0, 0.0], [ 2.5, -0.5,  10.0, 0.0],
+      [-3.0,  0.6,  15.0, 0.0], [ 3.0, -0.6,  15.0, 0.0]],
+     [[0.98058, -0.196116, 0.0, 0.0], [0.196116, 0.98058, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+     1),
+    ("cambered road (mode 0)",
+     [[-2.5,  0.5, -10.0, 0.0], [ 2.5, -0.5, -10.0, 0.0],
+      [-2.5,  0.5,  10.0, 0.0], [ 2.5, -0.5,  10.0, 0.0],
+      [-3.0,  0.6,  15.0, 0.0], [ 3.0, -0.6,  15.0, 0.0]],
+     [[0.98058, -0.196116, 0.0, 0.0], [0.196116, 0.98058, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+     0),
+]
+
+
+def run_crashfloor_cases():
+    fails = 0
+    print("\ncrash-floor / barrier staging (FUN_00125790), "
+          "real x86 vs the C port:")
+    for name, pts, basis, mode in CF_CASES:
+        try:
+            emu = cf_emulate(pts, basis, mode)
+            port = cf_port(pts, basis, mode)
+        except Exception as e:
+            print("  %-32s %s" % (name, e))
+            fails += 1
+            continue
+        bad = []
+        if emu['flag_1351'] != port['flag_1351']:
+            bad.append(('flag_1351', port['flag_1351'], emu['flag_1351']))
+        for i in range(6):
+            for k in ('p0', 'p1', 'p2', 'n'):
+                for c in range(4):
+                    ev_val = emu['polys'][i][k][c]
+                    pv_val = port['polys'][i][k][c]
+                    if abs(ev_val - pv_val) > max(1e-5, abs(ev_val) * 1e-5):
+                        bad.append(("%d.%s[%d]" % (i, k, c), pv_val, ev_val))
+        if bad:
+            fails += 1
+            print("  %-32s FAIL" % name)
+            for tag, pv, evv in bad[:8]:
+                print("      %-12s port %r  emu %r" % (tag, pv, evv))
+        else:
+            print("  %-32s OK" % name)
+    return fails
+
+
 def main():
     fails = 0
     print("%-38s %-13s %-13s %s" % ("case", "model_z", "emulated_z", "result"))
@@ -3463,16 +3633,17 @@ def main():
     c7fails = run_class7_cases()
     psfails = run_pieceseed_cases()
     rlfails = run_relocation_cases()
+    cffails = run_crashfloor_cases()
     fails += (efails + wfails + gfails + sfails + pfails + tfails + ifails
               + stfails + safails + plfails + advfails + wcfails + c7fails
-              + rlfails + psfails)
+              + rlfails + psfails + cffails)
 
     total = (len(CASES) + 5 + len(ENGINE_CASES) + len(WHEEL_CASES)
              + len(ENGAGE_CASES) + len(SUSP_CASES) + 2
              + len(TYRE_CASES) + 1 + len(INTEG_CASES) + len(STEER_CASES)
              + len(STEER_AWAY_CASES) + len(PIPELINE_WINDOWS)
              + len(ADVERSARIAL) + len(WC_CASES) + len(C7_CASES)
-             + len(RELOC_CASES) + len(PS_CASES))
+             + len(RELOC_CASES) + len(PS_CASES) + len(CF_CASES))
     print("\n%d/%d cases match the real code "
           "(%d resistance, 5 vertical, %d engine/transmission, %d wheel, "
           "%d engage, %d suspension, 2 pre-pass, %d tyre/airborne (+1 LSDM), "
@@ -3480,13 +3651,14 @@ def main():
           "%d full-pipeline trajectories, %d adversarial trajectories, "
           "%d world-contact resolves, %d class-7 updates, "
           "%d in-substep chassis-contact trajectories, "
-          "%d flying-part inertia seeds)"
+          "%d flying-part inertia seeds, "
+          "%d crash-floor barrier stagings)"
           % (total - fails, total, len(CASES), len(ENGINE_CASES),
              len(WHEEL_CASES), len(ENGAGE_CASES), len(SUSP_CASES),
              len(TYRE_CASES), len(INTEG_CASES), len(STEER_CASES),
              len(STEER_AWAY_CASES), len(PIPELINE_WINDOWS), len(ADVERSARIAL),
              len(WC_CASES), len(C7_CASES), len(RELOC_CASES),
-             len(PS_CASES)))
+             len(PS_CASES), len(CF_CASES)))
     print("The former KNOWN GAP (-20.0*dir.x on X) is CLOSED: it was the "
           "airborne damper table in FUN_0011D460 (see RE_NOTES section 11).")
     return 1 if fails else 0

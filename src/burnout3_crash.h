@@ -44,9 +44,12 @@ struct B3RigidBody;      // burnout3_vehicle_sim.h (included below)
 // ---------------------------------------------------------------------------
 // (Tagged: burnout3_vehicle_sim.h forward-declares it for B3ChassisSoup,
 // the veh+0x200 record FUN_0011AEF0 reads.)
+#ifndef B3_CRASH_POLY_DEFINED
+#define B3_CRASH_POLY_DEFINED
 typedef struct B3CrashPoly {
     float p0[4], p1[4], p2[4], n[4];
 } B3CrashPoly;
+#endif
 
 // ---------------------------------------------------------------------------
 // Contact accumulator -- mirrors the 0xE0-byte stack struct FUN_0011AEF0
