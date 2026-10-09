@@ -407,13 +407,11 @@ is fully resolved:
 * **Any extractor change must re-pass `tools/cextract/verify_cextract.py`**
   against a fresh oracle run. Byte-identical, pixel-identical for PNGs, and a
   file on only one side is a failure.
-* **`cx_art_postfx.c` does not emit the `env+0x60` `light_rgb` block** that
-  `tools/py_extract_archive/extract_postfx_art.py:297-302` writes, so all 37
-  `build/postfx/<ID>_env.txt` sidecars and `enviro_manifest.txt` fail the gate
-  (the 107 sky PNGs are all pixel-identical). Pre-existing at HEAD — `git show
-  HEAD:tools/cextract/cx_art_postfx.c | grep -c light_rgb` is 0 — and it is
-  the one open `verify_cextract.py` failure. Detail:
-  `docs/LOAD_PARALLELISM.md` §5.
+* **`cx_art_postfx.c` emits the `env+0x60` `light_rgb` block — RESOLVED.**
+  Both `build/postfx/<ID>_env.txt` sidecars and `enviro_manifest.txt` correctly
+  emit the `env+0x60` `light_rgb` line matching the oracle in
+  `tools/py_extract_archive/extract_postfx_art.py`. All 107 sky PNGs are
+  pixel-identical and all 37 text sidecars match.
 * **The extraction stages and the texture load run on a worker pool**
   (`tools/cextract/cx_pool.h`); `B3_JOBS=1` puts every one of them back on the
   calling thread, unchanged, which is the first thing to try when a
