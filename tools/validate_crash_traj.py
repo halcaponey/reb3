@@ -41,7 +41,7 @@ import os
 
 # The drivers link burnout3_backend.c; pin them to the RE path so a
 # flipped build/backends.cfg cannot change what this suite measures.
-os.environ['B3_BACKENDS'] = '/dev/null'
+os.environ['B3_BACKENDS'] = 'NUL' if os.name == 'nt' else '/dev/null'
 
 import struct
 import subprocess
@@ -363,11 +363,13 @@ int main(int argc, char** argv) {
 
 def build_driver(defines=(), tag=''):
     src = os.path.join(_root, 'build', 'crash_traj_drv.c')
-    exe = os.path.join(_root, 'build', 'crash_traj_drv' + tag)
+    exe = os.path.join(_root, 'build', 'crash_traj_drv' + tag + ('.exe' if os.name == 'nt' else ''))
     os.makedirs(os.path.join(_root, 'build'), exist_ok=True)
     with open(src, 'w') as f:
         f.write(DRIVER_C)
-    r = subprocess.run(['cc', '-O2', '-Isrc'] + list(defines)
+    cc = 'gcc' if os.name == 'nt' else 'cc'
+    flags = ['-Isrc/compat', '-include', os.path.join(_root, 'src', 'compat', 'win_posix_compat.h')] if os.name == 'nt' else []
+    r = subprocess.run([cc, '-O2', '-Isrc'] + flags + list(defines)
                        + ['-o', exe, src,
                           'src/burnout3_crash.c', 'src/burnout3_vehicle_sim.c',
                           # burnout3_crash.c carries the crash=retail switch;
@@ -966,7 +968,7 @@ def run_sleep_cases():
 def _c_omega2_limit():
     """B3_SLEEP_OMEGA2_LIMIT as the compiler sees it."""
     src = os.path.join(_root, 'build', 'crash_limit_drv.c')
-    exe = os.path.join(_root, 'build', 'crash_limit_drv')
+    exe = os.path.join(_root, 'build', 'crash_limit_drv' + ('.exe' if os.name == 'nt' else ''))
     with open(src, 'w') as f:
         f.write('#include <stdio.h>\n#include "burnout3_crash.h"\n'
                 'int b3_ground_probe(float x, float y, float z, float* h,'
@@ -974,7 +976,9 @@ def _c_omega2_limit():
                 ' return -1; }\n'
                 'int main(void){printf("%.9g\\n", B3_SLEEP_OMEGA2_LIMIT);'
                 'return 0;}\n')
-    r = subprocess.run(['cc', '-O2', '-Isrc', '-o', exe, src,
+    cc = 'gcc' if os.name == 'nt' else 'cc'
+    flags = ['-Isrc/compat', '-include', os.path.join(_root, 'src', 'compat', 'win_posix_compat.h')] if os.name == 'nt' else []
+    r = subprocess.run([cc, '-O2', '-Isrc'] + flags + ['-o', exe, src,
                         'src/burnout3_backend.c', 'src/burnout3_emu.c', '-lm'],
                        cwd=_root, capture_output=True, text=True)
     if r.returncode != 0:
@@ -986,13 +990,15 @@ def _c_omega2_limit():
 def _c_sleep(exe, over):
     """b3_crash_mode_frame's own gate under the same inputs."""
     src = os.path.join(_root, 'build', 'crash_sleep_drv.c')
-    exe2 = os.path.join(_root, 'build', 'crash_sleep_drv')
+    exe2 = os.path.join(_root, 'build', 'crash_sleep_drv' + ('.exe' if os.name == 'nt' else ''))
     if not os.path.exists(exe2) or (os.path.getmtime(exe2)
                                     < os.path.getmtime(os.path.join(
                                         _root, 'src', 'burnout3_crash.c'))):
         with open(src, 'w') as f:
             f.write(SLEEP_DRIVER_C)
-        r = subprocess.run(['cc', '-O2', '-Isrc', '-o', exe2, src,
+        cc = 'gcc' if os.name == 'nt' else 'cc'
+        flags = ['-Isrc/compat', '-include', os.path.join(_root, 'src', 'compat', 'win_posix_compat.h')] if os.name == 'nt' else []
+        r = subprocess.run([cc, '-O2', '-Isrc'] + flags + ['-o', exe2, src,
                             'src/burnout3_crash.c',
                             'src/burnout3_vehicle_sim.c',
                             'src/burnout3_backend.c', 'src/burnout3_emu.c',
@@ -1288,7 +1294,7 @@ def run_rest_cases(quick):
     real_peak = max(t['pos'][1] for t in rt) - ry0
     held = dict(base)
     held['after_x'] = 1.0
-    rows2 = run_driver(exe, 'wreck', held, extra=[n])
+    rows2 = run_driver(exe, 'wreck', held, extra=[max(n, 1200)])
     peak2 = max(r[1] for r in rows2) - base['ground']
     check("aftertouch held: the REAL machine throws the wreck %+.2f m up "
           "(one 0.6 corner kick per frame, no cooldown)" % real_peak,
